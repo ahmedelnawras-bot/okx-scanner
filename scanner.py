@@ -6,18 +6,26 @@ import numpy as np
 TELEGRAM_TOKEN = "8626651293:AAGTVnwdW36qLsoZdmC2ngKoYUGMeYZyjsg"
 CHAT_ID = "5523662724"
 
+EXCLUDE = ["USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","WIN","SHIB"]
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"})
 
-def get_okx_pairs():
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+def get_pairs(inst_type):
+    url = f"https://www.okx.com/api/v5/market/tickers?instType={inst_type}"
     r = requests.get(url).json()
-    pairs = [x["instId"] for x in r["data"] if x["instId"].endswith("-USDT")]
+    if inst_type == "SPOT":
+        pairs = [x["instId"] for x in r["data"] if x["instId"].endswith("-USDT") and x["instId"].split("-")[0] not in EXCLUDE]
+    else:
+        pairs = [x["instId"] for x in r["data"] if "USDT" in x["instId"] and x["instId"].split("-")[0] not in EXCLUDE]
     return pairs
 
-def get_candles(symbol, limit=50):
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
+def get_candles(symbol, inst_type, limit=50):
+    if inst_type == "SPOT":
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
+    else:
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
     r = requests.get(url).json()
     if "data" not in r or len(r["data"]) < 20:
         return None
@@ -40,36 +48,35 @@ def check_bb_squeeze(df, period=20, threshold=0.03):
     bandwidth = (upper - lower) / ma
     return bandwidth.iloc[-1] < threshold
 
-def scan():
-    print("Starting scan...")
-    pairs = get_okx_pairs()
+def scan(inst_type):
+    label = "سبوت 🟢" if inst_type == "SPOT" else "فيوتشر 🔴"
+    print(f"Scanning {inst_type}...")
+    pairs = get_pairs(inst_type)
     print(f"Found {len(pairs)} pairs")
     for symbol in pairs:
         try:
-            df = get_candles(symbol)
+            df = get_candles(symbol, inst_type)
             if df is None:
                 continue
             vol_spike = check_volume_spike(df)
             bb_squeeze = check_bb_squeeze(df)
             if vol_spike and bb_squeeze:
-                msg = f"🚨 <b>STRONG SIGNAL</b>\n{symbol}\n✅ Volume Spike + BB Squeeze\nالاتنين مع بعض - فرصة قوية"
+                msg = f"🚨 <b>STRONG SIGNAL</b>\n{symbol}\n{label}\n✅ Volume Spike + BB Squeeze\nالاتنين مع بعض - فرصة قوية"
                 send_telegram(msg)
-                print(f"STRONG: {symbol}")
             elif vol_spike:
-                msg = f"🔵 <b>Volume Spike</b>\n{symbol}\nارتفاع حجم تداول غير عادي على 4H"
+                msg = f"🔵 <b>Volume Spike</b>\n{symbol}\n{label}\nارتفاع حجم تداول غير عادي على 4H"
                 send_telegram(msg)
-                print(f"VOL: {symbol}")
             elif bb_squeeze:
-                msg = f"🟡 <b>BB Squeeze</b>\n{symbol}\nضغط في السعر - انتظر الانفجار على 4H"
+                msg = f"🟡 <b>BB Squeeze</b>\n{symbol}\n{label}\nضغط في السعر - انتظر الانفجار على 4H"
                 send_telegram(msg)
-                print(f"SQZ: {symbol}")
             time.sleep(0.3)
         except Exception as e:
             print(f"Error {symbol}: {e}")
             continue
-    print("Scan complete")
+    print(f"{inst_type} scan complete")
 
 while True:
-    scan()
+    scan("SPOT")
+    scan("SWAP")
     print("Waiting 4 hours...")
     time.sleep(14400)
