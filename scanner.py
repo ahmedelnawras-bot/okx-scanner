@@ -6,7 +6,7 @@ import numpy as np
 TELEGRAM_TOKEN = "8626651293:AAGTVnwdW36qLsoZdmC2ngKoYUGMeYZyjsg"
 CHAT_ID = "5523662724"
 
-EXCLUDE = ["USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","WIN","SHIB"]
+EXCLUDE = ["USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","BRL1","WIN","SHIB","USDG","SPURS","NFT","USDP","USDD","FRAX","LUSD","GUSD","HUSD","SUSD","CUSD","ZUSD","USDX","USDN","USDK","USDQ","USDB"]
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -21,11 +21,8 @@ def get_pairs(inst_type):
         pairs = [x["instId"] for x in r["data"] if "USDT" in x["instId"] and x["instId"].split("-")[0] not in EXCLUDE]
     return pairs
 
-def get_candles(symbol, inst_type, limit=50):
-    if inst_type == "SPOT":
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
-    else:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
+def get_candles(symbol, limit=50):
+    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
     r = requests.get(url).json()
     if "data" not in r or len(r["data"]) < 20:
         return None
@@ -55,7 +52,7 @@ def scan(inst_type):
     print(f"Found {len(pairs)} pairs")
     for symbol in pairs:
         try:
-            df = get_candles(symbol, inst_type)
+            df = get_candles(symbol)
             if df is None:
                 continue
             vol_spike = check_volume_spike(df)
