@@ -1,5 +1,3 @@
-
-```python
 import requests
 import time
 import pandas as pd
@@ -46,16 +44,13 @@ def scan():
     print("Starting scan...")
     pairs = get_okx_pairs()
     print(f"Found {len(pairs)} pairs")
-    
     for symbol in pairs:
         try:
             df = get_candles(symbol)
             if df is None:
                 continue
-            
             vol_spike = check_volume_spike(df)
             bb_squeeze = check_bb_squeeze(df)
-            
             if vol_spike and bb_squeeze:
                 msg = f"🚨 <b>STRONG SIGNAL</b>\n{symbol}\n✅ Volume Spike + BB Squeeze\nالاتنين مع بعض - فرصة قوية"
                 send_telegram(msg)
@@ -68,15 +63,13 @@ def scan():
                 msg = f"🟡 <b>BB Squeeze</b>\n{symbol}\nضغط في السعر - انتظر الانفجار على 4H"
                 send_telegram(msg)
                 print(f"SQZ: {symbol}")
-                
             time.sleep(0.3)
         except Exception as e:
             print(f"Error {symbol}: {e}")
             continue
-    
     print("Scan complete")
 
 while True:
     scan()
     print("Waiting 4 hours...")
-    time.sleep(14400
+    time.sleep(14400)
