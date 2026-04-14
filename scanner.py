@@ -1,11 +1,10 @@
-
 import requests
 import time
 import pandas as pd
 import numpy as np
 
-TELEGRAM_TOKEN = "8626651293:AAGTVnwdW36qLsoZdmC2ngKoYUGMeYZyjsg"
-CHAT_ID = "5523662724"
+TELEGRAM_TOKEN = "PUT_YOUR_TOKEN_HERE"
+CHAT_ID = "PUT_YOUR_CHAT_ID"
 
 EXCLUDE = ["USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","BRL1","WIN","SHIB","USDG","SPURS","NFT","USDP","USDD","FRAX","LUSD","GUSD","HUSD","SUSD","CUSD","ZUSD","USDX","USDN","USDK","USDQ","USDB","SPY","TSLA","AAPL","AMZN","GOOGL","MSFT","NVDA","META","NFLX","XAU","XAUT","XAG","PAXG","OIL","CRUDE"]
 
@@ -20,10 +19,7 @@ def get_btc_trend():
         return "غير معروف"
     closes = [float(x[4]) for x in r["data"]]
     closes.reverse()
-    if closes[-1] > closes[-3]:
-        return "إيجابي ✅"
-    else:
-        return "سلبي ⚠️"
+    return "إيجابي ✅" if closes[-1] > closes[-3] else "سلبي ⚠️"
 
 def get_pairs(inst_type):
     url = f"https://www.okx.com/api/v5/market/tickers?instType={inst_type}"
@@ -46,30 +42,43 @@ def get_candles(symbol, limit=100):
 
 def check_volume_spike(df, multiplier=3):
     avg_vol = df["vol"].iloc[-20:-1].mean()
-    last_vol = df["vol"].iloc[-1]
-    return last_vol > avg_vol * multiplier
+    return df["vol"].iloc[-1] > avg_vol * multiplier
 
 def check_bb_squeeze(df, period=20, threshold=0.03):
     close = df["close"]
     ma = close.rolling(period).mean()
     std = close.rolling(period).std()
-    upper = ma + 2 * std
-    lower = ma - 2 * std
-    bandwidth = (upper - lower) / ma
+    bandwidth = (ma + 2*std - (ma - 2*std)) / ma
     return bandwidth.iloc[-1] < threshold
 
 def check_rsi(df, period=14):
-    close = df["close"]
-    delta = close.diff()
+    delta = df["close"].diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = -delta.where(delta < 0, 0).rolling(period).mean()
     rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    return 100 - (100 / (1 + rs)).iloc[-1]
 
 def check_above_ma20(df):
-    ma20 = df["close"].rolling(20).mean().iloc[-1]
-    return df["close"].iloc[-1] > ma20
+    return df["close"].iloc[-1] > df["close"].rolling(20).mean().iloc[-1]
+
+# 🔥 ATR (حساب الفوليتيليتي)
+def calculate_atr(df, period=14):
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
+# 🔥 ستوب لوس احترافي
+def calc_entry_stop(df):
+    entry = df["close"].iloc[-1]
+
+    support = df["low"].iloc[-10:].min()   # أقرب دعم
+    atr = calculate_atr(df)
+
+    stop = support - (atr * 0.5)  # مسافة أمان حسب الحركة
+
+    return round(entry, 6), round(stop, 6)
 
 def calc_score(vol_spike, bb_squeeze, rsi_ok, above_ma20, btc_positive):
     score = 0
@@ -80,16 +89,8 @@ def calc_score(vol_spike, bb_squeeze, rsi_ok, above_ma20, btc_positive):
     if btc_positive: score += 2
     return score
 
-def calc_entry_stop(df, inst_type):
-    last_close = df["close"].iloc[-1]
-    last_low = df["low"].iloc[-5:].min()
-    entry = round(last_close, 6)
-    stop = round(last_low * 0.98, 6)
-    return entry, stop
-
 def scan(inst_type, top_signals):
     label = "سبوت 🟢" if inst_type == "SPOT" else "فيوتشر 🔴"
-    print(f"Scanning {inst_type}...")
     pairs = get_pairs(inst_type)
     btc_trend = get_btc_trend()
     btc_positive = "إيجابي" in btc_trend
@@ -112,14 +113,14 @@ def scan(inst_type, top_signals):
                 continue
 
             score = calc_score(vol_spike, bb_squeeze, rsi_ok, above_ma20, btc_positive)
-            entry, stop = calc_entry_stop(df, inst_type)
+            entry, stop = calc_entry_stop(df)
 
             if vol_spike and bb_squeeze:
-                signal_type = "🚨 <b>STRONG SIGNAL</b>"
+                signal_type = "🚨 <b>إشارة قوية</b>"
             elif vol_spike:
-                signal_type = "🔵 <b>Volume Spike</b>"
+                signal_type = "🔵 <b>فوليوم عالي</b>"
             else:
-                signal_type = "🟡 <b>BB Squeeze</b>"
+                signal_type = "🟡 <b>ضغط سعري</b>"
 
             msg = (
                 f"{signal_type}\n"
@@ -127,10 +128,11 @@ def scan(inst_type, top_signals):
                 f"💰 السعر: {price}\n"
                 f"📊 RSI: {rsi:.1f} | فوق MA20\n"
                 f"🎯 دخول: {entry}\n"
-                f"🛑 ستوب: {stop}\n"
-                f"₿ BTC: {btc_trend}\n"
-                f"🔥 تقييم الفرصة: {score}/10"
+                f"🛑 ستوب احترافي: {stop}\n"
+                f"₿ السوق: {btc_trend}\n"
+                f"🔥 تقييم: {score}/10"
             )
+
             send_telegram(msg)
 
             top_signals.append({
@@ -148,16 +150,17 @@ def scan(inst_type, top_signals):
             print(f"Error {symbol}: {e}")
             continue
 
-    print(f"{inst_type} scan complete")
-
 def send_top10(top_signals):
     if not top_signals:
         return
+
     sorted_signals = sorted(top_signals, key=lambda x: x["score"], reverse=True)[:10]
-    msg = "🏆 <b>أفضل الفرص الحالية:</b>\n\n"
+
+    msg = "🏆 <b>أفضل الفرص:</b>\n\n"
     for i, s in enumerate(sorted_signals, 1):
-        msg += f"{i}. {s['symbol']} ({s['label']}) - تقييم: {s['score']}/10\n"
-        msg += f"   💰 {s['price']} | 🎯 {s['entry']} | 🛑 {s['stop']}\n\n"
+        msg += f"{i}. {s['symbol']} ({s['label']}) - {s['score']}/10\n"
+        msg += f"💰 {s['price']} | 🎯 {s['entry']} | 🛑 {s['stop']}\n\n"
+
     send_telegram(msg)
 
 while True:
@@ -167,5 +170,3 @@ while True:
     send_top10(top_signals)
     print("Waiting 4 hours...")
     time.sleep(14400)
-اضغط
-ق
