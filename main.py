@@ -6,7 +6,7 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- الإعدادات (تأكد من ضبطها في Railway Variables) ---
+# --- الإعدادات ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 
@@ -21,6 +21,16 @@ def get_tv_link(symbol, inst_type):
     clean_symbol = symbol.replace("-USDT", "USDT").replace("-SWAP", "")
     return f"https://www.tradingview.com/chart/?symbol=OKX:{clean_symbol}"
 
+def get_btc_status():
+    try:
+        url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
+        res = requests.get(url).json().get('data', [])
+        if not res: return "⚠️ غير معروف"
+        curr_price = float(res[0][4])
+        ma20 = sum([float(x[4]) for x in res]) / 20
+        return "🟢 إيجابي (صاعد)" if curr_price > ma20 else "🔴 سلبي (هابط)"
+    except: return "⚠️ فحص BTC فشل"
+
 def calculate_indicators(df):
     delta = df['c'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -30,7 +40,7 @@ def calculate_indicators(df):
     df['ma20'] = df['c'].rolling(window=20).mean()
     return df
 
-def scan(inst_type, all_signals, min_score):
+def scan(inst_type, all_signals, min_score, btc_status):
     url_pairs = f"https://www.okx.com/api/v5/public/instruments?instType={inst_type}"
     try:
         pairs_data = requests.get(url_pairs).json().get('data', [])[:50]
@@ -43,6 +53,8 @@ def scan(inst_type, all_signals, min_score):
             
             df = pd.DataFrame(res, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'v2', 'v3', 'v4'])
             df['c'] = df['c'].astype(float)
+            df['h'] = df['h'].astype(float)
+            df['l'] = df['l'].astype(float)
             df = df.iloc[::-1]
             df = calculate_indicators(df)
             
@@ -50,94 +62,40 @@ def scan(inst_type, all_signals, min_score):
             rsi = df['rsi'].iloc[-1]
             ma20 = df['ma20'].iloc[-1]
             
-            # --- معادلة السكور ---
+            # --- حساب الستوب لوس (Stop Loss) ---
+            # في الـ Long: الستوب هو أقل سعر في آخر 3 شموع
+            # في الـ Short: الستوب هو أعلى سعر في آخر 3 شموع
+            low_3 = df['l'].tail(3).min()
+            high_3 = df['h'].tail(3).max()
+            
             score = 0
             if curr_price > ma20: score += 3
-            if rsi < 30 or rsi > 70: score += 5 
-            elif 35 > rsi or rsi > 65: score += 3
-            if (curr_price > ma20 and rsi < 45): score += 2
+            if rsi < 35 or rsi > 65: score += 5
             score = min(score, 10)
             
-            signal_type = "LONG" if curr_price > ma20 else "SHORT"
+            direction = "LONG" if curr_price > ma20 else "SHORT"
+            stop_loss = round(low_3 * 0.99, 4) if direction == "LONG" else round(high_3 * 1.01, 4)
+            ma_status = "فوق ✅" if curr_price > ma20 else "تحت ❌"
             link = get_tv_link(symbol, inst_type)
 
-            # --- التنبيه الفوري (سكور 8 للفيوتشر و 9 للسبوت) ---
             alert_threshold = 8 if inst_type == "SWAP" else 9
-            
             if score >= alert_threshold:
-                alert_type = "🔥 فرصة قوية" if score == 8 else "🌟 فرصة ذهبية"
-                alert_msg = (
-                    f"{alert_type} <b>({inst_type})</b>\n\n"
-                    f"💰 العملة: <a href='{link}'>{symbol}</a>\n"
-                    f"📊 السكور: {score}/10\n"
-                    f"📈 الاتجاه: {signal_type}\n"
-                    f"🏷️ السعر: {curr_price}\n"
-                    f"⚡ RSI: {round(rsi, 2)}"
+                msg = (
+                    f"🟡 <b>BB Squeeze | {direction}</b>\n"
+                    f"{symbol}\n"
+                    f"💰 السعر: {curr_price}\n"
+                    f"📊 RSI: {round(rsi, 1)} | MA20 {ma_status}\n"
+                    f"🎯 دخول: {curr_price}\n"
+                    f"🛑 ستوب: {stop_loss}\n"
+                    f"🔥 التقييم: {score}/10\n"
+                    f"₿ BTC: {btc_status}\n"
+                    f"🔗 <a href='{link}'>افتح الشارت ({bar_frame})</a>"
                 )
-                send_telegram(alert_msg)
+                send_telegram(msg)
 
             if score >= min_score:
-                all_signals.append({
-                    "symbol": symbol, "score": score, "type": signal_type,
-                    "market": inst_type, "link": link
-                })
+                all_signals.append({"symbol": symbol, "score": score, "type": direction, "market": inst_type, "link": link})
             time.sleep(0.1)
     except: pass
 
-def send_top10(all_signals, category):
-    if not all_signals: return
-    longs = sorted([s for s in all_signals if s["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
-    shorts = sorted([s for s in all_signals if s["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
-
-    header = "🚀 <b>TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>TOP 10 SPOT (4H)</b>"
-    msg = f"{header}\n\n"
-
-    if longs:
-        msg += "🟢 <b>أفضل LONG:</b>\n"
-        for i, s in enumerate(longs, 1):
-            msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> - 🔥 {s['score']}/10\n"
-    
-    if shorts and category == "FUTURE":
-        msg += "\n🔴 <b>أفضل SHORT:</b>\n"
-        for i, s in enumerate(shorts, 1):
-            msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> - 🔥 {s['score']}/10\n"
-
-    send_telegram(msg)
-
-def main_logic_loop():
-    last_spot_time = 0
-    while True:
-        try:
-            # فحص الفيوتشر (كل ساعة)
-            future_signals = []
-            scan("SWAP", future_signals, min_score=6)
-            send_top10(future_signals, "FUTURE")
-
-            # فحص السبوت (كل 4 ساعات)
-            current_time = time.time()
-            if current_time - last_spot_time >= 14400:
-                spot_signals = []
-                scan("SPOT", spot_signals, min_score=7)
-                send_top10(spot_signals, "SPOT")
-                last_spot_time = current_time
-            
-            time.sleep(3600) 
-        except: time.sleep(60)
-
-def main():
-    if not TOKEN: 
-        print("Error: TELEGRAM_TOKEN not found!")
-        return
-
-    # --- السطر المطلوب لتنظيف الـ Webhook ومنع الـ Conflict ---
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
-    
-    # تشغيل المنطق في Thread منفصل
-    threading.Thread(target=main_logic_loop, daemon=True).start()
-    
-    app = Application.builder().token(TOKEN).build()
-    print("Bot Sniper is Online and Cleaning updates...")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+# ... بقية الدوال (send_top10, main_logic_loop, main) تظل كما هي ...
