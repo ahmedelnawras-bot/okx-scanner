@@ -293,24 +293,66 @@ def scan(inst_type, results, btc_status):
 
             link = get_tv_link(symbol, bar)
 
+            # Build reason
+            reasons = []
+            if vol_ok:
+                reasons.append("Volume Spike")
+            if rsi < 35:
+                reasons.append("RSI oversold")
+            elif rsi > 65:
+                reasons.append("RSI overbought")
+            else:
+                reasons.append("RSI محايد")
+            sweep_high, sweep_low = liquidity_sweep(df)
+            bos_up, bos_down = structure_break(df)
+            if sweep_low and bos_up:
+                reasons.append("Liquidity Sweep + BOS ↑")
+            if sweep_high and bos_down:
+                reasons.append("Liquidity Sweep + BOS ↓")
+            if price > ma:
+                reasons.append("فوق MA20")
+            else:
+                reasons.append("تحت MA20")
+            reasons.append(f"BTC {btc_status}")
+            reason_str = " | ".join(reasons)
+
             vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if vip else ""
 
-            msg = (
-                f"{vip_tag}"
-                f"🧠 إشارة ذكية | {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
-                f"📊 النوع: {'🚀 FUTURES (1H)' if inst_type=='SWAP' else '💎 SPOT (4H)'}\n"
-                f"────────────\n"
-                f"🪙 {symbol}\n"
-                f"💰 السعر: {price}\n"
-                f"📊 RSI: {round(rsi,1)}\n"
-                f"🎯 دخول: {price}\n"
-                f"🛑 وقف: {round(stop,6)}\n"
-                f"🔥 القوة: {conf}/10 | {strength}\n"
-                f"📌 التصنيف: {priority}\n"
-                f"₿ BTC: {btc_status}\n"
-                f"────────────\n"
-                f"📈 <a href='{link}'>TradingView</a>"
-            )
+            if inst_type == "SPOT":
+                msg = (
+                    f"{vip_tag}"
+                    f"💎 SPOT SIGNAL | 🟢 LONG\n"
+                    f"────────────\n"
+                    f"🪙 {symbol}\n"
+                    f"💰 السعر: {price}\n"
+                    f"📊 RSI: {round(rsi,1)}\n"
+                    f"🎯 دخول: {price}\n"
+                    f"🛑 وقف: {round(stop,6)}\n"
+                    f"🔥 القوة: {conf}/10 | {strength}\n"
+                    f"📌 التصنيف: {priority}\n"
+                    f"📋 السبب: {reason_str}\n"
+                    f"────────────\n"
+                    f"⏱ الفريم: 4H\n"
+                    f"📈 <a href='{link}'>TradingView</a>"
+                )
+            else:
+                msg = (
+                    f"{vip_tag}"
+                    f"🧠 إشارة ذكية | {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
+                    f"🚀 FUTURES (1H)\n"
+                    f"────────────\n"
+                    f"🪙 {symbol}\n"
+                    f"💰 السعر: {price}\n"
+                    f"📊 RSI: {round(rsi,1)}\n"
+                    f"🎯 دخول: {price}\n"
+                    f"🛑 وقف: {round(stop,6)}\n"
+                    f"🔥 القوة: {conf}/10 | {strength}\n"
+                    f"📌 التصنيف: {priority}\n"
+                    f"📋 السبب: {reason_str}\n"
+                    f"────────────\n"
+                    f"⏱ الفريم: 1H\n"
+                    f"📈 <a href='{link}'>TradingView</a>"
+                )
 
             send_telegram(msg)
 
@@ -318,7 +360,8 @@ def scan(inst_type, results, btc_status):
                 "symbol": symbol,
                 "score": conf,
                 "type": direction,
-                "link": link
+                "link": link,
+                "price": price
             })
 
             time.sleep(0.05)
@@ -338,12 +381,12 @@ def send_top(results, title, btc_status, inst_type="SWAP"):
     msg = f"🚀 <b>{title}</b>\n📊 BTC: {btc_status}\n\n"
 
     for i, r in enumerate(longs, 1):
-        msg += f"🟢 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+        msg += f"🟢 {i}. <a href='{r['link']}'>{r['symbol']}</a> 💰 {r['price']} 🔥 {r['score']}\n"
 
     if inst_type == "SWAP":
         shorts = sorted([r for r in results if r["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
         for i, r in enumerate(shorts, 1):
-            msg += f"🔴 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+            msg += f"🔴 {i}. <a href='{r['link']}'>{r['symbol']}</a> 💰 {r['price']} 🔥 {r['score']}\n"
 
     send_telegram(msg)
 
