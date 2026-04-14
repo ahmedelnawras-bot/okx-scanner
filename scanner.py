@@ -7,62 +7,58 @@ import threading
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- جلب الإعدادات بأمان ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# --- الإعدادات (تأكد من كتابة الاسم صح في Railway) ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 
-EXCLUDE = {"USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","WIN","SHIB"}
-
-top_spot, top_long = [], []
-
 def send_telegram(message):
-    if not TELEGRAM_TOKEN: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    if not TOKEN: return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         requests.post(url, data=payload, timeout=10)
         time.sleep(1)
     except: pass
 
-# --- الأوامر ---
+# --- الأوامر التفاعلية ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html("📖 <b>دليل Sniper:</b>\n• سبوت (4H) 🟢\n• فيوتشر (1H) 🔴\n\n/top10 - القائمة\n/help - الدليل")
+    text = "📖 <b>دليل Sniper الجديد:</b>\n• سبوت (4H) 🟢\n• فيوتشر (1H) 🔴\n\n/top10 - قائمة التميز\n/help - الدليل"
+    await update.message.reply_html(text)
 
 async def top10_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "🏆 <b>أفضل الفرص:</b>\n\n"
-    # منطق جلب الـ top10 هنا
-    await update.message.reply_html(msg)
+    await update.message.reply_html("🏆 <b>Top 10:</b>\n<i>جاري جمع البيانات...</i>")
 
-# --- منطق الفحص (الشرطين معاً) ---
+# --- منطق المسح الدوري (الشرط المزدوج) ---
 def scan_loop():
-    global top_spot, top_long
     while True:
         try:
-            # هنا يتم فحص المؤشرات
-            # إذا تحقق Vol Spike و BB Squeeze معاً:
-            # العنوان = 🔥 🔵 Vol Spike & 🟡 BB Squeeze
+            # هنا الكود بيحدد العنوان بناءً على الحالة:
+            # 1. المزدوجة: 🔥 🔵 Vol Spike & 🟡 BB Squeeze
+            # 2. فوليوم فقط: 🔵 Volume Spike
+            # 3. ضغط فقط: 🟡 BB Squeeze
             
-            # إذا تحقق Vol Spike فقط:
-            # العنوان = 🔵 Volume Spike
+            # مثال لإرسال تنبيه مزدوج منظم:
+            # msg = "<b>🔥 🔵 Vol Spike & 🟡 BB Squeeze | فيوتشر 🔴</b>\n..."
+            # send_telegram(msg)
             
-            # إذا تحقق BB Squeeze فقط:
-            # العنوان = 🟡 BB Squeeze
-            
-            time.sleep(3600)
+            time.sleep(3600) # فحص كل ساعة
         except: time.sleep(300)
 
 def main():
-    if not TELEGRAM_TOKEN:
-        print("Error: TELEGRAM_TOKEN is missing!")
+    if not TOKEN:
+        print("CRITICAL ERROR: TELEGRAM_TOKEN not found in environment variables!")
         return
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # بناء البوت مع استقبال الأوامر
+    app = Application.builder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("top10", top10_command))
     
+    # تشغيل المسح في الخلفية
     threading.Thread(target=scan_loop, daemon=True).start()
     
-    print("Bot is running...")
+    print("Bot is starting successfully...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
