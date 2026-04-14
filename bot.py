@@ -32,9 +32,11 @@ def send_telegram(message):
 # =====================
 # TRADINGVIEW
 # =====================
-def get_tv_link(symbol):
+def get_tv_link(symbol, bar="1H"):
     clean = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
-    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}"
+    interval_map = {"1H": "60", "4H": "240"}
+    interval = interval_map.get(bar, "60")
+    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}&interval={interval}"
 
 # =====================
 # BTC STATUS
@@ -285,7 +287,11 @@ def scan(inst_type, results, btc_status):
 
             stop = low * 0.985 if direction == "LONG" else high * 1.015
 
-            link = get_tv_link(symbol)
+            # SPOT → LONG only
+            if inst_type == "SPOT" and direction == "SHORT":
+                continue
+
+            link = get_tv_link(symbol, bar)
 
             vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if vip else ""
 
@@ -323,20 +329,21 @@ def scan(inst_type, results, btc_status):
 # =====================
 # TOP REPORT
 # =====================
-def send_top(results, title, btc_status):
+def send_top(results, title, btc_status, inst_type="SWAP"):
     if not results:
         return
 
     longs = sorted([r for r in results if r["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
-    shorts = sorted([r for r in results if r["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
 
     msg = f"🚀 <b>{title}</b>\n📊 BTC: {btc_status}\n\n"
 
     for i, r in enumerate(longs, 1):
         msg += f"🟢 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
 
-    for i, r in enumerate(shorts, 1):
-        msg += f"🔴 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+    if inst_type == "SWAP":
+        shorts = sorted([r for r in results if r["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
+        for i, r in enumerate(shorts, 1):
+            msg += f"🔴 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
 
     send_telegram(msg)
 
@@ -348,7 +355,7 @@ def futures_loop():
         btc = get_btc_status()
         results = []
         scan("SWAP", results, btc)
-        send_top(results, "FUTURES TOP 10 (1H)", btc)
+        send_top(results, "FUTURES TOP 10 (1H)", btc, inst_type="SWAP")
         time.sleep(3600)
 
 
@@ -357,7 +364,7 @@ def spot_loop():
         btc = get_btc_status()
         results = []
         scan("SPOT", results, btc)
-        send_top(results, "SPOT TOP 10 (4H)", btc)
+        send_top(results, "SPOT TOP 10 (4H)", btc, inst_type="SPOT")
         time.sleep(14400)
 
 # =====================
