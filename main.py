@@ -3,142 +3,348 @@ import time
 import requests
 import threading
 import pandas as pd
+import numpy as np
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application
 
+# =====================
+# CONFIG
+# =====================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
-STABLE_COINS = ['USDC', 'FDUSD', 'DAI', 'TUSD', 'EUR', 'GBP', 'BUSD']
 
+# =====================
+# TELEGRAM
+# =====================
 def send_telegram(message):
-    if not TOKEN: return
+    if not TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try: requests.post(url, data=payload, timeout=15)
-    except: pass
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, data=payload, timeout=15)
+    except:
+        pass
 
+# =====================
+# TRADINGVIEW LINK
+# =====================
 def get_tv_link(symbol):
-    clean_symbol = symbol.replace("-USDT", "USDT").replace("-SWAP", "")
-    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean_symbol}"
+    clean = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
+    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}"
 
+# =====================
+# BTC STATUS
+# =====================
 def get_btc_status():
     try:
         url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
-        res = requests.get(url).json().get('data', [])
-        if not res: return "⚠️ غير معروف"
-        curr_price = float(res[0][4])
-        ma20 = sum([float(x[4]) for x in res]) / 20
-        return "🟢 إيجابي (صاعد)" if curr_price > ma20 else "🔴 سلبي (هابط)"
-    except: return "⚠️ فحص BTC فشل"
+        data = requests.get(url).json().get("data", [])
 
-def calculate_indicators(df):
+        if not data:
+            return "غير معروف"
+
+        df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
+        df = df.iloc[::-1]
+        df['c'] = df['c'].astype(float)
+
+        price = df['c'].iloc[-1]
+        ma = df['c'].rolling(20).mean().iloc[-1]
+
+        return "🟢 صاعد" if price > ma else "🔴 هابط"
+    except:
+        return "غير معروف"
+
+# =====================
+# INDICATORS
+# =====================
+def indicators(df):
+    df['c'] = df['c'].astype(float)
+    df['h'] = df['h'].astype(float)
+    df['l'] = df['l'].astype(float)
+    df['v'] = df['v'].astype(float)
+
     delta = df['c'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    df['ma20'] = df['c'].rolling(window=20).mean()
+
+    df['ma20'] = df['c'].rolling(20).mean()
+
     return df
 
-def scan(inst_type, all_signals, min_score, btc_status):
-    url_pairs = f"https://www.okx.com/api/v5/public/instruments?instType={inst_type}"
-    try:
-        pairs_data = requests.get(url_pairs).json().get('data', [])
-        for p in pairs_data:
-            symbol = p['instId']
-            if not symbol.endswith("-USDT") and not symbol.endswith("-USDT-SWAP"): continue
-            coin_name = symbol.split("-")[0]
-            if coin_name in STABLE_COINS: continue
+# =====================
+# SMART MONEY FILTER
+# =====================
+def liquidity_sweep(df):
+    high = df['h'].iloc[-20:-2].max()
+    low = df['l'].iloc[-20:-2].min()
 
-            bar_frame = "1H" if inst_type == "SWAP" else "4H"
-            url_candles = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar_frame}&limit=50"
-            res = requests.get(url_candles).json().get('data', [])
-            if not res or len(res) < 20: continue
-            
-            df = pd.DataFrame(res, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'v2', 'v3', 'v4'])
-            df['c'] = df['c'].astype(float)
-            df['h'] = df['h'].astype(float)
-            df['l'] = df['l'].astype(float)
+    last_high = df['h'].iloc[-1]
+    last_low = df['l'].iloc[-1]
+    close = df['c'].iloc[-1]
+
+    sweep_high = last_high > high and close < high
+    sweep_low = last_low < low and close > low
+
+    return sweep_high, sweep_low
+
+
+def volume_spike(df):
+    return df['v'].iloc[-1] > df['v'].rolling(20).mean().iloc[-1] * 1.5
+
+
+def structure_break(df):
+    high = df['h'].iloc[-20:-2].max()
+    low = df['l'].iloc[-20:-2].min()
+    close = df['c'].iloc[-1]
+
+    return close > high, close < low
+
+
+def smart_filter(df, prob):
+    sweep_high, sweep_low = liquidity_sweep(df)
+    vol = volume_spike(df)
+    bos_up, bos_down = structure_break(df)
+
+    direction = None
+    boost = 0
+
+    if sweep_low and bos_up:
+        direction = "LONG"
+        boost += 0.2
+
+    if sweep_high and bos_down:
+        direction = "SHORT"
+        boost += 0.2
+
+    if vol:
+        boost += 0.1
+
+    if prob > 0.7:
+        base = "LONG"
+    elif prob < 0.3:
+        base = "SHORT"
+    else:
+        return None
+
+    if direction and direction != base:
+        return None
+
+    return {
+        "direction": base,
+        "confidence": prob + boost
+    }
+
+# =====================
+# AI SIMPLE MODEL (rule-based placeholder)
+# =====================
+def ai_predict(df):
+    last = df.iloc[-1]
+    ma = df['ma20'].iloc[-1]
+    rsi = df['rsi'].iloc[-1]
+
+    prob = 0.5
+
+    if last['c'] > ma:
+        prob += 0.2
+    else:
+        prob -= 0.2
+
+    if 30 < rsi < 70:
+        prob += 0.1
+    else:
+        prob -= 0.1
+
+    return max(0, min(1, prob))
+
+# =====================
+# RANKING SCORE (UNIVERSE)
+# =====================
+def get_score(symbol):
+    try:
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1H&limit=40"
+        data = requests.get(url).json().get("data", [])
+        if len(data) < 30:
+            return 0
+
+        df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
+        df = df.iloc[::-1]
+
+        df['c'] = df['c'].astype(float)
+        df['h'] = df['h'].astype(float)
+        df['l'] = df['l'].astype(float)
+        df['v'] = df['v'].astype(float)
+
+        liquidity = df['v'].mean()
+        volatility = (df['h'] - df['l']).mean()
+
+        ma20 = df['c'].rolling(20).mean().iloc[-1]
+        price = df['c'].iloc[-1]
+        trend = abs(price - ma20) / ma20
+
+        score = (
+            np.log1p(liquidity) * 0.4 +
+            np.log1p(volatility) * 0.3 +
+            trend * 100 * 0.3
+        )
+
+        return score
+
+    except:
+        return 0
+
+def get_top75():
+    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+    data = requests.get(url).json().get("data", [])
+
+    coins = []
+
+    for p in data:
+        symbol = p["instId"]
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        score = get_score(symbol)
+
+        if score > 0:
+            coins.append({"symbol": symbol, "score": score})
+
+    coins = sorted(coins, key=lambda x: x["score"], reverse=True)
+
+    return [c["symbol"] for c in coins[:75]]
+
+# =====================
+# SCAN ENGINE
+# =====================
+def scan(inst_type, results, btc_status):
+    pairs = get_top75()
+
+    for symbol in pairs:
+        try:
+            bar = "1H" if inst_type == "SWAP" else "4H"
+
+            url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit=50"
+            data = requests.get(url).json().get("data", [])
+            if len(data) < 30:
+                continue
+
+            df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
             df = df.iloc[::-1]
-            df = calculate_indicators(df)
-            
-            curr_price = df['c'].iloc[-1]
+            df = indicators(df)
+
+            price = df['c'].iloc[-1]
             rsi = df['rsi'].iloc[-1]
-            ma20 = df['ma20'].iloc[-1]
-            
-            low_3 = df['l'].tail(3).min()
-            high_3 = df['h'].tail(3).max()
-            
-            score = 0
-            if curr_price > ma20: score += 3
-            if rsi < 35 or rsi > 65: score += 5
-            score = min(score, 10)
-            
-            direction = "LONG" if curr_price > ma20 else "SHORT"
-            stop_loss = round(low_3 * 0.985, 6) if direction == "LONG" else round(high_3 * 1.015, 6)
-            ma_status = "فوق ✅" if curr_price > ma20 else "تحت ❌"
+            ma = df['ma20'].iloc[-1]
+
+            prob = ai_predict(df)
+            decision = smart_filter(df, prob)
+
+            if not decision:
+                continue
+
+            direction = decision["direction"]
+            conf = round(decision["confidence"] * 10, 2)
+
+            low = df['l'].tail(3).min()
+            high = df['h'].tail(3).max()
+
+            stop = low * 0.985 if direction == "LONG" else high * 1.015
+
             link = get_tv_link(symbol)
 
-            alert_threshold = 8 if inst_type == "SWAP" else 9
-            if score >= alert_threshold:
-                msg = (
-                    f"🟡 <b>BB Squeeze | {direction}</b>\n"
-                    f"<code>{symbol}</code>\n"
-                    f"💰 السعر: {curr_price}\n"
-                    f"📊 RSI: {round(rsi, 1)} | MA20 {ma_status}\n"
-                    f"🎯 دخول: {curr_price}\n"
-                    f"🛑 ستوب: {stop_loss}\n"
-                    f"🔥 التقييم: {score}/10\n"
-                    f"₿ BTC: {btc_status}\n"
-                    f"🔗 <a href='{link}'>افتح الشارت ({bar_frame})</a>"
-                )
-                send_telegram(msg)
+            msg = (
+                f"🧠 <b>إشارة ذكية | {direction}</b>\n"
+                f"────────────\n"
+                f"🪙 {symbol}\n"
+                f"💰 السعر: {price}\n"
+                f"📊 RSI: {round(rsi,1)}\n"
+                f"🎯 دخول: {price}\n"
+                f"🛑 وقف: {round(stop,6)}\n"
+                f"🔥 القوة: {conf}/10\n"
+                f"₿ BTC: {btc_status}\n"
+                f"📈 <a href='{link}'>TradingView</a>"
+            )
 
-            if score >= min_score:
-                all_signals.append({"symbol": symbol, "score": score, "type": direction, "link": link})
+            send_telegram(msg)
+
+            results.append({
+                "symbol": symbol,
+                "score": conf,
+                "type": direction,
+                "link": link
+            })
+
             time.sleep(0.05)
-    except: pass
 
-def send_top10(all_signals, category, btc_status):
-    if not all_signals: return
-    longs = sorted([s for s in all_signals if s["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
-    shorts = sorted([s for s in all_signals if s["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
-    header = "🚀 <b>TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>TOP 10 SPOT (4H)</b>"
-    msg = f"{header}\n📊 <b>BTC: {btc_status}</b>\n\n"
+        except:
+            continue
+
+# =====================
+# TOP REPORT
+# =====================
+def send_top(results, title, btc_status):
+    if not results:
+        return
+
+    longs = sorted([r for r in results if r["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
+    shorts = sorted([r for r in results if r["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
+
+    msg = f"🚀 <b>{title}</b>\n📊 BTC: {btc_status}\n\n"
+
     if longs:
-        msg += "🟢 <b>أفضل LONG:</b>\n"
-        for i, s in enumerate(longs, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
-    if shorts and category == "FUTURE":
-        msg += "\n🔴 <b>أفضل SHORT:</b>\n"
-        for i, s in enumerate(shorts, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
+        msg += "🟢 LONG:\n"
+        for i, r in enumerate(longs, 1):
+            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+
+    if shorts:
+        msg += "\n🔴 SHORT:\n"
+        for i, r in enumerate(shorts, 1):
+            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+
     send_telegram(msg)
 
-def main_logic_loop():
-    last_spot_time = 0
+# =====================
+# LOOPS
+# =====================
+def futures_loop():
     while True:
-        try:
-            btc_status = get_btc_status()
-            future_signals = []
-            scan("SWAP", future_signals, 6, btc_status)
-            send_top10(future_signals, "FUTURE", btc_status)
-            if time.time() - last_spot_time >= 14400:
-                spot_signals = []
-                scan("SPOT", spot_signals, 7, btc_status)
-                send_top10(spot_signals, "SPOT", btc_status)
-                last_spot_time = time.time()
-            time.sleep(3600)
-        except: time.sleep(60)
+        btc = get_btc_status()
+        results = []
+        scan("SWAP", results, btc)
+        send_top(results, "FUTURES TOP 10 (1H)", btc)
+        time.sleep(3600)
 
+def spot_loop():
+    while True:
+        btc = get_btc_status()
+        results = []
+        scan("SPOT", results, btc)
+        send_top(results, "SPOT TOP 10 (4H)", btc)
+        time.sleep(14400)
+
+# =====================
+# MAIN
+# =====================
 def main():
-    if not TOKEN: return
-    # الخطوة الحاسمة: إغلاق أي اتصال قديم تماماً
+    if not TOKEN:
+        return
+
     requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
-    time.sleep(2) # انتظار بسيط لضمان تنفيذ الإغلاق في سيرفرات تليجرام
-    
-    threading.Thread(target=main_logic_loop, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
-    print("Sniper Bot V4 Gold is Active...")
-    app.run_polling(drop_pending_updates=True)
+
+    threading.Thread(target=futures_loop, daemon=True).start()
+    threading.Thread(target=spot_loop, daemon=True).start()
+
+    print("🚀 Bot Running...")
+    while True:
+        time.sleep(999999)
 
 if __name__ == "__main__":
     main()
