@@ -4,14 +4,12 @@ import requests
 import threading
 import pandas as pd
 import numpy as np
-from telegram import Update
-from telegram.ext import Application
 
 # =====================
 # CONFIG
 # =====================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "5523662724")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # =====================
 # TELEGRAM
@@ -32,33 +30,11 @@ def send_telegram(message):
         pass
 
 # =====================
-# TRADINGVIEW LINK
+# TRADINGVIEW
 # =====================
 def get_tv_link(symbol):
     clean = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
     return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}"
-
-# =====================
-# BTC STATUS
-# =====================
-def get_btc_status():
-    try:
-        url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
-        data = requests.get(url).json().get("data", [])
-
-        if not data:
-            return "غير معروف"
-
-        df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
-        df = df.iloc[::-1]
-        df['c'] = df['c'].astype(float)
-
-        price = df['c'].iloc[-1]
-        ma = df['c'].rolling(20).mean().iloc[-1]
-
-        return "🟢 صاعد" if price > ma else "🔴 هابط"
-    except:
-        return "غير معروف"
 
 # =====================
 # INDICATORS
@@ -74,13 +50,34 @@ def indicators(df):
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-
     df['ma20'] = df['c'].rolling(20).mean()
 
     return df
 
 # =====================
-# SMART MONEY FILTER
+# AI (Simple Model)
+# =====================
+def ai_predict(df):
+    last = df.iloc[-1]
+    ma = df['ma20'].iloc[-1]
+    rsi = df['rsi'].iloc[-1]
+
+    prob = 0.5
+
+    if last['c'] > ma:
+        prob += 0.25
+    else:
+        prob -= 0.25
+
+    if 30 < rsi < 70:
+        prob += 0.1
+    else:
+        prob -= 0.1
+
+    return max(0, min(1, prob))
+
+# =====================
+# SMART MONEY
 # =====================
 def liquidity_sweep(df):
     high = df['h'].iloc[-20:-2].max()
@@ -90,10 +87,8 @@ def liquidity_sweep(df):
     last_low = df['l'].iloc[-1]
     close = df['c'].iloc[-1]
 
-    sweep_high = last_high > high and close < high
-    sweep_low = last_low < low and close > low
-
-    return sweep_high, sweep_low
+    return (last_high > high and close < high,
+            last_low < low and close > low)
 
 
 def volume_spike(df):
@@ -127,9 +122,9 @@ def smart_filter(df, prob):
     if vol:
         boost += 0.1
 
-    if prob > 0.7:
+    if prob > 0.78:
         base = "LONG"
-    elif prob < 0.3:
+    elif prob < 0.22:
         base = "SHORT"
     else:
         return None
@@ -143,34 +138,39 @@ def smart_filter(df, prob):
     }
 
 # =====================
-# AI SIMPLE MODEL (rule-based placeholder)
+# PRIORITY + STRENGTH
 # =====================
-def ai_predict(df):
-    last = df.iloc[-1]
-    ma = df['ma20'].iloc[-1]
-    rsi = df['rsi'].iloc[-1]
-
-    prob = 0.5
-
-    if last['c'] > ma:
-        prob += 0.2
+def get_priority(score):
+    if score >= 7.5:
+        return "🚨 HIGH"
+    elif score >= 5:
+        return "⚡ MEDIUM"
     else:
-        prob -= 0.2
+        return "💤 LOW"
 
-    if 30 < rsi < 70:
-        prob += 0.1
+
+def strength_level(score):
+    if score >= 7:
+        return "🟢 قوي"
+    elif score >= 5:
+        return "🟡 متوسط"
     else:
-        prob -= 0.1
-
-    return max(0, min(1, prob))
+        return "🔴 ضعيف"
 
 # =====================
-# RANKING SCORE (UNIVERSE)
+# VIP SYSTEM
+# =====================
+def is_vip(prob, score, vol, smart):
+    return score >= 8.5 and vol and smart and (prob >= 0.8 or prob <= 0.2)
+
+# =====================
+# RANKING SCORE
 # =====================
 def get_score(symbol):
     try:
         url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1H&limit=40"
         data = requests.get(url).json().get("data", [])
+
         if len(data) < 30:
             return 0
 
@@ -200,6 +200,7 @@ def get_score(symbol):
     except:
         return 0
 
+
 def get_top75():
     url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
     data = requests.get(url).json().get("data", [])
@@ -214,8 +215,7 @@ def get_top75():
 
         score = get_score(symbol)
 
-        if score > 0:
-            coins.append({"symbol": symbol, "score": score})
+        coins.append({"symbol": symbol, "score": score})
 
     coins = sorted(coins, key=lambda x: x["score"], reverse=True)
 
@@ -233,6 +233,7 @@ def scan(inst_type, results, btc_status):
 
             url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar}&limit=50"
             data = requests.get(url).json().get("data", [])
+
             if len(data) < 30:
                 continue
 
@@ -253,6 +254,14 @@ def scan(inst_type, results, btc_status):
             direction = decision["direction"]
             conf = round(decision["confidence"] * 10, 2)
 
+            vol_ok = volume_spike(df)
+            smart_ok = True
+
+            vip = is_vip(prob, conf, vol_ok, smart_ok)
+
+            priority = get_priority(conf)
+            strength = strength_level(conf)
+
             low = df['l'].tail(3).min()
             high = df['h'].tail(3).max()
 
@@ -260,16 +269,22 @@ def scan(inst_type, results, btc_status):
 
             link = get_tv_link(symbol)
 
+            vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if vip else ""
+
             msg = (
-                f"🧠 <b>إشارة ذكية | {direction}</b>\n"
+                f"{vip_tag}"
+                f"🧠 إشارة ذكية | {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
+                f"📊 النوع: {'🚀 FUTURES (1H)' if inst_type=='SWAP' else '💎 SPOT (4H)'}\n"
                 f"────────────\n"
                 f"🪙 {symbol}\n"
                 f"💰 السعر: {price}\n"
                 f"📊 RSI: {round(rsi,1)}\n"
                 f"🎯 دخول: {price}\n"
                 f"🛑 وقف: {round(stop,6)}\n"
-                f"🔥 القوة: {conf}/10\n"
+                f"🔥 القوة: {conf}/10 | {strength}\n"
+                f"📌 التصنيف: {priority}\n"
                 f"₿ BTC: {btc_status}\n"
+                f"────────────\n"
                 f"📈 <a href='{link}'>TradingView</a>"
             )
 
@@ -299,15 +314,11 @@ def send_top(results, title, btc_status):
 
     msg = f"🚀 <b>{title}</b>\n📊 BTC: {btc_status}\n\n"
 
-    if longs:
-        msg += "🟢 LONG:\n"
-        for i, r in enumerate(longs, 1):
-            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+    for i, r in enumerate(longs, 1):
+        msg += f"🟢 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
 
-    if shorts:
-        msg += "\n🔴 SHORT:\n"
-        for i, r in enumerate(shorts, 1):
-            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
+    for i, r in enumerate(shorts, 1):
+        msg += f"🔴 {i}. <a href='{r['link']}'>{r['symbol']}</a> 🔥 {r['score']}\n"
 
     send_telegram(msg)
 
@@ -321,6 +332,7 @@ def futures_loop():
         scan("SWAP", results, btc)
         send_top(results, "FUTURES TOP 10 (1H)", btc)
         time.sleep(3600)
+
 
 def spot_loop():
     while True:
