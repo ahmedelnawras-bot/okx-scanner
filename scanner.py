@@ -12,9 +12,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("❌ TELEGRAM_TOKEN مش موجود في Environment Variables على Railway!")
-
 EXCLUDE = {
     "USDC","USDT","BUSD","TUSD","DAI","PYUSD","FDUSD","TRY","BRL","WIN","SHIB",
     "USDG","NFT","USDP","USDD","FRAX","LUSD","GUSD","HUSD","SUSD","CUSD",
@@ -22,7 +19,10 @@ EXCLUDE = {
     "GOOGL","MSFT","NVDA","META","NFLX","XAU","XAUT","XAG","PAXG","OIL","CRUDE"
 }
 
-top_signals_global = []
+# قوائم تخزين منفصلة للـ Top 10
+top_spot = []
+top_long = []
+top_short = []
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -31,7 +31,6 @@ def send_telegram(message):
         time.sleep(0.7)
     except Exception as e:
         print(f"Telegram error: {e}")
-
 
 def get_btc_trend():
     try:
@@ -42,7 +41,6 @@ def get_btc_trend():
         return "إيجابي ✅" if len(closes) >= 4 and closes[-1] > closes[-3] else "سلبي ⚠️"
     except:
         return "غير معروف"
-
 
 def get_pairs(inst_type):
     try:
@@ -58,37 +56,23 @@ def get_pairs(inst_type):
     except:
         return []
 
-
-def get_candles(symbol, limit=120):
+def get_candles(symbol, timeframe, limit=100):
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=4H&limit={limit}"
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
         r = requests.get(url, timeout=15).json()
-        if "data" not in r or len(r["data"]) < 40:
-            return None
+        if "data" not in r or len(r["data"]) < 40: return None
         df = pd.DataFrame(r["data"], columns=["ts","open","high","low","close","vol","volCcy","volCcyQuote","confirm"])
         df = df.astype(float)
         df = df.iloc[::-1].reset_index(drop=True)
-        return df.iloc[1:] if len(df) > 1 else df
+        return df
     except:
         return None
 
-
-def calc_atr(df, period=14):
-    high_low = df["high"] - df["low"]
-    high_close = np.abs(df["high"] - df["close"].shift())
-    low_close = np.abs(df["low"] - df["close"].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean().iloc[-1]
-
-
 def check_volume_spike(df, multiplier=3.0):
-    if len(df) < 30: return False
     avg_vol = df["vol"].iloc[-30:-1].mean()
     return df["vol"].iloc[-1] > avg_vol * multiplier
 
-
 def check_bb_squeeze(df, period=20):
-    if len(df) < period + 20: return False
     close = df["close"]
     ma = close.rolling(period).mean()
     std = close.rolling(period).std()
@@ -97,21 +81,12 @@ def check_bb_squeeze(df, period=20):
     avg = bandwidth.iloc[-60:-10].mean() if len(bandwidth) > 60 else bandwidth.mean()
     return current < avg * 0.65
 
-
 def check_rsi(df, period=14):
-    if len(df) < period + 10: 
-        return 50.0
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/period, adjust=False).mean()
     loss = -delta.where(delta < 0, 0).ewm(alpha=1/period, adjust=False).mean()
     rs = gain / loss
     return (100 - (100 / (1 + rs))).iloc[-1]
-
-
-def check_above_ma20(df):
-    if len(df) < 25: return False
-    return df["close"].iloc[-1] > df["close"].rolling(20).mean().iloc[-1]
-
 
 def calc_score(vol, bb, rsi_ok, ma_ok, btc_ok):
     score = 0
@@ -122,162 +97,117 @@ def calc_score(vol, bb, rsi_ok, ma_ok, btc_ok):
     if btc_ok: score += 0.5
     return round(min(score, 10), 1)
 
-
 # ===================== Commands =====================
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🚀 <b>OKX 4H Scanner Bot</b>\n\n"
-        "البوت بيسكان السوق كل 4 ساعات ويبعت إشارات قوية.\n\n"
-        "<b>أنواع الإشارات:</b>\n"
-        "🚨 STRONG SIGNAL → Long قوي جداً\n"
-        "🔵 Volume Spike → Long\n"
-        "🟡 BB Squeeze → Long\n"
-        "🔴 SHORT SIGNAL → Short (فيوتشر فقط)\n\n"
-        "/help - هذه الرسالة\n"
-        "/top10 - أفضل 10 إشارات حالية"
+        "📖 <b>الدليل الفني وتشغيل البوت:</b>\n\n"
+        "البوت يعمل كقناص آلي يعتمد على <b>التحليل الفني الحسابي</b> لمئات العملات لحظياً.\n\n"
+        "🛠 <b>المنطق البرمجي (Logic):</b>\n"
+        "1️⃣ <b>فريمات العمل:</b> يتم فحص <b>السبوت</b> على فريم 4 ساعات لتقليل الضوضاء، و<b>الفيوتشر</b> على فريم ساعة لاقتناص الزخم السريع.\n"
+        "2️⃣ <b>الفوليوم (Volume Spike):</b> يراقب البوت دخول السيولة المفاجئة؛ التنبيه يفعل إذا تجاوز الفوليوم الحالي 3 أضعاف متوسط الـ 30 شمعة السابقة.\n"
+        "3️⃣ <b>الانضغاط (BB Squeeze):</b> يبحث عن العملات الهادئة التي تستعد للانفجار، عندما يضيق نطاق البولنجر بنسبة 35% عن المعتاد.\n"
+        "4️⃣ <b>شرط RSI (الأمان):</b> للونج، يجب أن يكون RSI بين (42-62) لضمان أنك لا تشتري في قمة متضخمة. للشورت يجب أن يكون أعلى من 65.\n"
+        "5️⃣ <b>المتوسط المتحرك (MA20):</b> نستخدمه كفلتر اتجاه؛ لا دخول لونج إلا والسعر فوق المتوسط، ولا شورت إلا والسعر تحته.\n\n"
+        "📌 <b>الأوامر المتاحة:</b>\n"
+        "/top10 - عرض أفضل 10 فرص (سبوت - لونج - شورت)\n"
+        "/help - هذا الدليل التفصيلي"
     )
     await update.message.reply_html(text)
 
-
 async def top10_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not top_signals_global:
-        await update.message.reply_html("❌ مفيش إشارات حالية دلوقتي.")
-        return
+    msg = "🏆 <b>قائمة الـ Sniper Top 10:</b>\n\n"
+    
+    # 10 سبوت (4H)
+    msg += "🟢 <b>أفضل 10 عملات سبوت (4H):</b>\n"
+    if not top_spot: msg += "<i>جاري جمع البيانات...</i>\n"
+    else:
+        for i, s in enumerate(sorted(top_spot, key=lambda x: x["score"], reverse=True)[:10], 1):
+            tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{s['symbol'].split('-')[0]}USDT&interval=240"
+            msg += f"{i}. <b>{s['symbol']}</b> | {s['score']}/10 | 💰 {s['price']} | 🔗 <a href='{tv_link}'>📈</a>\n"
+    
+    # 10 لونج (1H)
+    msg += "\n🔵 <b>أفضل 10 لونج فيوتشر (1H):</b>\n"
+    if not top_long: msg += "<i>جاري جمع البيانات...</i>\n"
+    else:
+        for i, s in enumerate(sorted(top_long, key=lambda x: x["score"], reverse=True)[:10], 1):
+            tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{s['symbol'].split('-')[0]}USDT.P&interval=60"
+            msg += f"{i}. <b>{s['symbol']}</b> | {s['score']}/10 | 🎯 {s['price']} | 🔗 <a href='{tv_link}'>📈</a>\n"
 
-    sorted_signals = sorted(top_signals_global, key=lambda x: x["score"], reverse=True)[:10]
-    msg = "🏆 <b>أفضل 10 إشارات حالياً:</b>\n\n"
-    for i, s in enumerate(sorted_signals, 1):
-        msg += f"{i}. <b>{s['symbol']}</b> ({s.get('label', '')}) — <b>{s['score']}/10</b>\n"
-        msg += f"   💰 {s['price']:,.6f} | 🎯 {s['entry']} | 🛑 {s['stop']}\n\n"
+    # 10 شورت (1H)
+    msg += "\n🔴 <b>أفضل 10 شورت فيوتشر (1H):</b>\n"
+    if not top_short: msg += "<i>جاري جمع البيانات...</i>\n"
+    else:
+        for i, s in enumerate(sorted(top_short, key=lambda x: x["score"], reverse=True)[:10], 1):
+            tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{s['symbol'].split('-')[0]}USDT.P&interval=60"
+            msg += f"{i}. <b>{s['symbol']}</b> | {s['score']}/10 | 📉 {s['price']} | 🔗 <a href='{tv_link}'>📈</a>\n"
+
     await update.message.reply_html(msg)
 
-
 # ===================== Scan Function =====================
-def scan(inst_type):
-    global top_signals_global
-    label = "سبوت 🟢" if inst_type == "SPOT" else "فيوتشر 🔴"
-    print(f"[{datetime.now().strftime('%H:%M')}] Scanning {inst_type}...")
-
-    pairs = get_pairs(inst_type)
-    btc_trend = get_btc_trend()
-    btc_positive = "إيجابي" in btc_trend
-
-    for symbol, ticker_price in pairs:
+def scan_process():
+    global top_spot, top_long, top_short
+    while True:
         try:
-            df = get_candles(symbol)
-            if df is None or len(df) < 40:
-                continue
+            temp_spot, temp_long, temp_short = [], [], []
+            btc_trend = get_btc_trend()
+            btc_positive = "إيجابي" in btc_trend
 
-            current_price = df["close"].iloc[-1]
-            vol_spike = check_volume_spike(df)
-            bb_squeeze = check_bb_squeeze(df)
-            rsi = check_rsi(df)
-            above_ma20 = check_above_ma20(df)
-            rsi_ok = 42 <= rsi <= 62
+            # --- فحص السبوت (4H) ---
+            for symbol, price in get_pairs("SPOT"):
+                df = get_candles(symbol, "4H")
+                if df is not None:
+                    rsi = check_rsi(df)
+                    above_ma20 = df["close"].iloc[-1] > df["close"].rolling(20).mean().iloc[-1]
+                    vol_s = check_volume_spike(df)
+                    bb_s = check_bb_squeeze(df)
+                    if (vol_s or bb_s) and 42 <= rsi <= 62 and above_ma20:
+                        sc = calc_score(vol_s, bb_s, True, True, btc_positive)
+                        temp_spot.append({"symbol": symbol, "score": sc, "price": price})
+                        
+                        # إرسال تنبيه فوري
+                        tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{symbol.split('-')[0]}USDT&interval=240"
+                        sig_t = "🔵 Vol Spike" if vol_s else "🟡 BB Squeeze"
+                        send_telegram(f"<b>{sig_t} | سبوت 🟢</b>\n{symbol}\n💰 السعر: {price}\n🔥 التقييم: {sc}/10\n🔗 <a href='{tv_link}'>الشارت (4H)</a>")
+                time.sleep(0.1)
 
-            # === Long Signals ===
-            if (vol_spike or bb_squeeze) and rsi_ok and above_ma20:
-                score = calc_score(vol_spike, bb_squeeze, rsi_ok, above_ma20, btc_positive)
-                atr = calc_atr(df)
-                entry = round(current_price, 6)
-                stop = round(current_price - (atr * 1.8), 6)
+            # --- فحص الفيوتشر (1H) ---
+            for symbol, price in get_pairs("SWAP"):
+                df = get_candles(symbol, "1H")
+                if df is not None:
+                    rsi = check_rsi(df)
+                    ma20 = df["close"].rolling(20).mean().iloc[-1]
+                    vol_s = check_volume_spike(df)
+                    bb_s = check_bb_squeeze(df)
+                    
+                    # Long (1H)
+                    if (vol_s or bb_s) and 42 <= rsi <= 62 and df["close"].iloc[-1] > ma20:
+                        sc = calc_score(vol_s, bb_s, True, True, btc_positive)
+                        temp_long.append({"symbol": symbol, "score": sc, "price": price})
+                        tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{symbol.split('-')[0]}USDT.P&interval=60"
+                        send_telegram(f"<b>🔵 LONG SIGNAL | فيوتشر 🔴</b>\n{symbol}\n💰 السعر: {price}\n🔥 التقييم: {sc}/10\n🔗 <a href='{tv_link}'>الشارت (1H)</a>")
+                    
+                    # Short (1H)
+                    if (vol_s or bb_s) and rsi > 65 and df["close"].iloc[-1] < ma20:
+                        sc = calc_score(vol_s, bb_s, True, True, not btc_positive)
+                        temp_short.append({"symbol": symbol, "score": sc, "price": price})
+                        tv_link = f"https://www.tradingview.com/chart/?symbol=OKX%3A{symbol.split('-')[0]}USDT.P&interval=60"
+                        send_telegram(f"<b>🔴 SHORT SIGNAL | فيوتشر 🔴</b>\n{symbol}\n💰 السعر: {price}\n🔥 التقييم: {sc}/10\n🔗 <a href='{tv_link}'>الشارت (1H)</a>")
+                time.sleep(0.1)
 
-                if vol_spike and bb_squeeze:
-                    signal_type = "🚨 <b>STRONG SIGNAL</b>"
-                elif vol_spike:
-                    signal_type = "🔵 <b>Volume Spike</b>"
-                else:
-                    signal_type = "🟡 <b>BB Squeeze</b>"
-
-                tv_symbol = f"OKX:{symbol.split('-')[0]}USDT" + (".P" if inst_type != "SPOT" else "")
-                tv_link = f"https://www.tradingview.com/chart/?symbol={tv_symbol.replace(':', '%3A')}&interval=240"
-
-                msg = (
-                    f"{signal_type}\n"
-                    f"{symbol} | {label}\n"
-                    f"💰 السعر الحالي: {current_price:,.6f}\n"
-                    f"📊 RSI: {rsi:.1f} | فوق MA20\n"
-                    f"🎯 دخول: {entry}\n"
-                    f"🛑 ستوب: {stop}\n"
-                    f"₿ BTC: {btc_trend}\n"
-                    f"🔥 تقييم الإشارة: {score}/10\n\n"
-                    f"📈 <a href=\"{tv_link}\">افتح الشارت على TradingView (4H)</a>"
-                )
-                send_telegram(msg)
-
-                top_signals_global.append({
-                    "symbol": symbol, "score": score, "label": label,
-                    "price": current_price, "entry": entry, "stop": stop
-                })
-
-            # === Short Signal - فقط في الفيوتشر ===
-            if inst_type == "SWAP":
-                short_rsi = check_rsi(df)
-                below_ma20 = current_price < df["close"].rolling(20).mean().iloc[-1]
-                if short_rsi > 65 and below_ma20 and (vol_spike or bb_squeeze):
-                    score = calc_score(vol_spike, bb_squeeze, short_rsi > 65, not above_ma20, not btc_positive)
-                    atr = calc_atr(df)
-                    entry = round(current_price, 6)
-                    stop = round(current_price + (atr * 1.8), 6)
-
-                    signal_type = "🔴 <b>SHORT SIGNAL</b>"
-
-                    tv_symbol = f"OKX:{symbol.split('-')[0]}USDT.P"
-                    tv_link = f"https://www.tradingview.com/chart/?symbol={tv_symbol.replace(':', '%3A')}&interval=240"
-
-                    msg = (
-                        f"{signal_type}\n"
-                        f"{symbol} | {label}\n"
-                        f"💰 السعر الحالي: {current_price:,.6f}\n"
-                        f"📊 RSI: {short_rsi:.1f} | تحت MA20\n"
-                        f"🎯 دخول شورت: {entry}\n"
-                        f"🛑 ستوب: {stop}\n"
-                        f"₿ BTC: {btc_trend}\n"
-                        f"🔥 تقييم الإشارة: {score}/10\n\n"
-                        f"📈 <a href=\"{tv_link}\">افتح الشارت على TradingView (4H)</a>"
-                    )
-                    send_telegram(msg)
-
-                    top_signals_global.append({
-                        "symbol": symbol, "score": score, "label": "شورت فيوتشر 🔴",
-                        "price": current_price, "entry": entry, "stop": stop
-                    })
-
-            time.sleep(0.35)
-
+            top_spot, top_long, top_short = temp_spot, temp_long, temp_short
+            print(f"[{datetime.now().strftime('%H:%M')}] Scan Complete.")
+            time.sleep(3600) # فحص كل ساعة
         except Exception as e:
-            continue
+            print(f"Error in scan: {e}")
+            time.sleep(300)
 
-    print(f"{inst_type} scan finished.")
-
-
-# ===================== Main =====================
 def main():
-    print("🚀 OKX Scanner Bot بدأ على Railway...")
-
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("top10", top10_command))
-
-    # تشغيل السكان في thread منفصل
-    def scanner_loop():
-        while True:
-            try:
-                global top_signals_global
-                top_signals_global = []
-                scan("SPOT")
-                scan("SWAP")
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Scan complete")
-                time.sleep(14400)  # 4 ساعات
-            except Exception as e:
-                print(f"Scanner error: {e}")
-                time.sleep(300)
-
-    threading.Thread(target=scanner_loop, daemon=True).start()
-
-    # تشغيل الـ Bot
+    
+    threading.Thread(target=scan_process, daemon=True).start()
     application.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
