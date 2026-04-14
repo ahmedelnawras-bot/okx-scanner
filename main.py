@@ -6,7 +6,7 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- الإعدادات ---
+# --- الإعدادات (تأكد من ضبطها في Railway Variables) ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 
@@ -33,7 +33,6 @@ def calculate_indicators(df):
 def scan(inst_type, all_signals, min_score):
     url_pairs = f"https://www.okx.com/api/v5/public/instruments?instType={inst_type}"
     try:
-        # فحص أول 50 زوج سيولة لضمان جودة العملات
         pairs_data = requests.get(url_pairs).json().get('data', [])[:50]
         for p in pairs_data:
             symbol = p['instId']
@@ -51,7 +50,7 @@ def scan(inst_type, all_signals, min_score):
             rsi = df['rsi'].iloc[-1]
             ma20 = df['ma20'].iloc[-1]
             
-            # --- معادلة السكور المتطورة ---
+            # --- معادلة السكور ---
             score = 0
             if curr_price > ma20: score += 3
             if rsi < 30 or rsi > 70: score += 5 
@@ -62,7 +61,7 @@ def scan(inst_type, all_signals, min_score):
             signal_type = "LONG" if curr_price > ma20 else "SHORT"
             link = get_tv_link(symbol, inst_type)
 
-            # --- التنبيه الفوري (Score 8+ للفيوتشر و 9+ للسبوت) ---
+            # --- التنبيه الفوري (سكور 8 للفيوتشر و 9 للسبوت) ---
             alert_threshold = 8 if inst_type == "SWAP" else 9
             
             if score >= alert_threshold:
@@ -77,13 +76,12 @@ def scan(inst_type, all_signals, min_score):
                 )
                 send_telegram(alert_msg)
 
-            # إضافة للقائمة العامة للتقرير (الـ Top 10)
             if score >= min_score:
                 all_signals.append({
                     "symbol": symbol, "score": score, "type": signal_type,
                     "market": inst_type, "link": link
                 })
-            time.sleep(0.1) # حماية من الـ Rate Limit
+            time.sleep(0.1)
     except: pass
 
 def send_top10(all_signals, category):
@@ -91,7 +89,7 @@ def send_top10(all_signals, category):
     longs = sorted([s for s in all_signals if s["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
     shorts = sorted([s for s in all_signals if s["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
 
-    header = "🚀 <b>تقرير الـ TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>تقرير الـ TOP 10 SPOT (4H)</b>"
+    header = "🚀 <b>TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>TOP 10 SPOT (4H)</b>"
     msg = f"{header}\n\n"
 
     if longs:
@@ -110,12 +108,12 @@ def main_logic_loop():
     last_spot_time = 0
     while True:
         try:
-            # 1. فحص الفيوتشر كل ساعة (تنبيه فوري من سكور 8)
+            # فحص الفيوتشر (كل ساعة)
             future_signals = []
             scan("SWAP", future_signals, min_score=6)
             send_top10(future_signals, "FUTURE")
 
-            # 2. فحص السبوت كل 4 ساعات (تنبيه فوري من سكور 9)
+            # فحص السبوت (كل 4 ساعات)
             current_time = time.time()
             if current_time - last_spot_time >= 14400:
                 spot_signals = []
@@ -127,15 +125,18 @@ def main_logic_loop():
         except: time.sleep(60)
 
 def main():
-    if not TOKEN: return
-    # تنظيف الـ Webhook
+    if not TOKEN: 
+        print("Error: TELEGRAM_TOKEN not found!")
+        return
+
+    # --- السطر المطلوب لتنظيف الـ Webhook ومنع الـ Conflict ---
     requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
     
-    # تشغيل منطق الفحص
+    # تشغيل المنطق في Thread منفصل
     threading.Thread(target=main_logic_loop, daemon=True).start()
     
     app = Application.builder().token(TOKEN).build()
-    print("Sniper Bot V3 (Alert 8+) is Active...")
+    print("Bot Sniper is Online and Cleaning updates...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
