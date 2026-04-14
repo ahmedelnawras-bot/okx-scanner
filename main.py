@@ -1,68 +1,143 @@
 import os
-import asyncio
+import time
 import requests
+import threading
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- الإعدادات ---
-TOKEN = os.getenv("TELEGRAM_TOKEN", "8626651293:AAEcwKRT8kw_271P0pyLokigad7cYjrp-8g")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 STABLE_COINS = ['USDC', 'FDUSD', 'DAI', 'TUSD', 'EUR', 'GBP', 'BUSD']
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **بوت القناص V8 شغال!**\n\nأنا ببحث دلوقتي عن فرص.. أول ما الاقي سكور عالي هبعتلك فوراً.", parse_mode="HTML")
+def send_telegram(message):
+    if not TOKEN: return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    try: requests.post(url, data=payload, timeout=15)
+    except: pass
 
 def get_tv_link(symbol):
     clean_symbol = symbol.replace("-USDT", "USDT").replace("-SWAP", "")
-    return f"https://www.tradingview.com/chart/index.html?symbol=OKX:{clean_symbol}"
+    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean_symbol}"
 
-async def run_scanner_logic(bot):
-    """منطق الفحص الدوري"""
+def get_btc_status():
+    try:
+        url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
+        res = requests.get(url).json().get('data', [])
+        if not res: return "⚠️ غير معروف"
+        curr_price = float(res[0][4])
+        ma20 = sum([float(x[4]) for x in res]) / 20
+        return "🟢 إيجابي (صاعد)" if curr_price > ma20 else "🔴 سلبي (هابط)"
+    except: return "⚠️ فحص BTC فشل"
+
+def calculate_indicators(df):
+    delta = df['c'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    df['ma20'] = df['c'].rolling(window=20).mean()
+    return df
+
+def scan(inst_type, all_signals, min_score, btc_status):
+    url_pairs = f"https://www.okx.com/api/v5/public/instruments?instType={inst_type}"
+    try:
+        pairs_data = requests.get(url_pairs).json().get('data', [])
+        for p in pairs_data:
+            symbol = p['instId']
+            if not symbol.endswith("-USDT") and not symbol.endswith("-USDT-SWAP"): continue
+            coin_name = symbol.split("-")[0]
+            if coin_name in STABLE_COINS: continue
+
+            bar_frame = "1H" if inst_type == "SWAP" else "4H"
+            url_candles = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={bar_frame}&limit=50"
+            res = requests.get(url_candles).json().get('data', [])
+            if not res or len(res) < 20: continue
+            
+            df = pd.DataFrame(res, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'v2', 'v3', 'v4'])
+            df['c'] = df['c'].astype(float)
+            df['h'] = df['h'].astype(float)
+            df['l'] = df['l'].astype(float)
+            df = df.iloc[::-1]
+            df = calculate_indicators(df)
+            
+            curr_price = df['c'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            ma20 = df['ma20'].iloc[-1]
+            
+            low_3 = df['l'].tail(3).min()
+            high_3 = df['h'].tail(3).max()
+            
+            score = 0
+            if curr_price > ma20: score += 3
+            if rsi < 35 or rsi > 65: score += 5
+            score = min(score, 10)
+            
+            direction = "LONG" if curr_price > ma20 else "SHORT"
+            stop_loss = round(low_3 * 0.985, 6) if direction == "LONG" else round(high_3 * 1.015, 6)
+            ma_status = "فوق ✅" if curr_price > ma20 else "تحت ❌"
+            link = get_tv_link(symbol)
+
+            alert_threshold = 8 if inst_type == "SWAP" else 9
+            if score >= alert_threshold:
+                msg = (
+                    f"🟡 <b>BB Squeeze | {direction}</b>\n"
+                    f"<code>{symbol}</code>\n"
+                    f"💰 السعر: {curr_price}\n"
+                    f"📊 RSI: {round(rsi, 1)} | MA20 {ma_status}\n"
+                    f"🎯 دخول: {curr_price}\n"
+                    f"🛑 ستوب: {stop_loss}\n"
+                    f"🔥 التقييم: {score}/10\n"
+                    f"₿ BTC: {btc_status}\n"
+                    f"🔗 <a href='{link}'>افتح الشارت ({bar_frame})</a>"
+                )
+                send_telegram(msg)
+
+            if score >= min_score:
+                all_signals.append({"symbol": symbol, "score": score, "type": direction, "link": link})
+            time.sleep(0.05)
+    except: pass
+
+def send_top10(all_signals, category, btc_status):
+    if not all_signals: return
+    longs = sorted([s for s in all_signals if s["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
+    shorts = sorted([s for s in all_signals if s["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
+    header = "🚀 <b>TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>TOP 10 SPOT (4H)</b>"
+    msg = f"{header}\n📊 <b>BTC: {btc_status}</b>\n\n"
+    if longs:
+        msg += "🟢 <b>أفضل LONG:</b>\n"
+        for i, s in enumerate(longs, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
+    if shorts and category == "FUTURE":
+        msg += "\n🔴 <b>أفضل SHORT:</b>\n"
+        for i, s in enumerate(shorts, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
+    send_telegram(msg)
+
+def main_logic_loop():
+    last_spot_time = 0
     while True:
         try:
-            url_pairs = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-            pairs_data = requests.get(url_pairs, timeout=10).json().get('data', [])
-            
-            for p in pairs_data:
-                symbol = p['instId']
-                if "-USDT" not in symbol or any(s in symbol for s in STABLE_COINS): continue
-
-                url_candles = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1H&limit=30"
-                res = requests.get(url_candles, timeout=10).json().get('data', [])
-                if not res or len(res) < 20: continue
-                
-                df = pd.DataFrame(res, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'v2', 'v3', 'v4'])
-                df['c'] = df['c'].astype(float)
-                df = df.iloc[::-1]
-                df['ma20'] = df['c'].rolling(window=20).mean()
-                
-                curr_price = df['c'].iloc[-1]
-                ma20 = df['ma20'].iloc[-1]
-                
-                if abs(curr_price - ma20) / ma20 < 0.01:
-                    direction = "LONG" if curr_price > ma20 else "SHORT"
-                    msg = f"🟡 <b>فرصة جديدة | {direction}</b>\n<code>{symbol}</code>\n💰 السعر: {curr_price}\n🔗 <a href='{get_tv_link(symbol)}'>افتح الشارت</a>"
-                    await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML", disable_web_page_preview=True)
-                await asyncio.sleep(0.1)
-            await asyncio.sleep(3600)
-        except Exception as e:
-            print(f"Scanner Error: {e}")
-            await asyncio.sleep(60)
-
-async def post_init(application: Application):
-    """تشغيل الفحص في الخلفية فور تشغيل البوت"""
-    asyncio.create_task(run_scanner_logic(application.bot))
+            btc_status = get_btc_status()
+            future_signals = []
+            scan("SWAP", future_signals, 6, btc_status)
+            send_top10(future_signals, "FUTURE", btc_status)
+            if time.time() - last_spot_time >= 14400:
+                spot_signals = []
+                scan("SPOT", spot_signals, 7, btc_status)
+                send_top10(spot_signals, "SPOT", btc_status)
+                last_spot_time = time.time()
+            time.sleep(3600)
+        except: time.sleep(60)
 
 def main():
     if not TOKEN: return
-    # استخدام post_init يغنينا عن الـ JobQueue لو فيها مشكلة في المكتبات
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    # الخطوة الحاسمة: إغلاق أي اتصال قديم تماماً
+    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
+    time.sleep(2) # انتظار بسيط لضمان تنفيذ الإغلاق في سيرفرات تليجرام
     
-    app.add_handler(CommandHandler("help", help_command))
-    
-    print("Sniper Bot V8 is starting...")
-    # حل مشكلة الـ Conflict نهائياً
+    threading.Thread(target=main_logic_loop, daemon=True).start()
+    app = Application.builder().token(TOKEN).build()
+    print("Sniper Bot V4 Gold is Active...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
