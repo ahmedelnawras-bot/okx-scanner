@@ -10,6 +10,13 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "5523662724")
 STABLE_COINS = ['USDC', 'FDUSD', 'DAI', 'TUSD', 'EUR', 'GBP', 'BUSD']
 
+# --- أوامر التليجرام ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = "🤖 **مرحباً بك في بوت القناص**\n\n"
+    help_text += "✅ البوت يعمل تلقائياً ويرسل تنبيهات فورية\n"
+    help_text += "📊 /top10 - لعرض أفضل العملات الحالية\n"
+    await update.message.reply_text(help_text, parse_mode="HTML")
+
 def send_telegram(message):
     if not TOKEN: return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -19,7 +26,7 @@ def send_telegram(message):
 
 def get_tv_link(symbol):
     clean_symbol = symbol.replace("-USDT", "USDT").replace("-SWAP", "")
-    return f"https://www.tradingview.com/chart/?symbol=OKX:{clean_symbol}"
+    return f"https://www.tradingview.com/chart/index.html?symbol=OKX:{clean_symbol}"
 
 def get_btc_status():
     try:
@@ -46,7 +53,7 @@ def scan(inst_type, all_signals, min_score, btc_status):
         pairs_data = requests.get(url_pairs).json().get('data', [])
         for p in pairs_data:
             symbol = p['instId']
-            if not symbol.endswith("-USDT") and not symbol.endswith("-USDT-SWAP"): continue
+            if "-USDT" not in symbol: continue
             coin_name = symbol.split("-")[0]
             if coin_name in STABLE_COINS: continue
 
@@ -79,19 +86,8 @@ def scan(inst_type, all_signals, min_score, btc_status):
             ma_status = "فوق ✅" if curr_price > ma20 else "تحت ❌"
             link = get_tv_link(symbol)
 
-            alert_threshold = 8 if inst_type == "SWAP" else 9
-            if score >= alert_threshold:
-                msg = (
-                    f"🟡 <b>BB Squeeze | {direction}</b>\n"
-                    f"<code>{symbol}</code>\n"
-                    f"💰 السعر: {curr_price}\n"
-                    f"📊 RSI: {round(rsi, 1)} | MA20 {ma_status}\n"
-                    f"🎯 دخول: {curr_price}\n"
-                    f"🛑 ستوب: {stop_loss}\n"
-                    f"🔥 التقييم: {score}/10\n"
-                    f"₿ BTC: {btc_status}\n"
-                    f"🔗 <a href='{link}'>افتح الشارت ({bar_frame})</a>"
-                )
+            if score >= (8 if inst_type == "SWAP" else 9):
+                msg = f"🟡 <b>BB Squeeze | {direction}</b>\n<code>{symbol}</code>\n💰 السعر: {curr_price}\n📊 RSI: {round(rsi, 1)} | MA20 {ma_status}\n🎯 دخول: {curr_price}\n🛑 ستوب: {stop_loss}\n🔥 التقييم: {score}/10\n₿ BTC: {btc_status}\n🔗 <a href='{link}'>افتح الشارت ({bar_frame})</a>"
                 send_telegram(msg)
 
             if score >= min_score:
@@ -99,45 +95,27 @@ def scan(inst_type, all_signals, min_score, btc_status):
             time.sleep(0.05)
     except: pass
 
-def send_top10(all_signals, category, btc_status):
-    if not all_signals: return
-    longs = sorted([s for s in all_signals if s["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
-    shorts = sorted([s for s in all_signals if s["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
-    header = "🚀 <b>TOP 10 FUTURE (1H)</b>" if category == "FUTURE" else "💎 <b>TOP 10 SPOT (4H)</b>"
-    msg = f"{header}\n📊 <b>BTC: {btc_status}</b>\n\n"
-    if longs:
-        msg += "🟢 <b>أفضل LONG:</b>\n"
-        for i, s in enumerate(longs, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
-    if shorts and category == "FUTURE":
-        msg += "\n🔴 <b>أفضل SHORT:</b>\n"
-        for i, s in enumerate(shorts, 1): msg += f"{i}. <a href='{s['link']}'>{s['symbol']}</a> 🔥 {s['score']}/10\n"
-    send_telegram(msg)
-
 def main_logic_loop():
-    last_spot_time = 0
     while True:
         try:
             btc_status = get_btc_status()
             future_signals = []
             scan("SWAP", future_signals, 6, btc_status)
-            send_top10(future_signals, "FUTURE", btc_status)
-            if time.time() - last_spot_time >= 14400:
-                spot_signals = []
-                scan("SPOT", spot_signals, 7, btc_status)
-                send_top10(spot_signals, "SPOT", btc_status)
-                last_spot_time = time.time()
             time.sleep(3600)
         except: time.sleep(60)
 
 def main():
     if not TOKEN: return
-    # الخطوة الحاسمة: إغلاق أي اتصال قديم تماماً
     requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
-    time.sleep(2) # انتظار بسيط لضمان تنفيذ الإغلاق في سيرفرات تليجرام
     
+    # تشغيل منطق الفحص
     threading.Thread(target=main_logic_loop, daemon=True).start()
+    
+    # تشغيل البوت واستجابة الأوامر
     app = Application.builder().token(TOKEN).build()
-    print("Sniper Bot V4 Gold is Active...")
+    app.add_handler(CommandHandler("help", help_command))
+    
+    print("Sniper Bot V5 Gold is Active...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
