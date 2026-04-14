@@ -4,6 +4,8 @@ import requests
 import threading
 import pandas as pd
 import numpy as np
+
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =====================
@@ -12,10 +14,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-bot_active = True  # START ON DEFAULT
+bot_active = True
 
 # =====================
-# TELEGRAM SENDER
+# TELEGRAM SEND
 # =====================
 def send_telegram(message):
     if not TOKEN or not bot_active:
@@ -34,12 +36,11 @@ def send_telegram(message):
         pass
 
 # =====================
-# TRADINGVIEW LINK
+# TV LINK
 # =====================
 def get_tv_link(symbol, bar="1H"):
     clean = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
-    interval_map = {"1H": "60", "4H": "240"}
-    interval = interval_map.get(bar, "60")
+    interval = "60" if bar == "1H" else "240"
     return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}&interval={interval}"
 
 # =====================
@@ -80,7 +81,7 @@ def indicators(df):
     return df
 
 # =====================
-# AI MOMENTUM (EARLY)
+# EARLY ENTRY ENGINE
 # =====================
 def early_entry(df):
     price = df['c'].iloc[-1]
@@ -99,19 +100,13 @@ def early_entry(df):
     return None
 
 # =====================
-# VIP SYSTEM
-# =====================
-def is_vip(conf, vol_ok):
-    return conf >= 8.5 and vol_ok
-
-# =====================
-# SMART FILTER (soft now)
+# VOLUME SPIKE
 # =====================
 def volume_spike(df):
     return df['v'].iloc[-1] > df['v'].rolling(20).mean().iloc[-1] * 1.5
 
 # =====================
-# PRIORITY + STRENGTH
+# STRENGTH
 # =====================
 def strength(score):
     if score >= 8.5:
@@ -124,9 +119,9 @@ def strength(score):
         return "🔴 ضعيف"
 
 # =====================
-# SCAN ENGINE (UPDATED EARLY)
+# SCAN ENGINE
 # =====================
-def scan(inst_type, btc_status):
+def scan(inst_type):
     url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP" if inst_type == "SWAP" else \
           "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
@@ -160,11 +155,8 @@ def scan(inst_type, btc_status):
 
             vol_ok = volume_spike(df)
 
-            # SCORE SIMPLE
-            conf = 6 + (0.5 if vol_ok else 0) + (0.5 if rsi < 40 or rsi > 60 else 0)
+            conf = 6 + (0.7 if vol_ok else 0) + (0.3 if 30 < rsi < 70 else 0)
             conf = round(conf, 2)
-
-            vip = is_vip(conf, vol_ok)
 
             low = df['l'].tail(3).min()
             high = df['h'].tail(3).max()
@@ -173,14 +165,12 @@ def scan(inst_type, btc_status):
 
             link = get_tv_link(symbol, bar)
 
-            # TYPE LABEL
-            type_label = "⚡ EARLY ENTRY 🚀"
-            vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if vip else ""
+            vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if conf >= 8.5 else ""
 
             msg = (
                 f"{vip_tag}"
                 f"🧠 إشارة ذكية | {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
-                f"{type_label}\n"
+                f"⚡ EARLY ENTRY 🚀\n"
                 f"────────────\n"
                 f"🪙 {symbol}\n"
                 f"💰 السعر: {price}\n"
@@ -188,84 +178,74 @@ def scan(inst_type, btc_status):
                 f"🎯 دخول: {price}\n"
                 f"🛑 وقف: {round(stop,6)}\n"
                 f"🔥 القوة: {conf}/10 | {strength(conf)}\n"
-                f"₿ BTC: {btc_status}\n"
                 f"────────────\n"
                 f"📈 <a href='{link}'>TradingView</a>"
             )
 
             send_telegram(msg)
-
             time.sleep(0.05)
 
         except:
             continue
 
 # =====================
-# TOP REPORT (SIMPLE KEEP)
+# TOP 10 SIMPLE
 # =====================
-def send_top(inst_type, btc_status):
+def send_top(inst_type):
     url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP" if inst_type == "SWAP" else \
           "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
     data = requests.get(url).json().get("data", [])
 
-    coins = []
+    msg = f"🚀 TOP 10 {inst_type}\n\n"
 
-    for p in data[:75]:
+    for i, p in enumerate(data[:10], 1):
         symbol = p["instId"]
-        coins.append(symbol)
-
-    msg = f"🚀 TOP 10 ({inst_type})\n📊 BTC: {btc_status}\n\n"
-
-    for i, c in enumerate(coins[:10], 1):
-        link = get_tv_link(c, "1H" if inst_type == "SWAP" else "4H")
-        msg += f"{i}. <a href='{link}'>{c}</a>\n"
+        link = get_tv_link(symbol, "1H" if inst_type == "SWAP" else "4H")
+        msg += f"{i}. <a href='{link}'>{symbol}</a>\n"
 
     send_telegram(msg)
 
 # =====================
 # COMMANDS
 # =====================
-async def start_cmd(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_active
     bot_active = True
-    await update.message.reply_text("🚀 Bot Started\n🧠 Early Entry Active")
+    await update.message.reply_text("🚀 Bot Started\n⚡ Early Entry Active")
 
-async def stop_cmd(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_active
     bot_active = False
     await update.message.reply_text("⛔ Bot Stopped")
 
-async def help_cmd(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧠 Bot Philosophy:\n"
-        "⚡ Early Entry Momentum Detection\n"
-        "💎 VIP Signals Only\n"
+        "🧠 Bot System:\n"
+        "⚡ Early Entry Momentum\n"
+        "💎 VIP Signals\n"
         "📊 Futures 1H / Spot 4H\n"
         "/start /stop /help /top"
     )
 
-async def top_cmd(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    btc = get_btc_status()
-    send_top("SWAP", btc)
-    send_top("SPOT", btc)
-    await update.message.reply_text("🚀 Top 10 Sent")
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    send_top("SWAP")
+    send_top("SPOT")
+    await update.message.reply_text("🚀 TOP 10 Sent")
 
 # =====================
 # LOOPS
 # =====================
 def futures_loop():
     while True:
-        btc = get_btc_status()
-        scan("SWAP", btc)
-        send_top("SWAP", btc)
+        scan("SWAP")
+        send_top("SWAP")
         time.sleep(3600)
 
 def spot_loop():
     while True:
-        btc = get_btc_status()
-        scan("SPOT", btc)
-        send_top("SPOT", btc)
+        scan("SPOT")
+        send_top("SPOT")
         time.sleep(14400)
 
 # =====================
@@ -285,7 +265,7 @@ def main():
     threading.Thread(target=futures_loop, daemon=True).start()
     threading.Thread(target=spot_loop, daemon=True).start()
 
-    print("🚀 Bot Running (Early Entry Mode)")
+    print("🚀 Bot Running - Early Entry System")
     app.run_polling()
 
 if __name__ == "__main__":
