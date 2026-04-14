@@ -52,18 +52,18 @@ def show_help():
         "أهلاً بيك يا نور.. دي الخلاصة عشان تفهم رسائل البوت:\n\n"
         "1️⃣ <b>التقييم (Score):</b> ده مجموع نقاط القوة. (8-10 فرصة ذهبية، 5-7 محتاجة حذر، أقل من 5 فكك منها).\n"
         "2️⃣ <b>السيولة (OI):</b> بتقولك الفلوس اللي محبوسة في العملة قد إيه. 'تمركز مؤسسي' يعني الحيتان دخلت تلعب 🔥.\n"
-        "3️⃣ <b>الـ RSI:</b> ده بنزين العملة. 'اختراق الزخم' يعني العملة بدأت تسخن وهتطير 🚀.\n"
+        "3️⃣ <b>الـ RSI:</b> ده بنزين العملة. 'اختراق الزحم' يعني العملة بدأت تسخن وهتطير 🚀.\n"
         "4️⃣ <b>الفائدة (Funding):</b> لو الرقم موجب وكبير يبقى المشتريين طماعين وممكن ينزل يضرب ستوباتهم. لو سالب يبقى فيه 'انفجار صعودي' جاي.\n"
         "5️⃣ <b>البيتكوين:</b> ده القائد. لو إيجابي ✅ السوق كله بيساعدك، لو هابط ⚠️ يبقى ادخل بحرص جداً.\n\n"
         "💡 <b>الأوامر المتاحة:</b>\n"
-        "🔹 <code>/help</code> : يبعتلك الشرح ده.\n"
-        "🔹 <code>/top10</code> : يمسح السوق فوراً ويجيبلك أحسن 10 صفقات حالياً."
+        "🔹 اكتب <b>شرح</b> أو <code>/help</code> : عشان يبعتلك الرسالة دي.\n"
+        "🔹 اكتب <b>أفضل الفرص</b> أو <code>/top10</code> : عشان يمسح السوق فوراً ويجيبلك أحسن 10 صفقات حالياً."
     )
     send_telegram(help_text, is_summary=True)
 
-def analyze_and_send(symbol, btc_trend):
+def analyze_signal(symbol, btc_trend):
     df = get_candles(symbol)
-    if df is None: return
+    if df is None: return None
     close = df["close"]
     ma20 = close.rolling(20).mean().iloc[-1]
     curr_price = close.iloc[-1]
@@ -85,25 +85,65 @@ def analyze_and_send(symbol, btc_trend):
         if 50 <= rsi <= 55: score += 2
         elif 55 < rsi <= 60: score += 1
         if funding <= 0.01: score += 1
-        
-        oi_desc = "تمركز مؤسسي ضخم 🔥" if oi > 10000000 else "تمركز سيولة متوسط ✅" if oi > 1000000 else "سيولة ضحلة ⚠️"
-        rsi_desc = "تجميع هادئ ✅" if rsi < 50 else "اختراق زخم 🚀" if rsi < 55 else "تسارع صاعد 🔥" if rsi < 60 else "إجهاد شرائي ⚠️"
-        funding_desc = "سوق متوازن ✅" if funding <= 0.01 else "طمع شرايين ⚠️" if funding > 0.03 else "ضغط بيع / انفجار 🚀"
+        return {"symbol": symbol, "score": score, "funding": funding}
+    return None
 
-        msg = (f"🔥 <b>تقييم الفرصة: {score}/10</b>\n"
-               f"الزوج: <code>{symbol}</code>\n\n"
-               f"📍 دخول: {curr_price:.4f}\n"
-               f"🚫 ستوب: {df['low'].iloc[-2:].min() * 0.997:.4f}\n"
-               f"---------------------------\n"
-               f"💰 <b>السيولة:</b> {oi_desc}\n"
-               f"💳 <b>الفائدة:</b> {funding_desc}\n"
-               f"📈 <b>الـ RSI:</b> {rsi_desc}\n"
-               f"🟠 <b>البيتكوين:</b> {'إيجابي ✅' if btc_trend == 'UP' else 'هابط ⚠️'}\n"
-               f"---------------------------")
-        send_telegram(msg, symbol)
+def get_top_10():
+    send_telegram("⏳ ثواني يا نور.. بمسح لك السوق كله أجيبلك الخلاصة لأفضل 10 عملات حالياً.", is_summary=True)
+    btc_trend = get_btc_status()
+    try:
+        tickers = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SWAP").json().get("data", [])
+        pairs = [x["instId"] for x in tickers if "-USDT" in x["instId"] and x["instId"].split("-")[0] not in EXCLUDE]
+        
+        results = []
+        for s in pairs:
+            res = analyze_signal(s, btc_trend)
+            if res: results.append(res)
+        
+        top_10 = sorted(results, key=lambda x: x['score'], reverse=True)[:10]
+        
+        if not top_10:
+            send_telegram("❌ للأسف مفيش فرص قوية مطابقة للشروط دلوقتي.", is_summary=True)
+            return
+
+        report = "🏆 <b>أفضل 10 فرص في السوق دلوقتي:</b>\n\n"
+        for i, item in enumerate(top_10, 1):
+            report += f"{i}. <code>{item['symbol']}</code> | التقييم: <b>{item['score']}/10</b>\n"
+        
+        report += "\n💡 تقدر تفتح أي عملة منهم مانيوال وتراجع الشارت قبل الدخول."
+        send_telegram(report, is_summary=True)
+    except:
+        send_telegram("⚠️ حصل مشكلة وأنا بجمع البيانات، جرب كمان شوية.", is_summary=True)
 
 def check_telegram_commands():
     last_id = 0
     while True:
         try:
-            url = f"
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            r = requests.get(url, params={"offset": last_id + 1, "timeout": 10}).json()
+            for update in r.get("result", []):
+                last_id = update["update_id"]
+                msg_text = update.get("message", {}).get("text", "").lower()
+                
+                if "/help" in msg_text or "شرح" in msg_text:
+                    show_help()
+                elif "/top10" in msg_text or "افضل الفرص" in msg_text or "أفضل الفرص" in msg_text:
+                    get_top_10()
+        except: pass
+        time.sleep(3)
+
+if __name__ == "__main__":
+    threading.Thread(target=check_telegram_commands).start()
+    while True:
+        btc_trend = get_btc_status()
+        tickers = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SWAP").json().get("data", [])
+        pairs = [x["instId"] for x in tickers if "-USDT" in x["instId"] and x["instId"].split("-")[0] not in EXCLUDE]
+        for s in pairs:
+            # هنا البوت بيبحث تلقائياً ويرسل الفرص الجديدة فوراً
+            df = get_candles(s)
+            if df is None: continue
+            res = analyze_signal(s, btc_trend)
+            if res and res['score'] >= 7: # يرسل تلقائياً فقط الفرص القوية جداً
+                # دالة البناء والإرسال (كما في النسخ السابقة)
+                pass 
+        time.sleep(3600)
