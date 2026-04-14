@@ -37,6 +37,24 @@ def get_tv_link(symbol):
     return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}"
 
 # =====================
+# BTC STATUS
+# =====================
+def get_btc_status():
+    try:
+        url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
+        data = requests.get(url).json().get("data", [])
+        if not data:
+            return "غير معروف"
+        df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
+        df = df.iloc[::-1]
+        df['c'] = df['c'].astype(float)
+        price = df['c'].iloc[-1]
+        ma = df['c'].rolling(20).mean().iloc[-1]
+        return "🟢 صاعد" if price > ma else "🔴 هابط"
+    except:
+        return "غير معروف"
+
+# =====================
 # INDICATORS
 # =====================
 def indicators(df):
