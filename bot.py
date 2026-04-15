@@ -177,7 +177,7 @@ def scan(inst_type):
                 f"📊 RSI: {round(rsi,1)}\n"
                 f"🎯 دخول: {price}\n"
                 f"🛑 وقف: {round(stop,6)}\n"
-                f"🔥 القوة: {conf}/10 | {strength(conf)}\n"
+                f"�ى القوة: {conf}/10 | {strength(conf)}\n"
                 f"────────────\n"
                 f"📈 <a href='{link}'>TradingView</a>"
             )
@@ -266,7 +266,7 @@ def main():
     threading.Thread(target=spot_loop, daemon=True).start()
 
     print("🚀 Bot Running - Early Entry System")
-    app.run_polling(drop_pending_updates=True)  # Fix: prevents Conflict error from old instances
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
