@@ -30,7 +30,7 @@ def run():
 
     tested = 0
 
-    for pair_data in usdt_pairs[:20]:
+    for pair_data in usdt_pairs[:100]:
         tested += 1
         symbol = pair_data["instId"]
 
