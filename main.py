@@ -1,4 +1,5 @@
 from services.okx_client import get_tickers, get_candles
+from services.telegram_sender import send_telegram_message
 from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 
@@ -34,10 +35,14 @@ def run():
         if signal:
             price = df.iloc[-1]["close"]
 
-            print("🚀 LONG SIGNAL")
-            print(f"Pair: {symbol}")
-            print(f"Price: {price}")
-            print("-" * 40)
+            message = (
+                f"🚀 LONG SIGNAL\n"
+                f"Pair: {symbol}\n"
+                f"Price: {price}"
+            )
+
+            print(message)
+            send_telegram_message(message)
 
         tested += 1
 
