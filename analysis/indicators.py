@@ -2,43 +2,51 @@ import pandas as pd
 
 
 def to_dataframe(candles):
+    if not candles:
+        return pd.DataFrame()
+
     df = pd.DataFrame(candles)
 
-    df = df.rename(columns={
-        "ts": "time",
-        "o": "open",
-        "h": "high",
-        "l": "low",
-        "c": "close",
-        "vol": "volume"
-    })
+    df.columns = [
+        "time", "open", "high", "low", "close",
+        "volume", "volCcy", "volCcyQuote", "confirm"
+    ]
 
-    df["close"] = df["close"].astype(float)
+    df["open"] = df["open"].astype(float)
     df["high"] = df["high"].astype(float)
     df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
 
     return df
 
 
 def add_ma(df, period=20):
-    df[f"ma_{period}"] = df["close"].rolling(window=period).mean()
+    df[f"ma{period}"] = df["close"].rolling(window=period).mean()
     return df
 
 
 def add_rsi(df, period=14):
     delta = df["close"].diff()
 
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
 
-    rs = gain / loss
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
+    rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
     return df
 
 
 def add_atr(df, period=14):
-    df["tr"] = df["high"] - df["low"]
-    df["atr"] = df["tr"].rolling(window=period).mean()
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
+
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = true_range.rolling(window=period).mean()
+
     return df
