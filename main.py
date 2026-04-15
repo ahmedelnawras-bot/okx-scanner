@@ -36,16 +36,19 @@ def run():
             price = df.iloc[-1]["close"]
 
             message = (
-                f"🚀 <b>لونج فيوتشر</b>\n"
-                f"<b>{symbol}</b>\n\n"
-                f"💰 <code>{price}</code>\n"
-                f"⏱ 15m\n\n"
-                f"⭐ -- / 10\n"
-                f"🛑 --\n\n"
-                f"🪙 BTC: --\n\n"
-                f"📊 إشارة لونج أولية\n"
-                f"🔥 <b>Long detected</b>\n"
-            )
+    f"🚀 <b>لونج فيوتشر</b>\n"
+    f"<b>{symbol}</b>\n\n"
+
+    f"💰 <code>{price}</code>   ⏱ 15m\n\n"
+
+    f"⭐ -- / 10\n"
+    f"🛑 --\n\n"
+
+    f"🪙 BTC: --\n\n"
+
+    f"📊 إشارة لونج أولية\n"
+    f"🔥 <b>Long detected</b>"
+)
 
             print(message)
             send_telegram_message(message)
