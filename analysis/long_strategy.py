@@ -1,23 +1,13 @@
 def early_bullish_signal(df):
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < 20:
         return False
 
-    # تأكد إن الأعمدة موجودة
-    required_cols = ["open", "high", "low", "close"]
-    for col in required_cols:
-        if col not in df.columns:
-            return False
-
     last = df.iloc[-1]
-    prev = df.iloc[-2]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
 
-    # شمعة خضراء
-    bullish = last["close"] > last["open"]
+    cond_trend = last["close"] > last["ma20"]
+    cond_candle = last["close"] > last["open"]
+    cond_rsi = last["rsi"] > 50
+    cond_volume = last["volume"] > avg_volume
 
-    # اختراق أعلى من الشمعة السابقة
-    breakout = last["high"] > prev["high"]
-
-    # زخم صعودي بسيط
-    momentum = last["close"] > prev["close"]
-
-    return bullish and breakout and momentum
+    return cond_trend and cond_candle and (cond_rsi or cond_volume)
