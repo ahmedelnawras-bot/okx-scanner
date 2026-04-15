@@ -22,13 +22,13 @@ def early_bullish_signal(df):
     candle_range = last["high"] - last["low"]
 
     cond_green_candle = last["close"] > last["open"]
-    cond_body_strength = candle_range > 0 and (candle_body / candle_range) >= 0.5
+    cond_body_strength = candle_range > 0 and (candle_body / candle_range) >= 0.4
 
-    # 4) RSI مناسب للصعود
-    cond_rsi = 52 <= last["rsi"] <= 72
+    # 4) RSI مناسب للصعود — مخفف
+    cond_rsi = last["rsi"] > 50
 
-    # 5) الحجم أعلى من المتوسط
-    cond_volume = last["volume"] > (avg_volume_20 * 1.2)
+    # 5) الحجم أعلى من المتوسط — مخفف
+    cond_volume = last["volume"] > (avg_volume_20 * 1.05)
 
     # 6) كسر قريب أو استمرار قوي
     cond_breakout = last["close"] > recent_high_5
