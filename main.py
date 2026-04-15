@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,23 +10,8 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-ALERTS_FILE = "alerts.json"
-
-
-def load_alerts():
-    try:
-        with open(ALERTS_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_alerts(data):
-    with open(ALERTS_FILE, "w") as f:
-        json.dump(data, f)
-
-
-last_alert_time = load_alerts()
+last_alert_time = {}
+COOLDOWN = 3600  # ساعة
 
 
 def run():
@@ -49,8 +33,6 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
-    cooldown = 3600  # ساعة
-    sent_in_run = set()
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
@@ -81,14 +63,11 @@ def run():
             now = time.time()
 
             if signal and score >= 7.5:
-                if symbol in sent_in_run:
-                    print(f"{symbol} → skipped (already sent in this run)")
-                    continue
+                last_time = last_alert_time.get(symbol, 0)
 
-                if symbol in last_alert_time:
-                    if now - last_alert_time[symbol] < cooldown:
-                        print(f"{symbol} → skipped (cooldown)")
-                        continue
+                if now - last_time < COOLDOWN:
+                    print(f"{symbol} → skipped (cooldown)")
+                    continue
 
                 message = f"""
 🚀 لونج فيوتشر
@@ -106,10 +85,7 @@ def run():
 """
 
                 send_telegram_message(message)
-
                 last_alert_time[symbol] = now
-                save_alerts(last_alert_time)
-                sent_in_run.add(symbol)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
