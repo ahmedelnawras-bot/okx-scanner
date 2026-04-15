@@ -12,25 +12,33 @@ from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
 COOLDOWN_SECONDS = 900  # 15 دقيقة
-COOLDOWN_FILE = "cooldown.json"
+STATE_FILE = "alert_state.json"
 
 
-def load_cooldown():
-    if os.path.exists(COOLDOWN_FILE):
+def load_state():
+    if os.path.exists(STATE_FILE):
         try:
-            with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "last_sent_at": data.get("last_sent_at", {}),
+                    "last_fingerprint": data.get("last_fingerprint", {}),
+                }
         except Exception:
-            return {}
-    return {}
+            pass
+
+    return {
+        "last_sent_at": {},
+        "last_fingerprint": {},
+    }
 
 
-def save_cooldown(data):
+def save_state(state):
     try:
-        with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
     except Exception as e:
-        print(f"Error saving cooldown file: {e}")
+        print(f"Error saving state file: {e}")
 
 
 def is_volume_spike(df, multiplier=1.2):
@@ -46,11 +54,30 @@ def is_volume_spike(df, multiplier=1.2):
     return last_volume >= (avg_volume_20 * multiplier)
 
 
-last_signals = load_cooldown()
+def should_send_alert(state, signal_key, fingerprint, now, cooldown_seconds):
+    # 1) منع تكرار نفس الإشارة على نفس الشمعة
+    if state["last_fingerprint"].get(signal_key) == fingerprint:
+        return False, "same candle"
+
+    # 2) منع إعادة التنبيه قبل انتهاء الـ cooldown
+    last_time = float(state["last_sent_at"].get(signal_key, 0))
+    if now - last_time < cooldown_seconds:
+        return False, "cooldown"
+
+    return True, "ok"
+
+
+def mark_alert_sent(state, signal_key, fingerprint, now):
+    state["last_sent_at"][signal_key] = now
+    state["last_fingerprint"][signal_key] = fingerprint
+    save_state(state)
+
+
+state = load_state()
 
 
 def run():
-    global last_signals
+    global state
 
     print("🚀 Bot Started...")
 
@@ -92,11 +119,10 @@ def run():
             if signal:
                 score = calculate_long_score(df)
 
-                # لو مفيش volume spike نقلل السكور بدل ما نلغي الإشارة
+                # لو مفيش volume spike نقلل السكور بدل ما نرفض الإشارة نهائيًا
                 if not volume_spike:
                     score -= 1.5
 
-                # منع السكور من النزول تحت الصفر
                 if score < 0:
                     score = 0
             else:
@@ -104,24 +130,39 @@ def run():
 
             print(f"{symbol} → signal: {signal} | score: {score} | volume_spike: {volume_spike}")
 
-            if not (signal and score >= 7.5):
+            # فلترة أولية
+            if not signal:
+                continue
+
+            if score < 7.5:
+                continue
+
+            # لو السكور أقل من 8 لازم يكون فيه volume spike
+            if score < 8 and not volume_spike:
                 continue
 
             price = df["close"].iloc[-1]
             now = time.time()
 
-            current_candle_time = str(df.index[-1])
-            key = f"{symbol}_long_{current_candle_time}"
+            candle_time = str(df.index[-1])
+            signal_key = f"{symbol}_long"
+            fingerprint = f"{signal_key}_{candle_time}"
 
-            # منع التكرار داخل نفس الرن
-            if key in sent_in_this_run:
-                print(f"{symbol} → skipped (already sent in run)")
+            # حماية إضافية داخل نفس الرن
+            if fingerprint in sent_in_this_run:
+                print(f"{symbol} → skipped (already sent in this run)")
                 continue
 
-            # منع التكرار بين الرنزات
-            last_time = float(last_signals.get(key, 0))
-            if now - last_time < COOLDOWN_SECONDS:
-                print(f"{symbol} → skipped (cooldown)")
+            allowed, reason = should_send_alert(
+                state=state,
+                signal_key=signal_key,
+                fingerprint=fingerprint,
+                now=now,
+                cooldown_seconds=COOLDOWN_SECONDS,
+            )
+
+            if not allowed:
+                print(f"{symbol} → skipped ({reason})")
                 continue
 
             volume_line = "💥 Volume Spike" if volume_spike else "📊 Volume عادي"
@@ -143,9 +184,14 @@ def run():
 
             send_telegram_message(message)
 
-            last_signals[key] = now
-            save_cooldown(last_signals)
-            sent_in_this_run.add(key)
+            mark_alert_sent(
+                state=state,
+                signal_key=signal_key,
+                fingerprint=fingerprint,
+                now=now,
+            )
+
+            sent_in_this_run.add(fingerprint)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
