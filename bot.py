@@ -8,29 +8,40 @@ import numpy as np
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =====================
-# CONFIG
-# =====================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 bot_active = True
 
 # =====================
-# TELEGRAM
+# TELEGRAM SAFE SEND
 # =====================
 def send_telegram(message):
     if not TOKEN or not bot_active:
         return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
     try:
-        requests.post(url, data=payload, timeout=15)
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=10
+        )
+    except:
+        pass
+
+# =====================
+# CLEAN TELEGRAM SESSION 🔥
+# =====================
+def clean_telegram():
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
+        time.sleep(2)
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset=-1")
+        time.sleep(2)
     except:
         pass
 
@@ -41,24 +52,6 @@ def get_tv_link(symbol, bar="1H"):
     clean = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
     interval = "60" if bar == "1H" else "240"
     return f"https://www.tradingview.com/chart/?symbol=OKX:{clean}&interval={interval}"
-
-# =====================
-# BTC STATUS
-# =====================
-def get_btc_status():
-    try:
-        url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=20"
-        data = requests.get(url).json().get("data", [])
-        df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','v2','v3','v4'])
-        df = df.iloc[::-1]
-        df['c'] = df['c'].astype(float)
-
-        price = df['c'].iloc[-1]
-        ma = df['c'].rolling(20).mean().iloc[-1]
-
-        return "🟢 صاعد" if price > ma else "🔴 هابط"
-    except:
-        return "غير معروف"
 
 # =====================
 # INDICATORS
@@ -97,15 +90,9 @@ def early_entry(df):
         return "SHORT"
     return None
 
-# =====================
-# VOLUME
-# =====================
 def volume_spike(df):
     return df['v'].iloc[-1] > df['v'].rolling(20).mean().iloc[-1] * 1.5
 
-# =====================
-# STRENGTH
-# =====================
 def strength(score):
     if score >= 8.5:
         return "💎 VIP"
@@ -117,7 +104,7 @@ def strength(score):
         return "🔴 ضعيف"
 
 # =====================
-# GET TOP 75 (USDT ONLY)
+# TOP 75 (USDT ONLY)
 # =====================
 def get_top75(inst_type):
     url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP" if inst_type == "SWAP" else \
@@ -138,7 +125,6 @@ def get_top75(inst_type):
         coins.append({"symbol": symbol, "vol": vol})
 
     coins = sorted(coins, key=lambda x: x["vol"], reverse=True)
-
     return [c["symbol"] for c in coins[:75]]
 
 # =====================
@@ -177,23 +163,13 @@ def scan(inst_type, results):
             high = df['h'].tail(3).max()
 
             stop = low * 0.985 if direction == "LONG" else high * 1.015
-
             link = get_tv_link(symbol, bar)
 
-            vip_tag = "💎 VIP SIGNAL 🔥🔥\n" if score >= 8.5 else ""
-
             msg = (
-                f"{vip_tag}"
-                f"🧠 إشارة ذكية | {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
-                f"⚡ EARLY ENTRY\n"
-                f"────────────\n"
+                f"🧠 {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
                 f"🪙 {symbol}\n"
-                f"💰 السعر: {price}\n"
-                f"📊 RSI: {round(rsi,1)}\n"
-                f"🎯 دخول: {price}\n"
-                f"🛑 وقف: {round(stop,6)}\n"
-                f"🔥 القوة: {score}/10 | {strength(score)}\n"
-                f"────────────\n"
+                f"💰 {price}\n"
+                f"🔥 {score}/10 | {strength(score)}\n"
                 f"📈 <a href='{link}'>TradingView</a>"
             )
 
@@ -215,80 +191,62 @@ def scan(inst_type, results):
 # =====================
 # TOP REPORT
 # =====================
-def send_top(results, title, btc_status, inst_type="SWAP"):
+def send_top(results, title, inst_type="SWAP"):
     if not results:
         return
 
-    msg = f"🚀 <b>{title}</b>\n📊 BTC: {btc_status}\n\n"
+    msg = f"🚀 <b>{title}</b>\n\n"
 
     longs = sorted([r for r in results if r["type"] == "LONG"], key=lambda x: x["score"], reverse=True)[:10]
     shorts = sorted([r for r in results if r["type"] == "SHORT"], key=lambda x: x["score"], reverse=True)[:10]
 
     if longs:
-        msg += "🟢 <b>أفضل LONG:</b>\n"
-        for i, r in enumerate(longs, 1):
-            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a>\n💰 {round(r['price'],6)} | 🔥 {r['score']}\n"
+        msg += "🟢 LONG:\n"
+        for r in longs:
+            msg += f"{r['symbol']} 💰 {r['price']} 🔥 {r['score']}\n"
 
     if inst_type == "SWAP" and shorts:
-        msg += "\n🔴 <b>أفضل SHORT:</b>\n"
-        for i, r in enumerate(shorts, 1):
-            msg += f"{i}. <a href='{r['link']}'>{r['symbol']}</a>\n💰 {round(r['price'],6)} | 🔥 {r['score']}\n"
+        msg += "\n🔴 SHORT:\n"
+        for r in shorts:
+            msg += f"{r['symbol']} 💰 {r['price']} 🔥 {r['score']}\n"
 
     send_telegram(msg)
 
 # =====================
 # COMMANDS
 # =====================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_active
     bot_active = True
-    await update.message.reply_text("🚀 Bot Started")
+    await update.message.reply_text("🚀 Started")
 
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_active
     bot_active = False
-    await update.message.reply_text("⛔ Bot Stopped")
+    await update.message.reply_text("⛔ Stopped")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🧠 Early Entry Bot\n"
-        "⚡ Futures 1H\n"
-        "💎 Spot 4H\n"
-        "VIP + Smart Signals\n"
-        "/start /stop /help /top"
-    )
+    await update.message.reply_text("/start /stop /top")
 
-async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    btc = get_btc_status()
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    results = []
+    scan("SWAP", results)
+    send_top(results, "Futures Top 10")
 
-    futures_results = []
-    scan("SWAP", futures_results)
-    send_top(futures_results, "FUTURES TOP 10 (1H)", btc, "SWAP")
-
-    spot_results = []
-    scan("SPOT", spot_results)
-    send_top(spot_results, "SPOT TOP 10 (4H)", btc, "SPOT")
-
-    await update.message.reply_text("🚀 Report Sent")
+    await update.message.reply_text("Done")
 
 # =====================
 # LOOPS
 # =====================
-def futures_loop():
+def loop():
     while True:
-        btc = get_btc_status()
-        results = []
-        scan("SWAP", results)
-        send_top(results, "FUTURES TOP 10 (1H)", btc, "SWAP")
-        time.sleep(3600)
-
-def spot_loop():
-    while True:
-        btc = get_btc_status()
-        results = []
-        scan("SPOT", results)
-        send_top(results, "SPOT TOP 10 (4H)", btc, "SPOT")
-        time.sleep(14400)
+        try:
+            results = []
+            scan("SWAP", results)
+            send_top(results, "Auto Report")
+            time.sleep(3600)
+        except:
+            time.sleep(60)
 
 # =====================
 # MAIN
@@ -297,18 +255,19 @@ def main():
     if not TOKEN:
         return
 
+    clean_telegram()  # 🔥 الحل النهائي
+
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("top", top))
 
-    threading.Thread(target=futures_loop, daemon=True).start()
-    threading.Thread(target=spot_loop, daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
 
-    print("🚀 Bot Running Final Version")
-    app.run_polling()
+    print("🚀 Running Stable...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
