@@ -1,51 +1,131 @@
-def early_bullish_signal(df):
-    if df is None or df.empty or len(df) < 30:
-        return False
+import sys
+import os
+import time
+import json
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-    avg_volume_20 = df["volume"].rolling(20).mean().iloc[-1]
-    recent_high_5 = df["high"].iloc[-6:-1].max()
+from services.okx_client import get_tickers, get_candles
+from services.telegram_sender import send_telegram_message
+from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
+from analysis.long_strategy import early_bullish_signal
+from analysis.scoring import calculate_long_score
 
-    # ======================
-    # شروط أساسية (لازم)
-    # ======================
-    cond_trend = last["close"] > last["ma20"]
-    cond_rsi = last["rsi"] > 50
-    cond_not_overextended = last["close"] < (last["ma20"] * 1.1)
+COOLDOWN_SECONDS = 3600
+COOLDOWN_FILE = "cooldown.json"
 
-    # ======================
-    # شروط تعزيز (مش كلها لازم)
-    # ======================
-    cond_ma_slope = last["ma20"] > prev["ma20"]
 
-    cond_green = last["close"] > last["open"]
+def load_cooldown():
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-    candle_body = last["close"] - last["open"]
-    candle_range = last["high"] - last["low"]
-    cond_body = candle_range > 0 and (candle_body / candle_range) >= 0.3
 
-    cond_volume = last["volume"] > (avg_volume_20 * 1.0)
+def save_cooldown(data):
+    try:
+        with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving cooldown file: {e}")
 
-    cond_breakout = last["close"] > recent_high_5
-    cond_momentum = last["close"] > prev["close"]
 
-    # ======================
-    # نحسب عدد الشروط المحققة
-    # ======================
-    confirmations = [
-        cond_ma_slope,
-        cond_green,
-        cond_body,
-        cond_volume,
-        cond_breakout,
-        cond_momentum,
+last_signals = load_cooldown()
+
+
+def run():
+    global last_signals
+
+    print("🚀 Bot Started...")
+
+    futures = get_tickers("SWAP")
+    print(f"Fetched {len(futures)} futures pairs")
+
+    usdt_pairs = [
+        p for p in futures
+        if "USDT" in p["instId"]
+        and not p["instId"].startswith((
+            "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"
+        ))
     ]
 
-    score = sum(confirmations)
+    print(f"USDT pairs: {len(usdt_pairs)}")
 
-    # ======================
-    # القرار النهائي
-    # ======================
-    return cond_trend and cond_rsi and cond_not_overextended and score >= 3
+    tested = 0
+    sent_in_this_run = set()
+
+    for pair_data in usdt_pairs[:200]:
+        tested += 1
+        symbol = pair_data["instId"]
+        key = f"{symbol}_long"
+
+        try:
+            candles = get_candles(symbol, "15m", 100)
+            df = to_dataframe(candles)
+
+            if df.empty:
+                print(f"{symbol} → empty dataframe")
+                continue
+
+            df = add_ma(df)
+            df = add_rsi(df)
+            df = add_atr(df)
+
+            signal = early_bullish_signal(df)
+
+            if signal:
+                score = calculate_long_score(df)
+            else:
+                score = 0
+
+            print(f"{symbol} → signal: {signal} | score: {score}")
+
+            if not (signal and score >= 7.5):
+                continue
+
+            now = time.time()
+
+            # منع التكرار داخل نفس الرن
+            if key in sent_in_this_run:
+                print(f"{symbol} → skipped (already sent in this run)")
+                continue
+
+            # منع التكرار بين الرنزات
+            last_time = float(last_signals.get(key, 0))
+            if now - last_time < COOLDOWN_SECONDS:
+                print(f"{symbol} → skipped (cooldown)")
+                continue
+
+            price = df["close"].iloc[-1]
+
+            message = f"""🚀 لونج فيوتشر
+
+{symbol}
+
+💰 {price}
+⏱ 15m
+
+⭐ {score} / 10
+🪙 BTC: --
+
+📊 إشارة لونج أولية
+🔥 Long detected
+"""
+
+            send_telegram_message(message)
+
+            last_signals[key] = now
+            save_cooldown(last_signals)
+            sent_in_this_run.add(key)
+
+        except Exception as e:
+            print(f"Error on {symbol}: {e}")
+
+    print(f"Tested {tested} pairs")
+
+
+if __name__ == "__main__":
+    run()
