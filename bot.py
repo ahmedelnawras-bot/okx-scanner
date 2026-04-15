@@ -266,7 +266,7 @@ def main():
     threading.Thread(target=spot_loop, daemon=True).start()
 
     print("🚀 Bot Running - Early Entry System")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)  # Fix: prevents Conflict error from old instances
 
 if __name__ == "__main__":
     main()
