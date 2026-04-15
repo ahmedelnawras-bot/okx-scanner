@@ -13,7 +13,7 @@ from analysis.scoring import calculate_long_score
 
 COOLDOWN_SECONDS = 900  # 15 دقيقة
 STATE_FILE = "alert_state.json"
-INTERVAL_MINUTES = 15
+MAX_ALERTS_PER_RUN = 3
 
 
 def load_state():
@@ -55,63 +55,19 @@ def is_volume_spike(df, multiplier=1.2):
     return last_volume >= (avg_volume_20 * multiplier)
 
 
-def get_candle_bucket(df, interval_minutes=15):
-    """
-    يرجّع bucket ثابت لكل شمعة 15m
-    نحاول أولًا من ts أو timestamp
-    ولو مش موجود/مش ثابت → fallback على الوقت الحالي
-    """
-    try:
-        if "ts" in df.columns:
-            ts_value = df["ts"].iloc[-1]
-
-            # لو ts رقم بالملي ثانية
-            if isinstance(ts_value, (int, float)):
-                return int(ts_value) // (interval_minutes * 60 * 1000)
-
-            # لو ts نص رقم
-            ts_value = str(ts_value).strip()
-            if ts_value.isdigit():
-                return int(ts_value) // (interval_minutes * 60 * 1000)
-
-        if "timestamp" in df.columns:
-            ts_value = df["timestamp"].iloc[-1]
-
-            # لو timestamp datetime-like كنص أو timestamp
-            try:
-                import pandas as pd
-                unix_seconds = int(pd.Timestamp(ts_value).timestamp())
-                return unix_seconds // (interval_minutes * 60)
-            except Exception:
-                pass
-
-        # fallback: الاندكس
-        try:
-            import pandas as pd
-            unix_seconds = int(pd.Timestamp(df.index[-1]).timestamp())
-            return unix_seconds // (interval_minutes * 60)
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-    # fallback نهائي
+def get_fingerprint(symbol, signal_type="long"):
     now = time.time()
-    return int(now // (interval_minutes * 60))
-
-
-def get_fingerprint(df, symbol, signal_type="long", interval_minutes=15):
-    candle_bucket = get_candle_bucket(df, interval_minutes=interval_minutes)
-    return f"{symbol}_{signal_type}_{candle_bucket}"
+    interval_seconds = 15 * 60  # 15 دقيقة
+    current_bucket = int(now // interval_seconds)
+    return f"{symbol}_{signal_type}_{current_bucket}"
 
 
 def should_send_alert(state, signal_key, fingerprint, now, cooldown_seconds):
-    # 1) منع تكرار نفس الإشارة على نفس الشمعة/الفترة
+    # منع تكرار نفس الإشارة في نفس الفترة
     if state["last_fingerprint"].get(signal_key) == fingerprint:
         return False, "same candle"
 
-    # 2) منع إعادة التنبيه قبل انتهاء الكولداون
+    # منع إعادة التنبيه قبل انتهاء الكولداون
     last_time = float(state["last_sent_at"].get(signal_key, 0))
     if now - last_time < cooldown_seconds:
         return False, "cooldown"
@@ -131,7 +87,6 @@ state = load_state()
 def run():
     global state
 
-    # نحمل الحالة في بداية كل run للتأكد إن أحدث نسخة موجودة
     state = load_state()
 
     print("🚀 Bot Started...")
@@ -151,6 +106,7 @@ def run():
 
     tested = 0
     sent_in_this_run = set()
+    sent_count = 0
 
     for pair_data in usdt_pairs[:200]:
         tested += 1
@@ -174,7 +130,7 @@ def run():
             if signal:
                 score = calculate_long_score(df)
 
-                # لو مفيش volume spike نقلل السكور بدل ما نلغي الإشارة
+                # لو مفيش volume spike نقلل السكور بدل ما نرفض الإشارة نهائيًا
                 if not volume_spike:
                     score -= 1.5
 
@@ -199,14 +155,9 @@ def run():
             now = time.time()
 
             signal_key = f"{symbol}_long"
-            fingerprint = get_fingerprint(
-                df=df,
-                symbol=symbol,
-                signal_type="long",
-                interval_minutes=INTERVAL_MINUTES,
-            )
+            fingerprint = get_fingerprint(symbol, "long")
 
-            # حماية داخل نفس الرن
+            # حماية إضافية داخل نفس الرن
             if fingerprint in sent_in_this_run:
                 print(f"{symbol} → skipped (already sent in this run)")
                 continue
@@ -250,11 +201,17 @@ def run():
             )
 
             sent_in_this_run.add(fingerprint)
+            sent_count += 1
+
+            if sent_count >= MAX_ALERTS_PER_RUN:
+                print("Reached max alerts limit, stopping...")
+                break
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
     print(f"Tested {tested} pairs")
+    print(f"Sent alerts this run: {sent_count}")
 
 
 if __name__ == "__main__":
