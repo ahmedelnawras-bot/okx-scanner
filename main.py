@@ -22,6 +22,9 @@ def run():
             continue
 
         df = to_dataframe(candles)
+        if df.empty:
+            continue
+
         df = add_ma(df, 20)
         df = add_rsi(df, 14)
         df = add_atr(df, 14)
