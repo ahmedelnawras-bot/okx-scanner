@@ -9,11 +9,11 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
+last_alert_time = {}
+
 
 def run():
     print("🚀 Bot Started...")
-
-    send_telegram_message("✅ Test message from bot")
 
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
@@ -29,16 +29,13 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
-    sent_signals = set()
+    cooldown = 3600  # ساعة
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
         symbol = pair_data["instId"]
 
         try:
-            if symbol in sent_signals:
-                continue
-
             candles = get_candles(symbol, "15m", 100)
             df = to_dataframe(candles)
 
@@ -60,8 +57,14 @@ def run():
             print(f"{symbol} → signal: {signal} | score: {score}")
 
             price = df["close"].iloc[-1]
+            now = time.time()
 
             if signal and score >= 7.5:
+                if symbol in last_alert_time:
+                    if now - last_alert_time[symbol] < cooldown:
+                        print(f"{symbol} → skipped (cooldown)")
+                        continue
+
                 message = f"""
 🚀 لونج فيوتشر
 
@@ -76,8 +79,9 @@ def run():
 📊 إشارة لونج أولية
 🔥 Long detected
 """
+
                 send_telegram_message(message)
-                sent_signals.add(symbol)
+                last_alert_time[symbol] = now
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
