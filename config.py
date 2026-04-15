@@ -1,4 +1,7 @@
-# config.py
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 
 FUTURES_TIMEFRAME = "15m"
 SPOT_TIMEFRAME = "4H"
