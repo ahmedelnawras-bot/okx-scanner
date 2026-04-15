@@ -106,7 +106,7 @@ def run():
 
     tested = 0
     sent_in_this_run = set()
-    sent_count = 0
+    candidates = []
 
     for pair_data in usdt_pairs[:200]:
         tested += 1
@@ -130,7 +130,7 @@ def run():
             if signal:
                 score = calculate_long_score(df)
 
-                # لو مفيش volume spike نقلل السكور بدل ما نرفض الإشارة نهائيًا
+                # لو مفيش volume spike نقلل السكور بدل ما نلغي الإشارة
                 if not volume_spike:
                     score -= 1.5
 
@@ -157,9 +157,9 @@ def run():
             signal_key = f"{symbol}_long"
             fingerprint = get_fingerprint(symbol, "long")
 
-            # حماية إضافية داخل نفس الرن
+            # حماية داخل نفس الرن
             if fingerprint in sent_in_this_run:
-                print(f"{symbol} → skipped (already sent in this run)")
+                print(f"{symbol} → skipped (already collected in this run)")
                 continue
 
             allowed, reason = should_send_alert(
@@ -191,27 +191,52 @@ def run():
 🔥 Long detected
 """
 
-            send_telegram_message(message)
-
-            mark_alert_sent(
-                state=state,
-                signal_key=signal_key,
-                fingerprint=fingerprint,
-                now=now,
-            )
+            candidates.append({
+                "symbol": symbol,
+                "price": float(price),
+                "score": float(score),
+                "volume_spike": volume_spike,
+                "message": message,
+                "signal_key": signal_key,
+                "fingerprint": fingerprint,
+                "now": now,
+            })
 
             sent_in_this_run.add(fingerprint)
-            sent_count += 1
-
-            if sent_count >= MAX_ALERTS_PER_RUN:
-                print("Reached max alerts limit, stopping...")
-                break
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
-    print(f"Tested {tested} pairs")
+    # ترتيب الإشارات: الأعلى score أولًا، ومع التساوي volume_spike=True يطلع فوق
+    candidates.sort(
+        key=lambda x: (x["score"], x["volume_spike"]),
+        reverse=True
+    )
+
+    top_candidates = candidates[:MAX_ALERTS_PER_RUN]
+
+    sent_count = 0
+
+    for candidate in top_candidates:
+        send_telegram_message(candidate["message"])
+
+        mark_alert_sent(
+            state=state,
+            signal_key=candidate["signal_key"],
+            fingerprint=candidate["fingerprint"],
+            now=candidate["now"],
+        )
+
+        sent_count += 1
+        print(
+            f'SENT → {candidate["symbol"]} | '
+            f'score: {candidate["score"]} | '
+            f'volume_spike: {candidate["volume_spike"]}'
+        )
+
+    print(f"Candidates found: {len(candidates)}")
     print(f"Sent alerts this run: {sent_count}")
+    print(f"Tested {tested} pairs")
 
 
 if __name__ == "__main__":
