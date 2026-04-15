@@ -13,6 +13,7 @@ from analysis.scoring import calculate_long_score
 
 COOLDOWN_SECONDS = 900  # 15 دقيقة
 STATE_FILE = "alert_state.json"
+INTERVAL_MINUTES = 15
 
 
 def load_state():
@@ -54,12 +55,63 @@ def is_volume_spike(df, multiplier=1.2):
     return last_volume >= (avg_volume_20 * multiplier)
 
 
+def get_candle_bucket(df, interval_minutes=15):
+    """
+    يرجّع bucket ثابت لكل شمعة 15m
+    نحاول أولًا من ts أو timestamp
+    ولو مش موجود/مش ثابت → fallback على الوقت الحالي
+    """
+    try:
+        if "ts" in df.columns:
+            ts_value = df["ts"].iloc[-1]
+
+            # لو ts رقم بالملي ثانية
+            if isinstance(ts_value, (int, float)):
+                return int(ts_value) // (interval_minutes * 60 * 1000)
+
+            # لو ts نص رقم
+            ts_value = str(ts_value).strip()
+            if ts_value.isdigit():
+                return int(ts_value) // (interval_minutes * 60 * 1000)
+
+        if "timestamp" in df.columns:
+            ts_value = df["timestamp"].iloc[-1]
+
+            # لو timestamp datetime-like كنص أو timestamp
+            try:
+                import pandas as pd
+                unix_seconds = int(pd.Timestamp(ts_value).timestamp())
+                return unix_seconds // (interval_minutes * 60)
+            except Exception:
+                pass
+
+        # fallback: الاندكس
+        try:
+            import pandas as pd
+            unix_seconds = int(pd.Timestamp(df.index[-1]).timestamp())
+            return unix_seconds // (interval_minutes * 60)
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    # fallback نهائي
+    now = time.time()
+    return int(now // (interval_minutes * 60))
+
+
+def get_fingerprint(df, symbol, signal_type="long", interval_minutes=15):
+    candle_bucket = get_candle_bucket(df, interval_minutes=interval_minutes)
+    return f"{symbol}_{signal_type}_{candle_bucket}"
+
+
 def should_send_alert(state, signal_key, fingerprint, now, cooldown_seconds):
-    # 1) منع تكرار نفس الإشارة على نفس الشمعة
+    # 1) منع تكرار نفس الإشارة على نفس الشمعة/الفترة
     if state["last_fingerprint"].get(signal_key) == fingerprint:
         return False, "same candle"
 
-    # 2) منع إعادة التنبيه قبل انتهاء الـ cooldown
+    # 2) منع إعادة التنبيه قبل انتهاء الكولداون
     last_time = float(state["last_sent_at"].get(signal_key, 0))
     if now - last_time < cooldown_seconds:
         return False, "cooldown"
@@ -78,6 +130,9 @@ state = load_state()
 
 def run():
     global state
+
+    # نحمل الحالة في بداية كل run للتأكد إن أحدث نسخة موجودة
+    state = load_state()
 
     print("🚀 Bot Started...")
 
@@ -105,7 +160,7 @@ def run():
             candles = get_candles(symbol, "15m", 100)
             df = to_dataframe(candles)
 
-            if df.empty:
+            if df is None or df.empty:
                 print(f"{symbol} → empty dataframe")
                 continue
 
@@ -119,7 +174,7 @@ def run():
             if signal:
                 score = calculate_long_score(df)
 
-                # لو مفيش volume spike نقلل السكور بدل ما نرفض الإشارة نهائيًا
+                # لو مفيش volume spike نقلل السكور بدل ما نلغي الإشارة
                 if not volume_spike:
                     score -= 1.5
 
@@ -130,7 +185,6 @@ def run():
 
             print(f"{symbol} → signal: {signal} | score: {score} | volume_spike: {volume_spike}")
 
-            # فلترة أولية
             if not signal:
                 continue
 
@@ -144,11 +198,15 @@ def run():
             price = df["close"].iloc[-1]
             now = time.time()
 
-            candle_time = str(df.index[-1])
             signal_key = f"{symbol}_long"
-            fingerprint = f"{signal_key}_{candle_time}"
+            fingerprint = get_fingerprint(
+                df=df,
+                symbol=symbol,
+                signal_type="long",
+                interval_minutes=INTERVAL_MINUTES,
+            )
 
-            # حماية إضافية داخل نفس الرن
+            # حماية داخل نفس الرن
             if fingerprint in sent_in_this_run:
                 print(f"{symbol} → skipped (already sent in this run)")
                 continue
