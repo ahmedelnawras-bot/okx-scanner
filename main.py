@@ -15,9 +15,9 @@ def run():
     tested = 0
 
     for pair_data in usdt_pairs[:20]:
-        pair = pair_data["instId"]
+        symbol = pair_data["instId"]
 
-        candles = get_candles(pair, timeframe="15m", limit=100)
+        candles = get_candles(symbol, timeframe="15m", limit=100)
         if not candles:
             continue
 
@@ -32,13 +32,11 @@ def run():
         signal = early_bullish_signal(df)
 
         if signal:
+            price = df.iloc[-1]["close"]
+
             print("🚀 LONG SIGNAL")
-            print(f"Pair: {pair}")
-            print(f"Price: {signal['price']}")
-            print(f"Score: {signal['score']}")
-            print(f"RSI: {signal['rsi']}")
-            print(f"Vol Ratio: {signal['vol_ratio']}")
-            print(f"Reasons: {', '.join(signal['reasons'])}")
+            print(f"Pair: {symbol}")
+            print(f"Price: {price}")
             print("-" * 40)
 
         tested += 1
