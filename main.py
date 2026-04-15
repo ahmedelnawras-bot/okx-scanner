@@ -1,10 +1,13 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import time
 from services.data import get_tickers, get_candles, to_dataframe
 from services.indicators import add_ma, add_rsi, add_atr
 from services.strategy import early_bullish_signal
 from services.telegram_utils import send_telegram_message
 from analysis.scoring import calculate_long_score
-
 
 def run():
     print("🚀 Bot Started...")
