@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -10,8 +11,26 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-last_alert_time = {}
 COOLDOWN = 3600  # ساعة
+COOLDOWN_FILE = "cooldown.json"
+
+
+def load_cooldown():
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cooldown(data):
+    with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+last_alert_time = load_cooldown()
 
 
 def run():
@@ -33,10 +52,12 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
+    sent_in_run = set()
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
         symbol = pair_data["instId"]
+        alert_key = f"{symbol}_long"
 
         try:
             candles = get_candles(symbol, "15m", 100)
@@ -63,7 +84,11 @@ def run():
             now = time.time()
 
             if signal and score >= 7.5:
-                last_time = last_alert_time.get(symbol, 0)
+                if alert_key in sent_in_run:
+                    print(f"{symbol} → skipped (already sent in this run)")
+                    continue
+
+                last_time = last_alert_time.get(alert_key, 0)
 
                 if now - last_time < COOLDOWN:
                     print(f"{symbol} → skipped (cooldown)")
@@ -85,7 +110,10 @@ def run():
 """
 
                 send_telegram_message(message)
-                last_alert_time[symbol] = now
+
+                last_alert_time[alert_key] = now
+                save_cooldown(last_alert_time)
+                sent_in_run.add(alert_key)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
