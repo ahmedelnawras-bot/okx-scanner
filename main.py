@@ -6,6 +6,7 @@ from analysis.long_strategy import early_bullish_signal
 
 def run():
     print("🚀 Bot Started...")
+    send_telegram_message("✅ Test message from bot")
 
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
