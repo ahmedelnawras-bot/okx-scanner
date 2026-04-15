@@ -46,7 +46,7 @@ def run():
             df = add_rsi(df)
             df = add_atr(df)
 
-            signal = early_bullish_signal(df)
+            signal = True
 
             if signal:
                 score = calculate_long_score(df)
