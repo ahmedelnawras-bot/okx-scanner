@@ -3,11 +3,12 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import time
-from services.data import get_tickers, get_candles, to_dataframe
-from services.indicators import add_ma, add_rsi, add_atr
-from services.strategy import early_bullish_signal
-from services.telegram_utils import send_telegram_message
+from services.okx_client import get_tickers, get_candles
+from services.telegram_sender import send_telegram_message
+from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
+from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
+
 
 def run():
     print("🚀 Bot Started...")
@@ -27,41 +28,43 @@ def run():
         symbol = pair_data["instId"]
 
         try:
-            candles = get_candles(symbol, "15m")
+            candles = get_candles(symbol, "15m", 100)
             df = to_dataframe(candles)
 
-            if df.empty:
-                continue
-
-            df = add_ma(df, 20)
-            df = add_rsi(df, 14)
-            df = add_atr(df, 14)
+            df = add_ma(df)
+            df = add_rsi(df)
+            df = add_atr(df)
 
             signal = early_bullish_signal(df)
 
-            if signal:
-                price = df.iloc[-1]["close"]
-                score = calculate_long_score(df)
+            if not signal:
+                continue
 
-                message = (
-                    f"\u200E🚀 <b>LONG FUTURES</b>\n"
-                    f"\u200E<b>{symbol}</b>\n\n"
-                    f"\u200E💰 <code>{price}</code>|⏱15m\n\n"
-                    f"\u200E⭐ {score} / 10\n"
-                    f"\u200E🛑 --\n\n"
-                    f"\u200E🪙 BTC: --\n\n"
-                    f"\u200E📊 إشارة لونج أولية\n"
-                    f"\u200E🔥 <b>Long detected</b>"
-                )
+            score = calculate_long_score(df)
 
-                print(message)
-                send_telegram_message(message)
+            price = df["close"].iloc[-1]
+
+            message = f"""
+🚀 لونج فيوتشر
+
+{symbol}
+
+💰 {price}
+⏱ 15m
+
+⭐ {score} / 10
+🪙 BTC: --
+
+📊 إشارة لونج أولية
+🔥 Long detected
+"""
+
+            send_telegram_message(message)
 
             tested += 1
 
         except Exception as e:
-            print(f"Error with {symbol}: {e}")
-            continue
+            print(f"Error on {symbol}: {e}")
 
     print(f"Tested {tested} pairs")
 
