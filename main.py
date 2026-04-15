@@ -45,8 +45,6 @@ def run():
     f"\u200E📊 إشارة لونج أولية\n"
     f"\u200E🔥 <b>Long detected</b>"
 )
-)
-
             print(message)
             send_telegram_message(message)
 
