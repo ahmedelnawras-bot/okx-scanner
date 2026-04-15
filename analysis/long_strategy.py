@@ -1,4 +1,8 @@
 def early_bullish_signal(df):
+    """
+    استراتيجية لونج خفيفة ومناسبة لفحص عدد كبير من الأزواج.
+    """
+
     try:
         if df is None or df.empty or len(df) < 20:
             return False
@@ -8,36 +12,26 @@ def early_bullish_signal(df):
 
         score = 0
 
-        # ✅ نحل مشكلة ma
         ma = last.get("ma", None)
+        if ma is not None and last["close"] > ma:
+            score += 1
 
-        if ma is not None:
-            if last["close"] > ma:
-                score += 1
+        if "rsi" in df.columns and last["rsi"] > 50:
+            score += 1
 
-        # RSI
-        if "rsi" in df.columns:
-            if last["rsi"] > 50:
-                score += 1
+        if "atr" in df.columns and last["atr"] >= prev["atr"]:
+            score += 1
 
-        # ATR
-        if "atr" in df.columns:
-            if last["atr"] >= prev["atr"]:
-                score += 1
-
-        # شمعة خضراء
         if last["close"] > last["open"]:
             score += 1
 
-        # حجم
         if last["volume"] > prev["volume"]:
             score += 1
 
-        # مومنتوم
         if last["close"] > prev["close"]:
             score += 1
 
-        return score >= 3   # خففناها عشان الإشارات ترجع
+        return score >= 3
 
     except Exception as e:
         print(f"Strategy error: {e}")
