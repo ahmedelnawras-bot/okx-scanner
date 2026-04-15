@@ -11,7 +11,7 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-COOLDOWN = 3600  # ساعة
+COOLDOWN_SECONDS = 3600
 COOLDOWN_FILE = "cooldown.json"
 
 
@@ -26,21 +26,25 @@ def load_cooldown():
 
 
 def save_cooldown(data):
-    with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    try:
+        with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving cooldown file: {e}")
 
 
-last_alert_time = load_cooldown()
+last_signals = load_cooldown()
 
 
 def run():
-    global last_alert_time
+    global last_signals
 
     print("🚀 Bot Started...")
 
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
 
+    # فلترة USDT فقط
     usdt_pairs = [
         p for p in futures
         if "USDT" in p["instId"]
@@ -52,12 +56,13 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
-    sent_in_run = set()
+    sent_in_this_run = set()
 
-    for pair_data in usdt_pairs[:100]:
+    # 🔥 شغالين على 200 زوج
+    for pair_data in usdt_pairs[:200]:
         tested += 1
         symbol = pair_data["instId"]
-        alert_key = f"{symbol}_long"
+        key = f"{symbol}_long"
 
         try:
             candles = get_candles(symbol, "15m", 100)
@@ -80,22 +85,26 @@ def run():
 
             print(f"{symbol} → signal: {signal} | score: {score}")
 
-            price = df["close"].iloc[-1]
+            # فلترة نهائية
+            if not (signal and score >= 7.5):
+                continue
+
             now = time.time()
 
-            if signal and score >= 7.5:
-                if alert_key in sent_in_run:
-                    print(f"{symbol} → skipped (already sent in this run)")
-                    continue
+            # منع تكرار داخل نفس الرن
+            if key in sent_in_this_run:
+                print(f"{symbol} → skipped (already sent in run)")
+                continue
 
-                last_time = last_alert_time.get(alert_key, 0)
+            # منع تكرار بين الرنزات
+            last_time = float(last_signals.get(key, 0))
+            if now - last_time < COOLDOWN_SECONDS:
+                print(f"{symbol} → skipped (cooldown)")
+                continue
 
-                if now - last_time < COOLDOWN:
-                    print(f"{symbol} → skipped (cooldown)")
-                    continue
+            price = df["close"].iloc[-1]
 
-                message = f"""
-🚀 لونج فيوتشر
+            message = f"""🚀 لونج فيوتشر
 
 {symbol}
 
@@ -109,11 +118,11 @@ def run():
 🔥 Long detected
 """
 
-                send_telegram_message(message)
+            send_telegram_message(message)
 
-                last_alert_time[alert_key] = now
-                save_cooldown(last_alert_time)
-                sent_in_run.add(alert_key)
+            last_signals[key] = now
+            save_cooldown(last_signals)
+            sent_in_this_run.add(key)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
