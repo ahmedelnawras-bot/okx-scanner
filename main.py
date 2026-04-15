@@ -33,6 +33,19 @@ def save_cooldown(data):
         print(f"Error saving cooldown file: {e}")
 
 
+def is_volume_spike(df, multiplier=1.5):
+    if df is None or df.empty or len(df) < 20:
+        return False
+
+    last_volume = df["volume"].iloc[-1]
+    avg_volume_20 = df["volume"].rolling(20).mean().iloc[-1]
+
+    if avg_volume_20 == 0:
+        return False
+
+    return last_volume >= (avg_volume_20 * multiplier)
+
+
 last_signals = load_cooldown()
 
 
@@ -73,6 +86,8 @@ def run():
             df = add_rsi(df)
             df = add_atr(df)
 
+            volume_spike = is_volume_spike(df, multiplier=1.5)
+
             signal = early_bullish_signal(df)
 
             if signal:
@@ -80,9 +95,9 @@ def run():
             else:
                 score = 0
 
-            print(f"{symbol} → signal: {signal} | score: {score}")
+            print(f"{symbol} → signal: {signal} | score: {score} | volume_spike: {volume_spike}")
 
-            if not (signal and score >= 7.5):
+            if not (signal and score >= 7.5 and volume_spike):
                 continue
 
             price = df["close"].iloc[-1]
@@ -91,12 +106,10 @@ def run():
             current_candle_time = str(df.index[-1])
             key = f"{symbol}_long_{current_candle_time}"
 
-            # منع التكرار داخل نفس الرن
             if key in sent_in_this_run:
                 print(f"{symbol} → skipped (already sent in run)")
                 continue
 
-            # منع التكرار بين الرنزات
             last_time = float(last_signals.get(key, 0))
             if now - last_time < COOLDOWN_SECONDS:
                 print(f"{symbol} → skipped (cooldown)")
@@ -113,6 +126,7 @@ def run():
 🪙 BTC: --
 
 📊 إشارة لونج أولية
+💥 Volume Spike
 🔥 Long detected
 """
 
