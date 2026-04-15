@@ -10,9 +10,13 @@ from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
 last_alert_time = {}
+sent_in_run = set()
 
 
 def run():
+    global last_alert_time
+    global sent_in_run
+
     print("🚀 Bot Started...")
 
     futures = get_tickers("SWAP")
@@ -30,6 +34,7 @@ def run():
 
     tested = 0
     cooldown = 3600  # ساعة
+    sent_in_run.clear()
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
@@ -60,6 +65,10 @@ def run():
             now = time.time()
 
             if signal and score >= 7.5:
+                if symbol in sent_in_run:
+                    print(f"{symbol} → skipped (already sent in this run)")
+                    continue
+
                 if symbol in last_alert_time:
                     if now - last_alert_time[symbol] < cooldown:
                         print(f"{symbol} → skipped (cooldown)")
@@ -82,6 +91,7 @@ def run():
 
                 send_telegram_message(message)
                 last_alert_time[symbol] = now
+                sent_in_run.add(symbol)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
