@@ -1,8 +1,8 @@
 import time
-from data import get_tickers, get_candles, to_dataframe
-from indicators import add_ma, add_rsi, add_atr
-from strategy import early_bullish_signal
-from telegram_utils import send_telegram_message
+from services.data import get_tickers, get_candles, to_dataframe
+from services.indicators import add_ma, add_rsi, add_atr
+from services.strategy import early_bullish_signal
+from services.telegram_utils import send_telegram_message
 from analysis.scoring import calculate_long_score
 
 
