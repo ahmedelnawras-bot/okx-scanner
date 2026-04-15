@@ -1,4 +1,4 @@
 requests
 pandas
 numpy
-python-telegram-bot[job-queue]==20.7
+python-telegram-bot==20.3
