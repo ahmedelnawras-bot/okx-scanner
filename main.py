@@ -13,7 +13,6 @@ from analysis.scoring import calculate_long_score
 def run():
     print("🚀 Bot Started...")
 
-    # test message
     send_telegram_message("✅ Test message from bot")
 
     futures = get_tickers("SWAP")
@@ -25,26 +24,29 @@ def run():
     tested = 0
 
     for pair_data in usdt_pairs[:20]:
+        tested += 1
         symbol = pair_data["instId"]
 
         try:
             candles = get_candles(symbol, "15m", 100)
             df = to_dataframe(candles)
 
+            if df.empty:
+                print(f"{symbol} → empty dataframe")
+                continue
+
             df = add_ma(df)
             df = add_rsi(df)
             df = add_atr(df)
 
             signal = early_bullish_signal(df)
-
-            if not signal:
-                continue
+            print(f"{symbol} → signal: {signal}")
 
             score = calculate_long_score(df)
-
             price = df["close"].iloc[-1]
 
-            message = f"""
+            if signal:
+                message = f"""
 🚀 لونج فيوتشر
 
 {symbol}
@@ -58,10 +60,7 @@ def run():
 📊 إشارة لونج أولية
 🔥 Long detected
 """
-
-            send_telegram_message(message)
-
-            tested += 1
+                send_telegram_message(message)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
