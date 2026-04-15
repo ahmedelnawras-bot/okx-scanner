@@ -1,1 +1,0 @@
-remove bottom_hunter
