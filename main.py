@@ -18,7 +18,6 @@ def run():
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
 
-    # استبعاد العملات الثابتة من الـ base
     usdt_pairs = [
         p for p in futures
         if "USDT" in p["instId"]
@@ -49,12 +48,12 @@ def run():
 
             signal = early_bullish_signal(df)
 
-if signal:
-    score = calculate_long_score(df)
-else:
-    score = 0
+            if signal:
+                score = calculate_long_score(df)
+            else:
+                score = 0
 
-print(f"{symbol} → signal: {signal} | score: {score}")
+            print(f"{symbol} → signal: {signal} | score: {score}")
 
             price = df["close"].iloc[-1]
 
