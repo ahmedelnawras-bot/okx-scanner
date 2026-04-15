@@ -1,21 +1,37 @@
 import sys
 import os
+import time
+import json
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import time
 from services.okx_client import get_tickers, get_candles
 from services.telegram_sender import send_telegram_message
 from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-last_alert_time = {}
-sent_in_run = set()
+ALERTS_FILE = "alerts.json"
+
+
+def load_alerts():
+    try:
+        with open(ALERTS_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def save_alerts(data):
+    with open(ALERTS_FILE, "w") as f:
+        json.dump(data, f)
+
+
+last_alert_time = load_alerts()
 
 
 def run():
     global last_alert_time
-    global sent_in_run
 
     print("🚀 Bot Started...")
 
@@ -34,7 +50,7 @@ def run():
 
     tested = 0
     cooldown = 3600  # ساعة
-    sent_in_run.clear()
+    sent_in_run = set()
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
@@ -90,7 +106,9 @@ def run():
 """
 
                 send_telegram_message(message)
+
                 last_alert_time[symbol] = now
+                save_alerts(last_alert_time)
                 sent_in_run.add(symbol)
 
         except Exception as e:
