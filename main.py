@@ -48,9 +48,13 @@ def run():
             df = add_atr(df)
 
             signal = early_bullish_signal(df)
-            score = calculate_long_score(df)
 
-            print(f"{symbol} → signal: {signal} | score: {score}")
+if signal:
+    score = calculate_long_score(df)
+else:
+    score = 0
+
+print(f"{symbol} → signal: {signal} | score: {score}")
 
             price = df["close"].iloc[-1]
 
