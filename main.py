@@ -13,12 +13,21 @@ from analysis.scoring import calculate_long_score
 def run():
     print("🚀 Bot Started...")
 
+    # رسالة اختبار للتأكد من Telegram
     send_telegram_message("✅ Test message from bot")
 
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
 
-    usdt_pairs = [p for p in futures if "USDT" in p["instId"]]
+    # استبعاد العملات الثابتة من الـ base
+    usdt_pairs = [
+        p for p in futures
+        if "USDT" in p["instId"]
+        and not p["instId"].startswith((
+            "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"
+        ))
+    ]
+
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
