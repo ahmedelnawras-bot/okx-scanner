@@ -36,10 +36,12 @@ def run():
             price = df.iloc[-1]["close"]
 
             message = (
-                f"🚀 <b>LONG SIGNAL</b>\n\n"
-                f"💎 <b>Pair:</b> {symbol}\n"
-                f"💰 <b>Price:</b> <code>{price}</code>\n"
-                f"⏱ <b>Timeframe:</b> 15m\n"
+                f"🚀 <b>لونج فيوتشر</b> | <b>{symbol}</b>\n\n"
+                f"💰 <code>{price}</code> | ⏱ 15m\n"
+                f"⭐ -- / 10 | 🛑 --\n\n"
+                f"🪙 BTC: --\n\n"
+                f"📊 إشارة لونج أولية\n\n"
+                f"🔥 Long detected\n"
             )
 
             print(message)
