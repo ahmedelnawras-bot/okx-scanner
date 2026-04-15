@@ -13,7 +13,6 @@ from analysis.scoring import calculate_long_score
 def run():
     print("🚀 Bot Started...")
 
-    # رسالة اختبار للتأكد من Telegram
     send_telegram_message("✅ Test message from bot")
 
     futures = get_tickers("SWAP")
@@ -49,12 +48,13 @@ def run():
             df = add_atr(df)
 
             signal = early_bullish_signal(df)
-            print(f"{symbol} → signal: {signal}")
-
             score = calculate_long_score(df)
+
+            print(f"{symbol} → signal: {signal} | score: {score}")
+
             price = df["close"].iloc[-1]
 
-            if signal:
+            if signal and score >= 7.5:
                 message = f"""
 🚀 لونج فيوتشر
 
