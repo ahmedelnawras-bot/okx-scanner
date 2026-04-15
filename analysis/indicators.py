@@ -8,7 +8,7 @@ def to_dataframe(candles):
     df = pd.DataFrame(
         candles,
         columns=[
-            "time", "open", "high", "low", "close",
+            "ts", "open", "high", "low", "close",
             "volume", "volCcy", "volCcyQuote", "confirm"
         ]
     )
