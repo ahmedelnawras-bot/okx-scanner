@@ -29,12 +29,16 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
+    sent_signals = set()
 
     for pair_data in usdt_pairs[:100]:
         tested += 1
         symbol = pair_data["instId"]
 
         try:
+            if symbol in sent_signals:
+                continue
+
             candles = get_candles(symbol, "15m", 100)
             df = to_dataframe(candles)
 
@@ -46,7 +50,7 @@ def run():
             df = add_rsi(df)
             df = add_atr(df)
 
-            signal = True
+            signal = early_bullish_signal(df)
 
             if signal:
                 score = calculate_long_score(df)
@@ -73,6 +77,7 @@ def run():
 🔥 Long detected
 """
                 send_telegram_message(message)
+                sent_signals.add(symbol)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
