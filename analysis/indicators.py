@@ -1,53 +1,57 @@
-import pandas as pd
+def early_bullish_signal(df):
+    if df.empty or len(df) < 20:
+        return None
 
+    price = df["close"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
 
-def to_dataframe(candles):
-    if not candles:
-        return pd.DataFrame()
+    ma20 = df["ma20"].iloc[-1]
+    rsi = df["rsi"].iloc[-1]
 
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "time", "open", "high", "low", "close",
-            "volume", "volCcy", "volCcyQuote", "confirm"
-        ]
-    )
+    vol = df["volume"].iloc[-1]
+    avg_vol = df["volume"].rolling(20).mean().iloc[-1]
 
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
+    if avg_vol == 0:
+        return None
 
-    return df
+    momentum = (price - prev_close) / prev_close
+    vol_ratio = vol / avg_vol
 
+    if not (
+        price > ma20 and
+        momentum > 0.006 and
+        vol_ratio > 2 and
+        45 < rsi < 70
+    ):
+        return None
 
-def add_ma(df, period=20):
-    df[f"ma{period}"] = df["close"].rolling(window=period).mean()
-    return df
+    score = 0
+    reasons = []
 
+    if rsi > 55:
+        score += 1.5
+        reasons.append("RSI قوي")
 
-def add_rsi(df, period=14):
-    delta = df["close"].diff()
+    if vol_ratio > 3:
+        score += 2
+        reasons.append("فوليوم انفجار")
 
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    prev_highs = df["high"].iloc[-4:-1].max()
+    if price > prev_highs:
+        score += 1
+        reasons.append("كسر مقاومة")
 
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
+    candle_body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+    candle_range = df["high"].iloc[-1] - df["low"].iloc[-1]
 
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+    if candle_range > 0 and (candle_body / candle_range) > 0.7:
+        score += 1.5
+        reasons.append("شمعة قوية")
 
-    return df
-
-
-def add_atr(df, period=14):
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
-
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = true_range.rolling(window=period).mean()
-
-    return df
+    return {
+        "score": score,
+        "reasons": reasons,
+        "price": price,
+        "rsi": rsi,
+        "vol_ratio": vol_ratio
+    }
