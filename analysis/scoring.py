@@ -28,7 +28,6 @@ def classify_signal(score):
 def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=0.0):
     score = 0.0
     reasons = []
-    flags = []
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -54,13 +53,10 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     if 50 < rsi < 65:
         score += 2.5
         reasons.append("RSI صحي")
-        flags.append("RSI صحي")
     elif 45 < rsi <= 50:
         score += 1.0
-        flags.append("RSI مقبول")
     elif rsi > 65:
         score += 0.5
-        flags.append("RSI مرتفع")
     else:
         score -= 1.0
 
@@ -68,16 +64,14 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     if vol_ratio > 1.3:
         score += 2.5
         reasons.append("فوليوم قوي")
-        flags.append("فوليوم قوي")
     elif vol_ratio > 1:
         score += 1.0
-        flags.append("فوليوم داعم")
+        reasons.append("فوليوم داعم")
 
     # Trend
     if close > ma:
         score += 2.0
         reasons.append("فوق MA")
-        flags.append("فوق MA")
     else:
         score -= 1.0
 
@@ -87,29 +81,25 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         if ratio > 0.6:
             score += 1.5
             reasons.append("شمعة قوية")
-            flags.append("شمعة قوية")
         elif ratio > 0.4:
             score += 0.5
-            flags.append("شمعة متوسطة")
+            reasons.append("شمعة متوسطة")
 
     # Rejection
     rejection = False
     if full > 0 and upper_wick > body * 1.5:
         rejection = True
         score -= 1.0
-        flags.append("رفض علوي")
 
     # Breakout
     if breakout:
         score += 1.5
         reasons.append("اختراق")
-        flags.append("اختراق")
 
     # MTF
     if mtf_confirmed:
         score += 1.5
         reasons.append("تأكيد 1H")
-        flags.append("تأكيد 1H")
 
     # BTC mode
     if "🟢" in btc_mode:
@@ -127,20 +117,15 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     # New listing
     if is_new:
         score += 0.5
-        flags.append("عملة جديدة")
 
     # Fake filter
     fake_signal = False
-
     if score < 4.5:
         fake_signal = True
-
     if rejection and score < 6:
         fake_signal = True
-
     if vol_ratio < 0.7 and rsi < 45:
         fake_signal = True
-
     if score >= 7:
         fake_signal = False
 
@@ -152,7 +137,6 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     return {
         "score": score,
         "reasons": list(dict.fromkeys(reasons)),
-        "flags": list(dict.fromkeys(flags)),
         "fake_signal": fake_signal,
         "signal": score >= 5.0,
         "funding_label": funding_label,
