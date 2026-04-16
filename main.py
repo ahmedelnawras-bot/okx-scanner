@@ -36,7 +36,7 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
-OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate")
+OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
 
 SCAN_LIMIT = 200
 TIMEFRAME = "15m"
@@ -564,7 +564,6 @@ def apply_top_momentum_filter(candidates):
     top_n = max(3, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
     filtered = strong_candidates[:top_n]
 
-    # Cap للعملات الجديدة داخل نفس السايكل
     final_candidates = []
     new_count = 0
 
