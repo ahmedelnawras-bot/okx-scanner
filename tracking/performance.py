@@ -209,7 +209,12 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         return False
 
 
-def update_open_trades(redis_client, signal_type: str = "long", timeframe: str = "15m", max_age_hours: int = 24):
+def update_open_trades(
+    redis_client,
+    signal_type: str = "long",
+    timeframe: str = "15m",
+    max_age_hours: int = 24,
+):
     """
     يراجع الصفقات المفتوحة:
     - لو السعر لمس TP1 أولًا => win
@@ -247,7 +252,6 @@ def update_open_trades(redis_client, signal_type: str = "long", timeframe: str =
             continue
 
         symbol = trade["symbol"]
-        entry = safe_float(trade["entry"])
         sl = safe_float(trade["sl"])
         tp1 = safe_float(trade["tp1"])
         created_at = int(trade.get("created_at", now_ts))
@@ -266,7 +270,7 @@ def update_open_trades(redis_client, signal_type: str = "long", timeframe: str =
 
         result = None
 
-        # نراجع الشموع بعد وقت الإنشاء
+        # Long logic
         for candle in candles:
             candle_ts = candle["ts"]
             if candle_ts > 10_000_000_000:
@@ -278,7 +282,8 @@ def update_open_trades(redis_client, signal_type: str = "long", timeframe: str =
             low = safe_float(candle["low"])
             high = safe_float(candle["high"])
 
-            # Long logic
+            # نفترض الأسوأ: لو الشمعة لمست SL و TP1 معًا في نفس الشمعة،
+            # نعتبرها loss للمحافظة.
             if low <= sl:
                 result = "loss"
                 break
