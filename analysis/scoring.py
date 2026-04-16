@@ -151,10 +151,14 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     if mtf_confirmed:
         score += 1.5
         reasons.append("تأكيد 1H")
+    elif not is_new:
+        # في العملات العادية، غياب الـ MTF يخصم قليلًا
+        score -= 0.5
 
     # BTC mode
     if "🟢" in btc_mode:
         score += 1.0
+        reasons.append("BTC داعم")
     elif "🔴" in btc_mode:
         score -= 1.0
 
@@ -162,12 +166,22 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     funding_label = classify_funding_simple(funding)
     if funding < -0.0005:
         score += 1.0
+        reasons.append("تمويل سلبي")
     elif funding > 0.0005:
         score -= 1.0
 
-    # New listing
+    # New listing balanced mode
     if is_new:
+        # Bonus بسيط، لكن مش مبالغ فيه
         score += 0.5
+        reasons.append("عملة جديدة")
+
+        # نعطي أفضلية للانفجار الحقيقي
+        if breakout and vol_ratio >= 1.8:
+            score += 1.0
+            reasons.append("زخم جديد قوي")
+        elif breakout or vol_ratio >= 1.8:
+            score += 0.5
 
     # Fake filter
     fake_signal = False
@@ -179,6 +193,9 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         fake_signal = True
 
     if vol_ratio < 0.7 and rsi < 45:
+        fake_signal = True
+
+    if not is_new and not mtf_confirmed and score < 7:
         fake_signal = True
 
     if score >= 7:
