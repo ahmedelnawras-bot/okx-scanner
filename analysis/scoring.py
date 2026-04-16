@@ -17,7 +17,7 @@ def classify_funding_simple(funding):
 
 
 def classify_signal(score):
-    if score >= 8:
+    if score >= 8.5:
         return "🔥 نار"
     elif score >= 6.5:
         return "✅ جيد"
@@ -40,10 +40,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     prev_volume = float(prev["volume"])
     last_volume = float(last["volume"])
 
-    if prev_volume > 0:
-        vol_ratio = last_volume / prev_volume
-    else:
-        vol_ratio = 1.0
+    vol_ratio = (last_volume / prev_volume) if prev_volume > 0 else 1.0
 
     body = abs(close - open_)
     full = float(last["high"]) - float(last["low"])
@@ -132,13 +129,11 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     score = max(0.0, score)
     score = round(score, 1)
 
-    signal_rating = classify_signal(score)
-
     return {
         "score": score,
         "reasons": list(dict.fromkeys(reasons)),
         "fake_signal": fake_signal,
         "signal": score >= 5.0,
         "funding_label": funding_label,
-        "signal_rating": signal_rating,
+        "signal_rating": classify_signal(score),
     }
