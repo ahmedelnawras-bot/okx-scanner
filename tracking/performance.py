@@ -28,17 +28,11 @@ def get_stats_key(signal_type: str = "long") -> str:
 
 
 def calc_tp1(entry: float, sl: float) -> float:
-    """
-    TP1 = 1R
-    """
     risk = entry - sl
     return round(entry + risk, 6)
 
 
 def calc_tp2(entry: float, sl: float) -> float:
-    """
-    TP2 = 2R
-    """
     risk = entry - sl
     return round(entry + (risk * 2), 6)
 
@@ -93,9 +87,6 @@ def register_trade(
     btc_mode: str = "🟡 محايد",
     funding_label: str = "🟡 محايد",
 ):
-    """
-    يسجل الصفقة لو كانت جديدة فقط
-    """
     if redis_client is None:
         return False
 
@@ -120,13 +111,13 @@ def register_trade(
         "score": round(float(score), 2),
         "btc_mode": btc_mode,
         "funding_label": funding_label,
-        "status": "open",          # open / partial / closed
+        "status": "open",
         "tp1_hit": False,
         "tp1_hit_at": None,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "closed_at": None,
-        "result": None,            # win / loss / expired
+        "result": None,
     }
 
     try:
@@ -134,7 +125,7 @@ def register_trade(
             trade_key,
             json.dumps(trade_data, ensure_ascii=False),
             nx=True,
-            ex=60 * 60 * 24 * 7,  # 7 days
+            ex=60 * 60 * 24 * 7,
         )
 
         if not created:
@@ -180,9 +171,6 @@ def save_trade(redis_client, trade_key: str, trade_data: dict):
 
 
 def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: str):
-    """
-    result = win / loss / expired
-    """
     if redis_client is None:
         return False
 
@@ -218,11 +206,6 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
 
 
 def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
-    """
-    بعد TP1:
-    - نعتبر الصفقة partial
-    - ننقل SL إلى entry (breakeven)
-    """
     if redis_client is None:
         return False
 
@@ -233,7 +216,7 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         trade_data["tp1_hit"] = True
         trade_data["tp1_hit_at"] = int(time.time())
         trade_data["status"] = "partial"
-        trade_data["sl"] = trade_data["entry"]  # move SL to BE
+        trade_data["sl"] = trade_data["entry"]
         trade_data["updated_at"] = int(time.time())
 
         stats_key = get_stats_key(trade_data.get("signal_type", "long"))
@@ -251,14 +234,6 @@ def update_open_trades(
     timeframe: str = "15m",
     max_age_hours: int = 24,
 ):
-    """
-    يراجع الصفقات المفتوحة:
-    - لو السعر لمس SL أولًا قبل TP1 => loss
-    - لو لمس TP1 => نحرك SL إلى entry ونكمل
-    - لو لمس TP2 بعد TP1 => win
-    - لو رجع لـ entry بعد TP1 => win
-    - لو عدى عليها وقت طويل => expired
-    """
     if redis_client is None:
         return
 
@@ -290,14 +265,12 @@ def update_open_trades(
             continue
 
         symbol = trade["symbol"]
-        entry = safe_float(trade["entry"])
         sl = safe_float(trade["sl"])
         tp1 = safe_float(trade["tp1"])
         tp2 = safe_float(trade["tp2"])
         tp1_hit = bool(trade.get("tp1_hit", False))
         created_at = int(trade.get("created_at", now_ts))
 
-        # Expired
         if now_ts - created_at > max_age_seconds:
             mark_trade_closed(redis_client, trade_key, trade, "expired")
             logger.info(f"{symbol} → trade expired")
@@ -323,7 +296,6 @@ def update_open_trades(
             low = safe_float(candle["low"])
             high = safe_float(candle["high"])
 
-            # قبل TP1
             if not tp1_hit:
                 if low <= sl:
                     result = "loss"
@@ -334,25 +306,21 @@ def update_open_trades(
                     if ok:
                         trade = load_trade(redis_client, trade_key) or trade
                         tp1_hit = True
-                        sl = safe_float(trade["sl"])  # entry now
+                        sl = safe_float(trade["sl"])
                         state_changed = True
                         logger.info(f"{symbol} → TP1 hit, SL moved to entry")
                     else:
                         logger.error(f"{symbol} → failed to mark TP1")
                         break
 
-                    # لو نفس الشمعة كملت ووصلت TP2
                     if high >= tp2:
                         result = "win"
                         break
-
-            # بعد TP1
             else:
                 if high >= tp2:
                     result = "win"
                     break
 
-                # لو رجع للـ entry بعد TP1 نعتبرها win محفوظ
                 if low <= sl:
                     result = "win"
                     break
