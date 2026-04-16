@@ -13,6 +13,8 @@ from tracking.performance import (
     update_open_trades,
     get_winrate_summary,
     format_winrate_summary,
+    calc_tp1,
+    calc_tp2,
 )
 
 # =========================
@@ -98,23 +100,6 @@ def is_symbol_on_cooldown(symbol: str, signal_type: str = "long") -> bool:
         return bool(r.exists(get_symbol_cooldown_key(symbol, signal_type)))
     except Exception as e:
         logger.error(f"Redis symbol cooldown exists error: {e}")
-        return False
-
-
-def set_symbol_cooldown(symbol: str, signal_type: str = "long", cooldown_seconds: int = COOLDOWN_SECONDS) -> bool:
-    if not r:
-        return False
-    try:
-        return bool(
-            r.set(
-                get_symbol_cooldown_key(symbol, signal_type),
-                "1",
-                ex=cooldown_seconds,
-                nx=True,
-            )
-        )
-    except Exception as e:
-        logger.error(f"Redis set symbol cooldown error: {e}")
         return False
 
 
@@ -482,6 +467,12 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
     signal_rating = score_result.get("signal_rating", "⚡ عادي")
     sl_pct = calculate_sl_percent(price, stop_loss)
 
+    tp1 = calc_tp1(price, stop_loss)
+    tp2 = calc_tp2(price, stop_loss)
+
+    tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
+    tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
+
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
     safe_symbol = html.escape(symbol_clean)
@@ -495,6 +486,10 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 
 💰 {price:.6f} | ⏱ 15m
 ⭐ {score_result["score"]:.1f} / 10 | 🛑 SL: {stop_loss:.6f} (-{sl_pct}%)
+
+🎯 TP1: {tp1:.6f} (+{tp1_pct}%)
+🏁 TP2: {tp2:.6f} (+{tp2_pct}%)
+
 🏷 <b>التصنيف:</b> {safe_rating}
 
 🪙 BTC: {safe_btc}
@@ -588,6 +583,7 @@ def run():
                     logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
 
+                # منع تكرار نفس الزوج داخل نفس run
                 if symbol in candidates_symbols:
                     logger.info(f"{symbol} → skipped (already queued this run)")
                     continue
@@ -626,6 +622,7 @@ def run():
                     "sl": stop_loss,
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
                 })
+
                 candidates_symbols.add(symbol)
 
             candidates.sort(
