@@ -45,17 +45,23 @@ def is_volume_spike(df, multiplier=1.2):
 
 def get_last_candle_time(df):
     """
-    نجيب وقت آخر شمعة بشكل ثابت من عمود ts فقط.
+    نستخدم timestamp الخام من OKX بشكل ثابت لنفس الشمعة.
     """
     try:
-        ts = df["ts"].iloc[-1]
+        if "ts" in df.columns:
+            ts = df["ts"].iloc[-1]
+        else:
+            # fallback: أول عمود في الصف الأخير
+            ts = df.iloc[-1][0]
+
         ts = int(ts)
 
-        # لو milliseconds
+        # لو milliseconds نحوله لثواني
         if ts > 10_000_000_000:
             ts = ts // 1000
 
         return ts
+
     except Exception as e:
         print(f"⚠️ candle time error: {e}")
         return 0
@@ -101,7 +107,7 @@ def mark_sent(symbol, candle_time, signal_type="long"):
     cooldown_key = get_cooldown_key(symbol, signal_type)
 
     try:
-        # نفس الشمعة نخليها محفوظة شوية أطول
+        # نخزن نفس الشمعة لمدة ساعة
         r.set(same_candle_key, "1", ex=3600)
         # كولداون 15 دقيقة
         r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
