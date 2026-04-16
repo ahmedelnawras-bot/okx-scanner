@@ -36,7 +36,7 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
-OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
+OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate")
 
 SCAN_LIMIT = 200
 TIMEFRAME = "15m"
@@ -45,8 +45,19 @@ HTF_TIMEFRAME = "1H"
 MIN_SCORE = 5.0
 MAX_ALERTS_PER_RUN = 3
 COOLDOWN_SECONDS = 3600
+LOCAL_RECENT_SEND_SECONDS = 1800  # 30 دقيقة
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
+
+# Top Momentum filter
+TOP_MOMENTUM_PERCENT = 0.20
+TOP_MOMENTUM_MIN_SCORE = 7.0
+TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
+
+# New listings balanced mode
+NEW_LISTING_MIN_VOL_RATIO = 1.8
+NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
+NEW_LISTING_MAX_PER_RUN = 1
 
 # =========================
 # REDIS
@@ -322,10 +333,6 @@ def get_funding_rate(symbol):
 
 
 def get_signal_row(df):
-    """
-    استخدم آخر شمعة confirmed فقط.
-    لو آخر شمعة غير مؤكدة، خذ اللي قبلها.
-    """
     try:
         if "confirm" not in df.columns or len(df) < 2:
             return df.iloc[-2]
@@ -460,6 +467,122 @@ def build_tradingview_link(symbol):
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
 
 
+def get_candle_strength_ratio(df) -> float:
+    try:
+        signal_row = get_signal_row(df)
+        high = float(signal_row["high"])
+        low = float(signal_row["low"])
+        open_ = float(signal_row["open"])
+        close = float(signal_row["close"])
+
+        full = high - low
+        if full <= 0:
+            return 0.0
+
+        body = abs(close - open_)
+        return round(body / full, 4)
+    except Exception:
+        return 0.0
+
+
+def get_volume_ratio(df) -> float:
+    try:
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 1:
+            return 1.0
+
+        prev_volume = float(df.iloc[idx - 1]["volume"])
+        last_volume = float(signal_row["volume"])
+
+        if prev_volume <= 0:
+            return 1.0
+
+        return round(last_volume / prev_volume, 4)
+    except Exception:
+        return 1.0
+
+
+def passes_new_listing_filter(score: float, breakout: bool, vol_ratio: float, candle_strength: float) -> bool:
+    checks = 0
+
+    if breakout:
+        checks += 1
+
+    if vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
+        checks += 1
+
+    if candle_strength >= NEW_LISTING_MIN_CANDLE_STRENGTH:
+        checks += 1
+
+    if score >= TOP_MOMENTUM_NEW_MIN_SCORE:
+        checks += 1
+
+    return checks >= 3
+
+
+def get_effective_min_score(is_new: bool) -> float:
+    return TOP_MOMENTUM_NEW_MIN_SCORE if is_new else TOP_MOMENTUM_MIN_SCORE
+
+
+def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new: bool) -> float:
+    priority = float(score)
+
+    if breakout:
+        priority += 1.0
+
+    if vol_ratio >= 2.0:
+        priority += 1.0
+    elif vol_ratio >= 1.5:
+        priority += 0.5
+
+    if is_new and vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
+        priority += 0.5
+
+    return round(priority, 2)
+
+
+def apply_top_momentum_filter(candidates):
+    if not candidates:
+        return []
+
+    strong_candidates = []
+    for c in candidates:
+        min_score = get_effective_min_score(c["is_new"])
+        if c["score"] >= min_score:
+            strong_candidates.append(c)
+
+    if not strong_candidates:
+        logger.info("Top momentum filter: no candidates above threshold")
+        return []
+
+    strong_candidates.sort(
+        key=lambda x: (x["momentum_priority"], x["score"], x["rank_volume_24h"]),
+        reverse=True,
+    )
+
+    top_n = max(3, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
+    filtered = strong_candidates[:top_n]
+
+    # Cap للعملات الجديدة داخل نفس السايكل
+    final_candidates = []
+    new_count = 0
+
+    for c in filtered:
+        if c["is_new"]:
+            if new_count >= NEW_LISTING_MAX_PER_RUN:
+                continue
+            new_count += 1
+        final_candidates.append(c)
+
+    logger.info(
+        f"Top momentum filter: kept {len(final_candidates)} of {len(strong_candidates)} "
+        f"(from total {len(candidates)})"
+    )
+
+    return final_candidates
+
+
 def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new):
     symbol_clean = clean_symbol_for_message(symbol)
     details = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
@@ -501,15 +624,11 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 """
 
 
-# =========================
-# MAIN LOOP
-# =========================
 def run():
     while True:
         try:
             logger.info(f"RUN START | pid={os.getpid()} | ts={int(time.time())}")
 
-            # update performance tracking first
             update_open_trades(r, signal_type="long", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, signal_type="long")
             logger.info(format_winrate_summary(winrate_summary))
@@ -571,27 +690,23 @@ def run():
                 candle_time = get_signal_candle_time(df)
                 now = time.time()
 
-                # local duplicate prevention
                 if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
                     logger.info(f"{symbol} → skipped (same candle in memory)")
                     continue
 
-                # منع إرسال نفس الزوج لو اتبعت خلال 15 دقيقة
                 if symbol in sent_cache:
-                    if now - sent_cache[symbol] < 900:
-                        logger.info(f"{symbol} → skipped (15m recent send cache)")
+                    if now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
+                        logger.info(f"{symbol} → skipped (local cooldown 30m)")
                         continue
 
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
 
-                # منع تكرار نفس الزوج داخل نفس run
                 if symbol in candidates_symbols:
                     logger.info(f"{symbol} → skipped (already queued this run)")
                     continue
 
-                # redis duplicate prevention
                 if already_sent_same_candle(symbol, candle_time, "long"):
                     logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
@@ -600,15 +715,40 @@ def run():
                     logger.info(f"{symbol} → skipped (cooldown active)")
                     continue
 
+                vol_ratio = get_volume_ratio(df)
+                candle_strength = get_candle_strength_ratio(df)
+
+                if is_new:
+                    if not passes_new_listing_filter(
+                        score=float(score_result["score"]),
+                        breakout=breakout,
+                        vol_ratio=vol_ratio,
+                        candle_strength=candle_strength,
+                    ):
+                        logger.info(f"{symbol} → rejected by balanced new listing filter")
+                        continue
+
                 signal_row = get_signal_row(df)
                 price = float(signal_row["close"])
                 atr_value = float(signal_row["atr"])
                 stop_loss = calculate_stop_loss(price, atr_value)
                 tv_link = build_tradingview_link(symbol)
 
+                momentum_priority = get_momentum_priority(
+                    score=float(score_result["score"]),
+                    breakout=breakout,
+                    vol_ratio=vol_ratio,
+                    is_new=is_new,
+                )
+
                 candidates.append({
                     "symbol": symbol,
                     "score": float(score_result["score"]),
+                    "momentum_priority": momentum_priority,
+                    "breakout": breakout,
+                    "vol_ratio": vol_ratio,
+                    "candle_strength": candle_strength,
+                    "is_new": is_new,
                     "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
                     "message": build_message(
                         symbol=symbol,
@@ -628,11 +768,9 @@ def run():
 
                 candidates_symbols.add(symbol)
 
-            candidates.sort(
-                key=lambda x: (x["score"], x["rank_volume_24h"]),
-                reverse=True,
-            )
+            logger.info(f"Candidates found before momentum filter: {len(candidates)}")
 
+            candidates = apply_top_momentum_filter(candidates)
             top_candidates = candidates[:MAX_ALERTS_PER_RUN]
 
             for candidate in top_candidates:
@@ -648,12 +786,10 @@ def run():
                     f"cooldown={is_symbol_on_cooldown(symbol, 'long')}"
                 )
 
-                # final redis same-candle check
                 if already_sent_same_candle(symbol, candidate["candle_time"], "long"):
                     logger.info(f"{symbol} → skipped (already sent this candle Redis FINAL)")
                     continue
 
-                # final redis cooldown check
                 if is_symbol_on_cooldown(symbol, "long"):
                     logger.info(f"{symbol} → skipped (cooldown active final)")
                     continue
@@ -673,7 +809,7 @@ def run():
                 if sent_ok:
                     sent_symbols_this_run.add(symbol)
                     sent_count += 1
-                    sent_cache[symbol] = candidate["now"]
+                    sent_cache[symbol] = time.time()
                     last_candle_cache[symbol] = candidate["candle_time"]
 
                     register_trade(
@@ -689,7 +825,10 @@ def run():
                         funding_label=candidate["funding_label"],
                     )
 
-                    logger.info(f"SENT → {symbol} | score: {candidate['score']}")
+                    logger.info(
+                        f"SENT → {symbol} | score: {candidate['score']} | "
+                        f"momentum: {candidate['momentum_priority']} | new={candidate['is_new']}"
+                    )
                 else:
                     release_signal_slot(
                         symbol=symbol,
@@ -698,7 +837,7 @@ def run():
                     )
                     logger.error(f"FAILED SEND → {symbol}")
 
-            logger.info(f"Candidates found: {len(candidates)}")
+            logger.info(f"Candidates found after momentum filter: {len(candidates)}")
             logger.info(f"Sent alerts this run: {sent_count}")
             logger.info(f"Tested {tested} pairs")
             logger.info("Sleeping 60 seconds...")
