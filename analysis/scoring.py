@@ -26,7 +26,6 @@ def is_breakout(df, lookback=20):
 
         signal_idx = get_signal_index(df)
 
-        # لازم نقارن إغلاق شمعة الإشارة بأعلى قمة قبلها
         current_close = float(df.iloc[signal_idx]["close"])
 
         highs_before = df["high"].iloc[:signal_idx]
@@ -186,7 +185,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     if score >= 7:
         fake_signal = False
 
-    score = max(0.0, score)
+    score = max(0.0, min(10.0, score))
     score = round(score, 1)
 
     return {
