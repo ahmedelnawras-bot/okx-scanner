@@ -1,8 +1,40 @@
+def get_signal_index(df):
+    """
+    يرجّع index آخر شمعة confirmed.
+    لو آخر شمعة غير مؤكدة، نستخدم اللي قبلها.
+    """
+    try:
+        if df is None or df.empty:
+            return -1
+
+        if "confirm" not in df.columns or len(df) < 2:
+            return -1
+
+        last_confirm = str(int(float(df.iloc[-1]["confirm"])))
+        if last_confirm == "1":
+            return -1
+
+        return -2
+    except Exception:
+        return -1
+
+
 def is_breakout(df, lookback=20):
     try:
-        recent_high = df["high"].rolling(lookback).max().iloc[-2]
-        current_close = df["close"].iloc[-1]
-        return current_close > recent_high
+        if df is None or df.empty or len(df) < (lookback + 2):
+            return False
+
+        signal_idx = get_signal_index(df)
+
+        # لازم نقارن إغلاق شمعة الإشارة بأعلى قمة قبلها
+        current_close = float(df.iloc[signal_idx]["close"])
+
+        highs_before = df["high"].iloc[:signal_idx]
+        if len(highs_before) < lookback:
+            return False
+
+        recent_high = highs_before.rolling(lookback).max().iloc[-1]
+        return current_close > float(recent_high)
     except Exception:
         return False
 
@@ -29,8 +61,30 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     score = 0.0
     reasons = []
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    if df is None or df.empty or len(df) < 25:
+        return {
+            "score": 0.0,
+            "reasons": [],
+            "fake_signal": True,
+            "signal": False,
+            "funding_label": classify_funding_simple(funding),
+            "signal_rating": "⚡ عادي",
+        }
+
+    signal_idx = get_signal_index(df)
+
+    try:
+        last = df.iloc[signal_idx]
+        prev = df.iloc[signal_idx - 1]
+    except Exception:
+        return {
+            "score": 0.0,
+            "reasons": [],
+            "fake_signal": True,
+            "signal": False,
+            "funding_label": classify_funding_simple(funding),
+            "signal_rating": "⚡ عادي",
+        }
 
     rsi = float(last["rsi"])
     close = float(last["close"])
@@ -41,9 +95,12 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     last_volume = float(last["volume"])
     vol_ratio = (last_volume / prev_volume) if prev_volume > 0 else 1.0
 
+    high = float(last["high"])
+    low = float(last["low"])
+
     body = abs(close - open_)
-    full = float(last["high"]) - float(last["low"])
-    upper_wick = float(last["high"]) - max(open_, close)
+    full = high - low
+    upper_wick = high - max(open_, close)
 
     # RSI
     if 50 < rsi < 65:
@@ -116,12 +173,16 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
 
     # Fake filter
     fake_signal = False
+
     if score < 4.5:
         fake_signal = True
+
     if rejection and score < 6:
         fake_signal = True
+
     if vol_ratio < 0.7 and rsi < 45:
         fake_signal = True
+
     if score >= 7:
         fake_signal = False
 
