@@ -1,8 +1,4 @@
 def early_bullish_signal(df):
-    """
-    استراتيجية لونج خفيفة ومناسبة لفحص عدد كبير من الأزواج.
-    """
-
     try:
         if df is None or df.empty or len(df) < 20:
             return False
