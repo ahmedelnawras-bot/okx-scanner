@@ -15,11 +15,11 @@ from analysis.scoring import calculate_long_score
 # =========================
 # SETTINGS
 # =========================
-COOLDOWN_SECONDS = 3600          # ساعة لنفس الزوج/النوع
-MAX_ALERTS_PER_RUN = 2           # تقليل السبام
-SCAN_LIMIT = 200                 # Top 200 حقيقي
-MIN_24H_QUOTE_VOLUME = 1_000_000 # فلتر سيولة مبدئي
-NEW_LISTING_MAX_CANDLES = 50     # أقل من كده = عملة جديدة تقريبًا
+COOLDOWN_SECONDS = 3600           # ساعة
+MAX_ALERTS_PER_RUN = 2            # نقلل السبام
+SCAN_LIMIT = 200                  # Top 200
+MIN_24H_QUOTE_VOLUME = 1_000_000  # فلتر سيولة
+NEW_LISTING_MAX_CANDLES = 50      # أقل من 50 شمعة = عملة جديدة تقريبًا
 
 REDIS_URL = os.environ.get("REDIS_URL")
 
@@ -103,16 +103,12 @@ def mark_sent(symbol: str, candle_time: int, signal_type: str = "long") -> None:
 # MARKET FILTERING
 # =========================
 def is_excluded_symbol(symbol: str) -> bool:
-    """
-    استبعاد stablecoins وأشياء مزعجة شائعة.
-    """
     excluded_prefixes = (
         "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USD0"
     )
     if symbol.startswith(excluded_prefixes):
         return True
 
-    # فلتر بدائي للأسماء المبالغ فيها
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "")
     if len(base) > 20:
         return True
@@ -121,12 +117,8 @@ def is_excluded_symbol(symbol: str) -> bool:
 
 
 def extract_24h_quote_volume(ticker: dict) -> float:
-    """
-    يحاول يقرأ أفضل حقل متاح لسيولة 24h بقيمة quote/base مناسبة.
-    عدّل ترتيب الحقول لو okx_client عندك مختلف.
-    """
     candidate_fields = [
-        "volCcy24h",    # الأفضل غالبًا
+        "volCcy24h",
         "turnover24h",
         "quoteVolume",
         "vol24h",
@@ -145,13 +137,6 @@ def extract_24h_quote_volume(ticker: dict) -> float:
 
 
 def get_ranked_pairs():
-    """
-    Top 200 حقيقي:
-    1) USDT-SWAP فقط
-    2) استبعاد stablecoins والعملات الغريبة
-    3) فلتر سيولة
-    4) ترتيب تنازلي حسب 24h volume
-    """
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
 
@@ -176,7 +161,6 @@ def get_ranked_pairs():
         filtered.append(p)
 
     filtered.sort(key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)
-
     top_pairs = filtered[:SCAN_LIMIT]
 
     print(f"After liquidity filter: {len(filtered)}")
@@ -185,7 +169,7 @@ def get_ranked_pairs():
 
 
 # =========================
-# INDICATORS / HELPERS
+# HELPERS
 # =========================
 def is_volume_spike(df, multiplier=1.2):
     if df is None or df.empty or len(df) < 20:
@@ -201,15 +185,20 @@ def is_volume_spike(df, multiplier=1.2):
 
 
 def get_last_candle_time(df):
+    """
+    تثبيت وقت الشمعة بشكل صارم لتقليل التكرار.
+    """
     try:
-        ts = df["ts"].iloc[-1]
-        ts = int(ts)
+        ts = int(df["ts"].iloc[-1])
+
+        # OKX غالبًا milliseconds
         if ts > 10_000_000_000:
-            ts = ts // 1000
+            return ts // 1000
+
         return ts
-    except Exception as e:
-        print(f"⚠️ candle time error: {e}")
-        return 0
+    except Exception:
+        # fallback ثابت على 15m bucket
+        return int(time.time() // (15 * 60))
 
 
 def get_btc_mode():
@@ -242,12 +231,6 @@ def get_btc_mode():
 
 
 def is_higher_timeframe_confirmed(symbol):
-    """
-    MTF مرن:
-    - فوق MA20 = نقطة
-    - RSI > 50 = نقطة
-    يكفي نقطة واحدة
-    """
     try:
         candles = get_candles(symbol, "1H", 100)
         df = to_dataframe(candles)
@@ -295,9 +278,6 @@ def calculate_stop_loss(price, atr_value):
 
 
 def is_new_listing_by_candles(candles) -> bool:
-    """
-    لو التاريخ قليل، نعتبرها عملة جديدة.
-    """
     try:
         return len(candles) < NEW_LISTING_MAX_CANDLES
     except Exception:
@@ -306,7 +286,6 @@ def is_new_listing_by_candles(candles) -> bool:
 
 def build_tradingview_link(symbol):
     """
-    مثال:
     MINA-USDT-SWAP -> OKX:MINAUSDT.P
     """
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
@@ -315,52 +294,54 @@ def build_tradingview_link(symbol):
 
 
 def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_confirmed, breakout, tv_link, is_new):
-    msg_symbol = clean_symbol_for_message(symbol)
+    symbol_clean = clean_symbol_for_message(symbol)
 
-    reasons = ["زخم مبكر"]
-    flags = []
-
+    reasons = []
     if volume_spike:
         reasons.append("فوليوم قوي")
-        flags.append("Vol ↑")
-
     if breakout:
         reasons.append("اختراق")
-        flags.append("Break ✔")
-
-    flags.append("RSI ↑")
-
     if mtf_confirmed:
         reasons.append("تأكيد 1H")
+    if not reasons:
+        reasons.append("زخم مبكر")
+
+    reason_text = " + ".join(reasons)
+
+    flags = []
+    if volume_spike:
+        flags.append("Vol ↑")
+    flags.append("RSI ↑")
+    if mtf_confirmed:
         flags.append("MTF ✔")
 
-    reason_line = " + ".join(reasons)
-    flags_line = " | ".join(flags) if flags else "Setup"
+    flags_text = " | ".join(flags)
 
-    safe_symbol = html.escape(msg_symbol)
+    new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
+
+    safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
-    safe_reason = html.escape(reason_line)
-    safe_flags = html.escape(flags_line)
+    safe_reason = html.escape(reason_text)
+    safe_flags = html.escape(flags_text)
     safe_tv_link = html.escape(tv_link, quote=True)
-
-    new_tag = "\n🆕 <b>عملة جديدة</b>\n" if is_new else "\n"
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
-💰 {round(price, 6)} | ⏱ 15m
-⭐ {round(score, 1)} / 10 | 🛑 {stop_loss}
+💰 {price:.6f} | ⏱ 15m
+⭐ {score:.1f} / 10 | 🛑 {stop_loss}
 
 🪙 BTC: {safe_btc}{new_tag}
+
 📊 {safe_reason}
 
 🔥 {safe_flags}
 
-🔗 <a href="{safe_tv_link}">فتح الشارت</a>
+🔗 <a href="{safe_tv_link}">Open Chart</a>
 """
 
 
 # =========================
-# MAIN RUN
+# MAIN
 # =========================
 def run():
     print("🚀 Bot Started...")
@@ -372,6 +353,7 @@ def run():
 
     tested = 0
     collected_keys = set()
+    sent_symbols = set()
     candidates = []
 
     for pair_data in ranked_pairs:
@@ -417,7 +399,6 @@ def run():
                 elif "🟢" in btc_mode:
                     score += 0.3
 
-                # bonus صغير للعملات الجديدة فقط لو الشروط أصلًا جيدة
                 if is_new and score >= 7.5:
                     score += 0.2
 
@@ -449,6 +430,10 @@ def run():
                 continue
 
             same_candle_key = get_same_candle_key(symbol, candle_time, "long")
+
+            if symbol in sent_symbols:
+                print(f"{symbol} → skipped (already sent this run)")
+                continue
 
             if same_candle_key in collected_keys:
                 print(f"{symbol} → skipped (already collected in this run)")
@@ -498,10 +483,6 @@ def run():
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
-    # الترتيب النهائي:
-    # 1) score
-    # 2) volume spike
-    # 3) liquidity rank
     candidates.sort(
         key=lambda x: (x["score"], x["volume_spike"], x["rank_volume_24h"]),
         reverse=True
@@ -512,6 +493,10 @@ def run():
     sent_count = 0
 
     for candidate in top_candidates:
+        if candidate["symbol"] in sent_symbols:
+            print(f'{candidate["symbol"]} → skipped (already sent in final stage)')
+            continue
+
         sent_ok = send_telegram_message(candidate["message"])
 
         if sent_ok:
@@ -520,6 +505,7 @@ def run():
                 candle_time=candidate["candle_time"],
                 signal_type="long",
             )
+            sent_symbols.add(candidate["symbol"])
             sent_count += 1
             print(
                 f'SENT → {candidate["symbol"]} | '
