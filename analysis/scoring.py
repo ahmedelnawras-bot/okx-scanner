@@ -23,7 +23,7 @@ def classify_funding_simple(funding):
 def classify_signal(score):
     if score >= 8.5:
         return "🔥 نار"
-    elif score >= 7.5:
+    elif score >= 7.0:
         return "✅ جيد"
     else:
         return "⚡ عادي"
@@ -89,27 +89,27 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         elif rsi > 68:
             score -= 0.5
         else:
-            score -= 1.2
+            score -= 0.7   # مخفف
 
         # Volume
-        if vol_ratio >= 2.2:
+        if vol_ratio >= 2.0:
             score += 2.5
             reasons.append("فوليوم انفجار")
-        elif vol_ratio >= 1.6:
+        elif vol_ratio >= 1.5:
             score += 1.8
             reasons.append("فوليوم قوي")
         elif vol_ratio >= 1.2:
             score += 0.8
             reasons.append("فوليوم داعم")
         elif vol_ratio < 0.85:
-            score -= 0.8
+            score -= 0.5
 
         # Trend
         if close > ma:
-            score += 0.8
+            score += 1.0
             reasons.append("فوق MA")
         else:
-            score -= 1.2
+            score -= 0.8
 
         # Candle
         if candle_strength >= 0.7:
@@ -121,31 +121,29 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         elif candle_strength >= 0.35:
             score += 0.2
         else:
-            score -= 0.5
+            score -= 0.3
 
         if rejection:
-            score -= 1.5
+            score -= 1.0
 
         # Breakout
         if breakout:
             score += 2.2
             reasons.append("اختراق")
         else:
-            score -= 0.4
+            score -= 0.1   # مخفف جدًا
 
         # MTF
         if mtf_confirmed:
             score += 1.8
             reasons.append("تأكيد 1H")
-        elif not is_new:
-            score -= 1.0
 
         # BTC
         if "🟢" in btc_mode:
             score += 0.7
             reasons.append("BTC داعم")
         elif "🔴" in btc_mode:
-            score -= 0.7
+            score -= 0.5
 
         # Funding
         funding_label = classify_funding_simple(funding)
@@ -153,73 +151,41 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
             score += 0.6
             reasons.append("تمويل سلبي")
         elif funding > 0.0005:
-            score -= 0.7
+            score -= 0.5
 
         # New listing
         if is_new:
-            score += 0.2
+            score += 0.3
             reasons.append("عملة جديدة")
 
-            if breakout and vol_ratio >= 1.8:
-                score += 0.7
-                reasons.append("زخم جديد قوي")
-            elif breakout or vol_ratio >= 1.8:
-                score += 0.2
-
-        # Quality
-        strong_structure = breakout or mtf_confirmed
-        strong_momentum = vol_ratio >= 1.6 or candle_strength >= 0.6
-        premium_quality = breakout and mtf_confirmed
-        premium_momentum = vol_ratio >= 1.6 and candle_strength >= 0.5
-
-        if not strong_structure and not strong_momentum:
-            score -= 1.8
-
-        if close > ma and 50 <= rsi <= 62 and vol_ratio < 1.2 and not breakout and not mtf_confirmed:
-            score -= 1.5
-
-        if score >= 8.0 and not (premium_quality or premium_momentum):
-            score -= 1.3
-
-        if score >= 8.8 and not (breakout and mtf_confirmed and vol_ratio >= 1.4):
-            score -= 1.0
-
         # =========================
-        # Fake signal (مخفف)
+        # Fake signal (مخفف جدًا)
         # =========================
         fake_signal = False
 
-        if score < 5.0:
+        if score < 4.5:
             fake_signal = True
 
-        if rejection and candle_strength < 0.55:
-            fake_signal = True
-
-        # ❌ اتشال شرط الفوليوم الضعيف
-
-        if not is_new and not mtf_confirmed and not breakout and score < 5.5:
+        if rejection and candle_strength < 0.5:
             fake_signal = True
 
         if close <= ma and not breakout:
             fake_signal = True
 
-        if rsi < 50 and not breakout:
+        if rsi < 48 and not breakout:
             fake_signal = True
 
-        if score >= 8.5 and not (breakout or mtf_confirmed):
+        if score >= 8.5 and vol_ratio < 1.2:
             fake_signal = True
 
-        if score >= 8.5 and vol_ratio < 1.3:
-            fake_signal = True
-
-        score = max(0.0, min(9.2, score))
+        score = max(0.0, min(9.5, score))
         score = round(score, 1)
 
         return {
             "score": score,
             "reasons": list(dict.fromkeys(reasons)),
             "fake_signal": fake_signal,
-            "signal": score >= 6.0,
+            "signal": score >= 5.5,
             "funding_label": funding_label,
             "signal_rating": classify_signal(score),
         }
