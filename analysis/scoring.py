@@ -25,7 +25,6 @@ def is_breakout(df, lookback=20):
             return False
 
         signal_idx = get_signal_index(df)
-
         current_close = float(df.iloc[signal_idx]["close"])
 
         highs_before = df["high"].iloc[:signal_idx]
