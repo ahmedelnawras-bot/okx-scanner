@@ -100,10 +100,8 @@ def mark_sent(symbol, candle_time, signal_type="long"):
     cooldown_key = get_cooldown_key(symbol, signal_type)
 
     try:
-        # نفس الشمعة
-        r.set(same_candle_key, "1", ex=7200)
-        # كولداون ساعة
-        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
+        r.set(same_candle_key, "1", ex=7200)  # نفس الشمعة محفوظة ساعتين
+        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)  # كولداون ساعة
         print(f"✅ Redis saved for {symbol} | candle={candle_time}")
     except Exception as e:
         print(f"Redis save error: {e}")
@@ -145,7 +143,10 @@ def get_btc_mode():
 
 def is_higher_timeframe_confirmed(symbol):
     """
-    تأكيد 1H للفيوتشر
+    تأكيد 1H مرن:
+    - فوق MA20 = نقطة
+    - RSI > 50 = نقطة
+    ويكفي نقطة واحدة
     """
     try:
         candles = get_candles(symbol, "1H", 100)
@@ -160,10 +161,15 @@ def is_higher_timeframe_confirmed(symbol):
         last = df.iloc[-1]
         ma_value = last.get("ma", None)
 
-        if ma_value is None:
-            return False
+        score = 0
 
-        return last["close"] > ma_value and last["rsi"] > 50
+        if ma_value is not None and last["close"] > ma_value:
+            score += 1
+
+        if last.get("rsi", 0) > 50:
+            score += 1
+
+        return score >= 1
 
     except Exception as e:
         print(f"MTF error on {symbol}: {e}")
@@ -171,7 +177,6 @@ def is_higher_timeframe_confirmed(symbol):
 
 
 def build_tradingview_link(symbol):
-    # مثال: BTC-USDT-SWAP -> OKX:BTCUSDTSWAP
     tv_symbol = symbol.replace("-", "")
     return f"https://www.tradingview.com/chart/?symbol=OKX:{tv_symbol}"
 
@@ -229,7 +234,6 @@ def run():
             if signal:
                 score = calculate_long_score(df)
 
-                # bonus/penalty
                 if volume_spike:
                     score += 0.5
                 else:
@@ -237,6 +241,8 @@ def run():
 
                 if mtf_confirmed:
                     score += 0.5
+                else:
+                    score -= 0.5
 
                 if "🔴" in btc_mode:
                     score -= 1.0
@@ -258,11 +264,7 @@ def run():
                 f"mtf: {mtf_confirmed}"
             )
 
-            # الفلاتر النهائية
             if not signal:
-                continue
-
-            if not mtf_confirmed:
                 continue
 
             if score < 7.5:
@@ -295,16 +297,24 @@ def run():
             stop_loss = calculate_stop_loss(price, atr_value)
             tv_link = build_tradingview_link(symbol)
 
-            reason_line = "زخم مبكر + فوليوم قوي + تأكيد 1H"
+            reasons = []
             flags = []
+
+            reasons.append("زخم مبكر")
+            if volume_spike:
+                reasons.append("فوليوم قوي")
+            if mtf_confirmed:
+                reasons.append("تأكيد 1H")
 
             if volume_spike:
                 flags.append("Vol ↑")
             if df["rsi"].iloc[-1] > 50:
                 flags.append("RSI ↑")
-            flags.append("MTF ✔")
+            if mtf_confirmed:
+                flags.append("MTF ✔")
 
-            flags_line = " | ".join(flags)
+            reason_line = " + ".join(reasons)
+            flags_line = " | ".join(flags) if flags else "Setup"
 
             message = f"""🚀 لونج فيوتشر | {symbol}
 
@@ -333,7 +343,6 @@ def run():
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
-    # ترتيب الأفضل
     candidates.sort(
         key=lambda x: (x["score"], x["volume_spike"]),
         reverse=True
