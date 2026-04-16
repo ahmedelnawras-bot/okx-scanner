@@ -61,7 +61,9 @@ NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 180
+SCAN_LOCK_TTL = 90
+
+CANDLE_MAX_AGE_SECONDS = 13 * 60  # 13 دقيقة من شمعة 15m
 
 # =========================
 # REDIS
@@ -426,7 +428,7 @@ def is_higher_timeframe_confirmed(symbol):
         if float(signal_row.get("rsi", 0)) > 50:
             score += 1
 
-        return score >= 1
+        return score >= 2
 
     except Exception as e:
         logger.error(f"MTF error on {symbol}: {e}")
@@ -524,6 +526,20 @@ def get_volume_ratio(df) -> float:
         return round(last_volume / avg_volume, 4)
     except Exception:
         return 1.0
+
+
+def is_valid_candle_timing(df, max_age_seconds=CANDLE_MAX_AGE_SECONDS) -> bool:
+    try:
+        signal_row = get_signal_row(df)
+        ts = int(signal_row["ts"])
+
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+
+        candle_age = int(time.time()) - ts
+        return 0 <= candle_age <= max_age_seconds
+    except Exception:
+        return False
 
 
 def passes_new_listing_filter(score: float, breakout: bool, vol_ratio: float, candle_strength: float) -> bool:
@@ -769,6 +785,10 @@ def run():
                 df = to_dataframe(candles)
 
                 if df is None or df.empty:
+                    continue
+
+                if not is_valid_candle_timing(df):
+                    logger.info(f"{symbol} → skipped (candle timing invalid)")
                     continue
 
                 early_signal = early_bullish_signal(df)
