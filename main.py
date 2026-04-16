@@ -46,6 +46,8 @@ MIN_SCORE = 5.0
 MAX_ALERTS_PER_RUN = 3
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 1800  # 30 دقيقة
+GLOBAL_COOLDOWN_SECONDS = 300     # 5 دقائق بين دفعات الإرسال
+
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
@@ -79,6 +81,7 @@ else:
 # =========================
 sent_cache = {}
 last_candle_cache = {}
+last_global_send_ts = 0.0
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -542,6 +545,23 @@ def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new
     return round(priority, 2)
 
 
+def get_candidate_bucket(candidate: dict) -> str:
+    """
+    Bucket للتنويع:
+    - new_breakout
+    - breakout
+    - volume
+    - standard
+    """
+    if candidate["is_new"] and candidate["breakout"]:
+        return "new_breakout"
+    if candidate["breakout"]:
+        return "breakout"
+    if candidate["vol_ratio"] >= 2.0:
+        return "volume"
+    return "standard"
+
+
 def apply_top_momentum_filter(candidates):
     if not candidates:
         return []
@@ -580,6 +600,63 @@ def apply_top_momentum_filter(candidates):
     )
 
     return final_candidates
+
+
+def diversify_candidates(candidates, max_alerts=3):
+    """
+    تنويع بسيط:
+    - ما ناخدش كل الإشارات من نفس bucket لو في بدائل
+    - نحافظ على الأعلى score/momentum
+    """
+    if not candidates:
+        return []
+
+    buckets = {}
+    for candidate in candidates:
+        bucket = get_candidate_bucket(candidate)
+        buckets.setdefault(bucket, []).append(candidate)
+
+    for bucket in buckets:
+        buckets[bucket].sort(
+            key=lambda x: (x["momentum_priority"], x["score"], x["rank_volume_24h"]),
+            reverse=True,
+        )
+
+    diversified = []
+
+    # أول pass: ناخد أفضل واحدة من كل bucket
+    for bucket_name in ["new_breakout", "breakout", "volume", "standard"]:
+        if bucket_name in buckets and buckets[bucket_name]:
+            diversified.append(buckets[bucket_name].pop(0))
+            if len(diversified) >= max_alerts:
+                break
+
+    # ثاني pass: نكمل بأعلى المتبقين
+    if len(diversified) < max_alerts:
+        remaining = []
+        for items in buckets.values():
+            remaining.extend(items)
+
+        remaining.sort(
+            key=lambda x: (x["momentum_priority"], x["score"], x["rank_volume_24h"]),
+            reverse=True,
+        )
+
+        for candidate in remaining:
+            if len(diversified) >= max_alerts:
+                break
+            if candidate not in diversified:
+                diversified.append(candidate)
+
+    logger.info(
+        "Diversified selection: "
+        + ", ".join(
+            f"{c['symbol']}[{get_candidate_bucket(c)}|{c['momentum_priority']}]"
+            for c in diversified
+        )
+    )
+
+    return diversified[:max_alerts]
 
 
 def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new):
@@ -624,6 +701,8 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 
 
 def run():
+    global last_global_send_ts
+
     while True:
         try:
             logger.info(f"RUN START | pid={os.getpid()} | ts={int(time.time())}")
@@ -740,7 +819,7 @@ def run():
                     is_new=is_new,
                 )
 
-                candidates.append({
+                candidate = {
                     "symbol": symbol,
                     "score": float(score_result["score"]),
                     "momentum_priority": momentum_priority,
@@ -763,14 +842,29 @@ def run():
                     "entry": price,
                     "sl": stop_loss,
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
-                })
+                }
+                candidate["bucket"] = get_candidate_bucket(candidate)
 
+                candidates.append(candidate)
                 candidates_symbols.add(symbol)
 
             logger.info(f"Candidates found before momentum filter: {len(candidates)}")
 
             candidates = apply_top_momentum_filter(candidates)
-            top_candidates = candidates[:MAX_ALERTS_PER_RUN]
+            logger.info(f"Candidates found after momentum filter: {len(candidates)}")
+
+            top_candidates = diversify_candidates(candidates, MAX_ALERTS_PER_RUN)
+
+            # Global cooldown قبل الإرسال
+            global_elapsed = time.time() - last_global_send_ts
+            if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
+                remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
+                logger.info(f"GLOBAL COOLDOWN → skip sending this cycle ({remaining}s left)")
+                logger.info(f"Sent alerts this run: {sent_count}")
+                logger.info(f"Tested {tested} pairs")
+                logger.info("Sleeping 60 seconds...")
+                time.sleep(60)
+                continue
 
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
@@ -810,6 +904,7 @@ def run():
                     sent_count += 1
                     sent_cache[symbol] = time.time()
                     last_candle_cache[symbol] = candidate["candle_time"]
+                    last_global_send_ts = time.time()
 
                     register_trade(
                         redis_client=r,
@@ -826,7 +921,8 @@ def run():
 
                     logger.info(
                         f"SENT → {symbol} | score: {candidate['score']} | "
-                        f"momentum: {candidate['momentum_priority']} | new={candidate['is_new']}"
+                        f"momentum: {candidate['momentum_priority']} | "
+                        f"bucket: {candidate['bucket']} | new={candidate['is_new']}"
                     )
                 else:
                     release_signal_slot(
@@ -836,7 +932,6 @@ def run():
                     )
                     logger.error(f"FAILED SEND → {symbol}")
 
-            logger.info(f"Candidates found after momentum filter: {len(candidates)}")
             logger.info(f"Sent alerts this run: {sent_count}")
             logger.info(f"Tested {tested} pairs")
             logger.info("Sleeping 60 seconds...")
