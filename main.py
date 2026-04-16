@@ -13,18 +13,12 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score, is_breakout
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("okx-scanner")
 
-# =========================
-# SETTINGS
-# =========================
 COOLDOWN_SECONDS = 3600
 MAX_ALERTS_PER_RUN = 2
 SCAN_LIMIT = 200
@@ -47,9 +41,6 @@ else:
     logger.warning("⚠️ REDIS_URL not found")
 
 
-# =========================
-# REDIS
-# =========================
 def clean_symbol_for_message(symbol: str) -> str:
     return symbol.replace("-SWAP", "")
 
@@ -84,11 +75,6 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
-    """
-    يحجز الإشارة قبل الإرسال:
-    - نفس الشمعة
-    - نفس الزوج لمدة ساعة
-    """
     if not r:
         return True
 
@@ -117,7 +103,6 @@ def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
 def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> None:
     if not r:
         return
-
     try:
         r.delete(get_same_candle_key(symbol, candle_time, signal_type))
         r.delete(get_cooldown_key(symbol, signal_type))
@@ -125,9 +110,6 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         logger.error(f"Redis release error: {e}")
 
 
-# =========================
-# MARKET FILTERING
-# =========================
 def is_excluded_symbol(symbol: str) -> bool:
     excluded_prefixes = (
         "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USD0"
@@ -185,9 +167,6 @@ def get_ranked_pairs():
     return top_pairs
 
 
-# =========================
-# HELPERS
-# =========================
 def get_last_candle_time(df):
     try:
         ts = int(df["ts"].iloc[-1])
@@ -218,6 +197,7 @@ def get_btc_mode():
                 return "🟢 صاعد (داعم)"
             if last["close"] < ma_value and rsi_value <= 45:
                 return "🔴 هابط (ضاغط)"
+
         return "🟡 محايد"
 
     except Exception as e:
@@ -301,9 +281,6 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 """
 
 
-# =========================
-# MAIN
-# =========================
 def run():
     logger.info("🚀 Bot Started...")
 
@@ -359,6 +336,7 @@ def run():
             )
 
             if score_result["fake_signal"]:
+                logger.info(f"{symbol} → rejected by fake signal")
                 continue
 
             if score_result["score"] < MIN_SCORE_TO_SEND:
