@@ -76,7 +76,7 @@ def get_same_candle_key(symbol: str, candle_time: int, signal_type: str = "long"
     return f"sent:{signal_type}:{symbol}:{candle_time}"
 
 
-def get_cooldown_key(symbol: str, signal_type: str = "long") -> str:
+def get_symbol_cooldown_key(symbol: str, signal_type: str = "long") -> str:
     clean = clean_symbol_for_message(symbol)
     return f"cooldown:{signal_type}:{clean}"
 
@@ -91,13 +91,30 @@ def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "
         return False
 
 
-def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
+def is_symbol_on_cooldown(symbol: str, signal_type: str = "long") -> bool:
     if not r:
         return False
     try:
-        return bool(r.exists(get_cooldown_key(symbol, signal_type)))
+        return bool(r.exists(get_symbol_cooldown_key(symbol, signal_type)))
     except Exception as e:
-        logger.error(f"Redis cooldown exists error: {e}")
+        logger.error(f"Redis symbol cooldown exists error: {e}")
+        return False
+
+
+def set_symbol_cooldown(symbol: str, signal_type: str = "long", cooldown_seconds: int = COOLDOWN_SECONDS) -> bool:
+    if not r:
+        return False
+    try:
+        return bool(
+            r.set(
+                get_symbol_cooldown_key(symbol, signal_type),
+                "1",
+                ex=cooldown_seconds,
+                nx=True,
+            )
+        )
+    except Exception as e:
+        logger.error(f"Redis set symbol cooldown error: {e}")
         return False
 
 
@@ -111,7 +128,7 @@ def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         return True
 
     same_candle_key = get_same_candle_key(symbol, candle_time, signal_type)
-    cooldown_key = get_cooldown_key(symbol, signal_type)
+    cooldown_key = get_symbol_cooldown_key(symbol, signal_type)
 
     try:
         same_candle_ok = r.set(same_candle_key, "1", ex=7200, nx=True)
@@ -138,7 +155,7 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         return
     try:
         r.delete(get_same_candle_key(symbol, candle_time, signal_type))
-        r.delete(get_cooldown_key(symbol, signal_type))
+        r.delete(get_symbol_cooldown_key(symbol, signal_type))
     except Exception as e:
         logger.error(f"Redis release error: {e}")
 
@@ -156,7 +173,7 @@ def send_telegram_message(message: str) -> bool:
         "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
 
     try:
@@ -213,7 +230,7 @@ def get_ranked_pairs():
         res = requests.get(
             OKX_TICKERS_URL,
             params={"instType": "SWAP"},
-            timeout=20
+            timeout=20,
         ).json()
 
         data = res.get("data", [])
@@ -295,7 +312,7 @@ def get_candles(symbol, timeframe="15m", limit=100):
         params = {
             "instId": symbol,
             "bar": timeframe,
-            "limit": limit
+            "limit": limit,
         }
         res = requests.get(OKX_CANDLES_URL, params=params, timeout=20).json()
         return res.get("data", [])
@@ -356,10 +373,11 @@ def early_bullish_signal(df):
         if df is None or df.empty or len(df) < 25:
             return False
 
-        signal_idx = -1
-        if "confirm" in df.columns:
-            if str(int(float(df.iloc[-1]["confirm"]))) != "1":
-                signal_idx = -2
+        signal_row = get_signal_row(df)
+        signal_idx = signal_row.name
+
+        if signal_idx is None or signal_idx < 1:
+            return False
 
         last = df.iloc[signal_idx]
         prev = df.iloc[signal_idx - 1]
@@ -494,7 +512,8 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 def run():
     while True:
         try:
-            update_open_trades(r, signal_type="long")
+            # update performance tracking first
+            update_open_trades(r, signal_type="long", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, signal_type="long")
             logger.info(format_winrate_summary(winrate_summary))
 
@@ -578,8 +597,8 @@ def run():
                     logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
 
-                if in_cooldown(symbol, "long"):
-                    logger.info(f"{symbol} → skipped (cooldown in Redis)")
+                if is_symbol_on_cooldown(symbol, "long"):
+                    logger.info(f"{symbol} → skipped (cooldown active)")
                     continue
 
                 signal_row = get_signal_row(df)
@@ -611,7 +630,7 @@ def run():
 
             candidates.sort(
                 key=lambda x: (x["score"], x["rank_volume_24h"]),
-                reverse=True
+                reverse=True,
             )
 
             top_candidates = candidates[:MAX_ALERTS_PER_RUN]
@@ -621,6 +640,11 @@ def run():
 
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent final stage)")
+                    continue
+
+                # final redis cooldown check
+                if is_symbol_on_cooldown(symbol, "long"):
+                    logger.info(f"{symbol} → skipped (cooldown active final)")
                     continue
 
                 locked = reserve_signal_slot(
