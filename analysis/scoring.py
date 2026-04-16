@@ -3,7 +3,6 @@ def is_breakout(df, lookback=20):
     try:
         recent_high = df["high"].rolling(lookback).max().iloc[-2]
         current_close = df["close"].iloc[-1]
-
         return current_close > recent_high
     except:
         return False
@@ -23,7 +22,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
 
     if 50 < rsi < 65:
         score += 2
-        reasons.append("RSI صحي")
+        reasons.append("RSI healthy")
         flags.append("RSI")
     elif 45 < rsi <= 50:
         score += 1
@@ -33,11 +32,14 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
         score -= 1
 
     # ================= VOLUME =================
-    vol_ratio = last["volume"] / prev["volume"] if prev["volume"] > 0 else 1
+    if prev["volume"] > 0:
+        vol_ratio = last["volume"] / prev["volume"]
+    else:
+        vol_ratio = 1
 
     if vol_ratio > 1.3:
         score += 2
-        reasons.append("Volume قوي")
+        reasons.append("Strong volume")
         flags.append("Vol")
     elif vol_ratio > 1:
         score += 1
@@ -45,7 +47,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
     # ================= TREND =================
     if last["close"] > last["ma"]:
         score += 2
-        reasons.append("فوق الموفنج")
+        reasons.append("Above MA")
     else:
         score -= 1
 
@@ -55,17 +57,16 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
 
     if full > 0:
         ratio = body / full
-
         if ratio > 0.6:
             score += 1.5
-            reasons.append("شمعة قوية")
+            reasons.append("Strong candle")
         elif ratio > 0.4:
             score += 0.5
 
     # ================= REJECTION =================
     upper_wick = last["high"] - max(last["open"], last["close"])
-
     rejection = False
+
     if full > 0 and upper_wick > body * 1.5:
         rejection = True
         score -= 1
@@ -92,22 +93,18 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
         score += 0.5
         flags.append("NEW")
 
-    # ================= SMART FAKE FILTER =================
+    # ================= FAKE FILTER =================
     fake_signal = False
 
-    # ❌ فقط لو سيء جدًا
     if score < 3:
         fake_signal = True
 
-    # ❌ رفض قوي لو في rejection + ضعف
     if rejection and score < 6:
         fake_signal = True
 
-    # ❌ ضعف شديد في الحجم + RSI ضعيف
     if vol_ratio < 0.7 and rsi < 45:
         fake_signal = True
 
-    # ❗ مفيش رفض للسكورات العالية
     if score >= 7:
         fake_signal = False
 
@@ -116,4 +113,4 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
         "reasons": reasons,
         "flags": flags,
         "fake_signal": fake_signal
-    }١١
+    }
