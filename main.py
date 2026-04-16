@@ -56,16 +56,22 @@ def get_last_candle_time(df):
         return 0
 
 
+def clean_symbol_for_message(symbol):
+    return symbol.replace("-SWAP", "")
+
+
 def get_same_candle_key(symbol, candle_time, signal_type="long"):
     return f"sent:{signal_type}:{symbol}:{candle_time}"
 
 
 def get_cooldown_key(symbol, signal_type="long"):
-    return f"cooldown:{signal_type}:{symbol}"
+    clean = clean_symbol_for_message(symbol)
+    return f"cooldown:{signal_type}:{clean}"
 
 
 def get_pair_lock_key(symbol, signal_type="long"):
-    return f"pairlock:{signal_type}:{symbol}"
+    clean = clean_symbol_for_message(symbol)
+    return f"pairlock:{signal_type}:{clean}"
 
 
 def already_sent_same_candle(symbol, candle_time, signal_type="long"):
@@ -113,13 +119,9 @@ def mark_sent(symbol, candle_time, signal_type="long"):
     pair_lock_key = get_pair_lock_key(symbol, signal_type)
 
     try:
-        # نفس الشمعة
-        r.set(same_candle_key, "1", ex=7200)
-        # كولداون ساعة
-        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
-        # قفل الزوج ساعة
-        r.set(pair_lock_key, "1", ex=COOLDOWN_SECONDS)
-
+        r.set(same_candle_key, "1", ex=7200)                # منع نفس الشمعة
+        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)      # كولداون ساعة
+        r.set(pair_lock_key, "1", ex=COOLDOWN_SECONDS)     # قفل الزوج ساعة
         print(f"✅ Redis saved for {symbol} | candle={candle_time}")
     except Exception as e:
         print(f"Redis save error: {e}")
@@ -145,8 +147,7 @@ def get_btc_mode():
                 return "🟢 صاعد (داعم)"
             elif last["close"] < ma_value and rsi_value <= 45:
                 return "🔴 هابط (ضاغط)"
-            else:
-                return "🟡 محايد"
+            return "🟡 محايد"
 
         return "🟡 محايد"
 
@@ -156,12 +157,6 @@ def get_btc_mode():
 
 
 def is_higher_timeframe_confirmed(symbol):
-    """
-    تأكيد 1H مرن:
-    فوق MA20 = نقطة
-    RSI > 50 = نقطة
-    ويكفي نقطة واحدة
-    """
     try:
         candles = get_candles(symbol, "1H", 100)
         df = to_dataframe(candles)
@@ -176,10 +171,8 @@ def is_higher_timeframe_confirmed(symbol):
         ma_value = last.get("ma", None)
 
         score = 0
-
         if ma_value is not None and last["close"] > ma_value:
             score += 1
-
         if float(last.get("rsi", 0)) > 50:
             score += 1
 
@@ -210,13 +203,9 @@ def calculate_stop_loss(price, atr_value):
         return round(float(price), 6)
 
 
-def clean_symbol_for_message(symbol):
-    return symbol.replace("-SWAP", "")
-
-
 def build_tradingview_link(symbol):
     """
-    OKX futures perp format:
+    مثال:
     SPACE-USDT-SWAP -> OKX:SPACEUSDT.P
     """
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
@@ -245,14 +234,15 @@ def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_c
         flags.append("MTF ✔")
 
     reason_line = " + ".join(reasons)
-    flags_lines = "\n".join([f"• {f}" for f in flags]) if flags else "• Setup"
+    flags_line = " | ".join(flags) if flags else "Setup"
 
     safe_symbol = html.escape(msg_symbol)
     safe_btc = html.escape(btc_mode)
     safe_reason = html.escape(reason_line)
+    safe_flags = html.escape(flags_line)
     safe_tv_link = html.escape(tv_link, quote=True)
 
-    message = f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
+    return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
 💰 <b>السعر:</b> {round(price, 6)}
 ⏱ <b>الفريم:</b> 15m
@@ -265,11 +255,10 @@ def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_c
 {safe_reason}
 
 🔥 <b>عوامل القوة:</b>
-{flags_lines}
+{safe_flags}
 
-🔗 <a href="{safe_tv_link}">TradingView</a>
+🔗 <a href="{safe_tv_link}">فتح الشارت</a>
 """
-    return message
 
 
 def run():
@@ -337,10 +326,7 @@ def run():
                 elif "🟢" in btc_mode:
                     score += 0.3
 
-                if score < 0:
-                    score = 0
-                if score > 10:
-                    score = 10
+                score = max(0, min(10, score))
             else:
                 score = 0
 
