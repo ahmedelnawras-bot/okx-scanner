@@ -1,7 +1,6 @@
 def early_bullish_signal(df):
     """
-    فلتر أولي فقط
-    القرار الحقيقي للقبول من السكور
+    فلتر أولي خفيف
     """
     try:
         if df is None or df.empty or len(df) < 25:
@@ -28,7 +27,7 @@ def early_bullish_signal(df):
         if float(last["volume"]) > float(prev["volume"]):
             score += 1
 
-        return score >= 3
+        return score >= 2
 
     except Exception:
         return False
