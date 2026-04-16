@@ -2,7 +2,7 @@ def _safe_float(value, default=0.0):
     try:
         if value is None:
             return default
-        if value != value:  # NaN
+        if value != value:
             return default
         return float(value)
     except Exception:
@@ -10,26 +10,17 @@ def _safe_float(value, default=0.0):
 
 
 def _get_signal_and_prev_rows(df):
-    """
-    يرجّع:
-    - signal_row: آخر شمعة confirmed
-    - prev_row: الشمعة اللي قبلها
-    """
     if df is None or df.empty or len(df) < 3:
         return None, None
 
     try:
         if "confirm" in df.columns:
             last_confirm = str(int(_safe_float(df.iloc[-1]["confirm"], 0)))
-            if last_confirm == "1":
-                signal_idx = len(df) - 1
-            else:
-                signal_idx = len(df) - 2
+            signal_idx = len(df) - 1 if last_confirm == "1" else len(df) - 2
         else:
             signal_idx = len(df) - 2
 
         prev_idx = max(0, signal_idx - 1)
-
         return df.iloc[signal_idx], df.iloc[prev_idx]
     except Exception:
         return None, None
@@ -37,25 +28,24 @@ def _get_signal_and_prev_rows(df):
 
 def is_breakout(df, lookback=20):
     try:
-        if df is None or df.empty or len(df) < (lookback + 2):
+        if df is None or len(df) < lookback + 2:
             return False
 
         signal_row, _ = _get_signal_and_prev_rows(df)
         if signal_row is None:
             return False
 
-        signal_idx = int(signal_row.name)
-        if signal_idx <= lookback:
+        idx = int(signal_row.name)
+        if idx <= lookback:
             return False
 
-        current_close = _safe_float(signal_row["close"], 0.0)
-        recent_high = _safe_float(
-            df["high"].iloc[:signal_idx].rolling(lookback).max().iloc[-1],
-            0.0
+        close = _safe_float(signal_row["close"])
+        high = _safe_float(
+            df["high"].iloc[:idx].rolling(lookback).max().iloc[-1]
         )
 
-        return current_close > recent_high and recent_high > 0
-    except Exception:
+        return close > high and high > 0
+    except:
         return False
 
 
@@ -64,171 +54,129 @@ def classify_funding_simple(funding):
         return "🟢 سلبي"
     elif funding > 0.0005:
         return "🔴 إيجابي"
-    else:
-        return "🟡 محايد"
+    return "🟡 محايد"
 
 
 def classify_signal(score):
-    if score >= 8.5:
+    if score >= 8.7:
         return "🔥 نار"
     elif score >= 7.0:
         return "✅ جيد"
-    else:
-        return "⚡ عادي"
+    return "⚡ عادي"
 
 
 def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=0.0):
     funding_label = classify_funding_simple(funding)
 
-    if df is None or df.empty or len(df) < 25:
-        return {
-            "score": 0.0,
-            "reasons": [],
-            "fake_signal": True,
-            "signal": False,
-            "funding_label": funding_label,
-            "signal_rating": "⚡ عادي",
-        }
-
     signal_row, prev_row = _get_signal_and_prev_rows(df)
-    if signal_row is None or prev_row is None:
-        return {
-            "score": 0.0,
-            "reasons": [],
-            "fake_signal": True,
-            "signal": False,
-            "funding_label": funding_label,
-            "signal_rating": "⚡ عادي",
-        }
+    if signal_row is None:
+        return {"score": 0.0, "fake_signal": True, "signal": False}
 
     score = 0.0
     reasons = []
 
-    rsi = _safe_float(signal_row.get("rsi"), 50.0)
-    close = _safe_float(signal_row.get("close"), 0.0)
-    open_ = _safe_float(signal_row.get("open"), close)
+    close = _safe_float(signal_row["close"])
+    open_ = _safe_float(signal_row["open"])
+    high = _safe_float(signal_row["high"])
+    low = _safe_float(signal_row["low"])
     ma = _safe_float(signal_row.get("ma"), close)
+    rsi = _safe_float(signal_row.get("rsi"), 50)
 
-    high = _safe_float(signal_row.get("high"), close)
-    low = _safe_float(signal_row.get("low"), close)
+    vol = _safe_float(signal_row["volume"])
+    prev_vol = _safe_float(prev_row["volume"])
+    vol_ratio = vol / prev_vol if prev_vol > 0 else 1.0
 
-    last_volume = _safe_float(signal_row.get("volume"), 0.0)
-    prev_volume = _safe_float(prev_row.get("volume"), 0.0)
-
-    vol_ratio = (last_volume / prev_volume) if prev_volume > 0 else 1.0
-
+    # Candle
     body = abs(close - open_)
     full = max(high - low, 0.0)
-    upper_wick = max(high - max(open_, close), 0.0)
-    candle_strength = (body / full) if full > 0 else 0.0
-    rejection = full > 0 and upper_wick > body * 1.5
+    candle_strength = body / full if full > 0 else 0
 
-    # RSI
+    # =========================
+    # BASIC SCORE (زي ما هو)
+    # =========================
+
     if 52 <= rsi <= 62:
-        score += 1.5
-        reasons.append("RSI صحي")
-    elif 50 <= rsi < 52:
-        score += 0.7
-    elif 62 < rsi <= 68:
-        score += 0.5
+        score += 1.5; reasons.append("RSI صحي")
     elif rsi > 68:
         score -= 0.5
     else:
         score -= 0.7
 
-    # Volume
-    if vol_ratio >= 2.0:
-        score += 2.5
-        reasons.append("فوليوم انفجار")
+    if vol_ratio >= 2:
+        score += 2.5; reasons.append("فوليوم انفجار")
     elif vol_ratio >= 1.5:
-        score += 1.8
-        reasons.append("فوليوم قوي")
-    elif vol_ratio >= 1.2:
-        score += 0.8
-        reasons.append("فوليوم داعم")
-    elif vol_ratio < 0.85:
-        score -= 0.5
+        score += 1.8; reasons.append("فوليوم قوي")
 
-    # Trend
     if close > ma:
-        score += 1.0
-        reasons.append("فوق MA")
+        score += 1.0; reasons.append("فوق MA")
     else:
         score -= 0.8
 
-    # Candle
     if candle_strength >= 0.7:
-        score += 1.6
-        reasons.append("شمعة قوية")
+        score += 1.6; reasons.append("شمعة قوية")
     elif candle_strength >= 0.5:
         score += 0.9
-        reasons.append("شمعة جيدة")
-    elif candle_strength >= 0.35:
-        score += 0.2
-    else:
-        score -= 0.3
 
-    # Rejection
-    if rejection:
-        score -= 1.0
-
-    # Breakout
     if breakout:
-        score += 2.2
-        reasons.append("اختراق")
-    else:
-        score -= 0.1
+        score += 2.2; reasons.append("اختراق")
 
-    # MTF
     if mtf_confirmed:
-        score += 1.8
-        reasons.append("تأكيد 1H")
+        score += 1.8; reasons.append("تأكيد 1H")
 
-    # BTC
     if "🟢" in btc_mode:
-        score += 0.7
-        reasons.append("BTC داعم")
+        score += 0.7; reasons.append("BTC داعم")
     elif "🔴" in btc_mode:
         score -= 0.5
 
-    # Funding
     if funding < -0.0005:
-        score += 0.6
-        reasons.append("تمويل سلبي")
-    elif funding > 0.0005:
-        score -= 0.5
+        score += 0.6; reasons.append("تمويل سلبي")
 
-    # New listing bonus
-    if is_new:
-        score += 0.3
-        reasons.append("عملة جديدة")
+    # =========================
+    # 🔥 NEW INTELLIGENCE
+    # =========================
 
-        if breakout and vol_ratio >= 1.8:
-            score += 0.8
-            reasons.append("زخم جديد قوي")
-        elif vol_ratio >= 1.8 or breakout:
+    # 📏 distance from MA
+    dist_ma = ((close - ma) / ma) * 100 if ma > 0 else 0
+
+    if 0.3 <= dist_ma <= 2.5:
+        score += 0.5
+        reasons.append("بداية ترند")
+
+    elif dist_ma > 4:
+        score -= 0.7
+        reasons.append("بعيد عن MA")
+
+    # 📈 breakout extension
+    if breakout:
+        recent_high = df["high"].rolling(20).max().iloc[-2]
+        ext = ((close - recent_high) / recent_high) * 100 if recent_high > 0 else 0
+
+        if ext <= 1.5:
             score += 0.4
+            reasons.append("اختراق مبكر")
+        elif ext > 3:
+            score -= 0.6
+            reasons.append("متأخر بعد الاختراق")
 
-    # Clamp + round قبل fake_signal
-    score = max(0.0, min(9.5, score))
+    # 🔥 RSI overheat
+    if rsi > 72:
+        score -= 0.8
+        reasons.append("RSI عالي")
+
+    # 🚀 premium
+    if breakout and mtf_confirmed and vol_ratio >= 1.8 and candle_strength >= 0.5:
+        score += 0.4
+        reasons.append("توافق قوي")
+
+    # =========================
+    # FINAL
+    # =========================
+
+    score = max(0, min(9.5, score))
     score = round(score, 1)
 
-    # ==================== Fake signal (مخفف وأكثر ذكاء) ====================
     fake_signal = False
-
     if score < 4.5:
-        fake_signal = True
-
-    if rejection and candle_strength < 0.48:
-        fake_signal = True
-
-    if close <= ma * 0.997 and not breakout:
-        fake_signal = True
-
-    if rsi < 46 and not breakout:
-        fake_signal = True
-
-    if score >= 8.5 and vol_ratio < 1.15:
         fake_signal = True
 
     return {
