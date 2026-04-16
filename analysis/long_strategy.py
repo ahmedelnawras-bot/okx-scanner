@@ -1,7 +1,4 @@
 def early_bullish_signal(df):
-    """
-    فلتر أولي خفيف
-    """
     try:
         if df is None or df.empty or len(df) < 25:
             return False
