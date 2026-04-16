@@ -3,6 +3,7 @@ import os
 import time
 import redis
 import html
+import logging
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,6 +12,15 @@ from services.telegram_sender import send_telegram_message
 from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score, is_breakout
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("okx-scanner")
 
 # =========================
 # SETTINGS
@@ -28,12 +38,12 @@ if REDIS_URL:
     try:
         r = redis.from_url(REDIS_URL, decode_responses=True)
         r.ping()
-        print("✅ Redis connected")
+        logger.info("✅ Redis connected")
     except Exception as e:
-        print(f"❌ Redis connection error: {e}")
+        logger.error(f"❌ Redis connection error: {e}")
         r = None
 else:
-    print("⚠️ REDIS_URL not found")
+    logger.warning("⚠️ REDIS_URL not found")
 
 
 # =========================
@@ -58,7 +68,7 @@ def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "
     try:
         return bool(r.exists(get_same_candle_key(symbol, candle_time, signal_type)))
     except Exception as e:
-        print(f"Redis exists error (same candle): {e}")
+        logger.error(f"Redis exists error (same candle): {e}")
         return False
 
 
@@ -68,15 +78,15 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
     try:
         return bool(r.exists(get_cooldown_key(symbol, signal_type)))
     except Exception as e:
-        print(f"Redis exists error (cooldown): {e}")
+        logger.error(f"Redis exists error (cooldown): {e}")
         return False
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
     """
-    حجز Atomic قبل الإرسال:
-    1) نفس الشمعة
-    2) نفس الزوج لمدة ساعة
+    يحجز الإشارة قبل الإرسال:
+    - نفس الشمعة
+    - نفس الزوج لمدة ساعة
     """
     if not r:
         return True
@@ -98,20 +108,20 @@ def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
             return False
 
         return True
-
     except Exception as e:
-        print(f"Redis reserve error: {e}")
+        logger.error(f"Redis reserve error: {e}")
         return False
 
 
 def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> None:
     if not r:
         return
+
     try:
         r.delete(get_same_candle_key(symbol, candle_time, signal_type))
         r.delete(get_cooldown_key(symbol, signal_type))
     except Exception as e:
-        print(f"Redis release error: {e}")
+        logger.error(f"Redis release error: {e}")
 
 
 # =========================
@@ -132,13 +142,8 @@ def is_excluded_symbol(symbol: str) -> bool:
 
 
 def extract_24h_quote_volume(ticker: dict) -> float:
-    candidate_fields = [
-        "volCcy24h",
-        "turnover24h",
-        "quoteVolume",
-        "vol24h",
-    ]
-    for field in candidate_fields:
+    fields = ["volCcy24h", "turnover24h", "quoteVolume", "vol24h"]
+    for field in fields:
         value = ticker.get(field)
         if value is None:
             continue
@@ -151,7 +156,7 @@ def extract_24h_quote_volume(ticker: dict) -> float:
 
 def get_ranked_pairs():
     futures = get_tickers("SWAP")
-    print(f"Fetched {len(futures)} futures pairs")
+    logger.info(f"Fetched {len(futures)} futures pairs")
 
     filtered = []
     for p in futures:
@@ -174,8 +179,8 @@ def get_ranked_pairs():
     filtered.sort(key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)
     top_pairs = filtered[:SCAN_LIMIT]
 
-    print(f"After liquidity filter: {len(filtered)}")
-    print(f"Using top ranked pairs: {len(top_pairs)}")
+    logger.info(f"After liquidity filter: {len(filtered)}")
+    logger.info(f"Using top ranked pairs: {len(top_pairs)}")
     return top_pairs
 
 
@@ -215,7 +220,7 @@ def get_btc_mode():
         return "🟡 محايد"
 
     except Exception as e:
-        print(f"BTC mode error: {e}")
+        logger.error(f"BTC mode error: {e}")
         return "🟡 محايد"
 
 
@@ -242,7 +247,7 @@ def is_higher_timeframe_confirmed(symbol):
         return score >= 1
 
     except Exception as e:
-        print(f"MTF error on {symbol}: {e}")
+        logger.error(f"MTF error on {symbol}: {e}")
         return False
 
 
@@ -299,10 +304,10 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 # MAIN
 # =========================
 def run():
-    print("🚀 Bot Started...")
+    logger.info("🚀 Bot Started...")
 
     btc_mode = get_btc_mode()
-    print(f"BTC mode: {btc_mode}")
+    logger.info(f"BTC mode: {btc_mode}")
 
     ranked_pairs = get_ranked_pairs()
 
@@ -319,22 +324,21 @@ def run():
             df = to_dataframe(candles)
 
             if df is None or df.empty:
-                print(f"{symbol} → empty dataframe")
+                logger.info(f"{symbol} → empty dataframe")
                 continue
 
             df = add_ma(df)
             df = add_rsi(df)
             df = add_atr(df)
 
+            signal = early_bullish_signal(df)
+            if not signal:
+                logger.info(f"{symbol} → signal: False")
+                continue
+
             breakout = is_breakout(df, lookback=20)
             mtf_confirmed = is_higher_timeframe_confirmed(symbol)
             is_new = is_new_listing_by_candles(candles)
-
-            # فلتر مبكر
-            signal = early_bullish_signal(df)
-            if not signal:
-                print(f"{symbol} → signal: False")
-                continue
 
             score_result = calculate_long_score(
                 df=df,
@@ -344,7 +348,7 @@ def run():
                 is_new=is_new,
             )
 
-            print(
+            logger.info(
                 f"{symbol} → signal: True | "
                 f"score: {score_result['score']} | "
                 f"fake: {score_result['fake_signal']} | "
@@ -356,21 +360,21 @@ def run():
             if score_result["fake_signal"]:
                 continue
 
-            if score_result["score"] < 7.5:
+            if score_result["score"] < 7.0:
                 continue
 
             candle_time = get_last_candle_time(df)
 
             if symbol in sent_symbols_this_run:
-                print(f"{symbol} → skipped (already sent this run)")
+                logger.info(f"{symbol} → skipped (already sent this run)")
                 continue
 
             if already_sent_same_candle(symbol, candle_time, "long"):
-                print(f"{symbol} → skipped (same candle in Redis)")
+                logger.info(f"{symbol} → skipped (same candle in Redis)")
                 continue
 
             if in_cooldown(symbol, "long"):
-                print(f"{symbol} → skipped (cooldown in Redis)")
+                logger.info(f"{symbol} → skipped (cooldown in Redis)")
                 continue
 
             price = float(df["close"].iloc[-1])
@@ -395,7 +399,7 @@ def run():
             })
 
         except Exception as e:
-            print(f"Error on {symbol}: {e}")
+            logger.error(f"Error on {symbol}: {e}")
 
     candidates.sort(
         key=lambda x: (x["score"], x["rank_volume_24h"]),
@@ -410,7 +414,7 @@ def run():
         symbol = candidate["symbol"]
 
         if symbol in sent_symbols_this_run:
-            print(f"{symbol} → skipped (already sent final stage)")
+            logger.info(f"{symbol} → skipped (already sent final stage)")
             continue
 
         locked = reserve_signal_slot(
@@ -418,8 +422,9 @@ def run():
             candle_time=candidate["candle_time"],
             signal_type="long",
         )
+
         if not locked:
-            print(f"{symbol} → skipped (reserve failed / duplicate)")
+            logger.info(f"{symbol} → skipped (reserve failed / duplicate)")
             continue
 
         sent_ok = send_telegram_message(candidate["message"])
@@ -427,18 +432,18 @@ def run():
         if sent_ok:
             sent_symbols_this_run.add(symbol)
             sent_count += 1
-            print(f'SENT → {symbol} | score: {candidate["score"]}')
+            logger.info(f'SENT → {symbol} | score: {candidate["score"]}')
         else:
             release_signal_slot(
                 symbol=symbol,
                 candle_time=candidate["candle_time"],
                 signal_type="long",
             )
-            print(f'FAILED SEND → {symbol}')
+            logger.error(f'FAILED SEND → {symbol}')
 
-    print(f"Candidates found: {len(candidates)}")
-    print(f"Sent alerts this run: {sent_count}")
-    print(f"Tested {tested} pairs")
+    logger.info(f"Candidates found: {len(candidates)}")
+    logger.info(f"Sent alerts this run: {sent_count}")
+    logger.info(f"Tested {tested} pairs")
 
 
 if __name__ == "__main__":
@@ -446,7 +451,7 @@ if __name__ == "__main__":
         try:
             run()
         except Exception as e:
-            print(f"Fatal error: {e}")
+            logger.error(f"Fatal error: {e}")
 
-        print("Sleeping 60 seconds...")
+        logger.info("Sleeping 60 seconds...")
         time.sleep(60)
