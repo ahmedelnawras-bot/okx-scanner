@@ -43,10 +43,12 @@ TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
 MIN_SCORE = 5.0
+FINAL_MIN_SCORE = 7.5
 MAX_ALERTS_PER_RUN = 3
+
 COOLDOWN_SECONDS = 3600
-LOCAL_RECENT_SEND_SECONDS = 1800  # 30 دقيقة
-GLOBAL_COOLDOWN_SECONDS = 120     # 2 دقائق بين دفعات الإرسال
+LOCAL_RECENT_SEND_SECONDS = 1800   # 30 دقيقة
+GLOBAL_COOLDOWN_SECONDS = 120      # دقيقتين بين دفعات الإرسال
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
@@ -293,7 +295,10 @@ def to_dataframe(data):
         "volCcy", "volCcyQuote", "confirm"
     ])
 
-    numeric_cols = ["ts", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote", "confirm"]
+    numeric_cols = [
+        "ts", "open", "high", "low", "close",
+        "volume", "volCcy", "volCcyQuote", "confirm"
+    ]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -604,9 +609,9 @@ def apply_top_momentum_filter(candidates):
 
 def diversify_candidates(candidates, max_alerts=3):
     """
-    تنويع بسيط:
-    - ما ناخدش كل الإشارات من نفس bucket لو في بدائل
-    - نحافظ على الأعلى score/momentum
+    تنويع أقوى:
+    - ما ناخدش إشارات متشابهة جدًا
+    - كل bucket مرة واحدة قدر الإمكان
     """
     if not candidates:
         return []
@@ -623,15 +628,28 @@ def diversify_candidates(candidates, max_alerts=3):
         )
 
     diversified = []
+    used_patterns = set()
 
-    # أول pass: ناخد أفضل واحدة من كل bucket
+    # أول pass: أحسن واحدة من كل bucket
     for bucket_name in ["new_breakout", "breakout", "volume", "standard"]:
-        if bucket_name in buckets and buckets[bucket_name]:
-            diversified.append(buckets[bucket_name].pop(0))
-            if len(diversified) >= max_alerts:
-                break
+        if bucket_name not in buckets or not buckets[bucket_name]:
+            continue
 
-    # ثاني pass: نكمل بأعلى المتبقين
+        candidate = buckets[bucket_name][0]
+        pattern = (
+            candidate["breakout"],
+            round(candidate["vol_ratio"], 1),
+            candidate["is_new"],
+        )
+
+        if pattern not in used_patterns:
+            diversified.append(candidate)
+            used_patterns.add(pattern)
+
+        if len(diversified) >= max_alerts:
+            break
+
+    # ثاني pass: نكمل بأعلى المتبقين بشرط عدم التشابه الشديد
     if len(diversified) < max_alerts:
         remaining = []
         for items in buckets.values():
@@ -645,8 +663,21 @@ def diversify_candidates(candidates, max_alerts=3):
         for candidate in remaining:
             if len(diversified) >= max_alerts:
                 break
-            if candidate not in diversified:
-                diversified.append(candidate)
+
+            pattern = (
+                candidate["breakout"],
+                round(candidate["vol_ratio"], 1),
+                candidate["is_new"],
+            )
+
+            if pattern in used_patterns:
+                continue
+
+            if candidate in diversified:
+                continue
+
+            diversified.append(candidate)
+            used_patterns.add(pattern)
 
     logger.info(
         "Diversified selection: "
@@ -761,8 +792,8 @@ def run():
                     logger.info(f"{symbol} → rejected by fake signal")
                     continue
 
-                if score_result["score"] < MIN_SCORE and not breakout:
-                    logger.info(f"{symbol} → rejected by score ({score_result['score']})")
+                if score_result["score"] < FINAL_MIN_SCORE:
+                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']})")
                     continue
 
                 candle_time = get_signal_candle_time(df)
@@ -772,10 +803,9 @@ def run():
                     logger.info(f"{symbol} → skipped (same candle in memory)")
                     continue
 
-                if symbol in sent_cache:
-                    if now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
-                        logger.info(f"{symbol} → skipped (local cooldown 30m)")
-                        continue
+                if symbol in sent_cache and now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
+                    logger.info(f"{symbol} → skipped (local cooldown 30m)")
+                    continue
 
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent this run)")
@@ -855,7 +885,6 @@ def run():
 
             top_candidates = diversify_candidates(candidates, MAX_ALERTS_PER_RUN)
 
-            # Global cooldown قبل الإرسال
             global_elapsed = time.time() - last_global_send_ts
             if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
                 remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
