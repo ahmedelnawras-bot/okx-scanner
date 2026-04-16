@@ -88,14 +88,12 @@ def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", br
 
         score = 0.0
 
-        # 1) MA trend
         if close > ma:
             score += 2.0
             result["reasons"].append("فوق MA20")
         else:
             score -= 2.0
 
-        # 2) RSI zones الذكية
         if 55 <= rsi <= 68:
             score += 2.0
             result["reasons"].append("RSI قوي")
@@ -107,21 +105,20 @@ def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", br
             score += 1.0
             result["flags"].append("RSI Hot")
         else:
-            if rsi < 50:
-                score -= 2.0
+            if rsi < 48:
+                score -= 1.0
             else:
                 score -= 0.5
 
         if rsi > rsi_prev:
             score += 0.5
 
-        # 3) candle strength
         if close > open_:
             if candle_strength >= 0.60:
                 score += 2.0
                 result["reasons"].append("شمعة قوية")
                 result["flags"].append("Candle Strong")
-            elif candle_strength >= 0.45:
+            elif candle_strength >= 0.35:
                 score += 1.0
                 result["flags"].append("Candle OK")
             else:
@@ -129,54 +126,40 @@ def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", br
         else:
             score -= 2.0
 
-        # 4) volume
         if volume_spike:
             score += 1.5
             result["reasons"].append("فوليوم قوي")
             result["flags"].append("Vol ↑")
-        else:
-            score -= 0.5
 
-        # 5) breakout
         if breakout:
             score += 1.0
             result["reasons"].append("اختراق")
             result["flags"].append("Break ✔")
 
-        # 6) rejection
         if bull_reject:
             score += 0.5
             result["flags"].append("Reject ↓")
 
         if bear_reject:
-            score -= 1.5
+            score -= 1.0
             result["flags"].append("Upper Wick")
 
-        # 7) MTF
         if mtf_confirmed:
             score += 1.0
             result["reasons"].append("تأكيد 1H")
             result["flags"].append("MTF ✔")
-        else:
-            score -= 0.5
 
-        # 8) BTC mode
         if "🟢" in btc_mode:
             score += 0.5
         elif "🔴" in btc_mode:
             score -= 1.0
 
-        # 9) new listing
         if is_new and score >= 7.0:
             score += 0.2
             result["flags"].append("New")
 
-        # 10) fake filters المخففة
         if candle_strength < 0.35 and not volume_spike:
             score -= 1.5
-
-        if bear_reject and not mtf_confirmed:
-            score -= 2.0
 
         if atr <= 0:
             result["fake_signal"] = True
@@ -184,16 +167,4 @@ def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", br
         if close <= ma and rsi < 45 and not volume_spike:
             result["fake_signal"] = True
 
-        score = max(0.0, min(10.0, score))
-        result["score"] = round(score, 1)
-        result["reasons"] = list(dict.fromkeys(result["reasons"]))
-        result["flags"] = list(dict.fromkeys(result["flags"]))
-
-        if not result["reasons"]:
-            result["reasons"] = ["زخم مبكر"]
-
-        return result
-
-    except Exception:
-        result["fake_signal"] = True
-        return result
+        score = max(0.0, min(10.0, score
