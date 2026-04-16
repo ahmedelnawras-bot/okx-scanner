@@ -12,9 +12,14 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-COOLDOWN_SECONDS = 3600   # ساعة كاملة
-MAX_ALERTS_PER_RUN = 2
-SCAN_LIMIT = 200
+# =========================
+# SETTINGS
+# =========================
+COOLDOWN_SECONDS = 3600          # ساعة لنفس الزوج/النوع
+MAX_ALERTS_PER_RUN = 2           # تقليل السبام
+SCAN_LIMIT = 200                 # Top 200 حقيقي
+MIN_24H_QUOTE_VOLUME = 1_000_000 # فلتر سيولة مبدئي
+NEW_LISTING_MAX_CANDLES = 50     # أقل من كده = عملة جديدة تقريبًا
 
 REDIS_URL = os.environ.get("REDIS_URL")
 
@@ -31,6 +36,157 @@ else:
     print("⚠️ REDIS_URL not found")
 
 
+# =========================
+# REDIS KEYS
+# =========================
+def clean_symbol_for_message(symbol: str) -> str:
+    return symbol.replace("-SWAP", "")
+
+
+def get_same_candle_key(symbol: str, candle_time: int, signal_type: str = "long") -> str:
+    return f"sent:{signal_type}:{symbol}:{candle_time}"
+
+
+def get_cooldown_key(symbol: str, signal_type: str = "long") -> str:
+    clean = clean_symbol_for_message(symbol)
+    return f"cooldown:{signal_type}:{clean}"
+
+
+def get_pair_lock_key(symbol: str, signal_type: str = "long") -> str:
+    clean = clean_symbol_for_message(symbol)
+    return f"pairlock:{signal_type}:{clean}"
+
+
+def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
+    if not r:
+        return False
+    try:
+        return bool(r.exists(get_same_candle_key(symbol, candle_time, signal_type)))
+    except Exception as e:
+        print(f"Redis exists error (same candle): {e}")
+        return False
+
+
+def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
+    if not r:
+        return False
+    try:
+        return bool(r.exists(get_cooldown_key(symbol, signal_type)))
+    except Exception as e:
+        print(f"Redis exists error (cooldown): {e}")
+        return False
+
+
+def pair_locked(symbol: str, signal_type: str = "long") -> bool:
+    if not r:
+        return False
+    try:
+        return bool(r.exists(get_pair_lock_key(symbol, signal_type)))
+    except Exception as e:
+        print(f"Redis exists error (pair lock): {e}")
+        return False
+
+
+def mark_sent(symbol: str, candle_time: int, signal_type: str = "long") -> None:
+    if not r:
+        return
+    try:
+        r.set(get_same_candle_key(symbol, candle_time, signal_type), "1", ex=7200)
+        r.set(get_cooldown_key(symbol, signal_type), "1", ex=COOLDOWN_SECONDS)
+        r.set(get_pair_lock_key(symbol, signal_type), "1", ex=COOLDOWN_SECONDS)
+        print(f"✅ Redis saved for {symbol} | candle={candle_time}")
+    except Exception as e:
+        print(f"Redis save error: {e}")
+
+
+# =========================
+# MARKET FILTERING
+# =========================
+def is_excluded_symbol(symbol: str) -> bool:
+    """
+    استبعاد stablecoins وأشياء مزعجة شائعة.
+    """
+    excluded_prefixes = (
+        "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USD0"
+    )
+    if symbol.startswith(excluded_prefixes):
+        return True
+
+    # فلتر بدائي للأسماء المبالغ فيها
+    base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "")
+    if len(base) > 20:
+        return True
+
+    return False
+
+
+def extract_24h_quote_volume(ticker: dict) -> float:
+    """
+    يحاول يقرأ أفضل حقل متاح لسيولة 24h بقيمة quote/base مناسبة.
+    عدّل ترتيب الحقول لو okx_client عندك مختلف.
+    """
+    candidate_fields = [
+        "volCcy24h",    # الأفضل غالبًا
+        "turnover24h",
+        "quoteVolume",
+        "vol24h",
+    ]
+
+    for field in candidate_fields:
+        value = ticker.get(field)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+
+    return 0.0
+
+
+def get_ranked_pairs():
+    """
+    Top 200 حقيقي:
+    1) USDT-SWAP فقط
+    2) استبعاد stablecoins والعملات الغريبة
+    3) فلتر سيولة
+    4) ترتيب تنازلي حسب 24h volume
+    """
+    futures = get_tickers("SWAP")
+    print(f"Fetched {len(futures)} futures pairs")
+
+    filtered = []
+    for p in futures:
+        symbol = p.get("instId", "")
+
+        if "USDT" not in symbol:
+            continue
+
+        if not symbol.endswith("-SWAP"):
+            continue
+
+        if is_excluded_symbol(symbol):
+            continue
+
+        vol_24h = extract_24h_quote_volume(p)
+        if vol_24h < MIN_24H_QUOTE_VOLUME:
+            continue
+
+        p["_rank_volume_24h"] = vol_24h
+        filtered.append(p)
+
+    filtered.sort(key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)
+
+    top_pairs = filtered[:SCAN_LIMIT]
+
+    print(f"After liquidity filter: {len(filtered)}")
+    print(f"Using top ranked pairs: {len(top_pairs)}")
+    return top_pairs
+
+
+# =========================
+# INDICATORS / HELPERS
+# =========================
 def is_volume_spike(df, multiplier=1.2):
     if df is None or df.empty or len(df) < 20:
         return False
@@ -54,77 +210,6 @@ def get_last_candle_time(df):
     except Exception as e:
         print(f"⚠️ candle time error: {e}")
         return 0
-
-
-def clean_symbol_for_message(symbol):
-    return symbol.replace("-SWAP", "")
-
-
-def get_same_candle_key(symbol, candle_time, signal_type="long"):
-    return f"sent:{signal_type}:{symbol}:{candle_time}"
-
-
-def get_cooldown_key(symbol, signal_type="long"):
-    clean = clean_symbol_for_message(symbol)
-    return f"cooldown:{signal_type}:{clean}"
-
-
-def get_pair_lock_key(symbol, signal_type="long"):
-    clean = clean_symbol_for_message(symbol)
-    return f"pairlock:{signal_type}:{clean}"
-
-
-def already_sent_same_candle(symbol, candle_time, signal_type="long"):
-    if not r:
-        return False
-
-    key = get_same_candle_key(symbol, candle_time, signal_type)
-    try:
-        return bool(r.exists(key))
-    except Exception as e:
-        print(f"Redis exists error (same candle): {e}")
-        return False
-
-
-def in_cooldown(symbol, signal_type="long"):
-    if not r:
-        return False
-
-    key = get_cooldown_key(symbol, signal_type)
-    try:
-        return bool(r.exists(key))
-    except Exception as e:
-        print(f"Redis exists error (cooldown): {e}")
-        return False
-
-
-def pair_locked(symbol, signal_type="long"):
-    if not r:
-        return False
-
-    key = get_pair_lock_key(symbol, signal_type)
-    try:
-        return bool(r.exists(key))
-    except Exception as e:
-        print(f"Redis exists error (pair lock): {e}")
-        return False
-
-
-def mark_sent(symbol, candle_time, signal_type="long"):
-    if not r:
-        return
-
-    same_candle_key = get_same_candle_key(symbol, candle_time, signal_type)
-    cooldown_key = get_cooldown_key(symbol, signal_type)
-    pair_lock_key = get_pair_lock_key(symbol, signal_type)
-
-    try:
-        r.set(same_candle_key, "1", ex=7200)                # منع نفس الشمعة
-        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)      # كولداون ساعة
-        r.set(pair_lock_key, "1", ex=COOLDOWN_SECONDS)     # قفل الزوج ساعة
-        print(f"✅ Redis saved for {symbol} | candle={candle_time}")
-    except Exception as e:
-        print(f"Redis save error: {e}")
 
 
 def get_btc_mode():
@@ -157,6 +242,12 @@ def get_btc_mode():
 
 
 def is_higher_timeframe_confirmed(symbol):
+    """
+    MTF مرن:
+    - فوق MA20 = نقطة
+    - RSI > 50 = نقطة
+    يكفي نقطة واحدة
+    """
     try:
         candles = get_candles(symbol, "1H", 100)
         df = to_dataframe(candles)
@@ -203,17 +294,27 @@ def calculate_stop_loss(price, atr_value):
         return round(float(price), 6)
 
 
+def is_new_listing_by_candles(candles) -> bool:
+    """
+    لو التاريخ قليل، نعتبرها عملة جديدة.
+    """
+    try:
+        return len(candles) < NEW_LISTING_MAX_CANDLES
+    except Exception:
+        return False
+
+
 def build_tradingview_link(symbol):
     """
     مثال:
-    SPACE-USDT-SWAP -> OKX:SPACEUSDT.P
+    MINA-USDT-SWAP -> OKX:MINAUSDT.P
     """
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
     tv_symbol = f"OKX:{base}USDT.P"
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
 
 
-def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_confirmed, breakout, tv_link):
+def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_confirmed, breakout, tv_link, is_new):
     msg_symbol = clean_symbol_for_message(symbol)
 
     reasons = ["زخم مبكر"]
@@ -242,49 +343,38 @@ def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_c
     safe_flags = html.escape(flags_line)
     safe_tv_link = html.escape(tv_link, quote=True)
 
+    new_tag = "\n🆕 <b>عملة جديدة</b>\n" if is_new else "\n"
+
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
-💰 <b>السعر:</b> {round(price, 6)}
-⏱ <b>الفريم:</b> 15m
-⭐ <b>السكور:</b> {round(score, 1)} / 10
-🛑 <b>الستوب:</b> {stop_loss}
+💰 {round(price, 6)} | ⏱ 15m
+⭐ {round(score, 1)} / 10 | 🛑 {stop_loss}
 
-🪙 <b>BTC:</b> {safe_btc}
+🪙 BTC: {safe_btc}{new_tag}
+📊 {safe_reason}
 
-📊 <b>السبب:</b>
-{safe_reason}
-
-🔥 <b>عوامل القوة:</b>
-{safe_flags}
+🔥 {safe_flags}
 
 🔗 <a href="{safe_tv_link}">فتح الشارت</a>
 """
 
 
+# =========================
+# MAIN RUN
+# =========================
 def run():
     print("🚀 Bot Started...")
 
     btc_mode = get_btc_mode()
     print(f"BTC mode: {btc_mode}")
 
-    futures = get_tickers("SWAP")
-    print(f"Fetched {len(futures)} futures pairs")
-
-    usdt_pairs = [
-        p for p in futures
-        if "USDT" in p["instId"]
-        and not p["instId"].startswith((
-            "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"
-        ))
-    ]
-
-    print(f"USDT pairs: {len(usdt_pairs)}")
+    ranked_pairs = get_ranked_pairs()
 
     tested = 0
     collected_keys = set()
     candidates = []
 
-    for pair_data in usdt_pairs[:SCAN_LIMIT]:
+    for pair_data in ranked_pairs:
         tested += 1
         symbol = pair_data["instId"]
 
@@ -304,6 +394,7 @@ def run():
             volume_spike = is_volume_spike(df, multiplier=1.2)
             mtf_confirmed = is_higher_timeframe_confirmed(symbol)
             breakout = is_breakout(df, lookback=20)
+            is_new = is_new_listing_by_candles(candles)
 
             if signal:
                 score = calculate_long_score(df)
@@ -326,6 +417,10 @@ def run():
                 elif "🟢" in btc_mode:
                     score += 0.3
 
+                # bonus صغير للعملات الجديدة فقط لو الشروط أصلًا جيدة
+                if is_new and score >= 7.5:
+                    score += 0.2
+
                 score = max(0, min(10, score))
             else:
                 score = 0
@@ -335,7 +430,8 @@ def run():
                 f"score: {score} | "
                 f"volume_spike: {volume_spike} | "
                 f"mtf: {mtf_confirmed} | "
-                f"breakout: {breakout}"
+                f"breakout: {breakout} | "
+                f"new: {is_new}"
             )
 
             if not signal:
@@ -385,12 +481,14 @@ def run():
                 mtf_confirmed=mtf_confirmed,
                 breakout=breakout,
                 tv_link=tv_link,
+                is_new=is_new,
             )
 
             candidates.append({
                 "symbol": symbol,
                 "score": float(score),
                 "volume_spike": bool(volume_spike),
+                "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
                 "message": message,
                 "candle_time": candle_time,
             })
@@ -400,8 +498,12 @@ def run():
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
+    # الترتيب النهائي:
+    # 1) score
+    # 2) volume spike
+    # 3) liquidity rank
     candidates.sort(
-        key=lambda x: (x["score"], x["volume_spike"]),
+        key=lambda x: (x["score"], x["volume_spike"], x["rank_volume_24h"]),
         reverse=True
     )
 
