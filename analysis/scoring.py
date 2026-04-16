@@ -39,7 +39,6 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
 
     prev_volume = float(prev["volume"])
     last_volume = float(last["volume"])
-
     vol_ratio = (last_volume / prev_volume) if prev_volume > 0 else 1.0
 
     body = abs(close - open_)
