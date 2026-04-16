@@ -2,8 +2,7 @@ def _safe_float(value, default=0.0):
     try:
         if value is None:
             return default
-        # NaN check
-        if value != value:
+        if value != value:  # NaN
             return default
         return float(value)
     except Exception:
@@ -50,7 +49,10 @@ def is_breakout(df, lookback=20):
             return False
 
         current_close = _safe_float(signal_row["close"], 0.0)
-        recent_high = _safe_float(df["high"].iloc[:signal_idx].rolling(lookback).max().iloc[-1], 0.0)
+        recent_high = _safe_float(
+            df["high"].iloc[:signal_idx].rolling(lookback).max().iloc[-1],
+            0.0
+        )
 
         return current_close > recent_high and recent_high > 0
     except Exception:
@@ -196,31 +198,38 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
     elif funding > 0.0005:
         score -= 0.5
 
-    # New listing
+    # New listing bonus
     if is_new:
         score += 0.3
         reasons.append("عملة جديدة")
 
-    # Fake signal (مخفف)
+        if breakout and vol_ratio >= 1.8:
+            score += 0.8
+            reasons.append("زخم جديد قوي")
+        elif vol_ratio >= 1.8 or breakout:
+            score += 0.4
+
+    # Clamp + round قبل fake_signal
+    score = max(0.0, min(9.5, score))
+    score = round(score, 1)
+
+    # ==================== Fake signal (مخفف وأكثر ذكاء) ====================
     fake_signal = False
 
     if score < 4.5:
         fake_signal = True
 
-    if rejection and candle_strength < 0.5:
+    if rejection and candle_strength < 0.48:
         fake_signal = True
 
-    if close <= ma and not breakout:
+    if close <= ma * 0.997 and not breakout:
         fake_signal = True
 
-    if rsi < 48 and not breakout:
+    if rsi < 46 and not breakout:
         fake_signal = True
 
-    if score >= 8.5 and vol_ratio < 1.2:
+    if score >= 8.5 and vol_ratio < 1.15:
         fake_signal = True
-
-    score = max(0.0, min(9.5, score))
-    score = round(score, 1)
 
     return {
         "score": score,
