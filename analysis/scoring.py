@@ -171,7 +171,7 @@ def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", br
             score += 0.2
             result["flags"].append("New")
 
-        # 10) fake filters مخففة
+        # 10) fake filters المخففة
         if candle_strength < 0.35 and not volume_spike:
             score -= 1.5
 
