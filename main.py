@@ -60,9 +60,6 @@ NEW_LISTING_MIN_VOL_RATIO = 1.8
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
-# =========================
-# DISTRIBUTED SCAN LOCK
-# =========================
 SCAN_LOCK_KEY = "scan:running"
 SCAN_LOCK_TTL = 180
 
@@ -162,7 +159,6 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
 def acquire_scan_lock() -> bool:
     if not r:
         return True
-
     try:
         locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
         return bool(locked)
@@ -174,7 +170,6 @@ def acquire_scan_lock() -> bool:
 def release_scan_lock() -> None:
     if not r:
         return
-
     try:
         r.delete(SCAN_LOCK_KEY)
     except Exception as e:
@@ -288,7 +283,7 @@ def get_ranked_pairs():
 
 def compute_rsi(series, period=14):
     """
-    Wilder RSI
+    Wilder RSI (الأدق والأشهر)
     """
     delta = series.diff()
 
@@ -738,9 +733,6 @@ def run():
         scan_locked = False
 
         try:
-            # =========================
-            # GLOBAL COOLDOWN EARLY
-            # =========================
             global_elapsed = time.time() - last_global_send_ts
             if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
                 remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
@@ -748,9 +740,6 @@ def run():
                 time.sleep(min(remaining, 60))
                 continue
 
-            # =========================
-            # SCAN LOCK
-            # =========================
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 logger.info("Another scan is running — skipping")
