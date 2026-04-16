@@ -1,45 +1,211 @@
-def calculate_long_score(df):
-    score = 0.0
+def is_breakout(df, lookback=20):
+    try:
+        if df is None or df.empty or len(df) < lookback + 2:
+            return False
 
-    if df.empty or len(df) < 30:
+        recent_high = df["high"].rolling(lookback).max().iloc[-2]
+        last_close = float(df["close"].iloc[-1])
+        return last_close > float(recent_high)
+    except Exception:
+        return False
+
+
+def get_candle_strength(df):
+    try:
+        c = df.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        total_range = float(c["high"]) - float(c["low"])
+        if total_range <= 0:
+            return 0.0
+        return body / total_range
+    except Exception:
         return 0.0
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    close_price = float(last["close"])
-    ma20 = float(last["ma20"])
-    rsi = float(last["rsi"])
+def bullish_rejection(df):
+    try:
+        c = df.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        lower_wick = min(float(c["open"]), float(c["close"])) - float(c["low"])
+        return lower_wick > (body * 1.5)
+    except Exception:
+        return False
 
-    # 1) السعر فوق ma20
-    if close_price > ma20:
-        score += 2.5
 
-    # 2) RSI إيجابي
-    if 55 <= rsi <= 68:
-        score += 2.5
-    elif 50 <= rsi < 55:
-        score += 1.5
-    elif 68 < rsi <= 75:
-        score += 1.0
+def bearish_rejection(df):
+    try:
+        c = df.iloc[-1]
+        body = abs(float(c["close"]) - float(c["open"]))
+        upper_wick = float(c["high"]) - max(float(c["open"]), float(c["close"]))
+        return upper_wick > (body * 1.5)
+    except Exception:
+        return False
 
-    # 3) آخر شمعة أقوى من اللي قبلها
-    if float(last["close"]) > float(prev["close"]):
-        score += 2.0
 
-    # 4) ATR موجود
-    if "atr" in df.columns:
-        atr = float(last["atr"])
-        if atr > 0:
+def is_volume_spike(df, multiplier=1.2):
+    try:
+        if df is None or df.empty or len(df) < 20:
+            return False
+
+        last_volume = float(df["volume"].iloc[-1])
+        avg_volume_20 = float(df["volume"].rolling(20).mean().iloc[-1])
+
+        if avg_volume_20 <= 0:
+            return False
+
+        return last_volume >= (avg_volume_20 * multiplier)
+    except Exception:
+        return False
+
+
+def calculate_long_score(df, mtf_confirmed=False, btc_mode="🟡 محايد", breakout=False, is_new=False):
+    """
+    سكور حقيقي من 10
+    يرجع:
+    - score
+    - reasons
+    - flags
+    - fake_signal
+    """
+    result = {
+        "score": 0.0,
+        "reasons": [],
+        "flags": [],
+        "fake_signal": False,
+    }
+
+    try:
+        if df is None or df.empty or len(df) < 25:
+            result["fake_signal"] = True
+            return result
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        close = float(last["close"])
+        open_ = float(last["open"])
+        ma = float(last.get("ma", close))
+        rsi = float(last.get("rsi", 50))
+        rsi_prev = float(prev.get("rsi", rsi))
+        atr = float(last.get("atr", 0))
+        candle_strength = get_candle_strength(df)
+
+        volume_spike = is_volume_spike(df, 1.2)
+        bull_reject = bullish_rejection(df)
+        bear_reject = bearish_rejection(df)
+
+        score = 0.0
+
+        # 1) Trend vs MA
+        if close > ma:
+            score += 2.0
+            result["reasons"].append("فوق MA20")
+        else:
+            result["fake_signal"] = True
+            return result
+
+        # 2) RSI smart zones
+        if 55 <= rsi <= 68:
+            score += 2.0
+            result["reasons"].append("RSI قوي")
+            result["flags"].append("RSI ↑")
+        elif 50 <= rsi < 55:
+            score += 1.0
+            result["flags"].append("RSI ↗")
+        elif 68 < rsi <= 75:
+            score += 1.0
+            result["flags"].append("RSI Hot")
+        else:
+            if rsi < 50:
+                result["fake_signal"] = True
+                return result
+
+        if rsi > rsi_prev:
+            score += 0.5
+
+        # 3) Candle strength
+        if close > open_:
+            if candle_strength >= 0.60:
+                score += 2.0
+                result["reasons"].append("شمعة قوية")
+                result["flags"].append("Candle Strong")
+            elif candle_strength >= 0.45:
+                score += 1.0
+                result["flags"].append("Candle OK")
+            else:
+                score -= 0.5
+        else:
+            result["fake_signal"] = True
+            return result
+
+        # 4) Volume
+        if volume_spike:
             score += 1.5
+            result["reasons"].append("فوليوم قوي")
+            result["flags"].append("Vol ↑")
+        else:
+            score -= 0.5
 
-    # 5) المسافة فوق ma20 منطقية
-    if ma20 > 0:
-        distance_pct = ((close_price - ma20) / ma20) * 100
-        if 0.2 <= distance_pct <= 2.5:
-            score += 1.5
+        # 5) Breakout
+        if breakout:
+            score += 1.0
+            result["reasons"].append("اختراق")
+            result["flags"].append("Break ✔")
 
-    if score > 10:
-        score = 10.0
+        # 6) Rejection logic
+        if bull_reject:
+            score += 0.5
+            result["flags"].append("Reject ↓")
+        if bear_reject:
+            score -= 1.5
+            result["flags"].append("Upper Wick")
 
-    return round(score, 1)
+        # 7) MTF
+        if mtf_confirmed:
+            score += 1.0
+            result["reasons"].append("تأكيد 1H")
+            result["flags"].append("MTF ✔")
+        else:
+            score -= 0.5
+
+        # 8) BTC mode
+        if "🟢" in btc_mode:
+            score += 0.5
+        elif "🔴" in btc_mode:
+            score -= 1.0
+
+        # 9) New listing bonus خفيف
+        if is_new and score >= 7.5:
+            score += 0.2
+            result["flags"].append("New")
+
+        # 10) Fake signal filters
+        if candle_strength < 0.35 and not volume_spike:
+            result["fake_signal"] = True
+
+        if bear_reject and not mtf_confirmed:
+            result["fake_signal"] = True
+
+        if atr <= 0:
+            result["fake_signal"] = True
+
+        if score < 0:
+            score = 0.0
+        if score > 10:
+            score = 10.0
+
+        # ترتيب وتنظيف
+        result["score"] = round(score, 1)
+
+        # إزالة التكرار في reasons / flags
+        result["reasons"] = list(dict.fromkeys(result["reasons"]))
+        result["flags"] = list(dict.fromkeys(result["flags"]))
+
+        if not result["reasons"]:
+            result["reasons"] = ["زخم مبكر"]
+
+        return result
+
+    except Exception:
+        result["fake_signal"] = True
+        return result
