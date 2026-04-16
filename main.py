@@ -30,6 +30,7 @@ MAX_ALERTS_PER_RUN = 2
 SCAN_LIMIT = 200
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
+MIN_SCORE_TO_SEND = 6.5
 
 REDIS_URL = os.environ.get("REDIS_URL")
 
@@ -360,7 +361,8 @@ def run():
             if score_result["fake_signal"]:
                 continue
 
-            if score_result["score"] < 7.0:
+            if score_result["score"] < MIN_SCORE_TO_SEND:
+                logger.info(f"{symbol} → rejected by score ({score_result['score']})")
                 continue
 
             candle_time = get_last_candle_time(df)
