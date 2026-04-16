@@ -528,7 +528,7 @@ def get_volume_ratio(df) -> float:
         return 1.0
 
 
-def is_valid_candle_timing(df, max_age_seconds=CANDLE_MAX_AGE_SECONDS) -> bool:
+def is_valid_candle_timing(df) -> bool:
     try:
         signal_row = get_signal_row(df)
         ts = int(signal_row["ts"])
@@ -537,7 +537,8 @@ def is_valid_candle_timing(df, max_age_seconds=CANDLE_MAX_AGE_SECONDS) -> bool:
             ts = ts // 1000
 
         candle_age = int(time.time()) - ts
-        return 0 <= candle_age <= max_age_seconds
+        CANDLE_SECONDS = 15 * 60
+        return 0 <= candle_age < (CANDLE_SECONDS - 60)
     except Exception:
         return False
 
