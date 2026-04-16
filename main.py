@@ -94,6 +94,11 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
+    """
+    Atomic reserve:
+    - يمنع نفس الشمعة
+    - يمنع نفس الزوج أثناء الكولداون
+    """
     if not r:
         return True
 
@@ -513,7 +518,6 @@ def run():
                     continue
 
                 candle_time = get_last_candle_time(df)
-                memory_key = f"{symbol}_{candle_time}"
                 now = time.time()
 
                 # local duplicate prevention
@@ -522,7 +526,7 @@ def run():
                     continue
 
                 if symbol in sent_cache:
-                    if now - sent_cache[symbol] < COOLDOWN_SECONDS and score_result["score"] < 7:
+                    if now - sent_cache[symbol] < COOLDOWN_SECONDS:
                         logger.info(f"{symbol} → skipped (cooldown in memory)")
                         continue
 
@@ -530,12 +534,12 @@ def run():
                     logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
 
-                # redis duplicate prevention
+                # redis duplicate prevention before candidate add
                 if already_sent_same_candle(symbol, candle_time, "long"):
                     logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
 
-                if in_cooldown(symbol, "long") and score_result["score"] < 7:
+                if in_cooldown(symbol, "long"):
                     logger.info(f"{symbol} → skipped (cooldown in Redis)")
                     continue
 
@@ -558,7 +562,6 @@ def run():
                         is_new=is_new,
                     ),
                     "candle_time": candle_time,
-                    "memory_key": memory_key,
                     "now": now,
                 })
 
@@ -587,7 +590,7 @@ def run():
                     signal_type="long",
                 )
 
-                if not locked and candidate["score"] < 7:
+                if not locked:
                     logger.info(f"{symbol} → skipped (reserve failed / duplicate)")
                     continue
 
