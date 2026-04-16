@@ -54,9 +54,10 @@ else:
     logger.warning("⚠️ REDIS_URL not found")
 
 # =========================
-# LOCAL MEMORY CACHE
+# LOCAL CACHE
 # =========================
 sent_cache = {}
+last_candle_cache = {}
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -93,11 +94,6 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
-    """
-    يحجز الإشارة:
-    - يمنع نفس الشمعة
-    - يمنع نفس الزوج أثناء الكولداون
-    """
     if not r:
         return True
 
@@ -426,8 +422,7 @@ def build_tradingview_link(symbol):
 
 def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new):
     symbol_clean = clean_symbol_for_message(symbol)
-    reasons = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
-    flags = " | ".join(score_result["flags"]) if score_result["flags"] else "إعداد"
+    details = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
     funding_text = score_result.get("funding_label", "🟡 محايد")
     signal_rating = score_result.get("signal_rating", "⚡ عادي")
     sl_pct = calculate_sl_percent(price, stop_loss)
@@ -436,8 +431,7 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 
     safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
-    safe_reasons = html.escape(reasons)
-    safe_flags = html.escape(flags)
+    safe_details = html.escape(details)
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
@@ -451,9 +445,7 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 🪙 BTC: {safe_btc}
 💸 التمويل: {safe_funding}{new_tag}
 
-📊 {safe_reasons}
-
-🔥 {safe_flags}
+📊 {safe_details}
 
 🔗 <a href="{safe_tv_link}">Open Chart</a>
 """
@@ -524,10 +516,10 @@ def run():
                 memory_key = f"{symbol}_{candle_time}"
                 now = time.time()
 
-                if memory_key in sent_cache:
-                    if score_result["score"] < 7:
-                        logger.info(f"{symbol} → skipped (same candle in memory)")
-                        continue
+                # local duplicate prevention
+                if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
+                    logger.info(f"{symbol} → skipped (same candle in memory)")
+                    continue
 
                 if symbol in sent_cache:
                     if now - sent_cache[symbol] < COOLDOWN_SECONDS and score_result["score"] < 7:
@@ -538,7 +530,8 @@ def run():
                     logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
 
-                if already_sent_same_candle(symbol, candle_time, "long") and score_result["score"] < 7:
+                # redis duplicate prevention
+                if already_sent_same_candle(symbol, candle_time, "long"):
                     logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
 
@@ -574,7 +567,12 @@ def run():
                 reverse=True
             )
 
-            top_candidates = candidates[:MAX_ALERTS_PER_RUN]
+            unique_candidates = {}
+            for c in candidates:
+                if c["symbol"] not in unique_candidates:
+                    unique_candidates[c["symbol"]] = c
+
+            top_candidates = list(unique_candidates.values())[:MAX_ALERTS_PER_RUN]
 
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
@@ -598,8 +596,8 @@ def run():
                 if sent_ok:
                     sent_symbols_this_run.add(symbol)
                     sent_count += 1
-                    sent_cache[candidate["memory_key"]] = candidate["now"]
                     sent_cache[symbol] = candidate["now"]
+                    last_candle_cache[symbol] = candidate["candle_time"]
                     logger.info(f"SENT → {symbol} | score: {candidate['score']}")
                 else:
                     release_signal_slot(
