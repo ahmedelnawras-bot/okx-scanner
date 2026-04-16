@@ -68,7 +68,6 @@ else:
 # =========================
 sent_cache = {}
 last_candle_cache = {}
-sent_candle_cache = {}
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -636,14 +635,14 @@ def run():
 
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
-                candle_key = f"{symbol}_{candidate['candle_time']}"
 
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent final stage)")
                     continue
 
-                if candle_key in sent_candle_cache:
-                    logger.info(f"{symbol} → skipped (already sent this candle)")
+                # final redis same-candle check
+                if already_sent_same_candle(symbol, candidate["candle_time"], "long"):
+                    logger.info(f"{symbol} → skipped (already sent this candle Redis FINAL)")
                     continue
 
                 # final redis cooldown check
@@ -668,7 +667,6 @@ def run():
                     sent_count += 1
                     sent_cache[symbol] = candidate["now"]
                     last_candle_cache[symbol] = candidate["candle_time"]
-                    sent_candle_cache[candle_key] = True
 
                     register_trade(
                         redis_client=r,
