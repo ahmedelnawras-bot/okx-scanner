@@ -259,11 +259,20 @@ def get_ranked_pairs():
 
 
 def compute_rsi(series, period=14):
+    """
+    Wilder RSI (الأدق والأشهر)
+    """
     delta = series.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    avg_gain = gain.ewm(com=period - 1, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
 
 def compute_atr(df, period=14):
@@ -472,19 +481,24 @@ def get_candle_strength_ratio(df) -> float:
 
 
 def get_volume_ratio(df) -> float:
+    """
+    مقارنة حجم شمعة الإشارة بمتوسط آخر 20 شمعة قبلها
+    بدل الشمعة السابقة فقط
+    """
     try:
         signal_row = get_signal_row(df)
         idx = signal_row.name
         if idx is None or idx < 1:
             return 1.0
 
-        prev_volume = float(df.iloc[idx - 1]["volume"])
+        start_idx = max(0, idx - 20)
+        avg_volume = float(df.iloc[start_idx:idx]["volume"].mean())
         last_volume = float(signal_row["volume"])
 
-        if prev_volume <= 0:
+        if avg_volume <= 0:
             return 1.0
 
-        return round(last_volume / prev_volume, 4)
+        return round(last_volume / avg_volume, 4)
     except Exception:
         return 1.0
 
