@@ -8,6 +8,12 @@ import pandas as pd
 import redis
 
 from analysis.scoring import calculate_long_score, is_breakout
+from tracking.performance import (
+    register_trade,
+    update_open_trades,
+    get_winrate_summary,
+    format_winrate_summary,
+)
 
 # =========================
 # LOGGING
@@ -36,7 +42,7 @@ HTF_TIMEFRAME = "1H"
 
 MIN_SCORE = 5.0
 MAX_ALERTS_PER_RUN = 3
-COOLDOWN_SECONDS = 900
+COOLDOWN_SECONDS = 3600
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
@@ -271,7 +277,7 @@ def to_dataframe(data):
         "volCcy", "volCcyQuote", "confirm"
     ])
 
-    numeric_cols = ["ts", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote"]
+    numeric_cols = ["ts", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote", "confirm"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -313,9 +319,28 @@ def get_funding_rate(symbol):
         return 0.0
 
 
-def get_last_candle_time(df):
+def get_signal_row(df):
+    """
+    استخدم آخر شمعة confirmed فقط.
+    لو آخر شمعة غير مؤكدة، خذ اللي قبلها.
+    """
     try:
-        ts = int(df["ts"].iloc[-1])
+        if "confirm" not in df.columns or len(df) < 2:
+            return df.iloc[-2]
+
+        last = df.iloc[-1]
+        if str(int(float(last["confirm"]))) == "1":
+            return last
+
+        return df.iloc[-2]
+    except Exception:
+        return df.iloc[-2]
+
+
+def get_signal_candle_time(df):
+    try:
+        signal_row = get_signal_row(df)
+        ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
             return ts // 1000
         return ts
@@ -331,8 +356,13 @@ def early_bullish_signal(df):
         if df is None or df.empty or len(df) < 25:
             return False
 
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+        signal_idx = -1
+        if "confirm" in df.columns:
+            if str(int(float(df.iloc[-1]["confirm"]))) != "1":
+                signal_idx = -2
+
+        last = df.iloc[signal_idx]
+        prev = df.iloc[signal_idx - 1]
 
         score = 0
 
@@ -359,13 +389,13 @@ def is_higher_timeframe_confirmed(symbol):
         if df is None or df.empty:
             return False
 
-        last = df.iloc[-1]
-        ma_value = last.get("ma", None)
+        signal_row = get_signal_row(df)
+        ma_value = signal_row.get("ma", None)
 
         score = 0
-        if ma_value is not None and float(last["close"]) > float(ma_value):
+        if ma_value is not None and float(signal_row["close"]) > float(ma_value):
             score += 1
-        if float(last.get("rsi", 0)) > 50:
+        if float(signal_row.get("rsi", 0)) > 50:
             score += 1
 
         return score >= 1
@@ -383,14 +413,14 @@ def get_btc_mode():
         if df is None or df.empty:
             return "🟡 محايد"
 
-        last = df.iloc[-1]
-        ma_value = last.get("ma", None)
-        rsi_value = float(last.get("rsi", 50))
+        signal_row = get_signal_row(df)
+        ma_value = signal_row.get("ma", None)
+        rsi_value = float(signal_row.get("rsi", 50))
 
         if ma_value is not None:
-            if float(last["close"]) > float(ma_value) and rsi_value >= 55:
+            if float(signal_row["close"]) > float(ma_value) and rsi_value >= 55:
                 return "🟢 صاعد"
-            if float(last["close"]) < float(ma_value) and rsi_value <= 45:
+            if float(signal_row["close"]) < float(ma_value) and rsi_value <= 45:
                 return "🔴 هابط"
 
         return "🟡 محايد"
@@ -464,7 +494,9 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 def run():
     while True:
         try:
-            logger.info("🚀 Bot Started...")
+            update_open_trades(r, signal_type="long")
+            winrate_summary = get_winrate_summary(r, signal_type="long")
+            logger.info(format_winrate_summary(winrate_summary))
 
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
@@ -520,7 +552,7 @@ def run():
                     logger.info(f"{symbol} → rejected by score ({score_result['score']})")
                     continue
 
-                candle_time = get_last_candle_time(df)
+                candle_time = get_signal_candle_time(df)
                 now = time.time()
 
                 # local duplicate prevention
@@ -550,8 +582,9 @@ def run():
                     logger.info(f"{symbol} → skipped (cooldown in Redis)")
                     continue
 
-                price = float(df["close"].iloc[-1])
-                atr_value = float(df["atr"].iloc[-1])
+                signal_row = get_signal_row(df)
+                price = float(signal_row["close"])
+                atr_value = float(signal_row["atr"])
                 stop_loss = calculate_stop_loss(price, atr_value)
                 tv_link = build_tradingview_link(symbol)
 
@@ -570,6 +603,9 @@ def run():
                     ),
                     "candle_time": candle_time,
                     "now": now,
+                    "entry": price,
+                    "sl": stop_loss,
+                    "funding_label": score_result.get("funding_label", "🟡 محايد"),
                 })
                 candidates_symbols.add(symbol)
 
@@ -604,6 +640,20 @@ def run():
                     sent_count += 1
                     sent_cache[symbol] = candidate["now"]
                     last_candle_cache[symbol] = candidate["candle_time"]
+
+                    register_trade(
+                        redis_client=r,
+                        symbol=symbol,
+                        signal_type="long",
+                        candle_time=candidate["candle_time"],
+                        entry=candidate["entry"],
+                        sl=candidate["sl"],
+                        score=candidate["score"],
+                        timeframe=TIMEFRAME,
+                        btc_mode=btc_mode,
+                        funding_label=candidate["funding_label"],
+                    )
+
                     logger.info(f"SENT → {symbol} | score: {candidate['score']}")
                 else:
                     release_signal_slot(
