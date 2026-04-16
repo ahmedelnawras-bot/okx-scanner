@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import html
 import logging
@@ -13,7 +14,8 @@ from analysis.scoring import calculate_long_score, is_breakout
 # =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout
 )
 logger = logging.getLogger("okx-scanner")
 
@@ -471,6 +473,7 @@ def run():
             sent_count = 0
             sent_symbols_this_run = set()
             candidates = []
+            candidates_symbols = set()
 
             for pair_data in ranked_pairs:
                 tested += 1
@@ -534,7 +537,11 @@ def run():
                     logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
 
-                # redis duplicate prevention before candidate add
+                if symbol in candidates_symbols:
+                    logger.info(f"{symbol} → skipped (already queued this run)")
+                    continue
+
+                # redis duplicate prevention
                 if already_sent_same_candle(symbol, candle_time, "long"):
                     logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
@@ -564,18 +571,14 @@ def run():
                     "candle_time": candle_time,
                     "now": now,
                 })
+                candidates_symbols.add(symbol)
 
             candidates.sort(
                 key=lambda x: (x["score"], x["rank_volume_24h"]),
                 reverse=True
             )
 
-            unique_candidates = {}
-            for c in candidates:
-                if c["symbol"] not in unique_candidates:
-                    unique_candidates[c["symbol"]] = c
-
-            top_candidates = list(unique_candidates.values())[:MAX_ALERTS_PER_RUN]
+            top_candidates = candidates[:MAX_ALERTS_PER_RUN]
 
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
