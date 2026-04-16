@@ -44,16 +44,11 @@ def is_volume_spike(df, multiplier=1.2):
 
 
 def get_last_candle_time(df):
-    """
-    نستخدم ts الخام من OKX بشكل ثابت لنفس الشمعة.
-    """
     try:
         ts = df["ts"].iloc[-1]
         ts = int(ts)
-
         if ts > 10_000_000_000:
             ts = ts // 1000
-
         return ts
     except Exception as e:
         print(f"⚠️ candle time error: {e}")
@@ -122,9 +117,8 @@ def get_btc_mode():
         df = add_rsi(df)
 
         last = df.iloc[-1]
-
         ma_value = last.get("ma", None)
-        rsi_value = last.get("rsi", 50)
+        rsi_value = float(last.get("rsi", 50))
 
         if ma_value is not None:
             if last["close"] > ma_value and rsi_value >= 55:
@@ -166,7 +160,7 @@ def is_higher_timeframe_confirmed(symbol):
         if ma_value is not None and last["close"] > ma_value:
             score += 1
 
-        if last.get("rsi", 0) > 50:
+        if float(last.get("rsi", 0)) > 50:
             score += 1
 
         return score >= 1
@@ -176,9 +170,17 @@ def is_higher_timeframe_confirmed(symbol):
         return False
 
 
-def build_tradingview_link(symbol):
-    tv_symbol = symbol.replace("-", "")
-    return f"https://www.tradingview.com/chart/?symbol=OKX:{tv_symbol}"
+def is_breakout(df, lookback=20):
+    try:
+        if df is None or df.empty or len(df) < lookback + 2:
+            return False
+
+        recent_high = df["high"].rolling(lookback).max().iloc[-2]
+        last_close = df["close"].iloc[-1]
+        return bool(last_close > recent_high)
+    except Exception as e:
+        print(f"Breakout error: {e}")
+        return False
 
 
 def calculate_stop_loss(price, atr_value):
@@ -186,6 +188,21 @@ def calculate_stop_loss(price, atr_value):
         return round(float(price) - (float(atr_value) * 1.2), 6)
     except Exception:
         return round(float(price), 6)
+
+
+def clean_symbol_for_message(symbol):
+    return symbol.replace("-SWAP", "")
+
+
+def build_tradingview_link(symbol):
+    """
+    TradingView futures on OKX perp format:
+    SPACE-USDT-SWAP -> OKX:SPACEUSDT.P
+    BTC-USDT-SWAP   -> OKX:BTCUSDT.P
+    """
+    base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
+    tv_symbol = f"OKX:{base}USDT.P"
+    return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
 
 
 def run():
@@ -230,12 +247,13 @@ def run():
             signal = early_bullish_signal(df)
             volume_spike = is_volume_spike(df, multiplier=1.2)
             mtf_confirmed = is_higher_timeframe_confirmed(symbol)
+            breakout = is_breakout(df, lookback=20)
 
             if signal:
                 score = calculate_long_score(df)
 
                 if volume_spike:
-                    score += 0.5
+                    score += 0.3
                 else:
                     score -= 1.0
 
@@ -244,14 +262,16 @@ def run():
                 else:
                     score -= 0.5
 
+                if breakout:
+                    score += 0.5
+
                 if "🔴" in btc_mode:
                     score -= 1.0
                 elif "🟢" in btc_mode:
-                    score += 0.5
+                    score += 0.3
 
                 if score < 0:
                     score = 0
-
                 if score > 10:
                     score = 10
             else:
@@ -261,7 +281,8 @@ def run():
                 f"{symbol} → signal: {signal} | "
                 f"score: {score} | "
                 f"volume_spike: {volume_spike} | "
-                f"mtf: {mtf_confirmed}"
+                f"mtf: {mtf_confirmed} | "
+                f"breakout: {breakout}"
             )
 
             if not signal:
@@ -296,27 +317,30 @@ def run():
             atr_value = float(df["atr"].iloc[-1])
             stop_loss = calculate_stop_loss(price, atr_value)
             tv_link = build_tradingview_link(symbol)
+            msg_symbol = clean_symbol_for_message(symbol)
 
-            reasons = []
+            reasons = ["زخم مبكر"]
             flags = []
 
-            reasons.append("زخم مبكر")
             if volume_spike:
                 reasons.append("فوليوم قوي")
+                flags.append("Vol ↑")
+
+            if breakout:
+                reasons.append("اختراق")
+                flags.append("Break ✔")
+
+            if float(df["rsi"].iloc[-1]) > 50:
+                flags.append("RSI ↑")
+
             if mtf_confirmed:
                 reasons.append("تأكيد 1H")
-
-            if volume_spike:
-                flags.append("Vol ↑")
-            if df["rsi"].iloc[-1] > 50:
-                flags.append("RSI ↑")
-            if mtf_confirmed:
                 flags.append("MTF ✔")
 
             reason_line = " + ".join(reasons)
             flags_line = " | ".join(flags) if flags else "Setup"
 
-            message = f"""🚀 لونج فيوتشر | {symbol}
+            message = f"""🚀 لونج فيوتشر | {msg_symbol}
 
 💰 {round(price, 6)} | ⏱ 15m
 ⭐ {round(score, 1)} / 10 | 🛑 {stop_loss}
@@ -327,7 +351,8 @@ def run():
 
 🔥 {flags_line}
 
-🔗 {tv_link}
+🔗 TradingView
+{tv_link}
 """
 
             candidates.append({
