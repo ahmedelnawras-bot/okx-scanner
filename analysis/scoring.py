@@ -1,3 +1,15 @@
+# ================= BREAKOUT =================
+def is_breakout(df, lookback=20):
+    try:
+        recent_high = df["high"].rolling(lookback).max().iloc[-2]
+        current_close = df["close"].iloc[-1]
+
+        return current_close > recent_high
+    except:
+        return False
+
+
+# ================= SCORING =================
 def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
     score = 0
     reasons = []
@@ -16,7 +28,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
     elif 45 < rsi <= 50:
         score += 1
     elif rsi > 65:
-        score += 0.5  # مش زيادة أوي
+        score += 0.5
     else:
         score -= 1
 
@@ -61,17 +73,18 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
         score += 1.5
         flags.append("MTF")
 
-    # ================= BTC =================
+    # ================= BTC MODE =================
     if "🟢" in btc_mode:
         score += 1
     elif "🔴" in btc_mode:
         score -= 1
 
-    # ================= NEW =================
+    # ================= NEW LISTING =================
     if is_new:
         score += 0.5
+        flags.append("NEW")
 
-    # ================= FAKE FILTER =================
+    # ================= FAKE SIGNAL FILTER =================
     fake_signal = False
 
     # ضعيف جدًا
@@ -80,6 +93,10 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
 
     # مفيش حجم + RSI ضعيف
     if last["volume"] < prev["volume"] and rsi < 50:
+        fake_signal = True
+
+    # شمعة ضعيفة جدًا
+    if full > 0 and (body / full) < 0.3:
         fake_signal = True
 
     return {
