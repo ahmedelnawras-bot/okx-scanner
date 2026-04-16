@@ -68,6 +68,7 @@ else:
 # =========================
 sent_cache = {}
 last_candle_cache = {}
+sent_candle_cache = {}
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -378,7 +379,7 @@ def early_bullish_signal(df):
         if float(last["volume"]) > float(prev["volume"]):
             score += 1
 
-        return score >= 1
+        return score >= 2
 
     except Exception:
         return False
@@ -574,9 +575,10 @@ def run():
                     logger.info(f"{symbol} → skipped (same candle in memory)")
                     continue
 
+                # منع إرسال نفس الزوج لو اتبعت خلال 15 دقيقة
                 if symbol in sent_cache:
-                    if now - sent_cache[symbol] < COOLDOWN_SECONDS:
-                        logger.info(f"{symbol} → skipped (cooldown in memory)")
+                    if now - sent_cache[symbol] < 900:
+                        logger.info(f"{symbol} → skipped (15m recent send cache)")
                         continue
 
                 if symbol in sent_symbols_this_run:
@@ -634,9 +636,14 @@ def run():
 
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
+                candle_key = f"{symbol}_{candidate['candle_time']}"
 
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent final stage)")
+                    continue
+
+                if candle_key in sent_candle_cache:
+                    logger.info(f"{symbol} → skipped (already sent this candle)")
                     continue
 
                 # final redis cooldown check
@@ -661,6 +668,7 @@ def run():
                     sent_count += 1
                     sent_cache[symbol] = candidate["now"]
                     last_candle_cache[symbol] = candidate["candle_time"]
+                    sent_candle_cache[candle_key] = True
 
                     register_trade(
                         redis_client=r,
