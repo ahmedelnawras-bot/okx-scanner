@@ -45,58 +45,20 @@ def is_volume_spike(df, multiplier=1.2):
 
 def get_last_candle_time(df):
     """
-    نجيب وقت آخر شمعة بشكل ثابت قدر الإمكان.
+    نجيب وقت آخر شمعة بشكل ثابت من عمود ts فقط.
     """
-    if "timestamp" in df.columns:
-        try:
-            value = df["timestamp"].iloc[-1]
-            if hasattr(value, "timestamp"):
-                return int(value.timestamp())
-            value_str = str(value).strip()
-            if value_str.isdigit():
-                value_int = int(value_str)
-                if value_int > 10_000_000_000:
-                    return value_int // 1000
-                return value_int
-            return value_str
-        except Exception:
-            pass
-
-    if "ts" in df.columns:
-        try:
-            value = df["ts"].iloc[-1]
-            if isinstance(value, (int, float)):
-                if value > 10_000_000_000:
-                    return int(value // 1000)
-                return int(value)
-
-            value_str = str(value).strip()
-            if value_str.isdigit():
-                value_int = int(value_str)
-                if value_int > 10_000_000_000:
-                    return value_int // 1000
-                return value_int
-            return value_str
-        except Exception:
-            pass
-
     try:
-        idx_value = df.index[-1]
-        if hasattr(idx_value, "timestamp"):
-            return int(idx_value.timestamp())
-        value_str = str(idx_value).strip()
-        if value_str.isdigit():
-            value_int = int(value_str)
-            if value_int > 10_000_000_000:
-                return value_int // 1000
-            return value_int
-        return value_str
-    except Exception:
-        pass
+        ts = df["ts"].iloc[-1]
+        ts = int(ts)
 
-    # fallback: bucket 15m
-    now = int(time.time())
-    return (now // 900) * 900
+        # لو milliseconds
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+
+        return ts
+    except Exception as e:
+        print(f"⚠️ candle time error: {e}")
+        return 0
 
 
 def get_same_candle_key(symbol, candle_time, signal_type="long"):
@@ -139,9 +101,9 @@ def mark_sent(symbol, candle_time, signal_type="long"):
     cooldown_key = get_cooldown_key(symbol, signal_type)
 
     try:
-        # نفس الشمعة نخليها محفوظة شوية أطول من 15 دقيقة
+        # نفس الشمعة نخليها محفوظة شوية أطول
         r.set(same_candle_key, "1", ex=3600)
-        # الكولداون 15 دقيقة
+        # كولداون 15 دقيقة
         r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
         print(f"✅ Redis saved for {symbol} | candle={candle_time}")
     except Exception as e:
@@ -210,6 +172,10 @@ def run():
                 continue
 
             candle_time = get_last_candle_time(df)
+            if candle_time == 0:
+                print(f"{symbol} → skipped (invalid candle time)")
+                continue
+
             same_candle_key = get_same_candle_key(symbol, candle_time, "long")
 
             # منع التكرار داخل نفس run
