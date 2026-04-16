@@ -47,18 +47,16 @@ FINAL_MIN_SCORE = 7.5
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
-LOCAL_RECENT_SEND_SECONDS = 1800   # 30 دقيقة
-GLOBAL_COOLDOWN_SECONDS = 120      # دقيقتين بين دفعات الإرسال
+LOCAL_RECENT_SEND_SECONDS = 2700   # 45 دقيقة
+GLOBAL_COOLDOWN_SECONDS = 120
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
-# Top Momentum filter
 TOP_MOMENTUM_PERCENT = 0.20
 TOP_MOMENTUM_MIN_SCORE = 7.0
 TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
 
-# New listings balanced mode
 NEW_LISTING_MIN_VOL_RATIO = 1.8
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
@@ -120,11 +118,6 @@ def is_symbol_on_cooldown(symbol: str, signal_type: str = "long") -> bool:
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
-    """
-    Atomic reserve:
-    - يمنع نفس الشمعة
-    - يمنع نفس الزوج أثناء الكولداون
-    """
     if not r:
         return True
 
@@ -200,9 +193,7 @@ def send_telegram_message(message: str) -> bool:
 # OKX DATA
 # =========================
 def is_excluded_symbol(symbol: str) -> bool:
-    excluded_prefixes = (
-        "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USD0"
-    )
+    excluded_prefixes = ("USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USD0")
     if symbol.startswith(excluded_prefixes):
         return True
 
@@ -272,7 +263,6 @@ def compute_rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
@@ -281,7 +271,6 @@ def compute_atr(df, period=14):
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
-
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
@@ -303,7 +292,6 @@ def to_dataframe(data):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.sort_values("ts").reset_index(drop=True)
-
     df["ma"] = df["close"].rolling(20).mean()
     df["rsi"] = compute_rsi(df["close"])
     df["atr"] = compute_atr(df)
@@ -313,11 +301,7 @@ def to_dataframe(data):
 
 def get_candles(symbol, timeframe="15m", limit=100):
     try:
-        params = {
-            "instId": symbol,
-            "bar": timeframe,
-            "limit": limit,
-        }
+        params = {"instId": symbol, "bar": timeframe, "limit": limit}
         res = requests.get(OKX_CANDLES_URL, params=params, timeout=20).json()
         return res.get("data", [])
     except Exception as e:
@@ -330,10 +314,8 @@ def get_funding_rate(symbol):
         params = {"instId": symbol}
         res = requests.get(OKX_FUNDING_URL, params=params, timeout=10).json()
         data = res.get("data", [])
-
         if not data:
             return 0.0
-
         return float(data[0].get("fundingRate", 0))
     except Exception as e:
         logger.error(f"Funding rate error on {symbol}: {e}")
@@ -383,13 +365,10 @@ def early_bullish_signal(df):
         prev = df.iloc[signal_idx - 1]
 
         score = 0
-
         if float(last["close"]) > float(last["open"]):
             score += 1
-
         if "rsi" in df.columns and float(last["rsi"]) > 50:
             score += 1
-
         if float(last["volume"]) > float(prev["volume"]):
             score += 1
 
@@ -513,19 +492,14 @@ def get_volume_ratio(df) -> float:
 
 def passes_new_listing_filter(score: float, breakout: bool, vol_ratio: float, candle_strength: float) -> bool:
     checks = 0
-
     if breakout:
         checks += 1
-
     if vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
         checks += 1
-
     if candle_strength >= NEW_LISTING_MIN_CANDLE_STRENGTH:
         checks += 1
-
     if score >= TOP_MOMENTUM_NEW_MIN_SCORE:
         checks += 1
-
     return checks >= 3
 
 
@@ -551,13 +525,6 @@ def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new
 
 
 def get_candidate_bucket(candidate: dict) -> str:
-    """
-    Bucket للتنويع:
-    - new_breakout
-    - breakout
-    - volume
-    - standard
-    """
     if candidate["is_new"] and candidate["breakout"]:
         return "new_breakout"
     if candidate["breakout"]:
@@ -608,11 +575,6 @@ def apply_top_momentum_filter(candidates):
 
 
 def diversify_candidates(candidates, max_alerts=3):
-    """
-    تنويع أقوى:
-    - ما ناخدش إشارات متشابهة جدًا
-    - كل bucket مرة واحدة قدر الإمكان
-    """
     if not candidates:
         return []
 
@@ -630,7 +592,6 @@ def diversify_candidates(candidates, max_alerts=3):
     diversified = []
     used_patterns = set()
 
-    # أول pass: أحسن واحدة من كل bucket
     for bucket_name in ["new_breakout", "breakout", "volume", "standard"]:
         if bucket_name not in buckets or not buckets[bucket_name]:
             continue
@@ -649,7 +610,6 @@ def diversify_candidates(candidates, max_alerts=3):
         if len(diversified) >= max_alerts:
             break
 
-    # ثاني pass: نكمل بأعلى المتبقين بشرط عدم التشابه الشديد
     if len(diversified) < max_alerts:
         remaining = []
         for items in buckets.values():
@@ -672,7 +632,6 @@ def diversify_candidates(candidates, max_alerts=3):
 
             if pattern in used_patterns:
                 continue
-
             if candidate in diversified:
                 continue
 
@@ -804,7 +763,7 @@ def run():
                     continue
 
                 if symbol in sent_cache and now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
-                    logger.info(f"{symbol} → skipped (local cooldown 30m)")
+                    logger.info(f"{symbol} → skipped (local cooldown active)")
                     continue
 
                 if symbol in sent_symbols_this_run:
