@@ -11,7 +11,7 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-COOLDOWN_SECONDS = 900   # 15 دقيقة
+COOLDOWN_SECONDS = 3600   # ساعة كاملة للفيوتشر
 MAX_ALERTS_PER_RUN = 3
 SCAN_LIMIT = 200
 
@@ -45,23 +45,16 @@ def is_volume_spike(df, multiplier=1.2):
 
 def get_last_candle_time(df):
     """
-    نستخدم timestamp الخام من OKX بشكل ثابت لنفس الشمعة.
+    نستخدم ts الخام من OKX بشكل ثابت لنفس الشمعة.
     """
     try:
-        if "ts" in df.columns:
-            ts = df["ts"].iloc[-1]
-        else:
-            # fallback: أول عمود في الصف الأخير
-            ts = df.iloc[-1][0]
-
+        ts = df["ts"].iloc[-1]
         ts = int(ts)
 
-        # لو milliseconds نحوله لثواني
         if ts > 10_000_000_000:
             ts = ts // 1000
 
         return ts
-
     except Exception as e:
         print(f"⚠️ candle time error: {e}")
         return 0
@@ -107,17 +100,94 @@ def mark_sent(symbol, candle_time, signal_type="long"):
     cooldown_key = get_cooldown_key(symbol, signal_type)
 
     try:
-        # نخزن نفس الشمعة لمدة ساعة
-        r.set(same_candle_key, "1", ex=3600)
-        # كولداون 15 دقيقة
+        # نفس الشمعة
+        r.set(same_candle_key, "1", ex=7200)
+        # كولداون ساعة
         r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
         print(f"✅ Redis saved for {symbol} | candle={candle_time}")
     except Exception as e:
         print(f"Redis save error: {e}")
 
 
+def get_btc_mode():
+    """
+    تحليل بسيط للبيتكوين على 1H
+    """
+    try:
+        candles = get_candles("BTC-USDT-SWAP", "1H", 100)
+        df = to_dataframe(candles)
+
+        if df is None or df.empty:
+            return "🟡 محايد"
+
+        df = add_ma(df)
+        df = add_rsi(df)
+
+        last = df.iloc[-1]
+
+        ma_value = last.get("ma", None)
+        rsi_value = last.get("rsi", 50)
+
+        if ma_value is not None:
+            if last["close"] > ma_value and rsi_value >= 55:
+                return "🟢 صاعد (داعم)"
+            elif last["close"] < ma_value and rsi_value <= 45:
+                return "🔴 هابط (ضاغط)"
+            else:
+                return "🟡 محايد"
+
+        return "🟡 محايد"
+
+    except Exception as e:
+        print(f"BTC mode error: {e}")
+        return "🟡 محايد"
+
+
+def is_higher_timeframe_confirmed(symbol):
+    """
+    تأكيد 1H للفيوتشر
+    """
+    try:
+        candles = get_candles(symbol, "1H", 100)
+        df = to_dataframe(candles)
+
+        if df is None or df.empty:
+            return False
+
+        df = add_ma(df)
+        df = add_rsi(df)
+
+        last = df.iloc[-1]
+        ma_value = last.get("ma", None)
+
+        if ma_value is None:
+            return False
+
+        return last["close"] > ma_value and last["rsi"] > 50
+
+    except Exception as e:
+        print(f"MTF error on {symbol}: {e}")
+        return False
+
+
+def build_tradingview_link(symbol):
+    # مثال: BTC-USDT-SWAP -> OKX:BTCUSDTSWAP
+    tv_symbol = symbol.replace("-", "")
+    return f"https://www.tradingview.com/chart/?symbol=OKX:{tv_symbol}"
+
+
+def calculate_stop_loss(price, atr_value):
+    try:
+        return round(float(price) - (float(atr_value) * 1.2), 6)
+    except Exception:
+        return round(float(price), 6)
+
+
 def run():
     print("🚀 Bot Started...")
+
+    btc_mode = get_btc_mode()
+    print(f"BTC mode: {btc_mode}")
 
     futures = get_tickers("SWAP")
     print(f"Fetched {len(futures)} futures pairs")
@@ -154,21 +224,45 @@ def run():
 
             signal = early_bullish_signal(df)
             volume_spike = is_volume_spike(df, multiplier=1.2)
+            mtf_confirmed = is_higher_timeframe_confirmed(symbol)
 
             if signal:
                 score = calculate_long_score(df)
 
-                if not volume_spike:
-                    score -= 1.5
+                # bonus/penalty
+                if volume_spike:
+                    score += 0.5
+                else:
+                    score -= 1.0
+
+                if mtf_confirmed:
+                    score += 0.5
+
+                if "🔴" in btc_mode:
+                    score -= 1.0
+                elif "🟢" in btc_mode:
+                    score += 0.5
 
                 if score < 0:
                     score = 0
+
+                if score > 10:
+                    score = 10
             else:
                 score = 0
 
-            print(f"{symbol} → signal: {signal} | score: {score} | volume_spike: {volume_spike}")
+            print(
+                f"{symbol} → signal: {signal} | "
+                f"score: {score} | "
+                f"volume_spike: {volume_spike} | "
+                f"mtf: {mtf_confirmed}"
+            )
 
+            # الفلاتر النهائية
             if not signal:
+                continue
+
+            if not mtf_confirmed:
                 continue
 
             if score < 7.5:
@@ -184,37 +278,46 @@ def run():
 
             same_candle_key = get_same_candle_key(symbol, candle_time, "long")
 
-            # منع التكرار داخل نفس run
             if same_candle_key in collected_keys:
                 print(f"{symbol} → skipped (already collected in this run)")
                 continue
 
-            # منع التكرار من Redis لنفس الشمعة
             if already_sent_same_candle(symbol, candle_time, "long"):
                 print(f"{symbol} → skipped (same candle in Redis)")
                 continue
 
-            # منع إعادة نفس الزوج خلال الكولداون
             if in_cooldown(symbol, "long"):
                 print(f"{symbol} → skipped (cooldown in Redis)")
                 continue
 
-            price = df["close"].iloc[-1]
-            volume_line = "💥 Volume Spike" if volume_spike else "📊 Volume عادي"
+            price = float(df["close"].iloc[-1])
+            atr_value = float(df["atr"].iloc[-1])
+            stop_loss = calculate_stop_loss(price, atr_value)
+            tv_link = build_tradingview_link(symbol)
 
-            message = f"""🚀 لونج فيوتشر
+            reason_line = "زخم مبكر + فوليوم قوي + تأكيد 1H"
+            flags = []
 
-{symbol}
+            if volume_spike:
+                flags.append("Vol ↑")
+            if df["rsi"].iloc[-1] > 50:
+                flags.append("RSI ↑")
+            flags.append("MTF ✔")
 
-💰 {price}
-⏱ 15m
+            flags_line = " | ".join(flags)
 
-⭐ {score} / 10
-🪙 BTC: --
+            message = f"""🚀 لونج فيوتشر | {symbol}
 
-📊 إشارة لونج أولية
-{volume_line}
-🔥 Long detected
+💰 {round(price, 6)} | ⏱ 15m
+⭐ {round(score, 1)} / 10 | 🛑 {stop_loss}
+
+🪙 BTC: {btc_mode}
+
+📊 {reason_line}
+
+🔥 {flags_line}
+
+🔗 {tv_link}
 """
 
             candidates.append({
@@ -230,6 +333,7 @@ def run():
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
+    # ترتيب الأفضل
     candidates.sort(
         key=lambda x: (x["score"], x["volume_spike"]),
         reverse=True
