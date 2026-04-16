@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-import json
 import redis
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +13,7 @@ from analysis.scoring import calculate_long_score
 
 COOLDOWN_SECONDS = 900   # 15 دقيقة
 MAX_ALERTS_PER_RUN = 3
-REDIS_KEY = "alert_state"
+SCAN_LIMIT = 200
 
 REDIS_URL = os.environ.get("REDIS_URL")
 
@@ -22,41 +21,13 @@ r = None
 if REDIS_URL:
     try:
         r = redis.from_url(REDIS_URL, decode_responses=True)
+        r.ping()
         print("✅ Redis connected")
     except Exception as e:
         print(f"❌ Redis connection error: {e}")
         r = None
 else:
     print("⚠️ REDIS_URL not found")
-
-
-def load_state():
-    default_state = {
-        "last_sent_at": {},
-        "last_fingerprint": {},
-    }
-
-    if not r:
-        return default_state
-
-    try:
-        data = r.get(REDIS_KEY)
-        if data:
-            return json.loads(data)
-    except Exception as e:
-        print(f"Redis load error: {e}")
-
-    return default_state
-
-
-def save_state(state):
-    if not r:
-        return
-
-    try:
-        r.set(REDIS_KEY, json.dumps(state))
-    except Exception as e:
-        print(f"Redis save error: {e}")
 
 
 def is_volume_spike(df, multiplier=1.2):
@@ -74,21 +45,26 @@ def is_volume_spike(df, multiplier=1.2):
 
 def get_last_candle_time(df):
     """
-    يجيب وقت آخر شمعة من الداتا نفسها
+    نجيب وقت آخر شمعة بشكل ثابت قدر الإمكان.
     """
     if "timestamp" in df.columns:
         try:
             value = df["timestamp"].iloc[-1]
             if hasattr(value, "timestamp"):
                 return int(value.timestamp())
-            return str(value)
+            value_str = str(value).strip()
+            if value_str.isdigit():
+                value_int = int(value_str)
+                if value_int > 10_000_000_000:
+                    return value_int // 1000
+                return value_int
+            return value_str
         except Exception:
             pass
 
     if "ts" in df.columns:
         try:
             value = df["ts"].iloc[-1]
-
             if isinstance(value, (int, float)):
                 if value > 10_000_000_000:
                     return int(value // 1000)
@@ -98,9 +74,8 @@ def get_last_candle_time(df):
             if value_str.isdigit():
                 value_int = int(value_str)
                 if value_int > 10_000_000_000:
-                    return int(value_int // 1000)
+                    return value_int // 1000
                 return value_int
-
             return value_str
         except Exception:
             pass
@@ -109,41 +84,71 @@ def get_last_candle_time(df):
         idx_value = df.index[-1]
         if hasattr(idx_value, "timestamp"):
             return int(idx_value.timestamp())
-        return str(idx_value)
+        value_str = str(idx_value).strip()
+        if value_str.isdigit():
+            value_int = int(value_str)
+            if value_int > 10_000_000_000:
+                return value_int // 1000
+            return value_int
+        return value_str
     except Exception:
         pass
 
-    now = time.time()
-    return int(now // (15 * 60))
+    # fallback: bucket 15m
+    now = int(time.time())
+    return (now // 900) * 900
 
 
-def get_fingerprint(df, symbol, signal_type="long"):
-    candle_time = get_last_candle_time(df)
-    return f"{symbol}_{signal_type}_{candle_time}"
+def get_same_candle_key(symbol, candle_time, signal_type="long"):
+    return f"sent:{signal_type}:{symbol}:{candle_time}"
 
 
-def should_send_alert(state, signal_key, fingerprint, now, cooldown_seconds):
-    # منع تكرار نفس الشمعة
-    if state["last_fingerprint"].get(signal_key) == fingerprint:
-        return False, "same candle"
-
-    # منع إعادة التنبيه بسرعة
-    last_time = float(state["last_sent_at"].get(signal_key, 0))
-    if now - last_time < cooldown_seconds:
-        return False, "cooldown"
-
-    return True, "ok"
+def get_cooldown_key(symbol, signal_type="long"):
+    return f"cooldown:{signal_type}:{symbol}"
 
 
-def mark_alert_sent(state, signal_key, fingerprint, now):
-    state["last_sent_at"][signal_key] = now
-    state["last_fingerprint"][signal_key] = fingerprint
-    save_state(state)
+def already_sent_same_candle(symbol, candle_time, signal_type="long"):
+    if not r:
+        return False
+
+    key = get_same_candle_key(symbol, candle_time, signal_type)
+    try:
+        return bool(r.exists(key))
+    except Exception as e:
+        print(f"Redis exists error (same candle): {e}")
+        return False
+
+
+def in_cooldown(symbol, signal_type="long"):
+    if not r:
+        return False
+
+    key = get_cooldown_key(symbol, signal_type)
+    try:
+        return bool(r.exists(key))
+    except Exception as e:
+        print(f"Redis exists error (cooldown): {e}")
+        return False
+
+
+def mark_sent(symbol, candle_time, signal_type="long"):
+    if not r:
+        return
+
+    same_candle_key = get_same_candle_key(symbol, candle_time, signal_type)
+    cooldown_key = get_cooldown_key(symbol, signal_type)
+
+    try:
+        # نفس الشمعة نخليها محفوظة شوية أطول من 15 دقيقة
+        r.set(same_candle_key, "1", ex=3600)
+        # الكولداون 15 دقيقة
+        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
+        print(f"✅ Redis saved for {symbol} | candle={candle_time}")
+    except Exception as e:
+        print(f"Redis save error: {e}")
 
 
 def run():
-    state = load_state()
-
     print("🚀 Bot Started...")
 
     futures = get_tickers("SWAP")
@@ -160,10 +165,10 @@ def run():
     print(f"USDT pairs: {len(usdt_pairs)}")
 
     tested = 0
-    collected_fingerprints = set()
+    collected_keys = set()
     candidates = []
 
-    for pair_data in usdt_pairs[:200]:
+    for pair_data in usdt_pairs[:SCAN_LIMIT]:
         tested += 1
         symbol = pair_data["instId"]
 
@@ -204,28 +209,25 @@ def run():
             if score < 8 and not volume_spike:
                 continue
 
-            now = time.time()
-            price = df["close"].iloc[-1]
+            candle_time = get_last_candle_time(df)
+            same_candle_key = get_same_candle_key(symbol, candle_time, "long")
 
-            signal_key = f"{symbol}_long"
-            fingerprint = get_fingerprint(df, symbol, "long")
-
-            if fingerprint in collected_fingerprints:
+            # منع التكرار داخل نفس run
+            if same_candle_key in collected_keys:
                 print(f"{symbol} → skipped (already collected in this run)")
                 continue
 
-            allowed, reason = should_send_alert(
-                state=state,
-                signal_key=signal_key,
-                fingerprint=fingerprint,
-                now=now,
-                cooldown_seconds=COOLDOWN_SECONDS,
-            )
-
-            if not allowed:
-                print(f"{symbol} → skipped ({reason})")
+            # منع التكرار من Redis لنفس الشمعة
+            if already_sent_same_candle(symbol, candle_time, "long"):
+                print(f"{symbol} → skipped (same candle in Redis)")
                 continue
 
+            # منع إعادة نفس الزوج خلال الكولداون
+            if in_cooldown(symbol, "long"):
+                print(f"{symbol} → skipped (cooldown in Redis)")
+                continue
+
+            price = df["close"].iloc[-1]
             volume_line = "💥 Volume Spike" if volume_spike else "📊 Volume عادي"
 
             message = f"""🚀 لونج فيوتشر
@@ -248,12 +250,10 @@ def run():
                 "score": float(score),
                 "volume_spike": bool(volume_spike),
                 "message": message,
-                "signal_key": signal_key,
-                "fingerprint": fingerprint,
-                "now": now,
+                "candle_time": candle_time,
             })
 
-            collected_fingerprints.add(fingerprint)
+            collected_keys.add(same_candle_key)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
@@ -268,21 +268,22 @@ def run():
     sent_count = 0
 
     for candidate in top_candidates:
-        send_telegram_message(candidate["message"])
+        sent_ok = send_telegram_message(candidate["message"])
 
-        mark_alert_sent(
-            state=state,
-            signal_key=candidate["signal_key"],
-            fingerprint=candidate["fingerprint"],
-            now=candidate["now"],
-        )
-
-        sent_count += 1
-        print(
-            f'SENT → {candidate["symbol"]} | '
-            f'score: {candidate["score"]} | '
-            f'volume_spike: {candidate["volume_spike"]}'
-        )
+        if sent_ok:
+            mark_sent(
+                symbol=candidate["symbol"],
+                candle_time=candidate["candle_time"],
+                signal_type="long",
+            )
+            sent_count += 1
+            print(
+                f'SENT → {candidate["symbol"]} | '
+                f'score: {candidate["score"]} | '
+                f'volume_spike: {candidate["volume_spike"]}'
+            )
+        else:
+            print(f'FAILED SEND → {candidate["symbol"]}')
 
     print(f"Candidates found: {len(candidates)}")
     print(f"Sent alerts this run: {sent_count}")
