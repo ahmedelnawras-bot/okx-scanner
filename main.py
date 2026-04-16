@@ -42,8 +42,7 @@ SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-MIN_SCORE = 5.0
-FINAL_MIN_SCORE = 7.5
+FINAL_MIN_SCORE = 6.8
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
@@ -720,9 +719,9 @@ def run():
                 if df is None or df.empty:
                     continue
 
-                signal = early_bullish_signal(df)
-                if not signal:
-                    logger.info(f"{symbol} → signal: False")
+                early_signal = early_bullish_signal(df)
+                if not early_signal:
+                    logger.info(f"{symbol} → early_signal: False")
                     continue
 
                 breakout = is_breakout(df)
@@ -740,8 +739,9 @@ def run():
                 )
 
                 logger.info(
-                    f"{symbol} → signal: True | "
+                    f"{symbol} → early_signal: True | "
                     f"score: {score_result['score']} | "
+                    f"score_signal: {score_result['signal']} | "
                     f"fake: {score_result['fake_signal']} | "
                     f"mtf: {mtf_confirmed} | "
                     f"new: {is_new}"
