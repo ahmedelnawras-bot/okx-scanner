@@ -507,6 +507,8 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 def run():
     while True:
         try:
+            logger.info(f"RUN START | pid={os.getpid()} | ts={int(time.time())}")
+
             # update performance tracking first
             update_open_trades(r, signal_type="long", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, signal_type="long")
@@ -639,6 +641,12 @@ def run():
                 if symbol in sent_symbols_this_run:
                     logger.info(f"{symbol} → skipped (already sent final stage)")
                     continue
+
+                logger.info(
+                    f"FINAL CHECK | {symbol} | candle={candidate['candle_time']} | "
+                    f"same_candle={already_sent_same_candle(symbol, candidate['candle_time'], 'long')} | "
+                    f"cooldown={is_symbol_on_cooldown(symbol, 'long')}"
+                )
 
                 # final redis same-candle check
                 if already_sent_same_candle(symbol, candidate["candle_time"], "long"):
