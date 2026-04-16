@@ -56,11 +56,13 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
         if ratio > 0.6:
             score += 1.5
             reasons.append("شمعة قوية")
+        elif ratio > 0.4:
+            score += 0.5
 
     # ================= REJECTION =================
     upper_wick = last["high"] - max(last["open"], last["close"])
     if upper_wick > body * 1.5:
-        score -= 1.5
+        score -= 1
 
     # ================= BREAKOUT =================
     if breakout:
@@ -91,12 +93,12 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new):
     if score < 3:
         fake_signal = True
 
-    # مفيش حجم + RSI ضعيف
-    if last["volume"] < prev["volume"] and rsi < 50:
+    # حجم ضعيف جدًا + RSI ضعيف
+    if last["volume"] < prev["volume"] * 0.8 and rsi < 45:
         fake_signal = True
 
     # شمعة ضعيفة جدًا
-    if full > 0 and (body / full) < 0.3:
+    if full > 0 and (body / full) < 0.2:
         fake_signal = True
 
     return {
