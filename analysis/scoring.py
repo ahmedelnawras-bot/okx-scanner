@@ -212,7 +212,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         # =========================
         fake_signal = False
 
-        if score < 5.5:
+        if score < 5.0:
             fake_signal = True
 
         if rejection and candle_strength < 0.55:
@@ -221,7 +221,7 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         if vol_ratio < 0.9 and not breakout:
             fake_signal = True
 
-        if not is_new and not mtf_confirmed and not breakout and score < 7.0:
+        if not is_new and not mtf_confirmed and not breakout and score < 6.2:
             fake_signal = True
 
         if close <= ma and not breakout:
