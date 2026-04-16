@@ -31,7 +31,7 @@ SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-MIN_SCORE = 5.0
+MIN_SCORE = 5.5
 MAX_ALERTS_PER_RUN = 3
 COOLDOWN_SECONDS = 3600
 MIN_24H_QUOTE_VOLUME = 1_000_000
@@ -72,7 +72,7 @@ def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "
     try:
         return bool(r.exists(get_same_candle_key(symbol, candle_time, signal_type)))
     except Exception as e:
-        logger.error(f"Redis exists error (same candle): {e}")
+        logger.error(f"Redis same candle exists error: {e}")
         return False
 
 
@@ -82,15 +82,15 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
     try:
         return bool(r.exists(get_cooldown_key(symbol, signal_type)))
     except Exception as e:
-        logger.error(f"Redis exists error (cooldown): {e}")
+        logger.error(f"Redis cooldown exists error: {e}")
         return False
 
 
 def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
     """
-    حجز Atomic قبل الإرسال:
-    - نفس الشمعة
-    - نفس الزوج لنفس النوع أثناء الكولداون
+    Atomic reserve:
+    - يمنع نفس الشمعة
+    - يمنع نفس الزوج خلال الكولداون
     """
     if not r:
         return True
@@ -137,7 +137,6 @@ def send_telegram_message(message: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
@@ -196,7 +195,12 @@ def extract_24h_quote_volume(ticker: dict) -> float:
 
 def get_ranked_pairs():
     try:
-        res = requests.get(OKX_TICKERS_URL, params={"instType": "SWAP"}, timeout=20).json()
+        res = requests.get(
+            OKX_TICKERS_URL,
+            params={"instType": "SWAP"},
+            timeout=20
+        ).json()
+
         data = res.get("data", [])
         logger.info(f"Fetched {len(data)} futures pairs")
 
@@ -387,7 +391,6 @@ def is_new_listing_by_candles(candles) -> bool:
 
 
 def build_tradingview_link(symbol):
-    # مثال: MINA-USDT-SWAP -> OKX:MINAUSDT.P
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
     tv_symbol = f"OKX:{base}USDT.P"
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
@@ -468,7 +471,6 @@ def run():
                     f"{symbol} → signal: True | "
                     f"score: {score_result['score']} | "
                     f"fake: {score_result['fake_signal']} | "
-                    f"breakout: {breakout} | "
                     f"mtf: {mtf_confirmed} | "
                     f"new: {is_new}"
                 )
