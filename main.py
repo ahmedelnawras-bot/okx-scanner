@@ -10,16 +10,16 @@ from services.okx_client import get_tickers, get_candles
 from services.telegram_sender import send_telegram_message
 from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
-from analysis.scoring import calculate_long_score
+from analysis.scoring import calculate_long_score, is_breakout
 
 # =========================
 # SETTINGS
 # =========================
-COOLDOWN_SECONDS = 3600           # ساعة
-MAX_ALERTS_PER_RUN = 2            # نقلل السبام
-SCAN_LIMIT = 200                  # Top 200
-MIN_24H_QUOTE_VOLUME = 1_000_000  # فلتر سيولة
-NEW_LISTING_MAX_CANDLES = 50      # أقل من 50 شمعة = عملة جديدة تقريبًا
+COOLDOWN_SECONDS = 3600
+MAX_ALERTS_PER_RUN = 2
+SCAN_LIMIT = 200
+MIN_24H_QUOTE_VOLUME = 1_000_000
+NEW_LISTING_MAX_CANDLES = 50
 
 REDIS_URL = os.environ.get("REDIS_URL")
 
@@ -37,7 +37,7 @@ else:
 
 
 # =========================
-# REDIS KEYS
+# REDIS
 # =========================
 def clean_symbol_for_message(symbol: str) -> str:
     return symbol.replace("-SWAP", "")
@@ -50,11 +50,6 @@ def get_same_candle_key(symbol: str, candle_time: int, signal_type: str = "long"
 def get_cooldown_key(symbol: str, signal_type: str = "long") -> str:
     clean = clean_symbol_for_message(symbol)
     return f"cooldown:{signal_type}:{clean}"
-
-
-def get_pair_lock_key(symbol: str, signal_type: str = "long") -> str:
-    clean = clean_symbol_for_message(symbol)
-    return f"pairlock:{signal_type}:{clean}"
 
 
 def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
@@ -77,26 +72,46 @@ def in_cooldown(symbol: str, signal_type: str = "long") -> bool:
         return False
 
 
-def pair_locked(symbol: str, signal_type: str = "long") -> bool:
+def reserve_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> bool:
+    """
+    حجز Atomic قبل الإرسال:
+    1) نفس الشمعة
+    2) نفس الزوج لمدة ساعة
+    """
     if not r:
-        return False
+        return True
+
+    same_candle_key = get_same_candle_key(symbol, candle_time, signal_type)
+    cooldown_key = get_cooldown_key(symbol, signal_type)
+
     try:
-        return bool(r.exists(get_pair_lock_key(symbol, signal_type)))
+        same_candle_ok = r.set(same_candle_key, "1", ex=7200, nx=True)
+        if not same_candle_ok:
+            return False
+
+        cooldown_ok = r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS, nx=True)
+        if not cooldown_ok:
+            try:
+                r.delete(same_candle_key)
+            except Exception:
+                pass
+            return False
+
+        return True
+
     except Exception as e:
-        print(f"Redis exists error (pair lock): {e}")
+        print(f"Redis reserve error: {e}")
         return False
 
 
-def mark_sent(symbol: str, candle_time: int, signal_type: str = "long") -> None:
+def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long") -> None:
     if not r:
         return
     try:
-        r.set(get_same_candle_key(symbol, candle_time, signal_type), "1", ex=7200)
-        r.set(get_cooldown_key(symbol, signal_type), "1", ex=COOLDOWN_SECONDS)
-        r.set(get_pair_lock_key(symbol, signal_type), "1", ex=COOLDOWN_SECONDS)
-        print(f"✅ Redis saved for {symbol} | candle={candle_time}")
+        r.delete(get_same_candle_key(symbol, candle_time, signal_type))
+        r.delete(get_cooldown_key(symbol, signal_type))
     except Exception as e:
-        print(f"Redis save error: {e}")
+        print(f"Redis release error: {e}")
 
 
 # =========================
@@ -123,7 +138,6 @@ def extract_24h_quote_volume(ticker: dict) -> float:
         "quoteVolume",
         "vol24h",
     ]
-
     for field in candidate_fields:
         value = ticker.get(field)
         if value is None:
@@ -132,7 +146,6 @@ def extract_24h_quote_volume(ticker: dict) -> float:
             return float(value)
         except Exception:
             continue
-
     return 0.0
 
 
@@ -146,10 +159,8 @@ def get_ranked_pairs():
 
         if "USDT" not in symbol:
             continue
-
         if not symbol.endswith("-SWAP"):
             continue
-
         if is_excluded_symbol(symbol):
             continue
 
@@ -171,33 +182,13 @@ def get_ranked_pairs():
 # =========================
 # HELPERS
 # =========================
-def is_volume_spike(df, multiplier=1.2):
-    if df is None or df.empty or len(df) < 20:
-        return False
-
-    last_volume = df["volume"].iloc[-1]
-    avg_volume_20 = df["volume"].rolling(20).mean().iloc[-1]
-
-    if avg_volume_20 == 0:
-        return False
-
-    return last_volume >= (avg_volume_20 * multiplier)
-
-
 def get_last_candle_time(df):
-    """
-    تثبيت وقت الشمعة بشكل صارم لتقليل التكرار.
-    """
     try:
         ts = int(df["ts"].iloc[-1])
-
-        # OKX غالبًا milliseconds
         if ts > 10_000_000_000:
             return ts // 1000
-
         return ts
     except Exception:
-        # fallback ثابت على 15m bucket
         return int(time.time() // (15 * 60))
 
 
@@ -219,10 +210,8 @@ def get_btc_mode():
         if ma_value is not None:
             if last["close"] > ma_value and rsi_value >= 55:
                 return "🟢 صاعد (داعم)"
-            elif last["close"] < ma_value and rsi_value <= 45:
+            if last["close"] < ma_value and rsi_value <= 45:
                 return "🔴 هابط (ضاغط)"
-            return "🟡 محايد"
-
         return "🟡 محايد"
 
     except Exception as e:
@@ -257,19 +246,6 @@ def is_higher_timeframe_confirmed(symbol):
         return False
 
 
-def is_breakout(df, lookback=20):
-    try:
-        if df is None or df.empty or len(df) < lookback + 2:
-            return False
-
-        recent_high = df["high"].rolling(lookback).max().iloc[-2]
-        last_close = df["close"].iloc[-1]
-        return bool(last_close > recent_high)
-    except Exception as e:
-        print(f"Breakout error: {e}")
-        return False
-
-
 def calculate_stop_loss(price, atr_value):
     try:
         return round(float(price) - (float(atr_value) * 1.2), 6)
@@ -285,37 +261,16 @@ def is_new_listing_by_candles(candles) -> bool:
 
 
 def build_tradingview_link(symbol):
-    """
-    MINA-USDT-SWAP -> OKX:MINAUSDT.P
-    """
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
     tv_symbol = f"OKX:{base}USDT.P"
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
 
 
-def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_confirmed, breakout, tv_link, is_new):
+def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new):
     symbol_clean = clean_symbol_for_message(symbol)
 
-    reasons = []
-    if volume_spike:
-        reasons.append("فوليوم قوي")
-    if breakout:
-        reasons.append("اختراق")
-    if mtf_confirmed:
-        reasons.append("تأكيد 1H")
-    if not reasons:
-        reasons.append("زخم مبكر")
-
-    reason_text = " + ".join(reasons)
-
-    flags = []
-    if volume_spike:
-        flags.append("Vol ↑")
-    flags.append("RSI ↑")
-    if mtf_confirmed:
-        flags.append("MTF ✔")
-
-    flags_text = " | ".join(flags)
+    reason_text = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
+    flags_text = " | ".join(score_result["flags"]) if score_result["flags"] else "Setup"
 
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
@@ -328,7 +283,7 @@ def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_c
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
 💰 {price:.6f} | ⏱ 15m
-⭐ {score:.1f} / 10 | 🛑 {stop_loss}
+⭐ {score_result["score"]:.1f} / 10 | 🛑 {stop_loss}
 
 🪙 BTC: {safe_btc}{new_tag}
 
@@ -352,8 +307,7 @@ def run():
     ranked_pairs = get_ranked_pairs()
 
     tested = 0
-    collected_keys = set()
-    sent_symbols = set()
+    sent_symbols_this_run = set()
     candidates = []
 
     for pair_data in ranked_pairs:
@@ -372,71 +326,43 @@ def run():
             df = add_rsi(df)
             df = add_atr(df)
 
-            signal = early_bullish_signal(df)
-            volume_spike = is_volume_spike(df, multiplier=1.2)
-            mtf_confirmed = is_higher_timeframe_confirmed(symbol)
             breakout = is_breakout(df, lookback=20)
+            mtf_confirmed = is_higher_timeframe_confirmed(symbol)
             is_new = is_new_listing_by_candles(candles)
 
-            if signal:
-                score = calculate_long_score(df)
+            # فلتر مبكر
+            signal = early_bullish_signal(df)
+            if not signal:
+                print(f"{symbol} → signal: False")
+                continue
 
-                if volume_spike:
-                    score += 0.3
-                else:
-                    score -= 1.0
-
-                if mtf_confirmed:
-                    score += 0.5
-                else:
-                    score -= 0.5
-
-                if breakout:
-                    score += 0.5
-
-                if "🔴" in btc_mode:
-                    score -= 1.0
-                elif "🟢" in btc_mode:
-                    score += 0.3
-
-                if is_new and score >= 7.5:
-                    score += 0.2
-
-                score = max(0, min(10, score))
-            else:
-                score = 0
+            score_result = calculate_long_score(
+                df=df,
+                mtf_confirmed=mtf_confirmed,
+                btc_mode=btc_mode,
+                breakout=breakout,
+                is_new=is_new,
+            )
 
             print(
-                f"{symbol} → signal: {signal} | "
-                f"score: {score} | "
-                f"volume_spike: {volume_spike} | "
-                f"mtf: {mtf_confirmed} | "
+                f"{symbol} → signal: True | "
+                f"score: {score_result['score']} | "
+                f"fake: {score_result['fake_signal']} | "
                 f"breakout: {breakout} | "
+                f"mtf: {mtf_confirmed} | "
                 f"new: {is_new}"
             )
 
-            if not signal:
+            if score_result["fake_signal"]:
                 continue
 
-            if score < 7.5:
-                continue
-
-            if score < 8 and not volume_spike:
+            if score_result["score"] < 7.5:
                 continue
 
             candle_time = get_last_candle_time(df)
-            if candle_time == 0:
-                print(f"{symbol} → skipped (invalid candle time)")
-                continue
 
-            same_candle_key = get_same_candle_key(symbol, candle_time, "long")
-
-            if symbol in sent_symbols:
+            if symbol in sent_symbols_this_run:
                 print(f"{symbol} → skipped (already sent this run)")
-                continue
-
-            if same_candle_key in collected_keys:
-                print(f"{symbol} → skipped (already collected in this run)")
                 continue
 
             if already_sent_same_candle(symbol, candle_time, "long"):
@@ -447,44 +373,32 @@ def run():
                 print(f"{symbol} → skipped (cooldown in Redis)")
                 continue
 
-            if pair_locked(symbol, "long"):
-                print(f"{symbol} → skipped (pair lock)")
-                continue
-
             price = float(df["close"].iloc[-1])
             atr_value = float(df["atr"].iloc[-1])
             stop_loss = calculate_stop_loss(price, atr_value)
             tv_link = build_tradingview_link(symbol)
 
-            message = build_message(
-                symbol=symbol,
-                price=price,
-                score=score,
-                stop_loss=stop_loss,
-                btc_mode=btc_mode,
-                volume_spike=volume_spike,
-                mtf_confirmed=mtf_confirmed,
-                breakout=breakout,
-                tv_link=tv_link,
-                is_new=is_new,
-            )
-
             candidates.append({
                 "symbol": symbol,
-                "score": float(score),
-                "volume_spike": bool(volume_spike),
+                "score": float(score_result["score"]),
                 "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
-                "message": message,
+                "message": build_message(
+                    symbol=symbol,
+                    price=price,
+                    score_result=score_result,
+                    stop_loss=stop_loss,
+                    btc_mode=btc_mode,
+                    tv_link=tv_link,
+                    is_new=is_new,
+                ),
                 "candle_time": candle_time,
             })
-
-            collected_keys.add(same_candle_key)
 
         except Exception as e:
             print(f"Error on {symbol}: {e}")
 
     candidates.sort(
-        key=lambda x: (x["score"], x["volume_spike"], x["rank_volume_24h"]),
+        key=lambda x: (x["score"], x["rank_volume_24h"]),
         reverse=True
     )
 
@@ -493,27 +407,34 @@ def run():
     sent_count = 0
 
     for candidate in top_candidates:
-        if candidate["symbol"] in sent_symbols:
-            print(f'{candidate["symbol"]} → skipped (already sent in final stage)')
+        symbol = candidate["symbol"]
+
+        if symbol in sent_symbols_this_run:
+            print(f"{symbol} → skipped (already sent final stage)")
+            continue
+
+        locked = reserve_signal_slot(
+            symbol=symbol,
+            candle_time=candidate["candle_time"],
+            signal_type="long",
+        )
+        if not locked:
+            print(f"{symbol} → skipped (reserve failed / duplicate)")
             continue
 
         sent_ok = send_telegram_message(candidate["message"])
 
         if sent_ok:
-            mark_sent(
-                symbol=candidate["symbol"],
+            sent_symbols_this_run.add(symbol)
+            sent_count += 1
+            print(f'SENT → {symbol} | score: {candidate["score"]}')
+        else:
+            release_signal_slot(
+                symbol=symbol,
                 candle_time=candidate["candle_time"],
                 signal_type="long",
             )
-            sent_symbols.add(candidate["symbol"])
-            sent_count += 1
-            print(
-                f'SENT → {candidate["symbol"]} | '
-                f'score: {candidate["score"]} | '
-                f'volume_spike: {candidate["volume_spike"]}'
-            )
-        else:
-            print(f'FAILED SEND → {candidate["symbol"]}')
+            print(f'FAILED SEND → {symbol}')
 
     print(f"Candidates found: {len(candidates)}")
     print(f"Sent alerts this run: {sent_count}")
