@@ -61,6 +61,12 @@ NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
 # =========================
+# DISTRIBUTED SCAN LOCK
+# =========================
+SCAN_LOCK_KEY = "scan:running"
+SCAN_LOCK_TTL = 180
+
+# =========================
 # REDIS
 # =========================
 r = None
@@ -151,6 +157,28 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         r.delete(get_symbol_cooldown_key(symbol, signal_type))
     except Exception as e:
         logger.error(f"Redis release error: {e}")
+
+
+def acquire_scan_lock() -> bool:
+    if not r:
+        return True
+
+    try:
+        locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
+        return bool(locked)
+    except Exception as e:
+        logger.error(f"Scan lock acquire error: {e}")
+        return False
+
+
+def release_scan_lock() -> None:
+    if not r:
+        return
+
+    try:
+        r.delete(SCAN_LOCK_KEY)
+    except Exception as e:
+        logger.error(f"Scan lock release error: {e}")
 
 
 # =========================
@@ -260,7 +288,7 @@ def get_ranked_pairs():
 
 def compute_rsi(series, period=14):
     """
-    Wilder RSI (الأدق والأشهر)
+    Wilder RSI
     """
     delta = series.diff()
 
@@ -707,7 +735,28 @@ def run():
     global last_global_send_ts
 
     while True:
+        scan_locked = False
+
         try:
+            # =========================
+            # GLOBAL COOLDOWN EARLY
+            # =========================
+            global_elapsed = time.time() - last_global_send_ts
+            if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
+                remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
+                logger.info(f"GLOBAL COOLDOWN active ({remaining}s) — skipping scan")
+                time.sleep(min(remaining, 60))
+                continue
+
+            # =========================
+            # SCAN LOCK
+            # =========================
+            scan_locked = acquire_scan_lock()
+            if not scan_locked:
+                logger.info("Another scan is running — skipping")
+                time.sleep(30)
+                continue
+
             logger.info(f"RUN START | pid={os.getpid()} | ts={int(time.time())}")
 
             update_open_trades(r, signal_type="long", timeframe=TIMEFRAME)
@@ -858,16 +907,6 @@ def run():
 
             top_candidates = diversify_candidates(candidates, MAX_ALERTS_PER_RUN)
 
-            global_elapsed = time.time() - last_global_send_ts
-            if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
-                remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
-                logger.info(f"GLOBAL COOLDOWN → skip sending this cycle ({remaining}s left)")
-                logger.info(f"Sent alerts this run: {sent_count}")
-                logger.info(f"Tested {tested} pairs")
-                logger.info("Sleeping 60 seconds...")
-                time.sleep(60)
-                continue
-
             for candidate in top_candidates:
                 symbol = candidate["symbol"]
 
@@ -943,6 +982,10 @@ def run():
         except Exception as e:
             logger.error(f"Fatal error: {e}")
             time.sleep(10)
+
+        finally:
+            if scan_locked:
+                release_scan_lock()
 
 
 if __name__ == "__main__":
