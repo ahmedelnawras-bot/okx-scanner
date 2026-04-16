@@ -99,6 +99,11 @@ def register_trade(
     if redis_client is None:
         return False
 
+    entry = round(float(entry), 6)
+    sl = round(float(sl), 6)
+    tp1 = calc_tp1(entry, sl)
+    tp2 = calc_tp2(entry, sl)
+
     trade_key = get_trade_key(signal_type, symbol, candle_time)
     open_set_key = get_open_trades_set_key(signal_type)
 
@@ -107,18 +112,21 @@ def register_trade(
         "signal_type": signal_type,
         "timeframe": timeframe,
         "candle_time": int(candle_time),
-        "entry": round(float(entry), 6),
-        "sl": round(float(sl), 6),
-        "tp1": calc_tp1(float(entry), float(sl)),
-        "tp2": calc_tp2(float(entry), float(sl)),
+        "entry": entry,
+        "sl": sl,
+        "initial_sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
         "score": round(float(score), 2),
         "btc_mode": btc_mode,
         "funding_label": funding_label,
-        "status": "open",
+        "status": "open",          # open / partial / closed
+        "tp1_hit": False,
+        "tp1_hit_at": None,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "closed_at": None,
-        "result": None,
+        "result": None,            # win / loss / expired
     }
 
     try:
@@ -209,6 +217,34 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         return False
 
 
+def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
+    """
+    بعد TP1:
+    - نعتبر الصفقة partial
+    - ننقل SL إلى entry (breakeven)
+    """
+    if redis_client is None:
+        return False
+
+    try:
+        if trade_data.get("tp1_hit"):
+            return True
+
+        trade_data["tp1_hit"] = True
+        trade_data["tp1_hit_at"] = int(time.time())
+        trade_data["status"] = "partial"
+        trade_data["sl"] = trade_data["entry"]  # move SL to BE
+        trade_data["updated_at"] = int(time.time())
+
+        stats_key = get_stats_key(trade_data.get("signal_type", "long"))
+        redis_client.hincrby(stats_key, "tp1_hits", 1)
+
+        return save_trade(redis_client, trade_key, trade_data)
+    except Exception as e:
+        logger.error(f"mark_tp1_hit error on {trade_key}: {e}")
+        return False
+
+
 def update_open_trades(
     redis_client,
     signal_type: str = "long",
@@ -217,8 +253,10 @@ def update_open_trades(
 ):
     """
     يراجع الصفقات المفتوحة:
-    - لو السعر لمس TP1 أولًا => win
-    - لو لمس SL أولًا => loss
+    - لو السعر لمس SL أولًا قبل TP1 => loss
+    - لو لمس TP1 => نحرك SL إلى entry ونكمل
+    - لو لمس TP2 بعد TP1 => win
+    - لو رجع لـ entry بعد TP1 => win
     - لو عدى عليها وقت طويل => expired
     """
     if redis_client is None:
@@ -244,7 +282,7 @@ def update_open_trades(
                 pass
             continue
 
-        if trade.get("status") != "open":
+        if trade.get("status") == "closed":
             try:
                 redis_client.srem(open_set_key, trade_key)
             except Exception:
@@ -252,8 +290,11 @@ def update_open_trades(
             continue
 
         symbol = trade["symbol"]
+        entry = safe_float(trade["entry"])
         sl = safe_float(trade["sl"])
         tp1 = safe_float(trade["tp1"])
+        tp2 = safe_float(trade["tp2"])
+        tp1_hit = bool(trade.get("tp1_hit", False))
         created_at = int(trade.get("created_at", now_ts))
 
         # Expired
@@ -269,8 +310,8 @@ def update_open_trades(
             continue
 
         result = None
+        state_changed = False
 
-        # Long logic
         for candle in candles:
             candle_ts = candle["ts"]
             if candle_ts > 10_000_000_000:
@@ -282,19 +323,45 @@ def update_open_trades(
             low = safe_float(candle["low"])
             high = safe_float(candle["high"])
 
-            # نفترض الأسوأ: لو الشمعة لمست SL و TP1 معًا في نفس الشمعة،
-            # نعتبرها loss للمحافظة.
-            if low <= sl:
-                result = "loss"
-                break
+            # قبل TP1
+            if not tp1_hit:
+                if low <= sl:
+                    result = "loss"
+                    break
 
-            if high >= tp1:
-                result = "win"
-                break
+                if high >= tp1:
+                    ok = mark_tp1_hit(redis_client, trade_key, trade)
+                    if ok:
+                        trade = load_trade(redis_client, trade_key) or trade
+                        tp1_hit = True
+                        sl = safe_float(trade["sl"])  # entry now
+                        state_changed = True
+                        logger.info(f"{symbol} → TP1 hit, SL moved to entry")
+                    else:
+                        logger.error(f"{symbol} → failed to mark TP1")
+                        break
+
+                    # لو نفس الشمعة كملت ووصلت TP2
+                    if high >= tp2:
+                        result = "win"
+                        break
+
+            # بعد TP1
+            else:
+                if high >= tp2:
+                    result = "win"
+                    break
+
+                # لو رجع للـ entry بعد TP1 نعتبرها win محفوظ
+                if low <= sl:
+                    result = "win"
+                    break
 
         if result:
             mark_trade_closed(redis_client, trade_key, trade, result)
             logger.info(f"{symbol} → trade closed as {result}")
+        elif state_changed:
+            logger.info(f"{symbol} → trade updated")
 
 
 def get_winrate_summary(redis_client, signal_type: str = "long"):
@@ -304,6 +371,7 @@ def get_winrate_summary(redis_client, signal_type: str = "long"):
             "losses": 0,
             "expired": 0,
             "open": 0,
+            "tp1_hits": 0,
             "winrate": 0.0,
         }
 
@@ -315,6 +383,7 @@ def get_winrate_summary(redis_client, signal_type: str = "long"):
         wins = int(stats.get("wins", 0))
         losses = int(stats.get("losses", 0))
         expired = int(stats.get("expired", 0))
+        tp1_hits = int(stats.get("tp1_hits", 0))
         open_count = int(redis_client.scard(open_set_key) or 0)
 
         decided = wins + losses
@@ -325,6 +394,7 @@ def get_winrate_summary(redis_client, signal_type: str = "long"):
             "losses": losses,
             "expired": expired,
             "open": open_count,
+            "tp1_hits": tp1_hits,
             "winrate": winrate,
         }
 
@@ -335,6 +405,7 @@ def get_winrate_summary(redis_client, signal_type: str = "long"):
             "losses": 0,
             "expired": 0,
             "open": 0,
+            "tp1_hits": 0,
             "winrate": 0.0,
         }
 
@@ -344,6 +415,7 @@ def format_winrate_summary(summary: dict) -> str:
         f"Win rate: {summary['winrate']}% | "
         f"Wins: {summary['wins']} | "
         f"Losses: {summary['losses']} | "
+        f"TP1 Hits: {summary['tp1_hits']} | "
         f"Expired: {summary['expired']} | "
         f"Open: {summary['open']}"
     )
