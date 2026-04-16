@@ -172,6 +172,11 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         score -= 0.8
         reasons.append("بعيد عن MA (متأخر)")
 
+    # فلترة تأخر قوي
+    if dist_ma > 6.0:
+        score -= 1.2
+        reasons.append("ممتد زيادة")
+
     # 2) Extension بعد الاختراق
     if breakout:
         try:
@@ -198,8 +203,13 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
         score += 0.5
         reasons.append("توافق قوي مبكر")
 
+    # 4) منع تضخم السكور
+    if score >= 8.8:
+        if not (breakout and mtf_confirmed and vol_ratio >= 1.5):
+            score -= 0.8
+
     # ===================== FINAL =====================
-    score = max(0.0, min(9.5, score))
+    score = max(0.0, min(9.2, score))
     score = round(score, 1)
 
     # ===================== Fake signal (مخفف ومحافظ) =====================
