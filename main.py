@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import redis
+import html
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,8 +12,8 @@ from analysis.indicators import to_dataframe, add_ma, add_rsi, add_atr
 from analysis.long_strategy import early_bullish_signal
 from analysis.scoring import calculate_long_score
 
-COOLDOWN_SECONDS = 3600   # ساعة كاملة للفيوتشر
-MAX_ALERTS_PER_RUN = 3
+COOLDOWN_SECONDS = 3600   # ساعة كاملة
+MAX_ALERTS_PER_RUN = 2
 SCAN_LIMIT = 200
 
 REDIS_URL = os.environ.get("REDIS_URL")
@@ -63,6 +64,10 @@ def get_cooldown_key(symbol, signal_type="long"):
     return f"cooldown:{signal_type}:{symbol}"
 
 
+def get_pair_lock_key(symbol, signal_type="long"):
+    return f"pairlock:{signal_type}:{symbol}"
+
+
 def already_sent_same_candle(symbol, candle_time, signal_type="long"):
     if not r:
         return False
@@ -87,25 +92,40 @@ def in_cooldown(symbol, signal_type="long"):
         return False
 
 
+def pair_locked(symbol, signal_type="long"):
+    if not r:
+        return False
+
+    key = get_pair_lock_key(symbol, signal_type)
+    try:
+        return bool(r.exists(key))
+    except Exception as e:
+        print(f"Redis exists error (pair lock): {e}")
+        return False
+
+
 def mark_sent(symbol, candle_time, signal_type="long"):
     if not r:
         return
 
     same_candle_key = get_same_candle_key(symbol, candle_time, signal_type)
     cooldown_key = get_cooldown_key(symbol, signal_type)
+    pair_lock_key = get_pair_lock_key(symbol, signal_type)
 
     try:
-        r.set(same_candle_key, "1", ex=7200)  # نفس الشمعة محفوظة ساعتين
-        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)  # كولداون ساعة
+        # نفس الشمعة
+        r.set(same_candle_key, "1", ex=7200)
+        # كولداون ساعة
+        r.set(cooldown_key, "1", ex=COOLDOWN_SECONDS)
+        # قفل الزوج ساعة
+        r.set(pair_lock_key, "1", ex=COOLDOWN_SECONDS)
+
         print(f"✅ Redis saved for {symbol} | candle={candle_time}")
     except Exception as e:
         print(f"Redis save error: {e}")
 
 
 def get_btc_mode():
-    """
-    تحليل بسيط للبيتكوين على 1H
-    """
     try:
         candles = get_candles("BTC-USDT-SWAP", "1H", 100)
         df = to_dataframe(candles)
@@ -138,8 +158,8 @@ def get_btc_mode():
 def is_higher_timeframe_confirmed(symbol):
     """
     تأكيد 1H مرن:
-    - فوق MA20 = نقطة
-    - RSI > 50 = نقطة
+    فوق MA20 = نقطة
+    RSI > 50 = نقطة
     ويكفي نقطة واحدة
     """
     try:
@@ -196,13 +216,60 @@ def clean_symbol_for_message(symbol):
 
 def build_tradingview_link(symbol):
     """
-    TradingView futures on OKX perp format:
+    OKX futures perp format:
     SPACE-USDT-SWAP -> OKX:SPACEUSDT.P
-    BTC-USDT-SWAP   -> OKX:BTCUSDT.P
     """
     base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
     tv_symbol = f"OKX:{base}USDT.P"
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+
+
+def build_message(symbol, price, score, stop_loss, btc_mode, volume_spike, mtf_confirmed, breakout, tv_link):
+    msg_symbol = clean_symbol_for_message(symbol)
+
+    reasons = ["زخم مبكر"]
+    flags = []
+
+    if volume_spike:
+        reasons.append("فوليوم قوي")
+        flags.append("Vol ↑")
+
+    if breakout:
+        reasons.append("اختراق")
+        flags.append("Break ✔")
+
+    flags.append("RSI ↑")
+
+    if mtf_confirmed:
+        reasons.append("تأكيد 1H")
+        flags.append("MTF ✔")
+
+    reason_line = " + ".join(reasons)
+    flags_lines = "\n".join([f"• {f}" for f in flags]) if flags else "• Setup"
+
+    safe_symbol = html.escape(msg_symbol)
+    safe_btc = html.escape(btc_mode)
+    safe_reason = html.escape(reason_line)
+    safe_tv_link = html.escape(tv_link, quote=True)
+
+    message = f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
+
+💰 <b>السعر:</b> {round(price, 6)}
+⏱ <b>الفريم:</b> 15m
+⭐ <b>السكور:</b> {round(score, 1)} / 10
+🛑 <b>الستوب:</b> {stop_loss}
+
+🪙 <b>BTC:</b> {safe_btc}
+
+📊 <b>السبب:</b>
+{safe_reason}
+
+🔥 <b>عوامل القوة:</b>
+{flags_lines}
+
+🔗 <a href="{safe_tv_link}">TradingView</a>
+"""
+    return message
 
 
 def run():
@@ -313,47 +380,26 @@ def run():
                 print(f"{symbol} → skipped (cooldown in Redis)")
                 continue
 
+            if pair_locked(symbol, "long"):
+                print(f"{symbol} → skipped (pair lock)")
+                continue
+
             price = float(df["close"].iloc[-1])
             atr_value = float(df["atr"].iloc[-1])
             stop_loss = calculate_stop_loss(price, atr_value)
             tv_link = build_tradingview_link(symbol)
-            msg_symbol = clean_symbol_for_message(symbol)
 
-            reasons = ["زخم مبكر"]
-            flags = []
-
-            if volume_spike:
-                reasons.append("فوليوم قوي")
-                flags.append("Vol ↑")
-
-            if breakout:
-                reasons.append("اختراق")
-                flags.append("Break ✔")
-
-            if float(df["rsi"].iloc[-1]) > 50:
-                flags.append("RSI ↑")
-
-            if mtf_confirmed:
-                reasons.append("تأكيد 1H")
-                flags.append("MTF ✔")
-
-            reason_line = " + ".join(reasons)
-            flags_line = " | ".join(flags) if flags else "Setup"
-
-            message = f"""🚀 لونج فيوتشر | {msg_symbol}
-
-💰 {round(price, 6)} | ⏱ 15m
-⭐ {round(score, 1)} / 10 | 🛑 {stop_loss}
-
-🪙 BTC: {btc_mode}
-
-📊 {reason_line}
-
-🔥 {flags_line}
-
-🔗 TradingView
-{tv_link}
-"""
+            message = build_message(
+                symbol=symbol,
+                price=price,
+                score=score,
+                stop_loss=stop_loss,
+                btc_mode=btc_mode,
+                volume_spike=volume_spike,
+                mtf_confirmed=mtf_confirmed,
+                breakout=breakout,
+                tv_link=tv_link,
+            )
 
             candidates.append({
                 "symbol": symbol,
