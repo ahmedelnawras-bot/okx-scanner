@@ -13,6 +13,8 @@ from tracking.performance import (
     update_open_trades,
     get_winrate_summary,
     format_winrate_summary,
+    get_period_summary,
+    format_period_summary,
     calc_tp1,
     calc_tp2,
 )
@@ -33,6 +35,8 @@ logger = logging.getLogger("okx-scanner")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
+
+TELEGRAM_OFFSET = 0
 
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
@@ -227,6 +231,116 @@ def send_telegram_message(message: str) -> bool:
     except Exception as e:
         logger.error(f"❌ Telegram Exception: {e}")
         return False
+
+
+def send_telegram_reply(chat_id: str, message: str) -> bool:
+    if not BOT_TOKEN or not chat_id:
+        logger.error("❌ Telegram reply config missing")
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+
+        if response.status_code != 200:
+            logger.error(f"❌ Telegram reply HTTP Error: {response.text}")
+            return False
+
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(f"❌ Telegram reply API Error: {data}")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Telegram reply Exception: {e}")
+        return False
+
+
+def get_telegram_updates(offset: int = 0):
+    if not BOT_TOKEN:
+        return []
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {
+        "timeout": 1,
+        "offset": offset,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+
+        if response.status_code != 200:
+            logger.error(f"❌ getUpdates HTTP Error: {response.text}")
+            return []
+
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(f"❌ getUpdates API Error: {data}")
+            return []
+
+        return data.get("result", [])
+
+    except Exception as e:
+        logger.error(f"❌ getUpdates Exception: {e}")
+        return []
+
+
+def build_report_message(period: str) -> str:
+    title_map = {
+        "1h": "Report - Last 1H",
+        "today": "Report - Today",
+        "all": "Report - All Time",
+    }
+
+    summary = get_period_summary(
+        redis_client=r,
+        period=period,
+        market_type="futures",
+        side="long",
+    )
+
+    return format_period_summary(title_map.get(period, "Report"), summary)
+
+
+def handle_telegram_commands():
+    global TELEGRAM_OFFSET
+
+    updates = get_telegram_updates(offset=TELEGRAM_OFFSET)
+
+    for update in updates:
+        try:
+            TELEGRAM_OFFSET = update["update_id"] + 1
+
+            message = update.get("message") or {}
+            text = (message.get("text") or "").strip()
+            chat = message.get("chat") or {}
+            chat_id = str(chat.get("id", ""))
+
+            if not text or not chat_id:
+                continue
+
+            if text == "/report_1h":
+                report = build_report_message("1h")
+                send_telegram_reply(chat_id, report)
+
+            elif text == "/report_today":
+                report = build_report_message("today")
+                send_telegram_reply(chat_id, report)
+
+            elif text == "/report_all":
+                report = build_report_message("all")
+                send_telegram_reply(chat_id, report)
+
+        except Exception as e:
+            logger.error(f"handle_telegram_commands error: {e}")
 
 
 # =========================
@@ -789,6 +903,8 @@ def run():
         scan_locked = False
 
         try:
+            handle_telegram_commands()
+
             if is_global_cooldown_active():
                 logger.info("GLOBAL COOLDOWN (Redis) — skipping scan")
                 time.sleep(60)
