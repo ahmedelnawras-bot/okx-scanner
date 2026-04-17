@@ -47,7 +47,7 @@ MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 2700   # 45 دقيقة
-GLOBAL_COOLDOWN_SECONDS = 120
+GLOBAL_COOLDOWN_SECONDS = 300
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
@@ -174,6 +174,24 @@ def release_scan_lock() -> None:
         r.delete(SCAN_LOCK_KEY)
     except Exception as e:
         logger.error(f"Scan lock release error: {e}")
+
+
+def is_global_cooldown_active() -> bool:
+    if not r:
+        return False
+    try:
+        return bool(r.exists("global_cooldown"))
+    except Exception:
+        return False
+
+
+def set_global_cooldown() -> None:
+    if not r:
+        return
+    try:
+        r.set("global_cooldown", "1", ex=GLOBAL_COOLDOWN_SECONDS)
+    except Exception:
+        pass
 
 
 # =========================
@@ -755,11 +773,9 @@ def run():
         scan_locked = False
 
         try:
-            global_elapsed = time.time() - last_global_send_ts
-            if last_global_send_ts > 0 and global_elapsed < GLOBAL_COOLDOWN_SECONDS:
-                remaining = int(GLOBAL_COOLDOWN_SECONDS - global_elapsed)
-                logger.info(f"GLOBAL COOLDOWN active ({remaining}s) — skipping scan")
-                time.sleep(min(remaining, 60))
+            if is_global_cooldown_active():
+                logger.info("GLOBAL COOLDOWN (Redis) — skipping scan")
+                time.sleep(60)
                 continue
 
             scan_locked = acquire_scan_lock()
@@ -956,6 +972,7 @@ def run():
                 sent_ok = send_telegram_message(candidate["message"])
 
                 if sent_ok:
+                    set_global_cooldown()
                     sent_symbols_this_run.add(symbol)
                     sent_count += 1
                     sent_cache[symbol] = time.time()
