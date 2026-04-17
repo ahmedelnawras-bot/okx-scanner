@@ -242,6 +242,7 @@ def send_telegram_reply(chat_id: str, message: str) -> bool:
     payload = {
         "chat_id": chat_id,
         "text": message,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
 
@@ -293,6 +294,14 @@ def get_telegram_updates(offset: int = 0):
         return []
 
 
+TELEGRAM_COMMANDS = {
+    "/help": "عرض كل الأوامر المتاحة",
+    "/report_1h": "آخر ساعة",
+    "/report_today": "اليوم",
+    "/report_all": "كل الصفقات",
+}
+
+
 def build_report_message(period: str) -> str:
     title_map = {
         "1h": "Report - Last 1H",
@@ -308,6 +317,51 @@ def build_report_message(period: str) -> str:
     )
 
     return format_period_summary(title_map.get(period, "Report"), summary)
+
+
+def build_help_message() -> str:
+    report_commands = []
+    other_commands = []
+
+    for command, description in TELEGRAM_COMMANDS.items():
+        if command.startswith("/report"):
+            report_commands.append(f"{command} - {description}")
+        elif command != "/help":
+            other_commands.append(f"{command} - {description}")
+
+    lines = [
+        "🤖 <b>OKX Scanner Bot</b>",
+        "",
+        "📊 <b>التقارير:</b>",
+        *report_commands,
+        "",
+        "⚙️ <b>معلومات:</b>",
+        "• البوت بيبعت إشارات Long Futures",
+        "• مبني على Volume + Breakout + MTF",
+    ]
+
+    if other_commands:
+        lines.extend([
+            "",
+            "📚 <b>أوامر إضافية:</b>",
+            *other_commands,
+        ])
+
+    lines.extend([
+        "",
+        "🔥 <b>نصيحة:</b>",
+        "استخدم /report_today لمتابعة الأداء",
+    ])
+
+    return "\n".join(lines)
+
+
+COMMAND_HANDLERS = {
+    "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
+    "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
+    "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
+    "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
+}
 
 
 def handle_telegram_commands():
@@ -327,17 +381,9 @@ def handle_telegram_commands():
             if not text or not chat_id:
                 continue
 
-            if text == "/report_1h":
-                report = build_report_message("1h")
-                send_telegram_reply(chat_id, report)
-
-            elif text == "/report_today":
-                report = build_report_message("today")
-                send_telegram_reply(chat_id, report)
-
-            elif text == "/report_all":
-                report = build_report_message("all")
-                send_telegram_reply(chat_id, report)
+            handler = COMMAND_HANDLERS.get(text)
+            if handler:
+                handler(chat_id)
 
         except Exception as e:
             logger.error(f"handle_telegram_commands error: {e}")
