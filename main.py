@@ -3,6 +3,7 @@ import sys
 import time
 import html
 import logging
+import threading
 import requests
 import pandas as pd
 import redis
@@ -52,6 +53,7 @@ MAX_ALERTS_PER_RUN = 3
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 2700   # 45 دقيقة
 GLOBAL_COOLDOWN_SECONDS = 300
+COMMAND_POLL_INTERVAL = 3
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
@@ -381,7 +383,9 @@ def handle_telegram_commands():
             if not text or not chat_id:
                 continue
 
-            handler = COMMAND_HANDLERS.get(text)
+            command = text.split()[0].split("@")[0]
+
+            handler = COMMAND_HANDLERS.get(command)
             if handler:
                 handler(chat_id)
 
@@ -976,15 +980,23 @@ def build_message(
 """
 
 
-def run():
+def run_command_poller():
+    while True:
+        try:
+            handle_telegram_commands()
+        except Exception as e:
+            logger.error(f"Command poller error: {e}")
+
+        time.sleep(COMMAND_POLL_INTERVAL)
+
+
+def run_scanner_loop():
     global last_global_send_ts
 
     while True:
         scan_locked = False
 
         try:
-            handle_telegram_commands()
-
             if is_global_cooldown_active():
                 logger.info("GLOBAL COOLDOWN (Redis) — skipping scan")
                 time.sleep(60)
@@ -1239,6 +1251,13 @@ def run():
         finally:
             if scan_locked:
                 release_scan_lock()
+
+
+def run():
+    command_thread = threading.Thread(target=run_command_poller, daemon=True)
+    command_thread.start()
+
+    run_scanner_loop()
 
 
 if __name__ == "__main__":
