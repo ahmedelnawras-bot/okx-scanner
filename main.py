@@ -998,6 +998,7 @@ def run():
                     breakout=breakout,
                     is_new=is_new,
                     funding=funding,
+                    btc_dominance_proxy=btc_dominance_proxy,
                 )
 
                 logger.info(
