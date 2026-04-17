@@ -46,6 +46,8 @@ TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
 FINAL_MIN_SCORE = 6.3
+PRE_BREAKOUT_EXTRA_SCORE = 0.5
+PRE_BREAKOUT_SCORE_BONUS = 1.2
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
@@ -65,7 +67,7 @@ NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 300
+SCAN_LOCK_TTL = 120
 
 TELEGRAM_OFFSET_KEY = "telegram:offset"
 TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done"
@@ -244,6 +246,23 @@ def mark_telegram_bootstrap_done() -> None:
 # =========================
 # TELEGRAM
 # =========================
+def clear_webhook() -> None:
+    if not BOT_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+    params = {"drop_pending_updates": False}
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            logger.info("Telegram webhook cleared")
+        else:
+            logger.error(f"Webhook clear HTTP error: {response.text}")
+    except Exception as e:
+        logger.error(f"Webhook clear error: {e}")
+
+
 def send_telegram_message(message: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         logger.error("❌ Telegram config missing")
@@ -820,12 +839,67 @@ def get_volume_ratio(df) -> float:
         return 1.0
 
 
+def get_distance_from_ma_percent(df) -> float:
+    try:
+        signal_row = get_signal_row(df)
+        close = float(signal_row["close"])
+        ma_value = float(signal_row.get("ma", 0) or 0)
+        if ma_value <= 0:
+            return 0.0
+        return round(((close - ma_value) / ma_value) * 100, 4)
+    except Exception:
+        return 0.0
+
+
+def is_pre_breakout(df, lookback=20) -> bool:
+    """
+    السعر قريب جداً من القمة الأخيرة + تراكم فوليوم + ضغط ATR
+    """
+    try:
+        if df is None or df.empty or len(df) < lookback + 6:
+            return False
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+
+        if idx is None or idx < max(lookback, 5):
+            return False
+
+        close = float(signal_row["close"])
+        ma_value = float(signal_row.get("ma", close) or close)
+        recent_high = float(df["high"].iloc[idx - lookback:idx].max())
+
+        if recent_high <= 0 or close <= 0:
+            return False
+
+        proximity = close / recent_high
+        if not (0.965 <= proximity < 1.0):
+            return False
+
+        last_3_vol = df["volume"].iloc[idx - 3:idx].tolist()
+        vol_increasing = (
+            len(last_3_vol) == 3
+            and float(last_3_vol[1]) >= float(last_3_vol[0])
+            and float(last_3_vol[2]) >= float(last_3_vol[1])
+        )
+
+        recent_atr = float(signal_row.get("atr", 0) or 0)
+        prev_atr = float(df["atr"].iloc[idx - 5:idx].mean() or 0)
+        compressed = prev_atr > 0 and recent_atr > 0 and recent_atr < prev_atr * 0.90
+
+        above_ma = close > ma_value
+
+        return vol_increasing and compressed and above_ma
+
+    except Exception:
+        return False
+
+
 def is_valid_candle_timing(df) -> bool:
     try:
         now = int(time.time())
         candle_seconds = 15 * 60
 
-        # مرجع ثابت: بداية آخر شمعة حالية
         last_completed_ts = (now // candle_seconds) * candle_seconds
 
         signal_row = get_signal_row(df)
@@ -835,8 +909,6 @@ def is_valid_candle_timing(df) -> bool:
             ts = ts // 1000
 
         candle_age = last_completed_ts - ts
-
-        # مقبول لو شمعة الإشارة ليست أقدم من آخر شمعتين مكتملتين
         return 0 <= candle_age <= (candle_seconds * 2)
     except Exception:
         return False
@@ -859,11 +931,13 @@ def get_effective_min_score(is_new: bool) -> float:
     return TOP_MOMENTUM_NEW_MIN_SCORE if is_new else TOP_MOMENTUM_MIN_SCORE
 
 
-def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new: bool) -> float:
+def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new: bool, pre_breakout: bool = False) -> float:
     priority = float(score)
 
     if breakout:
         priority += 1.0
+    elif pre_breakout:
+        priority += 0.7
 
     if vol_ratio >= 2.0:
         priority += 1.0
@@ -879,6 +953,8 @@ def get_momentum_priority(score: float, breakout: bool, vol_ratio: float, is_new
 def get_candidate_bucket(candidate: dict) -> str:
     if candidate["is_new"] and candidate["breakout"]:
         return "new_breakout"
+    if candidate.get("pre_breakout") and not candidate["breakout"]:
+        return "pre_breakout"
     if candidate["breakout"]:
         return "breakout"
     if candidate["vol_ratio"] >= 2.0:
@@ -944,13 +1020,14 @@ def diversify_candidates(candidates, max_alerts=3):
     diversified = []
     used_patterns = set()
 
-    for bucket_name in ["new_breakout", "breakout", "volume", "standard"]:
+    for bucket_name in ["new_breakout", "pre_breakout", "breakout", "volume", "standard"]:
         if bucket_name not in buckets or not buckets[bucket_name]:
             continue
 
         candidate = buckets[bucket_name][0]
         pattern = (
             candidate["breakout"],
+            candidate.get("pre_breakout", False),
             round(candidate["vol_ratio"], 1),
             candidate["is_new"],
         )
@@ -978,6 +1055,7 @@ def diversify_candidates(candidates, max_alerts=3):
 
             pattern = (
                 candidate["breakout"],
+                candidate.get("pre_breakout", False),
                 round(candidate["vol_ratio"], 1),
                 candidate["is_new"],
             )
@@ -1119,8 +1197,10 @@ def run_scanner_loop():
                     continue
 
                 early_signal = early_bullish_signal(df)
-                if not early_signal:
-                    logger.info(f"{symbol} → early_signal: False")
+                pre_breakout = is_pre_breakout(df)
+
+                if not early_signal and not pre_breakout:
+                    logger.info(f"{symbol} → rejected (no early_signal / no pre_breakout)")
                     continue
 
                 breakout = is_breakout(df)
@@ -1128,6 +1208,7 @@ def run_scanner_loop():
                 is_new = is_new_listing_by_candles(candles)
                 funding = get_funding_rate(symbol)
                 vol_ratio = get_volume_ratio(df)
+                dist_ma = get_distance_from_ma_percent(df)
 
                 score_result = calculate_long_score(
                     df=df,
@@ -1140,9 +1221,24 @@ def run_scanner_loop():
                     btc_dominance_proxy=btc_dominance_proxy,
                 )
 
+                pre_breakout_only = pre_breakout and not early_signal
+
+                if pre_breakout and not breakout:
+                    score_result["score"] = round(
+                        min(9.2, float(score_result["score"]) + PRE_BREAKOUT_SCORE_BONUS),
+                        1
+                    )
+                    score_result["reasons"] = list(
+                        dict.fromkeys(score_result["reasons"] + ["على وشك الكسر 🎯"])
+                    )
+
+                required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
+
                 logger.info(
-                    f"{symbol} → early_signal: True | "
+                    f"{symbol} → early_signal: {early_signal} | "
+                    f"pre_breakout: {pre_breakout} | "
                     f"score: {score_result['score']} | "
+                    f"min_required: {required_min_score} | "
                     f"score_signal: {score_result['signal']} | "
                     f"fake: {score_result['fake_signal']} | "
                     f"mtf: {mtf_confirmed} | "
@@ -1153,8 +1249,12 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → rejected by fake signal")
                     continue
 
-                if score_result["score"] < FINAL_MIN_SCORE:
-                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']})")
+                if score_result["score"] < required_min_score:
+                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_score})")
+                    continue
+
+                if not breakout and not pre_breakout and dist_ma > 3.8:
+                    logger.info(f"{symbol} → rejected (late move without breakout/pre-breakout)")
                     continue
 
                 candle_time = get_signal_candle_time(df)
@@ -1189,7 +1289,7 @@ def run_scanner_loop():
                 if is_new:
                     if not passes_new_listing_filter(
                         score=float(score_result["score"]),
-                        breakout=breakout,
+                        breakout=breakout or pre_breakout,
                         vol_ratio=vol_ratio,
                         candle_strength=candle_strength,
                     ):
@@ -1207,6 +1307,7 @@ def run_scanner_loop():
                     breakout=breakout,
                     vol_ratio=vol_ratio,
                     is_new=is_new,
+                    pre_breakout=pre_breakout,
                 )
 
                 candidate = {
@@ -1214,6 +1315,7 @@ def run_scanner_loop():
                     "score": float(score_result["score"]),
                     "momentum_priority": momentum_priority,
                     "breakout": breakout,
+                    "pre_breakout": pre_breakout,
                     "vol_ratio": vol_ratio,
                     "candle_strength": candle_strength,
                     "is_new": is_new,
@@ -1334,6 +1436,8 @@ def run_scanner_loop():
 
 
 def run():
+    clear_webhook()
+
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
 
