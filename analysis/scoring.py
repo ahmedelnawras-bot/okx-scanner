@@ -81,6 +81,7 @@ def calculate_long_score(
     is_new,
     funding=0.0,
     btc_dominance_proxy=None,
+    vol_ratio=None,
 ):
     funding_label = classify_funding_simple(funding)
 
@@ -107,10 +108,14 @@ def calculate_long_score(
     low = _safe_float(signal_row["low"])
     ma = _safe_float(signal_row.get("ma"), close)
     rsi = _safe_float(signal_row.get("rsi"), 50)
+    prev_rsi = _safe_float(prev_row.get("rsi"), 50)
+    rsi_momentum = rsi - prev_rsi
 
     vol = _safe_float(signal_row["volume"])
     prev_vol = _safe_float(prev_row["volume"])
-    vol_ratio = vol / prev_vol if prev_vol > 0 else 1.0
+
+    if vol_ratio is None:
+        vol_ratio = vol / prev_vol if prev_vol > 0 else 1.0
 
     body = abs(close - open_)
     full = max(high - low, 0.0)
@@ -119,11 +124,18 @@ def calculate_long_score(
     rejection = full > 0 and upper_wick > body * 1.5
 
     # ===================== BASIC SCORING =====================
-    if 52 <= rsi <= 62:
-        score += 1.5
+    if 52 <= rsi <= 70 and rsi_momentum > 3:
+        score += 1.8
+        reasons.append("RSI صاعد بقوة")
+    elif 52 <= rsi <= 62:
+        score += 1.2
         reasons.append("RSI صحي")
     elif 62 < rsi <= 68:
+        score += 0.7
+        reasons.append("RSI جيد")
+    elif 68 < rsi <= 72 and rsi_momentum > 4:
         score += 0.5
+        reasons.append("RSI مرتفع لكن بزخم")
     elif rsi > 72:
         score -= 0.9
         reasons.append("RSI عالي")
