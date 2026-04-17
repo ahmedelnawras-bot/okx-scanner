@@ -372,6 +372,15 @@ def extract_24h_quote_volume(ticker: dict) -> float:
 
 
 def extract_24h_change_percent(ticker: dict) -> float:
+    try:
+        last = float(ticker.get("last", 0) or 0)
+        open_24h = float(ticker.get("open24h", 0) or 0)
+
+        if open_24h > 0:
+            return round(((last - open_24h) / open_24h) * 100, 2)
+    except Exception:
+        pass
+
     fields = ["change24h", "chgUtc8", "chgUtc0"]
     for field in fields:
         value = ticker.get(field)
@@ -601,6 +610,14 @@ def get_btc_mode():
     except Exception as e:
         logger.error(f"BTC mode error: {e}")
         return "🟡 محايد"
+
+
+def get_btc_dominance_proxy(btc_mode: str) -> str:
+    if "🔴 هابط" in btc_mode:
+        return "🟢 داعم للألت"
+    if "🟢 صاعد" in btc_mode:
+        return "🔴 ضد الألت"
+    return "🟡 محايد"
 
 
 def calculate_stop_loss(price, atr_value):
@@ -852,7 +869,17 @@ def diversify_candidates(candidates, max_alerts=3):
     return diversified[:max_alerts]
 
 
-def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new, change_24h=0.0):
+def build_message(
+    symbol,
+    price,
+    score_result,
+    stop_loss,
+    btc_mode,
+    btc_dominance_proxy,
+    tv_link,
+    is_new,
+    change_24h=0.0
+):
     symbol_clean = clean_symbol_for_message(symbol)
     details = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
     funding_text = score_result.get("funding_label", "🟡 محايد")
@@ -869,6 +896,7 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 
     safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
+    safe_dominance = html.escape(btc_dominance_proxy)
     safe_details = html.escape(details)
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
@@ -887,6 +915,7 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 🏷 <b>التصنيف:</b> {safe_rating}
 
 🪙 BTC: {safe_btc}
+👑 الهيمنة: {safe_dominance}
 💸 التمويل: {safe_funding}
 📈 تغير 24H: {change_24h_text}{new_tag}
 
@@ -924,6 +953,7 @@ def run():
 
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
+            btc_dominance_proxy = get_btc_dominance_proxy(btc_mode)
 
             tested = 0
             sent_count = 0
@@ -1050,6 +1080,7 @@ def run():
                         score_result=score_result,
                         stop_loss=stop_loss,
                         btc_mode=btc_mode,
+                        btc_dominance_proxy=btc_dominance_proxy,
                         tv_link=tv_link,
                         is_new=is_new,
                         change_24h=change_24h,
