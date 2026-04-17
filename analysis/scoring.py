@@ -82,6 +82,7 @@ def calculate_long_score(
     funding=0.0,
     btc_dominance_proxy=None,
     vol_ratio=None,
+    pre_breakout=False,
 ):
     funding_label = classify_funding_simple(funding)
 
@@ -172,6 +173,10 @@ def calculate_long_score(
         score += 2.2
         reasons.append("اختراق")
 
+    if pre_breakout and not breakout:
+        score += 1.2
+        reasons.append("على وشك الكسر 🎯")
+
     if mtf_confirmed:
         score += 1.8
         reasons.append("تأكيد فريم الساعة")
@@ -200,7 +205,6 @@ def calculate_long_score(
         reasons.append("عملة جديدة")
 
     # ===================== EARLY MOVE INTELLIGENCE =====================
-    # 1) مسافة السعر من MA
     dist_ma = ((close - ma) / ma) * 100 if ma > 0 else 0.0
 
     if 0.2 <= dist_ma <= 2.8:
@@ -210,12 +214,10 @@ def calculate_long_score(
         score -= 0.8
         reasons.append("بعيد عن MA (متأخر)")
 
-    # فلترة تأخر قوي
     if dist_ma > 6.0:
         score -= 1.2
         reasons.append("ممتد زيادة")
 
-    # 2) Extension بعد الاختراق
     if breakout:
         try:
             idx = int(signal_row.name)
@@ -236,21 +238,19 @@ def calculate_long_score(
         except Exception:
             pass
 
-    # 3) توافق قوي مبكر
     if breakout and mtf_confirmed and vol_ratio >= 1.6 and candle_strength >= 0.45:
         score += 0.5
         reasons.append("توافق قوي مبكر")
 
-    # 4) منع تضخم السكور
     if score >= 8.8:
-        if not (breakout and mtf_confirmed and vol_ratio >= 1.5):
+        if not ((breakout or pre_breakout) and mtf_confirmed and vol_ratio >= 1.5):
             score -= 0.8
 
     # ===================== FINAL =====================
     score = max(0.0, min(9.2, score))
     score = round(score, 1)
 
-    # ===================== Fake signal (مخفف ومحافظ) =====================
+    # ===================== Fake signal =====================
     fake_signal = False
 
     if score < 4.5:
@@ -259,10 +259,10 @@ def calculate_long_score(
     if rejection and candle_strength < 0.48:
         fake_signal = True
 
-    if close <= ma * 0.997 and not breakout:
+    if close <= ma * 0.997 and not breakout and not pre_breakout:
         fake_signal = True
 
-    if rsi < 46 and not breakout:
+    if rsi < 46 and not breakout and not pre_breakout:
         fake_signal = True
 
     if score >= 8.5 and vol_ratio < 1.15:
