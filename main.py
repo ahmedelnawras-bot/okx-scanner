@@ -358,6 +358,19 @@ def is_excluded_symbol(symbol: str) -> bool:
     return False
 
 
+def extract_24h_quote_volume(ticker: dict) -> float:
+    fields = ["volCcy24h", "turnover24h", "quoteVolume", "vol24h"]
+    for field in fields:
+        value = ticker.get(field)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return 0.0
+
+
 def extract_24h_change_percent(ticker: dict) -> float:
     try:
         last = float(ticker.get("last", 0) or 0)
@@ -381,31 +394,8 @@ def extract_24h_change_percent(ticker: dict) -> float:
                 return round(((last - sod) / sod) * 100, 2)
 
         return 0.0
-
     except Exception:
         return 0.0
-
-
-def extract_24h_change_percent(ticker: dict) -> float:
-    try:
-        last = float(ticker.get("last", 0) or 0)
-        open_24h = float(ticker.get("open24h", 0) or 0)
-
-        if open_24h > 0:
-            return round(((last - open_24h) / open_24h) * 100, 2)
-    except Exception:
-        pass
-
-    fields = ["change24h", "chgUtc8", "chgUtc0"]
-    for field in fields:
-        value = ticker.get(field)
-        if value is None:
-            continue
-        try:
-            return round(float(value) * 100, 2)
-        except Exception:
-            continue
-    return 0.0
 
 
 def get_ranked_pairs():
@@ -911,7 +901,7 @@ def build_message(
 
     safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
-    safe_dominance = html.escape(btc_dominance_proxy)
+    safe_dom = html.escape(btc_dominance_proxy)
     safe_details = html.escape(details)
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
@@ -930,7 +920,7 @@ def build_message(
 🏷 <b>التصنيف:</b> {safe_rating}
 
 🪙 BTC: {safe_btc}
-👑 الهيمنة: {safe_dominance}
+👑 الهيمنة: {safe_dom}
 💸 التمويل: {safe_funding}
 📈 تغير 24H: {change_24h_text}{new_tag}
 
