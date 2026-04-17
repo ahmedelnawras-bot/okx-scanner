@@ -686,19 +686,33 @@ def is_higher_timeframe_confirmed(symbol):
         candles = get_candles(symbol, HTF_TIMEFRAME, 100)
         df = to_dataframe(candles)
 
-        if df is None or df.empty:
+        if df is None or df.empty or len(df) < 10:
             return False
 
         signal_row = get_signal_row(df)
+        idx = signal_row.name
+
+        if idx is None or idx < 3:
+            return False
+
+        checks = 0
+
         ma_value = signal_row.get("ma", None)
-
-        score = 0
         if ma_value is not None and float(signal_row["close"]) > float(ma_value):
-            score += 1
-        if float(signal_row.get("rsi", 0)) > 50:
-            score += 1
+            checks += 1
 
-        return score >= 2
+        if float(signal_row.get("rsi", 0)) > 52:
+            checks += 1
+
+        last_3 = df.iloc[idx - 3:idx]
+        green_candles = sum(
+            1 for _, row in last_3.iterrows()
+            if float(row["close"]) > float(row["open"])
+        )
+        if green_candles >= 2:
+            checks += 1
+
+        return checks >= 2
 
     except Exception as e:
         logger.error(f"MTF error on {symbol}: {e}")
@@ -1113,9 +1127,11 @@ def run_scanner_loop():
                 mtf_confirmed = is_higher_timeframe_confirmed(symbol)
                 is_new = is_new_listing_by_candles(candles)
                 funding = get_funding_rate(symbol)
+                vol_ratio = get_volume_ratio(df)
 
                 score_result = calculate_long_score(
                     df=df,
+                    vol_ratio=vol_ratio,
                     mtf_confirmed=mtf_confirmed,
                     btc_mode=btc_mode,
                     breakout=breakout,
@@ -1168,7 +1184,6 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → skipped (cooldown active)")
                     continue
 
-                vol_ratio = get_volume_ratio(df)
                 candle_strength = get_candle_strength_ratio(df)
 
                 if is_new:
