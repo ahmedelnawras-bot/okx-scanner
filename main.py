@@ -536,7 +536,7 @@ def is_valid_candle_timing(df) -> bool:
 
         candle_age = int(time.time()) - ts
         CANDLE_SECONDS = 15 * 60
-        return -120 <= candle_age <= (CANDLE_SECONDS + 180)
+        return -300 <= candle_age <= (CANDLE_SECONDS + 300)
     except Exception:
         return False
 
