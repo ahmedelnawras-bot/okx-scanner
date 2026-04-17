@@ -392,7 +392,6 @@ def update_open_trades(
                     logger.error(f"{symbol} → failed to mark TP1")
                     break
 
-                # بعد تحديث الصفقة، لو نفس الشمعة وصلت TP2
                 if result == "win":
                     break
 
@@ -414,6 +413,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "expired": 0,
             "open": 0,
             "tp1_hits": 0,
+            "tp1_rate": 0.0,
             "winrate": 0.0,
             "market_type": normalize_market_type(market_type),
             "side": normalize_side(side),
@@ -434,7 +434,10 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         open_count = int(redis_client.scard(open_set_key) or 0)
 
         decided = wins + losses
+        total_closed = wins + losses + expired
+
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
+        tp1_rate = round((tp1_hits / total_closed) * 100, 2) if total_closed > 0 else 0.0
 
         return {
             "wins": wins,
@@ -442,6 +445,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "expired": expired,
             "open": open_count,
             "tp1_hits": tp1_hits,
+            "tp1_rate": tp1_rate,
             "winrate": winrate,
             "market_type": market_type,
             "side": side,
@@ -455,6 +459,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "expired": 0,
             "open": 0,
             "tp1_hits": 0,
+            "tp1_rate": 0.0,
             "winrate": 0.0,
             "market_type": market_type,
             "side": side,
@@ -475,6 +480,7 @@ def get_trade_summary(
             "expired": 0,
             "open": 0,
             "tp1_hits": 0,
+            "tp1_rate": 0.0,
             "winrate": 0.0,
         }
 
@@ -491,6 +497,7 @@ def get_trade_summary(
             "expired": 0,
             "open": 0,
             "tp1_hits": 0,
+            "tp1_rate": 0.0,
             "winrate": 0.0,
         }
 
@@ -537,7 +544,10 @@ def get_trade_summary(
             expired += 1
 
     decided = wins + losses
+    total_closed = wins + losses + expired
+
     winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
+    tp1_rate = round((tp1_hits / total_closed) * 100, 2) if total_closed > 0 else 0.0
 
     return {
         "total": total,
@@ -546,6 +556,7 @@ def get_trade_summary(
         "expired": expired,
         "open": open_count,
         "tp1_hits": tp1_hits,
+        "tp1_rate": tp1_rate,
         "winrate": winrate,
     }
 
@@ -553,7 +564,9 @@ def get_trade_summary(
 def get_period_summary(redis_client, period: str = "all", market_type: str = None, side: str = None):
     now_ts = int(time.time())
 
-    if period == "today":
+    if period == "1h":
+        since_ts = now_ts - (1 * 3600)
+    elif period == "today":
         local_now = time.localtime(now_ts)
         since_ts = int(time.mktime((
             local_now.tm_year, local_now.tm_mon, local_now.tm_mday,
@@ -586,6 +599,7 @@ def format_winrate_summary(summary: dict) -> str:
 
     return (
         f"{prefix}Win rate: {summary['winrate']}% | "
+        f"TP1 Rate: {summary.get('tp1_rate', 0)}% | "
         f"Wins: {summary['wins']} | "
         f"Losses: {summary['losses']} | "
         f"TP1 Hits: {summary['tp1_hits']} | "
@@ -595,7 +609,7 @@ def format_winrate_summary(summary: dict) -> str:
 
 
 def format_period_summary(title: str, summary: dict) -> str:
-    decided = summary["wins"] + summary["losses"]
+    decided = summary["wins"] + summary["losses"] + summary["expired"]
 
     return (
         f"📊 {title}\n"
@@ -604,6 +618,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"TP hits: {summary['wins']}\n"
         f"SL hits: {summary['losses']}\n"
         f"TP1 hits: {summary['tp1_hits']}\n"
+        f"TP1 rate: {summary.get('tp1_rate', 0)}%\n"
         f"Expired: {summary['expired']}\n"
         f"Open: {summary['open']}\n"
         f"Win rate: {summary['winrate']}%"
