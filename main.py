@@ -37,8 +37,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 
-TELEGRAM_OFFSET = 0
-
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
 OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
@@ -68,6 +66,9 @@ NEW_LISTING_MAX_PER_RUN = 1
 
 SCAN_LOCK_KEY = "scan:running"
 SCAN_LOCK_TTL = 300
+
+TELEGRAM_OFFSET_KEY = "telegram:offset"
+TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done"
 
 # =========================
 # REDIS
@@ -196,6 +197,46 @@ def set_global_cooldown() -> None:
         return
     try:
         r.set("global_cooldown", "1", ex=GLOBAL_COOLDOWN_SECONDS)
+    except Exception:
+        pass
+
+
+# =========================
+# TELEGRAM OFFSET (Redis-persisted)
+# =========================
+def get_telegram_offset() -> int:
+    if not r:
+        return 0
+    try:
+        val = r.get(TELEGRAM_OFFSET_KEY)
+        return int(val) if val else 0
+    except Exception:
+        return 0
+
+
+def save_telegram_offset(offset: int) -> None:
+    if not r:
+        return
+    try:
+        r.set(TELEGRAM_OFFSET_KEY, str(offset))
+    except Exception:
+        pass
+
+
+def is_telegram_bootstrap_done() -> bool:
+    if not r:
+        return False
+    try:
+        return bool(r.exists(TELEGRAM_BOOTSTRAP_DONE_KEY))
+    except Exception:
+        return False
+
+
+def mark_telegram_bootstrap_done() -> None:
+    if not r:
+        return
+    try:
+        r.set(TELEGRAM_BOOTSTRAP_DONE_KEY, "1")
     except Exception:
         pass
 
@@ -366,14 +407,33 @@ COMMAND_HANDLERS = {
 }
 
 
-def handle_telegram_commands():
-    global TELEGRAM_OFFSET
+def bootstrap_telegram_offset_once():
+    if is_telegram_bootstrap_done():
+        return
 
-    updates = get_telegram_updates(offset=TELEGRAM_OFFSET)
+    try:
+        updates = get_telegram_updates(offset=0)
+        if updates:
+            latest_offset = updates[-1]["update_id"] + 1
+            save_telegram_offset(latest_offset)
+            logger.info(f"Telegram bootstrap offset set to {latest_offset}")
+        else:
+            logger.info("Telegram bootstrap: no pending updates")
+
+        mark_telegram_bootstrap_done()
+    except Exception as e:
+        logger.error(f"Telegram bootstrap error: {e}")
+
+
+def handle_telegram_commands():
+    offset = get_telegram_offset()
+    updates = get_telegram_updates(offset=offset)
+
+    latest_offset = offset
 
     for update in updates:
         try:
-            TELEGRAM_OFFSET = update["update_id"] + 1
+            latest_offset = update["update_id"] + 1
 
             message = update.get("message") or {}
             text = (message.get("text") or "").strip()
@@ -391,6 +451,9 @@ def handle_telegram_commands():
 
         except Exception as e:
             logger.error(f"handle_telegram_commands error: {e}")
+
+    if latest_offset != offset:
+        save_telegram_offset(latest_offset)
 
 
 # =========================
@@ -981,6 +1044,8 @@ def build_message(
 
 
 def run_command_poller():
+    bootstrap_telegram_offset_once()
+
     while True:
         try:
             handle_telegram_commands()
