@@ -358,17 +358,32 @@ def is_excluded_symbol(symbol: str) -> bool:
     return False
 
 
-def extract_24h_quote_volume(ticker: dict) -> float:
-    fields = ["volCcy24h", "turnover24h", "quoteVolume", "vol24h"]
-    for field in fields:
-        value = ticker.get(field)
-        if value is None:
-            continue
-        try:
-            return float(value)
-        except Exception:
-            continue
-    return 0.0
+def extract_24h_change_percent(ticker: dict) -> float:
+    try:
+        last = float(ticker.get("last", 0) or 0)
+
+        prev = ticker.get("prevPx")
+        if prev is not None:
+            prev = float(prev)
+            if prev > 0:
+                return round(((last - prev) / prev) * 100, 2)
+
+        open24h = ticker.get("open24h")
+        if open24h is not None:
+            open24h = float(open24h)
+            if open24h > 0:
+                return round(((last - open24h) / open24h) * 100, 2)
+
+        sod = ticker.get("sodUtc0") or ticker.get("sodUtc8")
+        if sod is not None:
+            sod = float(sod)
+            if sod > 0:
+                return round(((last - sod) / sod) * 100, 2)
+
+        return 0.0
+
+    except Exception:
+        return 0.0
 
 
 def extract_24h_change_percent(ticker: dict) -> float:
