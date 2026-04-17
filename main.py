@@ -63,8 +63,6 @@ NEW_LISTING_MAX_PER_RUN = 1
 SCAN_LOCK_KEY = "scan:running"
 SCAN_LOCK_TTL = 90
 
-CANDLE_MAX_AGE_SECONDS = 13 * 60  # 13 دقيقة من شمعة 15m
-
 # =========================
 # REDIS
 # =========================
@@ -153,7 +151,7 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         return
     try:
         r.delete(get_same_candle_key(symbol, candle_time, signal_type))
-        r.delete(get_symbol_cooldown_key(symbol, signal_type))
+        r.delete(get_symbol_cooldown_key(symbol, candle_time, signal_type))
     except Exception as e:
         logger.error(f"Redis release error: {e}")
 
@@ -765,8 +763,8 @@ def run():
 
             logger.info(f"RUN START | pid={os.getpid()} | ts={int(time.time())}")
 
-            update_open_trades(r, signal_type="long", timeframe=TIMEFRAME)
-            winrate_summary = get_winrate_summary(r, signal_type="long")
+            update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
+            winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
             logger.info(format_winrate_summary(winrate_summary))
 
             ranked_pairs = get_ranked_pairs()
@@ -960,7 +958,8 @@ def run():
                     register_trade(
                         redis_client=r,
                         symbol=symbol,
-                        signal_type="long",
+                        market_type="futures",
+                        side="long",
                         candle_time=candidate["candle_time"],
                         entry=candidate["entry"],
                         sl=candidate["sl"],
