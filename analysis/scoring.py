@@ -65,8 +65,27 @@ def classify_signal(score):
     return "⚡ عادي"
 
 
-def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=0.0):
+def get_btc_dominance_proxy(btc_mode: str) -> str:
+    if "🔴 هابط" in btc_mode:
+        return "🟢 داعم للألت"
+    if "🟢 صاعد" in btc_mode:
+        return "🔴 ضد الألت"
+    return "🟡 محايد"
+
+
+def calculate_long_score(
+    df,
+    mtf_confirmed,
+    btc_mode,
+    breakout,
+    is_new,
+    funding=0.0,
+    btc_dominance_proxy=None,
+):
     funding_label = classify_funding_simple(funding)
+
+    if btc_dominance_proxy is None:
+        btc_dominance_proxy = get_btc_dominance_proxy(btc_mode)
 
     signal_row, prev_row = _get_signal_and_prev_rows(df)
     if signal_row is None or prev_row is None:
@@ -143,13 +162,20 @@ def calculate_long_score(df, mtf_confirmed, btc_mode, breakout, is_new, funding=
 
     if mtf_confirmed:
         score += 1.8
-        reasons.append("تأكيد 1H")
+        reasons.append("تأكيد فريم الساعة")
 
     if "🟢" in btc_mode:
         score += 0.7
         reasons.append("BTC داعم")
     elif "🔴" in btc_mode:
         score -= 0.5
+
+    if btc_dominance_proxy == "🟢 داعم للألت":
+        score += 0.4
+        reasons.append("هيمنة داعمة")
+    elif btc_dominance_proxy == "🔴 ضد الألت":
+        score -= 0.4
+        reasons.append("هيمنة ضد الألت")
 
     if funding < -0.0005:
         score += 0.6
