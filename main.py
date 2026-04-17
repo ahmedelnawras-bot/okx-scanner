@@ -61,7 +61,7 @@ NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 90
+SCAN_LOCK_TTL = 300
 
 # =========================
 # REDIS
@@ -151,7 +151,7 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
         return
     try:
         r.delete(get_same_candle_key(symbol, candle_time, signal_type))
-        r.delete(get_symbol_cooldown_key(symbol, candle_time, signal_type))
+        r.delete(get_symbol_cooldown_key(symbol, signal_type))
     except Exception as e:
         logger.error(f"Redis release error: {e}")
 
@@ -528,15 +528,22 @@ def get_volume_ratio(df) -> float:
 
 def is_valid_candle_timing(df) -> bool:
     try:
+        now = int(time.time())
+        candle_seconds = 15 * 60
+
+        # مرجع ثابت: بداية آخر شمعة حالية
+        last_completed_ts = (now // candle_seconds) * candle_seconds
+
         signal_row = get_signal_row(df)
         ts = int(signal_row["ts"])
 
         if ts > 10_000_000_000:
             ts = ts // 1000
 
-        candle_age = int(time.time()) - ts
-        CANDLE_SECONDS = 15 * 60
-        return -300 <= candle_age <= (CANDLE_SECONDS + 300)
+        candle_age = last_completed_ts - ts
+
+        # مقبول لو شمعة الإشارة ليست أقدم من آخر شمعتين مكتملتين
+        return 0 <= candle_age <= (candle_seconds * 2)
     except Exception:
         return False
 
