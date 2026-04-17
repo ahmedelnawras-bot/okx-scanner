@@ -972,7 +972,6 @@ def run():
                 sent_ok = send_telegram_message(candidate["message"])
 
                 if sent_ok:
-                    set_global_cooldown()
                     sent_symbols_this_run.add(symbol)
                     sent_count += 1
                     sent_cache[symbol] = time.time()
@@ -1005,6 +1004,10 @@ def run():
                         signal_type="long",
                     )
                     logger.error(f"FAILED SEND → {symbol}")
+
+            if sent_count > 0:
+                set_global_cooldown()
+                logger.info(f"Global cooldown set for {GLOBAL_COOLDOWN_SECONDS}s after {sent_count} alert(s)")
 
             logger.info(f"Sent alerts this run: {sent_count}")
             logger.info(f"Tested {tested} pairs")
