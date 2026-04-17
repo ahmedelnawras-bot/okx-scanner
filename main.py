@@ -257,6 +257,19 @@ def extract_24h_quote_volume(ticker: dict) -> float:
     return 0.0
 
 
+def extract_24h_change_percent(ticker: dict) -> float:
+    fields = ["change24h", "chgUtc8", "chgUtc0"]
+    for field in fields:
+        value = ticker.get(field)
+        if value is None:
+            continue
+        try:
+            return round(float(value) * 100, 2)
+        except Exception:
+            continue
+    return 0.0
+
+
 def get_ranked_pairs():
     try:
         res = requests.get(
@@ -725,7 +738,7 @@ def diversify_candidates(candidates, max_alerts=3):
     return diversified[:max_alerts]
 
 
-def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new):
+def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_new, change_24h=0.0):
     symbol_clean = clean_symbol_for_message(symbol)
     details = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
     funding_text = score_result.get("funding_label", "🟡 محايد")
@@ -747,6 +760,8 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
 
+    change_24h_text = f"{change_24h:+.2f}%"
+
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
 💰 {price:.6f} | ⏱ 15m
@@ -758,7 +773,8 @@ def build_message(symbol, price, score_result, stop_loss, btc_mode, tv_link, is_
 🏷 <b>التصنيف:</b> {safe_rating}
 
 🪙 BTC: {safe_btc}
-💸 التمويل: {safe_funding}{new_tag}
+💸 التمويل: {safe_funding}
+📈 تغير 24H: {change_24h_text}{new_tag}
 
 📊 {safe_details}
 
@@ -802,6 +818,7 @@ def run():
             for pair_data in ranked_pairs:
                 tested += 1
                 symbol = pair_data["instId"]
+                change_24h = extract_24h_change_percent(pair_data)
 
                 candles = get_candles(symbol, TIMEFRAME, 100)
                 df = to_dataframe(candles)
@@ -919,6 +936,7 @@ def run():
                         btc_mode=btc_mode,
                         tv_link=tv_link,
                         is_new=is_new,
+                        change_24h=change_24h,
                     ),
                     "candle_time": candle_time,
                     "now": now,
