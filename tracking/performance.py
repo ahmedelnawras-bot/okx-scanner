@@ -120,6 +120,15 @@ def register_trade(
     timeframe: str = "15m",
     btc_mode: str = "🟡 محايد",
     funding_label: str = "🟡 محايد",
+    reasons=None,
+    pre_breakout: bool = False,
+    breakout: bool = False,
+    vol_ratio: float = 0.0,
+    candle_strength: float = 0.0,
+    mtf_confirmed: bool = False,
+    is_new: bool = False,
+    btc_dominance_proxy: str = "🟡 محايد",
+    change_24h: float = 0.0,
 ):
     if redis_client is None:
         return False
@@ -137,6 +146,9 @@ def register_trade(
     all_trades_key = get_all_trades_set_key()
 
     now_ts = int(time.time())
+
+    if reasons is None:
+        reasons = []
 
     trade_data = {
         "symbol": symbol,
@@ -159,6 +171,17 @@ def register_trade(
         "updated_at": now_ts,
         "closed_at": None,
         "result": None,
+
+        # extra fields for backtesting / analytics
+        "reasons": list(reasons),
+        "pre_breakout": bool(pre_breakout),
+        "breakout": bool(breakout),
+        "vol_ratio": round(float(vol_ratio), 4),
+        "candle_strength": round(float(candle_strength), 4),
+        "mtf_confirmed": bool(mtf_confirmed),
+        "is_new": bool(is_new),
+        "btc_dominance_proxy": btc_dominance_proxy,
+        "change_24h": round(float(change_24h), 2),
     }
 
     try:
