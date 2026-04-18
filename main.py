@@ -65,11 +65,19 @@ NEW_LISTING_MIN_VOL_RATIO = 1.8
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
+PRE_BREAKOUT_LOOKBACK = 20
+PRE_BREAKOUT_PROXIMITY_MIN = 0.965
+PRE_BREAKOUT_VOLUME_SIGNIFICANCE = 1.20
+PRE_BREAKOUT_RECENT_VOL_BARS = 3
+PRE_BREAKOUT_BASELINE_VOL_BARS = 12
+
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 120
+SCAN_LOCK_TTL = 240
 
 TELEGRAM_OFFSET_KEY = "telegram:offset"
 TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done"
+TELEGRAM_POLL_LOCK_KEY = "telegram:poll:lock"
+TELEGRAM_POLL_LOCK_TTL = 10
 
 # =========================
 # REDIS
@@ -240,6 +248,26 @@ def mark_telegram_bootstrap_done() -> None:
         r.set(TELEGRAM_BOOTSTRAP_DONE_KEY, "1")
     except Exception:
         pass
+
+
+def acquire_telegram_poll_lock() -> bool:
+    if not r:
+        return True
+    try:
+        locked = r.set(TELEGRAM_POLL_LOCK_KEY, "1", ex=TELEGRAM_POLL_LOCK_TTL, nx=True)
+        return bool(locked)
+    except Exception as e:
+        logger.error(f"Telegram poll lock acquire error: {e}")
+        return False
+
+
+def release_telegram_poll_lock() -> None:
+    if not r:
+        return
+    try:
+        r.delete(TELEGRAM_POLL_LOCK_KEY)
+    except Exception as e:
+        logger.error(f"Telegram poll lock release error: {e}")
 
 
 # =========================
@@ -444,34 +472,41 @@ def bootstrap_telegram_offset_once():
 
 
 def handle_telegram_commands():
-    offset = get_telegram_offset()
-    updates = get_telegram_updates(offset=offset)
+    if not acquire_telegram_poll_lock():
+        return
 
-    latest_offset = offset
+    try:
+        offset = get_telegram_offset()
+        updates = get_telegram_updates(offset=offset)
 
-    for update in updates:
-        try:
-            latest_offset = update["update_id"] + 1
+        latest_offset = offset
 
-            message = update.get("message") or {}
-            text = (message.get("text") or "").strip()
-            chat = message.get("chat") or {}
-            chat_id = str(chat.get("id", ""))
+        for update in updates:
+            try:
+                latest_offset = update["update_id"] + 1
 
-            if not text or not chat_id:
-                continue
+                message = update.get("message") or {}
+                text = (message.get("text") or "").strip()
+                chat = message.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
 
-            command = text.split()[0].split("@")[0]
+                if not text or not chat_id:
+                    continue
 
-            handler = COMMAND_HANDLERS.get(command)
-            if handler:
-                handler(chat_id)
+                command = text.split()[0].split("@")[0]
 
-        except Exception as e:
-            logger.error(f"handle_telegram_commands error: {e}")
+                handler = COMMAND_HANDLERS.get(command)
+                if handler:
+                    handler(chat_id)
 
-    if latest_offset != offset:
-        save_telegram_offset(latest_offset)
+            except Exception as e:
+                logger.error(f"handle_telegram_commands error: {e}")
+
+        if latest_offset != offset:
+            save_telegram_offset(latest_offset)
+
+    finally:
+        release_telegram_poll_lock()
 
 
 # =========================
@@ -850,18 +885,18 @@ def get_distance_from_ma_percent(df) -> float:
         return 0.0
 
 
-def is_pre_breakout(df, lookback=20) -> bool:
+def is_pre_breakout(df, lookback=PRE_BREAKOUT_LOOKBACK) -> bool:
     """
-    السعر قريب جداً من القمة الأخيرة + تراكم فوليوم + ضغط ATR
+    السعر قريب جداً من القمة الأخيرة + تراكم فوليوم + significance + ضغط ATR
     """
     try:
-        if df is None or df.empty or len(df) < lookback + 6:
+        if df is None or df.empty or len(df) < max(lookback + 6, PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS + 2):
             return False
 
         signal_row = get_signal_row(df)
         idx = signal_row.name
 
-        if idx is None or idx < max(lookback, 5):
+        if idx is None or idx < max(lookback, PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS):
             return False
 
         close = float(signal_row["close"])
@@ -872,15 +907,30 @@ def is_pre_breakout(df, lookback=20) -> bool:
             return False
 
         proximity = close / recent_high
-        if not (0.965 <= proximity < 1.0):
+        if not (PRE_BREAKOUT_PROXIMITY_MIN <= proximity < 1.0):
             return False
 
-        last_3_vol = df["volume"].iloc[idx - 3:idx].tolist()
+        recent_vols = df["volume"].iloc[idx - PRE_BREAKOUT_RECENT_VOL_BARS:idx].astype(float).tolist()
         vol_increasing = (
-            len(last_3_vol) == 3
-            and float(last_3_vol[1]) >= float(last_3_vol[0])
-            and float(last_3_vol[2]) >= float(last_3_vol[1])
+            len(recent_vols) == PRE_BREAKOUT_RECENT_VOL_BARS
+            and recent_vols[1] >= recent_vols[0]
+            and recent_vols[2] >= recent_vols[1]
         )
+
+        baseline_start = idx - (PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS)
+        baseline_end = idx - PRE_BREAKOUT_RECENT_VOL_BARS
+        baseline_vols = df["volume"].iloc[baseline_start:baseline_end].astype(float)
+
+        if baseline_vols.empty:
+            return False
+
+        recent_avg_vol = sum(recent_vols) / len(recent_vols)
+        baseline_avg_vol = float(baseline_vols.mean())
+
+        if baseline_avg_vol <= 0:
+            return False
+
+        volume_significant = recent_avg_vol >= baseline_avg_vol * PRE_BREAKOUT_VOLUME_SIGNIFICANCE
 
         recent_atr = float(signal_row.get("atr", 0) or 0)
         prev_atr = float(df["atr"].iloc[idx - 5:idx].mean() or 0)
@@ -888,7 +938,7 @@ def is_pre_breakout(df, lookback=20) -> bool:
 
         above_ma = close > ma_value
 
-        return vol_increasing and compressed and above_ma
+        return vol_increasing and volume_significant and compressed and above_ma
 
     except Exception:
         return False
