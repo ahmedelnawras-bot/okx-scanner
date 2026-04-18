@@ -79,12 +79,16 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 240
+SCAN_LOCK_TTL = 300
 
 TELEGRAM_OFFSET_KEY = "telegram:offset"
 TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done"
 TELEGRAM_POLL_LOCK_KEY = "telegram:poll:lock"
 TELEGRAM_POLL_LOCK_TTL = 10
+
+# Economic news
+NEWS_WINDOW_HOURS = 2
+ECONOMIC_CALENDAR_URL = "https://www.tradingview.com/economic-calendar/"
 
 # =========================
 # REDIS
@@ -215,6 +219,89 @@ def set_global_cooldown() -> None:
         r.set("global_cooldown", "1", ex=GLOBAL_COOLDOWN_SECONDS)
     except Exception:
         pass
+
+
+# =========================
+# ECONOMIC CALENDAR
+# =========================
+def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> list:
+    """
+    بيجيب الأحداث الاقتصادية High Impact خلال النافذة الزمنية القادمة.
+    بيرجع list من dicts: [{title, date, country, impact, link}, ...]
+    """
+    try:
+        now = int(time.time())
+        window_end = now + (window_hours * 3600)
+
+        url = "https://economic-calendar.tradingview.com/events"
+        params = {
+            "from": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
+            "to": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(window_end)),
+            "countries": "US",
+        }
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.tradingview.com/",
+        }
+
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+
+        if res.status_code != 200:
+            logger.warning(f"Economic calendar HTTP {res.status_code}")
+            return []
+
+        data = res.json()
+        events = data if isinstance(data, list) else data.get("result", [])
+
+        high_impact = []
+        for event in events:
+            importance = str(event.get("importance", "")).lower()
+            if importance in ("high", "3", "-1"):
+                event_link = (
+                    event.get("url")
+                    or event.get("link")
+                    or event.get("source_url")
+                    or event.get("event_url")
+                    or ECONOMIC_CALENDAR_URL
+                )
+
+                high_impact.append({
+                    "title": event.get("title", "Unknown Event"),
+                    "date": event.get("date", ""),
+                    "country": event.get("country", ""),
+                    "impact": "High",
+                    "link": event_link,
+                })
+
+        logger.info(f"Economic calendar: {len(high_impact)} high-impact events in next {window_hours}h")
+        return high_impact
+
+    except Exception as e:
+        logger.warning(f"Economic calendar error: {e}")
+        return []
+
+
+def format_news_warning(events: list) -> str:
+    """
+    بيرجع نص التحذير للرسالة مع لينكات HTML مدمجة.
+    """
+    if not events:
+        return ""
+
+    parts = []
+    for event in events[:2]:
+        title = html.escape(event.get("title", "Unknown Event"))
+        link = html.escape(event.get("link", ECONOMIC_CALENDAR_URL), quote=True)
+        parts.append(f'<a href="{link}">{title}</a>')
+
+    events_text = " | ".join(parts)
+    calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
+
+    return (
+        f'📰 <b>تحذير أخبار:</b> {events_text}\n'
+        f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
+    )
 
 
 # =========================
@@ -991,16 +1078,16 @@ def get_market_state(btc_mode: str, alt_snapshot: dict):
 def calculate_stop_loss(price, atr_value, signal_type="standard"):
     """
     Dynamic SL multiplier based on signal type:
-    - breakout:     ATR × 1.0  (حركة سريعة، SL ضيق)
-    - pre_breakout: ATR × 1.5  (محتاج مساحة للتجميع)
-    - new_listing:  ATR × 1.8  (volatile أكتر)
-    - standard:     ATR × 1.2  (المعتاد)
+    - breakout:     ATR × 1.0
+    - pre_breakout: ATR × 1.5
+    - new_listing:  ATR × 1.8
+    - standard:     ATR × 1.2
     """
     multipliers = {
-        "breakout":     1.0,
+        "breakout": 1.0,
         "pre_breakout": 1.5,
-        "new_listing":  1.8,
-        "standard":     1.2,
+        "new_listing": 1.8,
+        "standard": 1.2,
     }
     multiplier = multipliers.get(signal_type, 1.2)
     try:
@@ -1048,10 +1135,6 @@ def get_candle_strength_ratio(df) -> float:
 
 
 def get_volume_ratio(df) -> float:
-    """
-    مقارنة حجم شمعة الإشارة بمتوسط آخر 20 شمعة قبلها
-    بدل الشمعة السابقة فقط
-    """
     try:
         signal_row = get_signal_row(df)
         idx = signal_row.name
@@ -1083,9 +1166,6 @@ def get_distance_from_ma_percent(df) -> float:
 
 
 def is_pre_breakout(df, lookback=PRE_BREAKOUT_LOOKBACK) -> bool:
-    """
-    السعر قريب جداً من القمة الأخيرة + تراكم فوليوم + significance + ضغط ATR
-    """
     try:
         min_len = max(
             lookback + 6,
@@ -1371,6 +1451,7 @@ def normalize_reason(reason: str) -> str:
         "ممتد زيادة": "ممتد زيادة",
         "أسفل المتوسط": "أسفل المتوسط",
         "رفض سعري علوي": "رفض سعري علوي",
+        "أخبار اقتصادية مهمة قريبة": "أخبار اقتصادية مهمة قريبة",
     }
     return mapping.get(reason, reason)
 
@@ -1411,6 +1492,7 @@ def sort_reasons(reasons):
         "BTC غير داعم": 107,
         "تمويل إيجابي (ضغط محتمل)": 108,
         "رفض سعري علوي": 109,
+        "أخبار اقتصادية مهمة قريبة": 110,
     }
 
     return sorted(reasons, key=lambda x: priority.get(x, 999))
@@ -1428,6 +1510,7 @@ def classify_reasons(reasons):
         "رفض سعري",
         "BTC غير داعم",
         "تمويل إيجابي",
+        "أخبار اقتصادية",
     ]
 
     normalized = [normalize_reason(r) for r in reasons]
@@ -1501,6 +1584,7 @@ def build_message(
     market_state_label=None,
     market_bias_label=None,
     alt_mode=None,
+    news_warning="",
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -1551,6 +1635,7 @@ def build_message(
     change_24h_text = f"{change_24h:+.2f}%"
 
     warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
+    news_block = f"\n\n{news_warning}" if news_warning else ""
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
@@ -1570,7 +1655,7 @@ def build_message(
 📈 تغير 24H: {change_24h_text}{new_tag}
 
 📊 <b>أسباب الدخول:</b>
-{bullish_text}{warnings_block}
+{bullish_text}{warnings_block}{news_block}
 
 ⚖️ <b>المخاطرة:</b> {risk_level}
 
@@ -1625,6 +1710,13 @@ def run_scanner_loop():
             btc_dominance_proxy = market_info["btc_dominance_proxy"]
             alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
 
+            upcoming_events = get_upcoming_high_impact_events()
+            has_high_impact_news = len(upcoming_events) > 0
+            news_warning_text = format_news_warning(upcoming_events)
+
+            if has_high_impact_news:
+                logger.info(f"⚠️ High-impact events detected: {[e['title'] for e in upcoming_events]}")
+
             logger.info(
                 f"MARKET STATE | btc={btc_mode} | alt={alt_mode} | "
                 f"state={market_state_label} | flow={market_bias_label}"
@@ -1677,7 +1769,6 @@ def run_scanner_loop():
                         market_bias_label=market_bias_label,
                     )
                 except TypeError:
-                    # fallback للتوافق مع نسخة scoring القديمة
                     score_result = calculate_long_score(
                         df=df,
                         vol_ratio=vol_ratio,
@@ -1694,6 +1785,14 @@ def run_scanner_loop():
                     if score_result["score"] < 6.8:
                         logger.info(f"{symbol} → rejected (no early_signal / no pre_breakout / score<{6.8})")
                         continue
+
+                # الأخبار تبقى تحذير فقط بدون خصم على السكور
+                if has_high_impact_news:
+                    if "warning_reasons" not in score_result:
+                        score_result["warning_reasons"] = []
+
+                    if "أخبار اقتصادية مهمة قريبة" not in score_result["warning_reasons"]:
+                        score_result["warning_reasons"].append("أخبار اقتصادية مهمة قريبة")
 
                 pre_breakout_only = pre_breakout and not early_signal
                 required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
@@ -1807,6 +1906,7 @@ def run_scanner_loop():
                         market_state_label=market_state_label,
                         market_bias_label=market_bias_label,
                         alt_mode=alt_mode,
+                        news_warning=news_warning_text,
                     ),
                     "candle_time": candle_time,
                     "now": now,
