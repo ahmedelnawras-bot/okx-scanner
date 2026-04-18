@@ -225,10 +225,6 @@ def set_global_cooldown() -> None:
 # ECONOMIC CALENDAR
 # =========================
 def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> list:
-    """
-    بيجيب الأحداث الاقتصادية High Impact خلال النافذة الزمنية القادمة.
-    بيرجع list من dicts: [{title, date, country, impact, link}, ...]
-    """
     try:
         now = int(time.time())
         window_end = now + (window_hours * 3600)
@@ -284,10 +280,17 @@ def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> li
 
 def format_news_warning(events: list) -> str:
     """
-    بيرجع نص التحذير للرسالة مع لينكات HTML مدمجة.
+    تنويه أخبار دائم:
+    - لو فيه أخبار: تحذير + لينكات
+    - لو مفيش: تنويه هادئ
     """
+    calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
+
     if not events:
-        return ""
+        return (
+            f'📰 <b>الأخبار:</b> لا توجد أخبار High-Impact قريبة\n'
+            f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
+        )
 
     parts = []
     for event in events[:2]:
@@ -296,10 +299,9 @@ def format_news_warning(events: list) -> str:
         parts.append(f'<a href="{link}">{title}</a>')
 
     events_text = " | ".join(parts)
-    calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
 
     return (
-        f'📰 <b>تحذير أخبار:</b> {events_text}\n'
+        f'📰 <b>تنويه أخبار:</b> {events_text}\n'
         f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
     )
 
@@ -708,11 +710,7 @@ def get_ranked_pairs():
 
 
 def compute_rsi(series, period=14):
-    """
-    Wilder RSI (الأدق والأشهر)
-    """
     delta = series.diff()
-
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
 
@@ -907,9 +905,6 @@ def get_btc_dominance_proxy(btc_mode: str) -> str:
 
 
 def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
-    """
-    Snapshot سريع لحالة الألت من عينة محدودة لتجنب الضغط الكبير على الـ API.
-    """
     try:
         if not ranked_pairs:
             return {
@@ -1030,9 +1025,6 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
 
 
 def get_market_state(btc_mode: str, alt_snapshot: dict):
-    """
-    يركّب الحالة النهائية للسوق من BTC + عينة الألت.
-    """
     alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
 
     if "🔴 هابط" in btc_mode and "🔴 ضعيف" in alt_mode:
@@ -1075,14 +1067,45 @@ def get_market_state(btc_mode: str, alt_snapshot: dict):
     }
 
 
+def get_dynamic_entry_threshold(
+    market_state: str,
+    score_result: dict,
+    vol_ratio: float,
+    mtf_confirmed: bool,
+    is_new: bool,
+) -> float:
+    if market_state == "risk_off":
+        threshold = 6.9
+    elif market_state == "btc_leading":
+        threshold = 6.8
+    elif market_state == "mixed":
+        threshold = 6.5
+    elif market_state == "bull_market":
+        threshold = 6.2
+    elif market_state == "alt_season":
+        threshold = 6.0
+    else:
+        threshold = 6.4
+
+    if mtf_confirmed:
+        threshold -= 0.1
+
+    if vol_ratio >= 2.0:
+        threshold -= 0.2
+    elif vol_ratio >= 1.5:
+        threshold -= 0.1
+
+    if is_new:
+        threshold += 0.2
+
+    if score_result.get("fake_signal"):
+        threshold += 0.2
+
+    threshold = max(5.9, min(7.0, threshold))
+    return round(threshold, 2)
+
+
 def calculate_stop_loss(price, atr_value, signal_type="standard"):
-    """
-    Dynamic SL multiplier based on signal type:
-    - breakout:     ATR × 1.0
-    - pre_breakout: ATR × 1.5
-    - new_listing:  ATR × 1.8
-    - standard:     ATR × 1.2
-    """
     multipliers = {
         "breakout": 1.0,
         "pre_breakout": 1.5,
@@ -1416,37 +1439,26 @@ def normalize_reason(reason: str) -> str:
         "RSI صاعد بقوة": "RSI صاعد بقوة",
         "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
         "RSI عالي": "RSI عالي (تشبع شراء)",
-
         "فوليوم داعم": "فوليوم داعم",
         "فوليوم قوي": "فوليوم قوي",
         "فوليوم انفجار": "فوليوم انفجاري",
-
         "فوق MA": "فوق المتوسط",
-
         "شمعة جيدة": "شمعة جيدة",
         "شمعة قوية": "شمعة قوية",
-
         "اختراق": "اختراق",
         "اختراق مبكر جداً": "اختراق مبكر",
         "اختراق متأخر": "اختراق متأخر",
         "اختراق قوي مؤكد": "اختراق قوي مؤكد",
-
         "تأكيد فريم الساعة": "تأكيد فريم الساعة",
-
         "BTC داعم": "BTC داعم",
         "BTC غير داعم": "BTC غير داعم",
-
         "هيمنة داعمة": "هيمنة داعمة للألت",
         "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
-
         "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
         "تمويل إيجابي": "تمويل إيجابي (ضغط محتمل)",
-
         "عملة جديدة": "عملة جديدة",
-
         "بداية ترند مبكرة": "بداية ترند مبكرة",
         "زخم مبكر تحت المقاومة 🎯": "زخم مبكر تحت المقاومة 🎯",
-
         "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
         "ممتد زيادة": "ممتد زيادة",
         "أسفل المتوسط": "أسفل المتوسط",
@@ -1464,25 +1476,20 @@ def sort_reasons(reasons):
         "اختراق": 4,
         "اختراق مبكر": 5,
         "اختراق قوي مؤكد": 6,
-
         "فوليوم داعم": 7,
         "فوليوم قوي": 8,
         "فوليوم انفجاري": 9,
-
         "شمعة جيدة": 10,
         "شمعة قوية": 11,
-
         "RSI في منطقة صحية": 12,
         "RSI جيد": 13,
         "RSI صاعد بقوة": 14,
         "RSI مرتفع بزخم": 15,
-
         "تأكيد فريم الساعة": 16,
         "BTC داعم": 17,
         "هيمنة داعمة للألت": 18,
         "تمويل سلبي (داعم للشراء)": 19,
         "عملة جديدة": 20,
-
         "RSI عالي (تشبع شراء)": 101,
         "أسفل المتوسط": 102,
         "بعيد عن المتوسط (دخول متأخر)": 103,
@@ -1563,10 +1570,10 @@ def format_bullish_reasons(bullish):
     formatted = []
     for r in bullish:
         safe = html.escape(r)
+        line = f"• {safe}"
         if r in highlighted:
-            formatted.append(f"• <b>{safe}</b>")
-        else:
-            formatted.append(f"• {safe}")
+            line = f"• <b>{safe}</b>"
+        formatted.append(line)
 
     return "\n".join(formatted)
 
@@ -1639,20 +1646,21 @@ def build_message(
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
-💰 {price:.6f} | ⏱ 15m
-⭐ {score_result["score"]:.1f} / 10 | 🛑 SL: {stop_loss:.6f} (-{sl_pct}%)
+💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
+⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
+🛑 <b>SL:</b> {stop_loss:.6f} (-{sl_pct}%)
 
-🎯 TP1: {tp1:.6f} (+{tp1_pct}%)
-🏁 TP2: {tp2:.6f} (+{tp2_pct}%)
+🎯 <b>TP1:</b> {tp1:.6f} (+{tp1_pct}%)
+🏁 <b>TP2:</b> {tp2:.6f} (+{tp2_pct}%)
 
 🏷 <b>التصنيف:</b> {safe_rating}
 
-🪙 BTC: {safe_btc}
-🌐 السوق: {safe_market}
-📊 حالة الألت: {safe_alt_mode}
-👑 السيولة: {safe_dom}
-💸 التمويل: {safe_funding}
-📈 تغير 24H: {change_24h_text}{new_tag}
+🪙 <b>BTC:</b> {safe_btc}
+🌐 <b>السوق:</b> {safe_market}
+📊 <b>حالة الألت:</b> {safe_alt_mode}
+👑 <b>السيولة:</b> {safe_dom}
+💸 <b>التمويل:</b> {safe_funding}
+📈 <b>تغير 24H:</b> {change_24h_text}{new_tag}
 
 📊 <b>أسباب الدخول:</b>
 {bullish_text}{warnings_block}{news_block}
@@ -1782,11 +1790,20 @@ def run_scanner_loop():
                     )
 
                 if not early_signal and not pre_breakout:
-                    if score_result["score"] < 6.8:
-                        logger.info(f"{symbol} → rejected (no early_signal / no pre_breakout / score<{6.8})")
+                    dynamic_threshold = get_dynamic_entry_threshold(
+                        market_state=market_state,
+                        score_result=score_result,
+                        vol_ratio=vol_ratio,
+                        mtf_confirmed=mtf_confirmed,
+                        is_new=is_new,
+                    )
+                    if score_result["score"] < dynamic_threshold:
+                        logger.info(
+                            f"{symbol} → rejected (no early_signal / no pre_breakout / "
+                            f"score<{dynamic_threshold} | market={market_state} | vol={vol_ratio})"
+                        )
                         continue
 
-                # الأخبار تبقى تحذير فقط بدون خصم على السكور
                 if has_high_impact_news:
                     if "warning_reasons" not in score_result:
                         score_result["warning_reasons"] = []
@@ -1863,6 +1880,7 @@ def run_scanner_loop():
                 signal_row = get_signal_row(df)
                 price = float(signal_row["close"])
                 atr_value = float(signal_row["atr"])
+
                 if breakout:
                     sl_type = "breakout"
                 elif pre_breakout:
