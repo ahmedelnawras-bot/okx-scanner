@@ -1654,10 +1654,6 @@ def run_scanner_loop():
                 early_signal = early_bullish_signal(df)
                 pre_breakout = is_pre_breakout(df)
 
-                if not early_signal and not pre_breakout:
-                    logger.info(f"{symbol} → rejected (no early_signal / no pre_breakout)")
-                    continue
-
                 breakout = is_breakout(df)
                 mtf_confirmed = is_higher_timeframe_confirmed(symbol)
                 is_new = is_new_listing_by_candles(candles)
@@ -1693,6 +1689,11 @@ def run_scanner_loop():
                         funding=funding,
                         btc_dominance_proxy=btc_dominance_proxy,
                     )
+
+                if not early_signal and not pre_breakout:
+                    if score_result["score"] < 6.8:
+                        logger.info(f"{symbol} → rejected (no early_signal / no pre_breakout / score<{6.8})")
+                        continue
 
                 pre_breakout_only = pre_breakout and not early_signal
                 required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
