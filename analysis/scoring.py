@@ -170,7 +170,7 @@ def calculate_long_score(
         score -= 1.0
 
     if breakout:
-        score += 2.2
+        score += 1.5  # خُفض من 2.2 — الـ breakout وحده بيخسر أكتر من الـ standard
         reasons.append("اختراق")
 
     if pre_breakout and not breakout:
@@ -239,7 +239,7 @@ def calculate_long_score(
             pass
 
     if breakout and mtf_confirmed and vol_ratio >= 1.6 and candle_strength >= 0.45:
-        score += 0.5
+        score += 1.2  # رُفع من 0.5 — الـ breakout القوي المؤكد يستحق مكافأة أكبر
         reasons.append("اختراق قوي مؤكد")
 
     if score >= 8.8:
