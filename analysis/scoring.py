@@ -175,7 +175,7 @@ def calculate_long_score(
 
     if pre_breakout and not breakout:
         score += 1.2
-        reasons.append("على وشك الكسر 🎯")
+        reasons.append("زخم مبكر تحت المقاومة 🎯")
 
     if mtf_confirmed:
         score += 1.8
