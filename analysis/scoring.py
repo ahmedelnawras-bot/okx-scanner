@@ -8,6 +8,9 @@ def calculate_long_score(
     btc_dominance_proxy=None,
     vol_ratio=None,
     pre_breakout=False,
+    market_state=None,
+    alt_mode=None,
+    market_bias_label=None,
 ):
     funding_label = classify_funding_simple(funding)
 
@@ -112,20 +115,35 @@ def calculate_long_score(
         score += 1.8
         reasons.append("تأكيد فريم الساعة")
 
-    if "🟢" in btc_mode:
-        score += 0.7
-        reasons.append("BTC داعم")
-    elif "🔴" in btc_mode:
-        score -= 0.5
-        warning_reasons.append("BTC غير داعم")
+    # ===================== MARKET CONTEXT =====================
+    if market_state == "alt_season":
+        score += 1.0
+        reasons.append("السوق داعم للألت")
+    elif market_state == "bull_market":
+        score += 0.8
+        reasons.append("السوق في توافق صاعد")
+    elif market_state == "btc_leading":
+        score -= 1.0
+        warning_reasons.append("BTC يقود والسيولة ليست في الألت")
+    elif market_state == "risk_off":
+        score -= 1.2
+        warning_reasons.append("السوق دفاعي وضعيف")
+    else:
+        # fallback لو market_state غير متوفر
+        if "🟢" in btc_mode:
+            score += 0.7
+            reasons.append("BTC داعم")
+        elif "🔴" in btc_mode:
+            score -= 0.5
+            warning_reasons.append("BTC غير داعم")
 
-    if btc_dominance_proxy == "🟢 داعم للألت":
-        score += 0.4
-        reasons.append("هيمنة داعمة للألت")
-    elif btc_dominance_proxy == "🔴 ضد الألت":
-        score -= 0.9
-        reasons.append("هيمنة ضد الألت (ضغط على العملات)")
-        warning_reasons.append("هيمنة ضد الألت (ضغط على العملات)")
+        if btc_dominance_proxy == "🟢 داعم للألت":
+            score += 0.4
+            reasons.append("هيمنة داعمة للألت")
+        elif btc_dominance_proxy == "🔴 ضد الألت":
+            score -= 0.9
+            reasons.append("هيمنة ضد الألت (ضغط على العملات)")
+            warning_reasons.append("هيمنة ضد الألت (ضغط على العملات)")
 
     if funding < -0.0005:
         score += 0.6
@@ -205,7 +223,12 @@ def calculate_long_score(
     if score >= 8.5 and vol_ratio < 1.15:
         fake_signal = True
 
-    if btc_dominance_proxy == "🔴 ضد الألت" and not breakout and not pre_breakout:
+    if market_state == "btc_leading" and not breakout and not pre_breakout:
+        if score < 7.3:
+            fake_signal = True
+    elif market_state == "risk_off" and score < 7.6:
+        fake_signal = True
+    elif btc_dominance_proxy == "🔴 ضد الألت" and not breakout and not pre_breakout:
         if score < 7.3:
             fake_signal = True
 
@@ -222,6 +245,10 @@ def calculate_long_score(
         risk_points += 1
     if dist_ma > 6.0:
         risk_points += 1
+    if market_state == "btc_leading":
+        risk_points += 1
+    if market_state == "risk_off":
+        risk_points += 2
 
     if risk_points >= 3:
         risk_level = "🔴 عالية"
