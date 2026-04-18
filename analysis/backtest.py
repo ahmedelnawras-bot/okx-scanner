@@ -1,50 +1,79 @@
-import os
-import json
-import redis
 from collections import Counter, defaultdict
 
 
-REDIS_URL = os.getenv("REDIS_URL")
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
-def get_redis():
-    if not REDIS_URL:
-        raise ValueError("REDIS_URL not found")
-    client = redis.from_url(REDIS_URL, decode_responses=True)
-    client.ping()
-    return client
+def _safe_bool(value):
+    return bool(value)
 
 
-def load_trade(redis_client, trade_key: str):
+def _normalize_reason(reason: str) -> str:
+    mapping = {
+        "RSI صحي": "RSI في منطقة صحية",
+        "RSI جيد": "RSI جيد",
+        "RSI صاعد بقوة": "RSI صاعد بقوة",
+        "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
+        "RSI عالي": "RSI عالي (تشبع شراء)",
+        "فوليوم داعم": "فوليوم داعم",
+        "فوليوم قوي": "فوليوم قوي",
+        "فوليوم انفجار": "فوليوم انفجاري",
+        "فوق MA": "فوق المتوسط",
+        "شمعة جيدة": "شمعة جيدة",
+        "شمعة قوية": "شمعة قوية",
+        "اختراق": "اختراق",
+        "اختراق مبكر جداً": "اختراق مبكر",
+        "اختراق متأخر": "اختراق متأخر",
+        "اختراق قوي مؤكد": "اختراق قوي مؤكد",
+        "تأكيد فريم الساعة": "تأكيد فريم الساعة",
+        "BTC داعم": "BTC داعم",
+        "هيمنة داعمة": "هيمنة داعمة للألت",
+        "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
+        "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
+        "عملة جديدة": "عملة جديدة",
+        "بداية ترند مبكرة": "بداية ترند مبكرة",
+        "زخم مبكر تحت المقاومة 🎯": "زخم مبكر تحت المقاومة 🎯",
+        "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
+        "ممتد زيادة": "ممتد زيادة",
+    }
+    return mapping.get(reason, reason)
+
+
+def _load_trade(redis_client, trade_key: str):
+    if redis_client is None:
+        return None
     try:
         raw = redis_client.get(trade_key)
         if not raw:
             return None
+        import json
         return json.loads(raw)
     except Exception:
         return None
 
 
-def get_all_trades(redis_client):
+def _get_all_trades(redis_client):
+    if redis_client is None:
+        return []
+
     try:
-        trade_keys = list(redis_client.smembers("trades:all"))
+        keys = list(redis_client.smembers("trades:all"))
     except Exception:
         return []
 
     trades = []
-    for key in trade_keys:
-        trade = load_trade(redis_client, key)
+    for key in keys:
+        trade = _load_trade(redis_client, key)
         if trade:
             trades.append(trade)
-
     return trades
 
 
-def is_decided_trade(trade: dict) -> bool:
-    return trade.get("result") in ("win", "loss")
-
-
-def summarize_group(trades):
+def _summarize_group(trades):
     total = len(trades)
     wins = sum(1 for t in trades if t.get("result") == "win")
     losses = sum(1 for t in trades if t.get("result") == "loss")
@@ -68,211 +97,107 @@ def summarize_group(trades):
     }
 
 
-def get_score_bucket(score: float) -> str:
-    try:
-        score = float(score)
-    except Exception:
-        return "unknown"
-
+def _score_bucket(score):
+    score = _safe_float(score, 0.0)
     if score < 6.3:
-        return "< 6.3"
+        return "<6.3"
     if score < 7.0:
-        return "6.3 - 6.9"
+        return "6.3-6.9"
     if score < 8.0:
-        return "7.0 - 7.9"
+        return "7.0-7.9"
     return "8.0+"
 
 
-def summarize_by_score_bucket(trades):
-    buckets = defaultdict(list)
-    for trade in trades:
-        bucket = get_score_bucket(trade.get("score", 0))
-        buckets[bucket].append(trade)
-
-    ordered = ["< 6.3", "6.3 - 6.9", "7.0 - 7.9", "8.0+", "unknown"]
-    rows = []
-    for bucket in ordered:
-        group = buckets.get(bucket, [])
-        if not group:
-            continue
-        summary = summarize_group(group)
-        rows.append((bucket, summary))
-    return rows
-
-
-def summarize_setup_types(trades):
-    groups = {
-        "pre_breakout_only": [],
-        "breakout_only": [],
-        "breakout_and_pre_breakout": [],
-        "standard": [],
-        "new_listing": [],
-    }
-
-    for trade in trades:
-        pre_breakout = bool(trade.get("pre_breakout", False))
-        breakout = bool(trade.get("breakout", False))
-        is_new = bool(trade.get("is_new", False))
-
-        if is_new:
-            groups["new_listing"].append(trade)
-
-        if pre_breakout and breakout:
-            groups["breakout_and_pre_breakout"].append(trade)
-        elif pre_breakout:
-            groups["pre_breakout_only"].append(trade)
-        elif breakout:
-            groups["breakout_only"].append(trade)
-        else:
-            groups["standard"].append(trade)
-
-    rows = []
-    for name, group in groups.items():
-        if not group:
-            continue
-        rows.append((name, summarize_group(group)))
-    return rows
-
-
-def normalize_reason(reason: str) -> str:
-    mapping = {
-        "RSI صحي": "RSI في منطقة صحية",
-        "RSI جيد": "RSI جيد",
-        "RSI صاعد بقوة": "RSI صاعد بقوة",
-        "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
-        "RSI عالي": "RSI عالي (تشبع شراء)",
-
-        "فوليوم داعم": "فوليوم داعم",
-        "فوليوم قوي": "فوليوم قوي",
-        "فوليوم انفجار": "فوليوم انفجاري",
-
-        "فوق MA": "فوق المتوسط",
-
-        "شمعة جيدة": "شمعة جيدة",
-        "شمعة قوية": "شمعة قوية",
-
-        "اختراق": "اختراق",
-        "اختراق مبكر جداً": "اختراق مبكر",
-        "اختراق متأخر": "اختراق متأخر",
-        "اختراق قوي مؤكد": "اختراق قوي مؤكد",
-
-        "تأكيد فريم الساعة": "تأكيد فريم الساعة",
-        "BTC داعم": "BTC داعم",
-        "هيمنة داعمة": "هيمنة داعمة للألت",
-        "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
-        "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
-        "عملة جديدة": "عملة جديدة",
-        "بداية ترند مبكرة": "بداية ترند مبكرة",
-        "زخم مبكر تحت المقاومة 🎯": "زخم مبكر تحت المقاومة 🎯",
-        "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
-        "ممتد زيادة": "ممتد زيادة",
-    }
-    return mapping.get(reason, reason)
-
-
-def top_reasons(trades, result_filter: str, limit: int = 10):
+def _top_reasons(trades, result_filter: str, limit=5):
     counter = Counter()
 
     for trade in trades:
         if trade.get("result") != result_filter:
             continue
 
-        reasons = trade.get("reasons", []) or []
-        normalized = list(dict.fromkeys(normalize_reason(r) for r in reasons))
+        reasons = trade.get("reasons") or []
+        normalized = list(dict.fromkeys(_normalize_reason(r) for r in reasons))
         for reason in normalized:
             counter[reason] += 1
 
     return counter.most_common(limit)
 
 
-def avg_metrics(trades):
-    if not trades:
-        return {
-            "avg_score": 0.0,
-            "avg_vol_ratio": 0.0,
-            "avg_candle_strength": 0.0,
-        }
-
-    def _avg(field):
-        vals = []
-        for t in trades:
-            try:
-                vals.append(float(t.get(field, 0)))
-            except Exception:
-                pass
-        return round(sum(vals) / len(vals), 4) if vals else 0.0
-
-    return {
-        "avg_score": _avg("score"),
-        "avg_vol_ratio": _avg("vol_ratio"),
-        "avg_candle_strength": _avg("candle_strength"),
-    }
-
-
-def print_summary(title: str, summary: dict):
-    print(f"\n=== {title} ===")
-    print(f"Total     : {summary['total']}")
-    print(f"Wins      : {summary['wins']}")
-    print(f"Losses    : {summary['losses']}")
-    print(f"Expired   : {summary['expired']}")
-    print(f"Open      : {summary['open']}")
-    print(f"TP1 Hits  : {summary['tp1_hits']}")
-    print(f"Win Rate  : {summary['winrate']}%")
-    print(f"TP1 Rate  : {summary['tp1_rate']}%")
-
-
-def main():
-    redis_client = get_redis()
-    trades = get_all_trades(redis_client)
+def build_deep_report(redis_client) -> str:
+    trades = _get_all_trades(redis_client)
 
     if not trades:
-        print("No trades found.")
-        return
+        return "📊 <b>Deep Report</b>\n\nلا توجد صفقات مسجلة بعد."
 
-    print_summary("OVERALL", summarize_group(trades))
+    overall = _summarize_group(trades)
 
-    decided_trades = [t for t in trades if is_decided_trade(t)]
-    print_summary("DECIDED ONLY", summarize_group(decided_trades))
+    # Score buckets
+    bucket_groups = defaultdict(list)
+    for trade in trades:
+        bucket_groups[_score_bucket(trade.get("score"))].append(trade)
 
-    print("\n=== SCORE BUCKETS ===")
-    for bucket, summary in summarize_by_score_bucket(trades):
-        metrics = avg_metrics([
-            t for t in trades
-            if get_score_bucket(t.get("score", 0)) == bucket
-        ])
-        print(
-            f"{bucket:12} | total={summary['total']:3} | "
-            f"winrate={summary['winrate']:6}% | "
-            f"avg_score={metrics['avg_score']}"
-        )
+    bucket_lines = []
+    for bucket in ["<6.3", "6.3-6.9", "7.0-7.9", "8.0+"]:
+        group = bucket_groups.get(bucket, [])
+        if not group:
+            continue
+        s = _summarize_group(group)
+        bucket_lines.append(f"• {bucket}: {s['winrate']}% ({s['wins']}/{s['wins'] + s['losses']})")
 
-    print("\n=== SETUP TYPES ===")
-    for name, summary in summarize_setup_types(trades):
-        metrics = avg_metrics([
-            t for t in trades
-            if (
-                (name == "pre_breakout_only" and t.get("pre_breakout") and not t.get("breakout")) or
-                (name == "breakout_only" and t.get("breakout") and not t.get("pre_breakout")) or
-                (name == "breakout_and_pre_breakout" and t.get("breakout") and t.get("pre_breakout")) or
-                (name == "standard" and not t.get("breakout") and not t.get("pre_breakout")) or
-                (name == "new_listing" and t.get("is_new"))
-            )
-        ])
-        print(
-            f"{name:24} | total={summary['total']:3} | "
-            f"winrate={summary['winrate']:6}% | "
-            f"avg_score={metrics['avg_score']} | "
-            f"avg_vol_ratio={metrics['avg_vol_ratio']}"
-        )
+    # Setup types
+    pre_only = []
+    breakout_only = []
+    both = []
+    standard = []
 
-    print("\n=== TOP WINNING REASONS ===")
-    for reason, count in top_reasons(trades, "win", limit=12):
-        print(f"{reason} -> {count}")
+    for trade in trades:
+        pre = _safe_bool(trade.get("pre_breakout"))
+        br = _safe_bool(trade.get("breakout"))
 
-    print("\n=== TOP LOSING REASONS ===")
-    for reason, count in top_reasons(trades, "loss", limit=12):
-        print(f"{reason} -> {count}")
+        if pre and br:
+            both.append(trade)
+        elif pre:
+            pre_only.append(trade)
+        elif br:
+            breakout_only.append(trade)
+        else:
+            standard.append(trade)
 
+    setup_map = [
+        ("Pre-breakout فقط", pre_only),
+        ("Breakout فقط", breakout_only),
+        ("الاتنين معًا", both),
+        ("Standard", standard),
+    ]
 
-if __name__ == "__main__":
-    main()
+    setup_lines = []
+    for name, group in setup_map:
+        if not group:
+            continue
+        s = _summarize_group(group)
+        setup_lines.append(f"• {name}: {s['winrate']}% ({s['wins']}/{s['wins'] + s['losses']})")
+
+    top_wins = _top_reasons(trades, "win", limit=5)
+    top_losses = _top_reasons(trades, "loss", limit=5)
+
+    win_reason_lines = [f"• {reason} ({count})" for reason, count in top_wins] or ["• لا يوجد"]
+    loss_reason_lines = [f"• {reason} ({count})" for reason, count in top_losses] or ["• لا يوجد"]
+
+    return (
+        f"📊 <b>Deep Report</b>\n\n"
+        f"📌 <b>الملخص العام:</b>\n"
+        f"• Signals: {overall['total']}\n"
+        f"• Wins: {overall['wins']}\n"
+        f"• Losses: {overall['losses']}\n"
+        f"• TP1 Hits: {overall['tp1_hits']}\n"
+        f"• Win Rate: {overall['winrate']}%\n"
+        f"• TP1 Rate: {overall['tp1_rate']}%\n\n"
+        f"🎯 <b>حسب السكور:</b>\n"
+        f"{chr(10).join(bucket_lines) if bucket_lines else '• لا يوجد'}\n\n"
+        f"🧠 <b>حسب نوع الإشارة:</b>\n"
+        f"{chr(10).join(setup_lines) if setup_lines else '• لا يوجد'}\n\n"
+        f"✅ <b>أكثر أسباب الفوز:</b>\n"
+        f"{chr(10).join(win_reason_lines)}\n\n"
+        f"⚠️ <b>أكثر أسباب الخسارة:</b>\n"
+        f"{chr(10).join(loss_reason_lines)}"
+    )
