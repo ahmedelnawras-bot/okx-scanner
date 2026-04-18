@@ -17,6 +17,7 @@ from tracking.performance import (
     get_winrate_summary,
     format_winrate_summary,
     get_period_summary,
+    get_trade_summary,
     format_period_summary,
     calc_tp1,
     calc_tp2,
@@ -99,6 +100,10 @@ STATS_RESET_TS_KEY = "stats:last_reset_ts"
 CANDLE_CACHE_TTL_15M = 25
 CANDLE_CACHE_TTL_1H = 90
 CANDLE_CACHE_TTL_DEFAULT = 20
+
+# Alt snapshot cache
+ALT_SNAPSHOT_CACHE_KEY = "cache:alt_snapshot"
+ALT_SNAPSHOT_CACHE_TTL = 600  # 10 دقايق
 
 # =========================
 # REDIS
@@ -600,11 +605,11 @@ def stats_since_reset(chat_id: str):
         reset_ts = int(reset_ts_raw)
         reset_time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_ts))
 
-        summary = get_period_summary(
+        summary = get_trade_summary(
             redis_client=r,
-            period="all",
             market_type="futures",
             side="long",
+            since_ts=reset_ts,
         )
 
         header = f"📊 <b>Stats Since Reset</b>\n🕒 منذ: {html.escape(reset_time_text)}\n\n"
@@ -1822,7 +1827,23 @@ def run_scanner_loop():
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
 
-            alt_snapshot = get_alt_market_snapshot(ranked_pairs)
+            alt_snapshot = None
+            if r:
+                try:
+                    cached_snapshot = r.get(ALT_SNAPSHOT_CACHE_KEY)
+                    if cached_snapshot:
+                        alt_snapshot = json.loads(cached_snapshot)
+                        logger.info("ALT SNAPSHOT → loaded from cache")
+                except Exception as e:
+                    logger.warning(f"Alt snapshot cache read error: {e}")
+
+            if alt_snapshot is None:
+                alt_snapshot = get_alt_market_snapshot(ranked_pairs)
+                if r:
+                    try:
+                        r.set(ALT_SNAPSHOT_CACHE_KEY, json.dumps(alt_snapshot), ex=ALT_SNAPSHOT_CACHE_TTL)
+                    except Exception as e:
+                        logger.warning(f"Alt snapshot cache write error: {e}")
             market_info = get_market_state(btc_mode, alt_snapshot)
 
             market_state = market_info["market_state"]
@@ -1889,18 +1910,9 @@ def run_scanner_loop():
                         alt_mode=alt_mode,
                         market_bias_label=market_bias_label,
                     )
-                except TypeError:
-                    score_result = calculate_long_score(
-                        df=df,
-                        vol_ratio=vol_ratio,
-                        mtf_confirmed=mtf_confirmed,
-                        btc_mode=btc_mode,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                        is_new=is_new,
-                        funding=funding,
-                        btc_dominance_proxy=btc_dominance_proxy,
-                    )
+                except Exception as score_err:
+                    logger.error(f"{symbol} → calculate_long_score failed: {score_err}")
+                    continue
 
                 if not early_signal and not pre_breakout:
                     dynamic_threshold = get_dynamic_entry_threshold(
@@ -1944,7 +1956,7 @@ def run_scanner_loop():
                     continue
 
                 if score_result["score"] < required_min_score:
-                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_SCORE})")
+                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_score})")
                     continue
 
                 if not breakout and not pre_breakout and dist_ma > 3.8:
