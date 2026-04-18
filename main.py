@@ -1179,11 +1179,13 @@ def normalize_reason(reason: str) -> str:
         "تأكيد فريم الساعة": "تأكيد فريم الساعة",
 
         "BTC داعم": "BTC داعم",
+        "BTC غير داعم": "BTC غير داعم",
 
         "هيمنة داعمة": "هيمنة داعمة للألت",
         "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
 
         "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
+        "تمويل إيجابي": "تمويل إيجابي (ضغط محتمل)",
 
         "عملة جديدة": "عملة جديدة",
 
@@ -1192,6 +1194,8 @@ def normalize_reason(reason: str) -> str:
 
         "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
         "ممتد زيادة": "ممتد زيادة",
+        "أسفل المتوسط": "أسفل المتوسط",
+        "رفض سعري علوي": "رفض سعري علوي",
     }
     return mapping.get(reason, reason)
 
@@ -1224,10 +1228,14 @@ def sort_reasons(reasons):
         "عملة جديدة": 20,
 
         "RSI عالي (تشبع شراء)": 101,
-        "بعيد عن المتوسط (دخول متأخر)": 102,
-        "ممتد زيادة": 103,
-        "اختراق متأخر": 104,
-        "هيمنة ضد الألت (ضغط على العملات)": 105,
+        "أسفل المتوسط": 102,
+        "بعيد عن المتوسط (دخول متأخر)": 103,
+        "ممتد زيادة": 104,
+        "اختراق متأخر": 105,
+        "هيمنة ضد الألت (ضغط على العملات)": 106,
+        "BTC غير داعم": 107,
+        "تمويل إيجابي (ضغط محتمل)": 108,
+        "رفض سعري علوي": 109,
     }
 
     return sorted(reasons, key=lambda x: priority.get(x, 999))
@@ -1241,6 +1249,10 @@ def classify_reasons(reasons):
         "ممتد",
         "اختراق متأخر",
         "هيمنة ضد",
+        "أسفل المتوسط",
+        "رفض سعري",
+        "BTC غير داعم",
+        "تمويل إيجابي",
     ]
 
     normalized = [normalize_reason(r) for r in reasons]
@@ -1314,7 +1326,16 @@ def build_message(
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
-    bullish, warnings = classify_reasons(score_result.get("reasons", []))
+    bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
+
+    explicit_warnings = [
+        normalize_reason(w)
+        for w in (score_result.get("warning_reasons") or [])
+    ]
+
+    warnings = explicit_warnings if explicit_warnings else inferred_warnings
+    warnings = list(dict.fromkeys(warnings))
+    warnings = sort_reasons(warnings)
 
     bullish_text = format_bullish_reasons(bullish) if bullish else "• زخم مبكر"
     warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
@@ -1329,12 +1350,14 @@ def build_message(
     tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
 
-    if len(warnings) == 0:
-        risk_level = "🟢 منخفضة"
-    elif len(warnings) == 1:
-        risk_level = "🟡 متوسطة"
-    else:
-        risk_level = "🔴 عالية"
+    risk_level = score_result.get("risk_level")
+    if not risk_level:
+        if len(warnings) == 0:
+            risk_level = "🟢 منخفضة"
+        elif len(warnings) == 1:
+            risk_level = "🟡 متوسطة"
+        else:
+            risk_level = "🔴 عالية"
 
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
