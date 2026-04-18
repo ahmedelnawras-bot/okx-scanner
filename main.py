@@ -457,6 +457,9 @@ def bootstrap_telegram_offset_once():
     if is_telegram_bootstrap_done():
         return
 
+    if not acquire_telegram_poll_lock():
+        return
+
     try:
         updates = get_telegram_updates(offset=0)
         if updates:
@@ -469,6 +472,8 @@ def bootstrap_telegram_offset_once():
         mark_telegram_bootstrap_done()
     except Exception as e:
         logger.error(f"Telegram bootstrap error: {e}")
+    finally:
+        release_telegram_poll_lock()
 
 
 def handle_telegram_commands():
@@ -890,7 +895,11 @@ def is_pre_breakout(df, lookback=PRE_BREAKOUT_LOOKBACK) -> bool:
     السعر قريب جداً من القمة الأخيرة + تراكم فوليوم + significance + ضغط ATR
     """
     try:
-        if df is None or df.empty or len(df) < max(lookback + 6, PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS + 2):
+        min_len = max(
+            lookback + 6,
+            PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS + 2,
+        )
+        if df is None or df.empty or len(df) < min_len:
             return False
 
         signal_row = get_signal_row(df)
@@ -1476,6 +1485,10 @@ def run_scanner_loop():
 
 
 def run():
+    logger.info(
+        f"BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
+    )
+
     clear_webhook()
 
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
