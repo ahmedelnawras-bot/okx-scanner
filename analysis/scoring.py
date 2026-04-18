@@ -130,22 +130,22 @@ def calculate_long_score(
         reasons.append("RSI صاعد بقوة")
     elif 52 <= rsi <= 62:
         score += 1.2
-        reasons.append("RSI صحي")
+        reasons.append("RSI في منطقة صحية")
     elif 62 < rsi <= 68:
         score += 0.7
         reasons.append("RSI جيد")
     elif 68 < rsi <= 72 and rsi_momentum > 4:
         score += 0.5
-        reasons.append("RSI مرتفع لكن بزخم")
+        reasons.append("RSI مرتفع بزخم")
     elif rsi > 72:
         score -= 0.9
-        reasons.append("RSI عالي")
+        reasons.append("RSI عالي (تشبع شراء)")
     elif rsi < 48:
         score -= 0.7
 
     if vol_ratio >= 2.0:
         score += 2.5
-        reasons.append("فوليوم انفجار")
+        reasons.append("فوليوم انفجاري")
     elif vol_ratio >= 1.5:
         score += 1.8
         reasons.append("فوليوم قوي")
@@ -155,7 +155,7 @@ def calculate_long_score(
 
     if close > ma:
         score += 1.0
-        reasons.append("فوق MA")
+        reasons.append("فوق المتوسط")
     else:
         score -= 0.8
 
@@ -189,14 +189,14 @@ def calculate_long_score(
 
     if btc_dominance_proxy == "🟢 داعم للألت":
         score += 0.4
-        reasons.append("هيمنة داعمة")
+        reasons.append("هيمنة داعمة للألت")
     elif btc_dominance_proxy == "🔴 ضد الألت":
         score -= 0.4
         reasons.append("هيمنة ضد الألت")
 
     if funding < -0.0005:
         score += 0.6
-        reasons.append("تمويل سلبي")
+        reasons.append("تمويل سلبي (داعم للشراء)")
     elif funding > 0.0005:
         score -= 0.5
 
@@ -212,7 +212,7 @@ def calculate_long_score(
         reasons.append("بداية ترند مبكرة")
     elif dist_ma > 4.5:
         score -= 0.8
-        reasons.append("بعيد عن MA (متأخر)")
+        reasons.append("بعيد عن المتوسط (دخول متأخر)")
 
     if dist_ma > 6.0:
         score -= 1.2
@@ -229,7 +229,7 @@ def calculate_long_score(
 
                 if ext <= 1.8:
                     score += 0.6
-                    reasons.append("اختراق مبكر جداً")
+                    reasons.append("اختراق مبكر")
                 elif 1.8 < ext <= 3.0:
                     score += 0.2
                 elif ext > 3.5:
@@ -240,7 +240,7 @@ def calculate_long_score(
 
     if breakout and mtf_confirmed and vol_ratio >= 1.6 and candle_strength >= 0.45:
         score += 0.5
-        reasons.append("توافق قوي مبكر")
+        reasons.append("اختراق قوي مؤكد")
 
     if score >= 8.8:
         if not ((breakout or pre_breakout) and mtf_confirmed and vol_ratio >= 1.5):
