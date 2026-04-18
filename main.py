@@ -72,6 +72,12 @@ PRE_BREAKOUT_VOLUME_SIGNIFICANCE = 1.20
 PRE_BREAKOUT_RECENT_VOL_BARS = 3
 PRE_BREAKOUT_BASELINE_VOL_BARS = 12
 
+# Market state sampling
+ALT_MARKET_SAMPLE_SIZE = 12
+ALT_MARKET_MIN_VALID = 6
+ALT_MARKET_TIMEFRAME = "1H"
+ALT_MARKET_CANDLE_LIMIT = 60
+
 SCAN_LOCK_KEY = "scan:running"
 SCAN_LOCK_TTL = 240
 
@@ -813,6 +819,175 @@ def get_btc_dominance_proxy(btc_mode: str) -> str:
     return "🟡 محايد"
 
 
+def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
+    """
+    Snapshot سريع لحالة الألت من عينة محدودة لتجنب الضغط الكبير على الـ API.
+    """
+    try:
+        if not ranked_pairs:
+            return {
+                "sample_size": 0,
+                "valid_count": 0,
+                "above_ma_ratio": 0.0,
+                "rsi_support_ratio": 0.0,
+                "positive_24h_ratio": 0.0,
+                "alt_strength_score": 0.0,
+                "alt_mode": "🟡 متماسك",
+            }
+
+        sampled = []
+        for item in ranked_pairs:
+            symbol = item.get("instId", "")
+            if symbol == "BTC-USDT-SWAP":
+                continue
+            sampled.append(item)
+            if len(sampled) >= sample_size:
+                break
+
+        valid = 0
+        above_ma_count = 0
+        rsi_support_count = 0
+        positive_24h_count = 0
+
+        for item in sampled:
+            symbol = item.get("instId", "")
+            change_24h = extract_24h_change_percent(item)
+
+            candles = get_candles(symbol, ALT_MARKET_TIMEFRAME, ALT_MARKET_CANDLE_LIMIT)
+            df = to_dataframe(candles)
+
+            if df is None or df.empty or len(df) < 25:
+                continue
+
+            try:
+                signal_row = get_signal_row(df)
+                close = float(signal_row["close"])
+                ma_value = float(signal_row.get("ma", 0) or 0)
+                rsi_value = float(signal_row.get("rsi", 50) or 50)
+
+                valid += 1
+
+                if ma_value > 0 and close > ma_value:
+                    above_ma_count += 1
+
+                if rsi_value >= 52:
+                    rsi_support_count += 1
+
+                if change_24h > 0:
+                    positive_24h_count += 1
+
+            except Exception:
+                continue
+
+        if valid == 0:
+            return {
+                "sample_size": len(sampled),
+                "valid_count": 0,
+                "above_ma_ratio": 0.0,
+                "rsi_support_ratio": 0.0,
+                "positive_24h_ratio": 0.0,
+                "alt_strength_score": 0.0,
+                "alt_mode": "🟡 متماسك",
+            }
+
+        above_ma_ratio = round(above_ma_count / valid, 4)
+        rsi_support_ratio = round(rsi_support_count / valid, 4)
+        positive_24h_ratio = round(positive_24h_count / valid, 4)
+
+        alt_strength_score = round(
+            (above_ma_ratio * 0.45) +
+            (rsi_support_ratio * 0.35) +
+            (positive_24h_ratio * 0.20),
+            4
+        )
+
+        if valid < ALT_MARKET_MIN_VALID:
+            alt_mode = "🟡 متماسك"
+        elif alt_strength_score >= 0.68 and above_ma_ratio >= 0.58 and rsi_support_ratio >= 0.50:
+            alt_mode = "🟢 قوي"
+        elif alt_strength_score >= 0.50:
+            alt_mode = "🟡 متماسك"
+        else:
+            alt_mode = "🔴 ضعيف"
+
+        snapshot = {
+            "sample_size": len(sampled),
+            "valid_count": valid,
+            "above_ma_ratio": above_ma_ratio,
+            "rsi_support_ratio": rsi_support_ratio,
+            "positive_24h_ratio": positive_24h_ratio,
+            "alt_strength_score": alt_strength_score,
+            "alt_mode": alt_mode,
+        }
+
+        logger.info(
+            f"ALT SNAPSHOT | valid={valid}/{len(sampled)} | "
+            f"above_ma={above_ma_ratio:.2f} | rsi={rsi_support_ratio:.2f} | "
+            f"pos24h={positive_24h_ratio:.2f} | strength={alt_strength_score:.2f} | "
+            f"mode={alt_mode}"
+        )
+
+        return snapshot
+
+    except Exception as e:
+        logger.error(f"Alt market snapshot error: {e}")
+        return {
+            "sample_size": 0,
+            "valid_count": 0,
+            "above_ma_ratio": 0.0,
+            "rsi_support_ratio": 0.0,
+            "positive_24h_ratio": 0.0,
+            "alt_strength_score": 0.0,
+            "alt_mode": "🟡 متماسك",
+        }
+
+
+def get_market_state(btc_mode: str, alt_snapshot: dict):
+    """
+    يركّب الحالة النهائية للسوق من BTC + عينة الألت.
+    """
+    alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+
+    if "🔴 هابط" in btc_mode and "🔴 ضعيف" in alt_mode:
+        return {
+            "market_state": "risk_off",
+            "market_state_label": "🔴 Risk-Off",
+            "market_bias_label": "🔴 السوق ضعيف والسيولة دفاعية",
+            "btc_dominance_proxy": "🔴 ضد الألت",
+        }
+
+    if "🟢 صاعد" in btc_mode and "🔴 ضعيف" in alt_mode:
+        return {
+            "market_state": "btc_leading",
+            "market_state_label": "⚠️ BTC Leading",
+            "market_bias_label": "🔴 BTC يقود والسيولة ليست في الألت",
+            "btc_dominance_proxy": "🔴 ضد الألت",
+        }
+
+    if "🟢 صاعد" in btc_mode and "🟢 قوي" in alt_mode:
+        return {
+            "market_state": "bull_market",
+            "market_state_label": "✅ Bull Market",
+            "market_bias_label": "🟢 BTC والألت في توافق صاعد",
+            "btc_dominance_proxy": "🟢 داعم للألت",
+        }
+
+    if ("🟡 محايد" in btc_mode or "🔴 هابط" in btc_mode) and "🟢 قوي" in alt_mode:
+        return {
+            "market_state": "alt_season",
+            "market_state_label": "🔥 Alt Season",
+            "market_bias_label": "🟢 الألت أقوى من BTC حالياً",
+            "btc_dominance_proxy": "🟢 داعم للألت",
+        }
+
+    return {
+        "market_state": "mixed",
+        "market_state_label": "🟡 Mixed",
+        "market_bias_label": "🟡 السوق مختلط والسيولة غير محسومة",
+        "btc_dominance_proxy": "🟡 محايد",
+    }
+
+
 def calculate_stop_loss(price, atr_value, signal_type="standard"):
     """
     Dynamic SL multiplier based on signal type:
@@ -1322,7 +1497,10 @@ def build_message(
     btc_dominance_proxy,
     tv_link,
     is_new,
-    change_24h=0.0
+    change_24h=0.0,
+    market_state_label=None,
+    market_bias_label=None,
+    alt_mode=None,
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -1363,7 +1541,9 @@ def build_message(
 
     safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
-    safe_dom = html.escape(btc_dominance_proxy)
+    safe_dom = html.escape(market_bias_label or btc_dominance_proxy)
+    safe_market = html.escape(market_state_label or "🟡 Mixed")
+    safe_alt_mode = html.escape(alt_mode or "🟡 متماسك")
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
@@ -1383,7 +1563,9 @@ def build_message(
 🏷 <b>التصنيف:</b> {safe_rating}
 
 🪙 BTC: {safe_btc}
-👑 الهيمنة: {safe_dom}
+🌐 السوق: {safe_market}
+📊 حالة الألت: {safe_alt_mode}
+👑 السيولة: {safe_dom}
 💸 التمويل: {safe_funding}
 📈 تغير 24H: {change_24h_text}{new_tag}
 
@@ -1433,7 +1615,20 @@ def run_scanner_loop():
 
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
-            btc_dominance_proxy = get_btc_dominance_proxy(btc_mode)
+
+            alt_snapshot = get_alt_market_snapshot(ranked_pairs)
+            market_info = get_market_state(btc_mode, alt_snapshot)
+
+            market_state = market_info["market_state"]
+            market_state_label = market_info["market_state_label"]
+            market_bias_label = market_info["market_bias_label"]
+            btc_dominance_proxy = market_info["btc_dominance_proxy"]
+            alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+
+            logger.info(
+                f"MARKET STATE | btc={btc_mode} | alt={alt_mode} | "
+                f"state={market_state_label} | flow={market_bias_label}"
+            )
 
             tested = 0
             sent_count = 0
@@ -1470,17 +1665,34 @@ def run_scanner_loop():
                 vol_ratio = get_volume_ratio(df)
                 dist_ma = get_distance_from_ma_percent(df)
 
-                score_result = calculate_long_score(
-                    df=df,
-                    vol_ratio=vol_ratio,
-                    mtf_confirmed=mtf_confirmed,
-                    btc_mode=btc_mode,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    is_new=is_new,
-                    funding=funding,
-                    btc_dominance_proxy=btc_dominance_proxy,
-                )
+                try:
+                    score_result = calculate_long_score(
+                        df=df,
+                        vol_ratio=vol_ratio,
+                        mtf_confirmed=mtf_confirmed,
+                        btc_mode=btc_mode,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_new=is_new,
+                        funding=funding,
+                        btc_dominance_proxy=btc_dominance_proxy,
+                        market_state=market_state,
+                        alt_mode=alt_mode,
+                        market_bias_label=market_bias_label,
+                    )
+                except TypeError:
+                    # fallback للتوافق مع نسخة scoring القديمة
+                    score_result = calculate_long_score(
+                        df=df,
+                        vol_ratio=vol_ratio,
+                        mtf_confirmed=mtf_confirmed,
+                        btc_mode=btc_mode,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_new=is_new,
+                        funding=funding,
+                        btc_dominance_proxy=btc_dominance_proxy,
+                    )
 
                 pre_breakout_only = pre_breakout and not early_signal
                 required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
@@ -1493,7 +1705,8 @@ def run_scanner_loop():
                     f"score_signal: {score_result['signal']} | "
                     f"fake: {score_result['fake_signal']} | "
                     f"mtf: {mtf_confirmed} | "
-                    f"new: {is_new}"
+                    f"new: {is_new} | "
+                    f"market={market_state}"
                 )
 
                 if score_result["fake_signal"]:
@@ -1590,6 +1803,9 @@ def run_scanner_loop():
                         tv_link=tv_link,
                         is_new=is_new,
                         change_24h=change_24h,
+                        market_state_label=market_state_label,
+                        market_bias_label=market_bias_label,
+                        alt_mode=alt_mode,
                     ),
                     "candle_time": candle_time,
                     "now": now,
@@ -1598,8 +1814,10 @@ def run_scanner_loop():
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
                     "reasons": score_result.get("reasons", []),
                     "mtf_confirmed": mtf_confirmed,
-                    "btc_dominance_proxy": btc_dominance_proxy,
+                    "btc_dominance_proxy": market_bias_label,
                     "change_24h": change_24h,
+                    "market_state": market_state,
+                    "alt_mode": alt_mode,
                 }
                 candidate["bucket"] = get_candidate_bucket(candidate)
 
@@ -1679,7 +1897,8 @@ def run_scanner_loop():
                     logger.info(
                         f"SENT → {symbol} | score: {candidate['score']} | "
                         f"momentum: {candidate['momentum_priority']} | "
-                        f"bucket: {candidate['bucket']} | new={candidate['is_new']}"
+                        f"bucket: {candidate['bucket']} | new={candidate['is_new']} | "
+                        f"market={candidate['market_state']} | alt={candidate['alt_mode']}"
                     )
                 else:
                     release_signal_slot(
