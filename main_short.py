@@ -101,8 +101,8 @@ CANDLE_CACHE_TTL_15M = 25
 CANDLE_CACHE_TTL_1H = 90
 CANDLE_CACHE_TTL_DEFAULT = 20
 
-# Alt snapshot cache
-ALT_SNAPSHOT_CACHE_KEY = "cache:alt_snapshot:short"
+# Alt snapshot cache — نفس key اللونج عشان نشارك الـ cache
+ALT_SNAPSHOT_CACHE_KEY = "cache:alt_snapshot"
 ALT_SNAPSHOT_CACHE_TTL = 600  # 10 دقايق
 
 # =========================
@@ -1924,11 +1924,10 @@ def run_scanner_loop():
                         pre_breakdown=pre_breakdown,
                         is_new=is_new,
                         funding=funding,
-                        btc_short_bias=btc_short_bias,
+                        btc_short_bias_proxy=btc_short_bias,
                         market_state=market_state,
                         alt_mode=alt_mode,
                         market_bias_label=market_bias_label,
-                        change_24h=change_24h,
                     )
                 except Exception as score_err:
                     logger.error(f"{symbol} → calculate_short_score failed: {score_err}")
