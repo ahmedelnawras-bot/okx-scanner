@@ -116,6 +116,38 @@ def normalize_candles(raw):
     return candles
 
 
+def cleanup_missing_trades_from_index(redis_client) -> int:
+    """
+    ينظف trades:all من المفاتيح التي لم تعد موجودة فعلياً في Redis.
+    مفيد بعد reset جزئي للشورت أو اللونج.
+    """
+    if redis_client is None:
+        return 0
+
+    all_trades_key = get_all_trades_set_key()
+
+    try:
+        trade_keys = list(redis_client.smembers(all_trades_key))
+    except Exception as e:
+        logger.error(f"cleanup_missing_trades_from_index read error: {e}")
+        return 0
+
+    removed = 0
+
+    for trade_key in trade_keys:
+        try:
+            if not redis_client.exists(trade_key):
+                redis_client.srem(all_trades_key, trade_key)
+                removed += 1
+        except Exception:
+            continue
+
+    if removed > 0:
+        logger.info(f"cleanup_missing_trades_from_index → removed {removed} stale keys")
+
+    return removed
+
+
 def register_trade(
     redis_client,
     symbol: str,
@@ -158,6 +190,15 @@ def register_trade(
     if reasons is None:
         reasons = []
 
+    # حقول عامة جديدة غير منحازة للونج
+    pre_signal = bool(pre_breakout)
+    break_signal = bool(breakout)
+
+    if side == "short":
+        signal_event = "breakdown"
+    else:
+        signal_event = "breakout"
+
     trade_data = {
         "symbol": symbol,
         "market_type": market_type,
@@ -182,8 +223,16 @@ def register_trade(
 
         # extra fields for backtesting / analytics
         "reasons": list(reasons),
-        "pre_breakout": bool(pre_breakout),
-        "breakout": bool(breakout),
+
+        # legacy fields (للتوافق مع الملفات القديمة)
+        "pre_breakout": pre_signal,
+        "breakout": break_signal,
+
+        # new generic fields
+        "signal_event": signal_event,
+        "pre_signal": pre_signal,
+        "break_signal": break_signal,
+
         "vol_ratio": round(float(vol_ratio), 4),
         "candle_strength": round(float(candle_strength), 4),
         "mtf_confirmed": bool(mtf_confirmed),
@@ -329,6 +378,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             if high >= tp2:
                 result = "win"
             elif low <= sl:
+                # بعد TP1 تم نقل SL إلى entry → خروج رابح / آمن
                 result = "win"
     else:  # short
         if not tp1_hit:
@@ -342,6 +392,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             if low <= tp2:
                 result = "win"
             elif high >= sl:
+                # بعد TP1 تم نقل SL إلى entry → خروج رابح / آمن
                 result = "win"
 
     return result, tp1_now
