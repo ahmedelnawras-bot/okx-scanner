@@ -53,21 +53,29 @@ def get_all_trades_set_key() -> str:
 
 
 def calc_tp1(entry: float, sl: float, side: str = "long") -> float:
+    """
+    TP1 = 1.5× risk
+    عند 47% win rate → رابح بدل breakeven
+    """
     side = normalize_side(side)
     risk = abs(entry - sl)
 
     if side == "short":
-        return round(entry - risk, 6)
-    return round(entry + risk, 6)
+        return round(entry - (risk * 1.5), 6)
+    return round(entry + (risk * 1.5), 6)
 
 
 def calc_tp2(entry: float, sl: float, side: str = "long") -> float:
+    """
+    TP2 = 3× risk
+    هدف بعيد للصفقات القوية
+    """
     side = normalize_side(side)
     risk = abs(entry - sl)
 
     if side == "short":
-        return round(entry - (risk * 2), 6)
-    return round(entry + (risk * 2), 6)
+        return round(entry - (risk * 3.0), 6)
+    return round(entry + (risk * 3.0), 6)
 
 
 def fetch_recent_candles(symbol: str, timeframe: str = "15m", limit: int = 100):
