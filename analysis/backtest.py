@@ -123,11 +123,22 @@ def _top_reasons(trades, result_filter: str, limit=5):
     return counter.most_common(limit)
 
 
-def build_deep_report(redis_client) -> str:
+def build_deep_report(redis_client, market_type: str = None, side: str = None) -> str:
     trades = _get_all_trades(redis_client)
 
+    if market_type:
+        trades = [t for t in trades if t.get("market_type", "futures") == market_type]
+    if side:
+        trades = [t for t in trades if t.get("side", "long") == side]
+
+    report_label = "Deep Report"
+    if side == "short":
+        report_label = "Deep Report — Short"
+    elif side == "long":
+        report_label = "Deep Report — Long"
+
     if not trades:
-        return "📊 <b>Deep Report</b>\n\nلا توجد صفقات مسجلة بعد."
+        return f"📊 <b>{report_label}</b>\n\nلا توجد صفقات مسجلة بعد."
 
     overall = _summarize_group(trades)
 
@@ -184,7 +195,7 @@ def build_deep_report(redis_client) -> str:
     loss_reason_lines = [f"• {reason} ({count})" for reason, count in top_losses] or ["• لا يوجد"]
 
     return (
-        f"📊 <b>Deep Report</b>\n\n"
+        f"📊 <b>{report_label}</b>\n\n"
         f"📌 <b>الملخص العام:</b>\n"
         f"• Signals: {overall['total']}\n"
         f"• Wins: {overall['wins']}\n"
