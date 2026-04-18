@@ -192,7 +192,7 @@ def calculate_long_score(
         reasons.append("هيمنة داعمة للألت")
     elif btc_dominance_proxy == "🔴 ضد الألت":
         score -= 0.4
-        reasons.append("هيمنة ضد الألت")
+        reasons.append("هيمنة ضد الألت (ضغط على العملات)")
 
     if funding < -0.0005:
         score += 0.6
