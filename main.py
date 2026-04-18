@@ -1,3 +1,19 @@
+تمام، ده main.py كامل بعد التنظيف النهائي بحيث:
+
+pre_breakout يتبعت إلى calculate_long_score()
+
+اتشال التزويد اليدوي للـ score من main
+
+اتشال إضافة الـ reason اليدوية من main
+
+فضلنا محافظين على منطق:
+
+early_signal أو pre_breakout يعدّي
+
+ولو pre_breakout only يبقى له required_min_score أعلى بـ 0.5
+
+
+
 import os
 import sys
 import time
@@ -47,7 +63,6 @@ HTF_TIMEFRAME = "1H"
 
 FINAL_MIN_SCORE = 6.3
 PRE_BREAKOUT_EXTRA_SCORE = 0.5
-PRE_BREAKOUT_SCORE_BONUS = 1.2
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
@@ -1216,22 +1231,13 @@ def run_scanner_loop():
                     mtf_confirmed=mtf_confirmed,
                     btc_mode=btc_mode,
                     breakout=breakout,
+                    pre_breakout=pre_breakout,
                     is_new=is_new,
                     funding=funding,
                     btc_dominance_proxy=btc_dominance_proxy,
                 )
 
                 pre_breakout_only = pre_breakout and not early_signal
-
-                if pre_breakout and not breakout:
-                    score_result["score"] = round(
-                        min(9.2, float(score_result["score"]) + PRE_BREAKOUT_SCORE_BONUS),
-                        1
-                    )
-                    score_result["reasons"] = list(
-                        dict.fromkeys(score_result["reasons"] + ["على وشك الكسر 🎯"])
-                    )
-
                 required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
 
                 logger.info(
