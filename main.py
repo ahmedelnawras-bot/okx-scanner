@@ -1547,6 +1547,10 @@ def run_scanner_loop():
                     "entry": price,
                     "sl": stop_loss,
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
+                    "reasons": score_result.get("reasons", []),
+                    "mtf_confirmed": mtf_confirmed,
+                    "btc_dominance_proxy": btc_dominance_proxy,
+                    "change_24h": change_24h,
                 }
                 candidate["bucket"] = get_candidate_bucket(candidate)
 
@@ -1612,6 +1616,15 @@ def run_scanner_loop():
                         timeframe=TIMEFRAME,
                         btc_mode=btc_mode,
                         funding_label=candidate["funding_label"],
+                        reasons=candidate["reasons"],
+                        pre_breakout=candidate["pre_breakout"],
+                        breakout=candidate["breakout"],
+                        vol_ratio=candidate["vol_ratio"],
+                        candle_strength=candidate["candle_strength"],
+                        mtf_confirmed=candidate["mtf_confirmed"],
+                        is_new=candidate["is_new"],
+                        btc_dominance_proxy=candidate["btc_dominance_proxy"],
+                        change_24h=candidate["change_24h"],
                     )
 
                     logger.info(
