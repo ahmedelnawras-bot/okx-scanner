@@ -83,9 +83,9 @@ ALT_MARKET_CANDLE_LIMIT = 60
 SCAN_LOCK_KEY = "scan:running"
 SCAN_LOCK_TTL = 300
 
-TELEGRAM_OFFSET_KEY = "telegram:offset"
-TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done"
-TELEGRAM_POLL_LOCK_KEY = "telegram:poll:lock"
+TELEGRAM_OFFSET_KEY = "telegram:offset:long"
+TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done:long"
+TELEGRAM_POLL_LOCK_KEY = "telegram:poll:lock:long"
 TELEGRAM_POLL_LOCK_TTL = 10
 
 # Economic news
@@ -94,7 +94,7 @@ ECONOMIC_CALENDAR_URL = "https://www.tradingview.com/economic-calendar/"
 
 # Admin / stats reset
 ADMIN_CHAT_ID = str(CHAT_ID) if CHAT_ID else ""
-STATS_RESET_TS_KEY = "stats:last_reset_ts"
+STATS_RESET_TS_KEY = "stats:last_reset_ts:long"
 
 # Candle cache
 CANDLE_CACHE_TTL_15M = 25
@@ -294,11 +294,6 @@ def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> li
 
 
 def format_news_warning(events: list) -> str:
-    """
-    تنويه أخبار دائم:
-    - لو فيه أخبار: تحذير + لينكات
-    - لو مفيش: تنويه هادئ
-    """
     calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
 
     if not events:
@@ -496,6 +491,7 @@ def get_telegram_updates(offset: int = 0):
 
 TELEGRAM_COMMANDS = {
     "/help": "عرض كل الأوامر المتاحة",
+    "/how_it_work": "شرح طريقة عمل البوت",
     "/report_1h": "آخر ساعة",
     "/report_today": "اليوم",
     "/report_all": "كل الصفقات",
@@ -520,6 +516,14 @@ def build_report_message(period: str) -> str:
     )
 
     return format_period_summary(title_map.get(period, "Report"), summary)
+
+
+def build_deep_report_message() -> str:
+    try:
+        return build_deep_report(r, market_type="futures", side="long")
+    except Exception as e:
+        logger.error(f"build_deep_report error: {e}")
+        return "❌ حصل خطأ أثناء بناء التقرير"
 
 
 def build_help_message() -> str:
@@ -559,6 +563,110 @@ def build_help_message() -> str:
     return "\n".join(lines)
 
 
+def build_how_it_work_message() -> str:
+    return """📘 <b>كيف يعمل البوت؟</b>
+
+🤖 <b>فكرة البوت:</b>
+البوت متخصص في البحث عن فرص <b>Long Futures</b> على منصة OKX،
+ولا يرسل إشارات عشوائية، بل يعتمد على نظام فلترة قوي لتقليل الإشارات الضعيفة.
+
+🔍 <b>منطق العمل:</b>
+1. اختيار العملات الأعلى سيولة وحجم تداول
+2. تحليل الشموع على فريم <b>15 دقيقة</b>
+3. تقييم عدة عوامل:
+• الزخم
+• الفوليوم
+• موقع السعر بالنسبة للمتوسط
+• الاختراق أو الزخم قبل الاختراق
+• تأكيد فريم الساعة (1H)
+• حالة السوق العامة
+4. إعطاء كل فرصة <b>Score من 10</b>
+5. إرسال فقط الفرص التي تتجاوز الشروط النهائية
+
+📊 <b>متى تعتبر الإشارة قوية؟</b>
+• فوليوم أعلى من الطبيعي
+• شمعة صاعدة نظيفة
+• RSI في منطقة صحية
+• اختراق أو زخم واضح
+• توافق مع السوق العام
+
+⚠️ <b>متى تكون الإشارة فيها مخاطرة؟</b>
+• الحركة متأخرة (السعر بعيد عن المتوسط)
+• RSI عالي جدًا (تشبع شراء)
+• السوق ضعيف أو غير واضح
+• فوليوم ضعيف
+• وجود أخبار اقتصادية قريبة
+
+🧠 <b>شرح رسالة البوت:</b>
+
+🚀 <b>العملة</b>
+الزوج الذي تم رصد الإشارة عليه
+
+💰 <b>السعر</b>
+سعر الدخول التقريبي
+
+⭐ <b>السكور</b>
+تقييم من 10
+كلما زاد → جودة أعلى، لكن ليس ضمان ربح
+
+🛑 <b>Stop Loss</b>
+مستوى وقف الخسارة
+
+🎯 <b>TP1 / TP2</b>
+أهداف الربح
+TP1 = هدف قريب
+TP2 = هدف أبعد
+
+🏷 <b>التصنيف</b>
+نوع الإشارة مثل:
+• اختراق
+• زخم
+• بداية ترند
+
+🪙 <b>BTC</b>
+حالة بيتكوين، وهي مهمة لأنها تؤثر على السوق
+
+🌐 <b>السوق</b>
+حالة السوق العامة:
+• صاعد
+• مختلط
+• ضعيف
+
+📊 <b>الألت</b>
+قوة أو ضعف سوق العملات البديلة
+
+👑 <b>السيولة</b>
+اتجاه تدفق الأموال وهل هو داعم للألت أم لا
+
+💸 <b>التمويل</b>
+يعطي تصورًا عن الضغط أو الدعم في الحركة
+
+📈 <b>24H</b>
+تغير السعر خلال آخر 24 ساعة
+
+📊 <b>أسباب الدخول</b>
+أهم الأسباب التي جعلت البوت يرسل الإشارة
+
+⚠️ <b>تحذيرات</b>
+مخاطر إضافية يجب الانتباه لها
+
+⚖️ <b>المخاطرة</b>
+تقييم عام:
+• منخفضة
+• متوسطة
+• عالية
+
+📌 <b>مهم جدًا:</b>
+• البوت أداة مساعدة وليس قرار نهائي
+• لا تعتمد عليه بدون مراجعة الشارت
+• الجودة أهم من عدد الإشارات
+• السوق دائمًا له الكلمة الأخيرة
+
+✅ <b>أفضل استخدام:</b>
+استخدم البوت كفلتر ذكي يوفر وقتك،
+ثم خذ القرار بعد مراجعة سريعة للسوق والشارت."""
+    
+
 def reset_stats(chat_id: str):
     if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
         send_telegram_reply(chat_id, "⛔ غير مسموح")
@@ -570,21 +678,27 @@ def reset_stats(chat_id: str):
 
     try:
         deleted = 0
-        for key in r.scan_iter("trades:*"):
+        for key in r.scan_iter("trade:futures:long:*"):
             r.delete(key)
             deleted += 1
+
+        try:
+            r.delete("open_trades:futures:long")
+            r.delete("stats:futures:long")
+        except Exception:
+            pass
 
         reset_ts = int(time.time())
         r.set(STATS_RESET_TS_KEY, str(reset_ts))
 
         send_telegram_reply(
             chat_id,
-            f"🧹 تم تصفير البيانات بنجاح\n"
+            f"🧹 تم تصفير بيانات اللونج بنجاح\n"
             f"📊 عدد المفاتيح المحذوفة: {deleted}\n"
             f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}"
         )
 
-        logger.info(f"RESET STATS → deleted keys: {deleted} | reset_ts={reset_ts}")
+        logger.info(f"RESET LONG STATS → deleted keys: {deleted} | reset_ts={reset_ts}")
 
     except Exception as e:
         logger.error(f"Reset stats error: {e}")
@@ -625,10 +739,11 @@ def stats_since_reset(chat_id: str):
 
 COMMAND_HANDLERS = {
     "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
+    "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
     "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
-    "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report(r)),
+    "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
     "/reset_stats": lambda chat_id: reset_stats(chat_id),
     "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
 }
@@ -1844,6 +1959,7 @@ def run_scanner_loop():
                         r.set(ALT_SNAPSHOT_CACHE_KEY, json.dumps(alt_snapshot), ex=ALT_SNAPSHOT_CACHE_TTL)
                     except Exception as e:
                         logger.warning(f"Alt snapshot cache write error: {e}")
+
             market_info = get_market_state(btc_mode, alt_snapshot)
 
             market_state = market_info["market_state"]
@@ -2058,7 +2174,7 @@ def run_scanner_loop():
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
                     "reasons": score_result.get("reasons", []),
                     "mtf_confirmed": mtf_confirmed,
-                    "btc_dominance_proxy": market_bias_label,
+                    "btc_dominance_proxy": btc_dominance_proxy,
                     "change_24h": change_24h,
                     "market_state": market_state,
                     "alt_mode": alt_mode,
