@@ -9,6 +9,7 @@ import pandas as pd
 import redis
 
 from analysis.scoring import calculate_long_score, is_breakout
+from analysis.backtest import build_deep_report
 from tracking.performance import (
     register_trade,
     update_open_trades,
@@ -388,6 +389,7 @@ TELEGRAM_COMMANDS = {
     "/report_1h": "آخر ساعة",
     "/report_today": "اليوم",
     "/report_all": "كل الصفقات",
+    "/report_deep": "تحليل متقدم للأداء",
 }
 
 
@@ -450,6 +452,7 @@ COMMAND_HANDLERS = {
     "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
+    "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report(r)),
 }
 
 
