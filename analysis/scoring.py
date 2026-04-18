@@ -1,3 +1,78 @@
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if value != value:  # NaN
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _get_signal_and_prev_rows(df):
+    if df is None or df.empty or len(df) < 3:
+        return None, None
+
+    try:
+        if "confirm" in df.columns:
+            last_confirm = str(int(_safe_float(df.iloc[-1]["confirm"], 0)))
+            signal_idx = len(df) - 1 if last_confirm == "1" else len(df) - 2
+        else:
+            signal_idx = len(df) - 2
+
+        prev_idx = max(0, signal_idx - 1)
+        return df.iloc[signal_idx], df.iloc[prev_idx]
+    except Exception:
+        return None, None
+
+
+def is_breakout(df, lookback=20):
+    try:
+        if df is None or len(df) < lookback + 2:
+            return False
+
+        signal_row, _ = _get_signal_and_prev_rows(df)
+        if signal_row is None:
+            return False
+
+        idx = int(signal_row.name)
+        if idx <= lookback:
+            return False
+
+        close = _safe_float(signal_row["close"])
+        recent_high = _safe_float(
+            df["high"].iloc[:idx].rolling(lookback).max().iloc[-1]
+        )
+
+        return close > recent_high and recent_high > 0
+    except Exception:
+        return False
+
+
+def classify_funding_simple(funding):
+    if funding < -0.0005:
+        return "🟢 سلبي"
+    elif funding > 0.0005:
+        return "🔴 إيجابي"
+    return "🟡 محايد"
+
+
+def classify_signal(score):
+    if score >= 8.7:
+        return "🔥 نار"
+    elif score >= 7.0:
+        return "✅ جيد"
+    return "⚡ عادي"
+
+
+def get_btc_dominance_proxy(btc_mode: str) -> str:
+    if "🔴 هابط" in btc_mode:
+        return "🟢 داعم للألت"
+    if "🟢 صاعد" in btc_mode:
+        return "🔴 ضد الألت"
+    return "🟡 محايد"
+
+
 def calculate_long_score(
     df,
     mtf_confirmed,
