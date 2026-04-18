@@ -1139,15 +1139,42 @@ def diversify_candidates(candidates, max_alerts=3):
 
 def normalize_reason(reason: str) -> str:
     mapping = {
-        "فوق MA": "فوق المتوسط",
-        "فوليوم انفجار": "فوليوم انفجاري",
         "RSI صحي": "RSI في منطقة صحية",
+        "RSI جيد": "RSI جيد",
+        "RSI صاعد بقوة": "RSI صاعد بقوة",
         "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
-        "هيمنة داعمة": "هيمنة داعمة للألت",
-        "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
         "RSI عالي": "RSI عالي (تشبع شراء)",
-        "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
+
+        "فوليوم داعم": "فوليوم داعم",
+        "فوليوم قوي": "فوليوم قوي",
+        "فوليوم انفجار": "فوليوم انفجاري",
+
+        "فوق MA": "فوق المتوسط",
+
+        "شمعة جيدة": "شمعة جيدة",
+        "شمعة قوية": "شمعة قوية",
+
+        "اختراق": "اختراق",
         "اختراق مبكر جداً": "اختراق مبكر",
+        "اختراق متأخر": "اختراق متأخر",
+        "اختراق قوي مؤكد": "اختراق قوي مؤكد",
+
+        "تأكيد فريم الساعة": "تأكيد فريم الساعة",
+
+        "BTC داعم": "BTC داعم",
+
+        "هيمنة داعمة": "هيمنة داعمة للألت",
+        "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
+
+        "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
+
+        "عملة جديدة": "عملة جديدة",
+
+        "بداية ترند مبكرة": "بداية ترند مبكرة",
+        "زخم مبكر تحت المقاومة 🎯": "زخم مبكر تحت المقاومة 🎯",
+
+        "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
+        "ممتد زيادة": "ممتد زيادة",
     }
     return mapping.get(reason, reason)
 
@@ -1156,19 +1183,23 @@ def sort_reasons(reasons):
     priority = {
         "فوق المتوسط": 1,
         "بداية ترند مبكرة": 2,
-        "اختراق": 3,
-        "اختراق مبكر": 4,
-        "اختراق قوي مؤكد": 5,
-        "زخم مبكر تحت المقاومة 🎯": 6,
+        "زخم مبكر تحت المقاومة 🎯": 3,
+        "اختراق": 4,
+        "اختراق مبكر": 5,
+        "اختراق قوي مؤكد": 6,
+
         "فوليوم داعم": 7,
         "فوليوم قوي": 8,
         "فوليوم انفجاري": 9,
+
         "شمعة جيدة": 10,
         "شمعة قوية": 11,
+
         "RSI في منطقة صحية": 12,
         "RSI جيد": 13,
         "RSI صاعد بقوة": 14,
         "RSI مرتفع بزخم": 15,
+
         "تأكيد فريم الساعة": 16,
         "BTC داعم": 17,
         "هيمنة داعمة للألت": 18,
@@ -1179,41 +1210,78 @@ def sort_reasons(reasons):
         "بعيد عن المتوسط (دخول متأخر)": 102,
         "ممتد زيادة": 103,
         "اختراق متأخر": 104,
-        "هيمنة ضد الألت": 105,
+        "هيمنة ضد الألت (ضغط على العملات)": 105,
     }
 
-    normalized = [normalize_reason(r) for r in reasons]
-    deduped = list(dict.fromkeys(normalized))
-    return sorted(deduped, key=lambda x: priority.get(x, 999))
+    return sorted(reasons, key=lambda x: priority.get(x, 999))
 
 
 def classify_reasons(reasons):
     warning_keywords = [
         "RSI عالي",
         "بعيد عن المتوسط",
+        "بعيد عن MA",
         "ممتد",
         "اختراق متأخر",
         "هيمنة ضد",
     ]
 
+    normalized = [normalize_reason(r) for r in reasons]
+
     bullish = []
     warnings = []
 
-    for r in reasons:
+    for r in normalized:
         if any(k in r for k in warning_keywords):
             warnings.append(r)
         else:
             bullish.append(r)
 
+    bullish = list(dict.fromkeys(bullish))
+    warnings = list(dict.fromkeys(warnings))
+
+    if "اختراق مبكر" in bullish and "اختراق" in bullish:
+        bullish.remove("اختراق")
+
+    if "اختراق قوي مؤكد" in bullish and "اختراق" in bullish:
+        bullish.remove("اختراق")
+
+    bullish = sort_reasons(bullish)
+    warnings = sort_reasons(warnings)
+
     return bullish, warnings
 
 
-def get_risk_label(warnings_count: int) -> str:
-    if warnings_count <= 0:
-        return "🟢 منخفضة"
-    if warnings_count == 1:
-        return "🟡 متوسطة"
-    return "🔴 مرتفعة"
+def format_bullish_reasons(bullish):
+    highlight_keywords = [
+        "اختراق",
+        "زخم مبكر",
+        "فوليوم",
+        "شمعة",
+        "RSI",
+    ]
+
+    highlighted = []
+    used = set()
+
+    for kw in highlight_keywords:
+        for r in bullish:
+            if kw in r and r not in used:
+                highlighted.append(r)
+                used.add(r)
+                break
+        if len(highlighted) >= 2:
+            break
+
+    formatted = []
+    for r in bullish:
+        safe = html.escape(r)
+        if r in highlighted:
+            formatted.append(f"• <b>{safe}</b>")
+        else:
+            formatted.append(f"• {safe}")
+
+    return "\n".join(formatted)
 
 
 def build_message(
@@ -1229,10 +1297,9 @@ def build_message(
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
-    sorted_reasons = sort_reasons(score_result.get("reasons", []))
-    bullish, warnings = classify_reasons(sorted_reasons)
+    bullish, warnings = classify_reasons(score_result.get("reasons", []))
 
-    bullish_text = "\n".join(f"• {html.escape(r)}" for r in bullish) if bullish else "• زخم مبكر"
+    bullish_text = format_bullish_reasons(bullish) if bullish else "• زخم مبكر"
     warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
 
     funding_text = score_result.get("funding_label", "🟡 محايد")
@@ -1245,6 +1312,13 @@ def build_message(
     tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
 
+    if len(warnings) == 0:
+        risk_level = "🟢 منخفضة"
+    elif len(warnings) == 1:
+        risk_level = "🟡 متوسطة"
+    else:
+        risk_level = "🔴 عالية"
+
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
     safe_symbol = html.escape(symbol_clean)
@@ -1255,8 +1329,8 @@ def build_message(
     safe_tv_link = html.escape(tv_link, quote=True)
 
     change_24h_text = f"{change_24h:+.2f}%"
+
     warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
-    risk_label = get_risk_label(len(warnings))
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
@@ -1276,7 +1350,7 @@ def build_message(
 📊 <b>أسباب الدخول:</b>
 {bullish_text}{warnings_block}
 
-⚖️ <b>المخاطرة:</b> {risk_label}
+⚖️ <b>المخاطرة:</b> {risk_level}
 
 🔗 <a href="{safe_tv_link}">Open Chart</a>"""
 
