@@ -1137,6 +1137,27 @@ def diversify_candidates(candidates, max_alerts=3):
     return diversified[:max_alerts]
 
 
+def classify_reasons(reasons):
+    warning_keywords = [
+        "RSI عالي",
+        "بعيد عن MA",
+        "ممتد",
+        "اختراق متأخر",
+        "هيمنة ضد",
+    ]
+
+    bullish = []
+    warnings = []
+
+    for r in reasons:
+        if any(k in r for k in warning_keywords):
+            warnings.append(r)
+        else:
+            bullish.append(r)
+
+    return bullish, warnings
+
+
 def build_message(
     symbol,
     price,
@@ -1149,7 +1170,12 @@ def build_message(
     change_24h=0.0
 ):
     symbol_clean = clean_symbol_for_message(symbol)
-    details = " + ".join(score_result["reasons"]) if score_result["reasons"] else "زخم مبكر"
+
+    bullish, warnings = classify_reasons(score_result.get("reasons", []))
+
+    bullish_text = "\n".join(f"• {html.escape(r)}" for r in bullish) if bullish else "• زخم مبكر"
+    warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
+
     funding_text = score_result.get("funding_label", "🟡 محايد")
     signal_rating = score_result.get("signal_rating", "⚡ عادي")
     sl_pct = calculate_sl_percent(price, stop_loss)
@@ -1165,12 +1191,13 @@ def build_message(
     safe_symbol = html.escape(symbol_clean)
     safe_btc = html.escape(btc_mode)
     safe_dom = html.escape(btc_dominance_proxy)
-    safe_details = html.escape(details)
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
 
     change_24h_text = f"{change_24h:+.2f}%"
+
+    warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
@@ -1187,10 +1214,10 @@ def build_message(
 💸 التمويل: {safe_funding}
 📈 تغير 24H: {change_24h_text}{new_tag}
 
-📊 {safe_details}
+📊 <b>أسباب الدخول:</b>
+{bullish_text}{warnings_block}
 
-🔗 <a href="{safe_tv_link}">Open Chart</a>
-"""
+🔗 <a href="{safe_tv_link}">Open Chart</a>"""
 
 
 def run_command_poller():
