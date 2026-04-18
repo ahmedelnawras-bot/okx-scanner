@@ -1,19 +1,3 @@
-تمام، ده main.py كامل بعد التنظيف النهائي بحيث:
-
-pre_breakout يتبعت إلى calculate_long_score()
-
-اتشال التزويد اليدوي للـ score من main
-
-اتشال إضافة الـ reason اليدوية من main
-
-فضلنا محافظين على منطق:
-
-early_signal أو pre_breakout يعدّي
-
-ولو pre_breakout only يبقى له required_min_score أعلى بـ 0.5
-
-
-
 import os
 import sys
 import time
