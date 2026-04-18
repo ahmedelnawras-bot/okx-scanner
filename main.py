@@ -49,7 +49,7 @@ TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
 FINAL_MIN_SCORE = 6.3
-PRE_BREAKOUT_EXTRA_SCORE = 0.5
+PRE_BREAKOUT_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
@@ -1193,7 +1193,7 @@ def get_dynamic_entry_threshold(
     is_new: bool,
 ) -> float:
     if market_state == "risk_off":
-        threshold = 6.9
+        threshold = 6.7
     elif market_state == "btc_leading":
         threshold = 6.8
     elif market_state == "mixed":
@@ -1914,7 +1914,7 @@ def run_scanner_loop():
                     logger.error(f"{symbol} → calculate_long_score failed: {score_err}")
                     continue
 
-                if not early_signal and not pre_breakout:
+                if not early_signal and not pre_breakout and vol_ratio < 1.3:
                     dynamic_threshold = get_dynamic_entry_threshold(
                         market_state=market_state,
                         score_result=score_result,
@@ -1951,7 +1951,7 @@ def run_scanner_loop():
                     f"market={market_state}"
                 )
 
-                if score_result["fake_signal"]:
+                if score_result["fake_signal"] and not pre_breakout:
                     logger.info(f"{symbol} → rejected by fake signal")
                     continue
 
