@@ -813,9 +813,23 @@ def get_btc_dominance_proxy(btc_mode: str) -> str:
     return "🟡 محايد"
 
 
-def calculate_stop_loss(price, atr_value):
+def calculate_stop_loss(price, atr_value, signal_type="standard"):
+    """
+    Dynamic SL multiplier based on signal type:
+    - breakout:     ATR × 1.0  (حركة سريعة، SL ضيق)
+    - pre_breakout: ATR × 1.5  (محتاج مساحة للتجميع)
+    - new_listing:  ATR × 1.8  (volatile أكتر)
+    - standard:     ATR × 1.2  (المعتاد)
+    """
+    multipliers = {
+        "breakout":     1.0,
+        "pre_breakout": 1.5,
+        "new_listing":  1.8,
+        "standard":     1.2,
+    }
+    multiplier = multipliers.get(signal_type, 1.2)
     try:
-        return round(float(price) - (float(atr_value) * 1.2), 6)
+        return round(float(price) - (float(atr_value) * multiplier), 6)
     except Exception:
         return round(float(price), 6)
 
@@ -1513,7 +1527,16 @@ def run_scanner_loop():
                 signal_row = get_signal_row(df)
                 price = float(signal_row["close"])
                 atr_value = float(signal_row["atr"])
-                stop_loss = calculate_stop_loss(price, atr_value)
+                if breakout:
+                    sl_type = "breakout"
+                elif pre_breakout:
+                    sl_type = "pre_breakout"
+                elif is_new:
+                    sl_type = "new_listing"
+                else:
+                    sl_type = "standard"
+
+                stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
                 tv_link = build_tradingview_link(symbol)
 
                 momentum_priority = get_momentum_priority(
