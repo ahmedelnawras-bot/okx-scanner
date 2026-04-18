@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import html
+import json
 import logging
 import threading
 import requests
@@ -89,6 +90,11 @@ TELEGRAM_POLL_LOCK_TTL = 10
 # Economic news
 NEWS_WINDOW_HOURS = 2
 ECONOMIC_CALENDAR_URL = "https://www.tradingview.com/economic-calendar/"
+
+# Candle cache
+CANDLE_CACHE_TTL_15M = 25
+CANDLE_CACHE_TTL_1H = 90
+CANDLE_CACHE_TTL_DEFAULT = 20
 
 # =========================
 # REDIS
@@ -754,11 +760,46 @@ def to_dataframe(data):
     return df
 
 
+def get_candle_cache_key(symbol: str, timeframe: str, limit: int) -> str:
+    return f"candles:{symbol}:{timeframe}:{limit}"
+
+
+def get_candle_cache_ttl(timeframe: str) -> int:
+    tf = str(timeframe).strip().lower()
+    if tf == "15m":
+        return CANDLE_CACHE_TTL_15M
+    if tf == "1h":
+        return CANDLE_CACHE_TTL_1H
+    return CANDLE_CACHE_TTL_DEFAULT
+
+
 def get_candles(symbol, timeframe="15m", limit=100):
+    cache_key = get_candle_cache_key(symbol, timeframe, limit)
+    cache_ttl = get_candle_cache_ttl(timeframe)
+
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                data = json.loads(cached)
+                if isinstance(data, list) and data:
+                    logger.debug(f"{symbol} {timeframe} → candles cache hit")
+                    return data
+        except Exception as e:
+            logger.warning(f"Candle cache read error on {symbol} {timeframe}: {e}")
+
     try:
         params = {"instId": symbol, "bar": timeframe, "limit": limit}
         res = requests.get(OKX_CANDLES_URL, params=params, timeout=20).json()
-        return res.get("data", [])
+        data = res.get("data", [])
+
+        if data and r:
+            try:
+                r.set(cache_key, json.dumps(data), ex=cache_ttl)
+            except Exception as e:
+                logger.warning(f"Candle cache write error on {symbol} {timeframe}: {e}")
+
+        return data
     except Exception as e:
         logger.error(f"get_candles error on {symbol} {timeframe}: {e}")
         return []
