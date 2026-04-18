@@ -91,6 +91,10 @@ TELEGRAM_POLL_LOCK_TTL = 10
 NEWS_WINDOW_HOURS = 2
 ECONOMIC_CALENDAR_URL = "https://www.tradingview.com/economic-calendar/"
 
+# Admin / stats reset
+ADMIN_CHAT_ID = str(CHAT_ID) if CHAT_ID else ""
+STATS_RESET_TS_KEY = "stats:last_reset_ts"
+
 # Candle cache
 CANDLE_CACHE_TTL_15M = 25
 CANDLE_CACHE_TTL_1H = 90
@@ -491,6 +495,8 @@ TELEGRAM_COMMANDS = {
     "/report_today": "اليوم",
     "/report_all": "كل الصفقات",
     "/report_deep": "تحليل متقدم للأداء",
+    "/reset_stats": "تصفير نتائج البوت",
+    "/stats_since_reset": "الأداء من بعد آخر تصفير",
 }
 
 
@@ -548,12 +554,78 @@ def build_help_message() -> str:
     return "\n".join(lines)
 
 
+def reset_stats(chat_id: str):
+    if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
+        send_telegram_reply(chat_id, "⛔ غير مسموح")
+        return
+
+    if not r:
+        send_telegram_reply(chat_id, "❌ Redis غير متصل")
+        return
+
+    try:
+        deleted = 0
+        for key in r.scan_iter("trades:*"):
+            r.delete(key)
+            deleted += 1
+
+        reset_ts = int(time.time())
+        r.set(STATS_RESET_TS_KEY, str(reset_ts))
+
+        send_telegram_reply(
+            chat_id,
+            f"🧹 تم تصفير البيانات بنجاح\n"
+            f"📊 عدد المفاتيح المحذوفة: {deleted}\n"
+            f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}"
+        )
+
+        logger.info(f"RESET STATS → deleted keys: {deleted} | reset_ts={reset_ts}")
+
+    except Exception as e:
+        logger.error(f"Reset stats error: {e}")
+        send_telegram_reply(chat_id, "❌ حصل خطأ أثناء التصفير")
+
+
+def stats_since_reset(chat_id: str):
+    if not r:
+        send_telegram_reply(chat_id, "❌ Redis غير متصل")
+        return
+
+    try:
+        reset_ts_raw = r.get(STATS_RESET_TS_KEY)
+        if not reset_ts_raw:
+            send_telegram_reply(chat_id, "ℹ️ لا يوجد Reset مسجل بعد")
+            return
+
+        reset_ts = int(reset_ts_raw)
+        reset_time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_ts))
+
+        summary = get_period_summary(
+            redis_client=r,
+            period="all",
+            market_type="futures",
+            side="long",
+        )
+
+        header = f"📊 <b>Stats Since Reset</b>\n🕒 منذ: {html.escape(reset_time_text)}\n\n"
+        body = format_period_summary("Since Reset", summary)
+
+        send_telegram_reply(chat_id, header + body)
+        logger.info(f"STATS SINCE RESET → reset_ts={reset_ts}")
+
+    except Exception as e:
+        logger.error(f"stats_since_reset error: {e}")
+        send_telegram_reply(chat_id, "❌ حصل خطأ أثناء جلب التقرير")
+
+
 COMMAND_HANDLERS = {
     "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
     "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
     "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report(r)),
+    "/reset_stats": lambda chat_id: reset_stats(chat_id),
+    "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
 }
 
 
@@ -837,7 +909,7 @@ def get_signal_candle_time(df):
         signal_row = get_signal_row(df)
         ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
-            return ts // 1000
+            ts = ts // 1000
         return ts
     except Exception:
         return int(time.time() // (15 * 60))
@@ -1872,7 +1944,7 @@ def run_scanner_loop():
                     continue
 
                 if score_result["score"] < required_min_score:
-                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_score})")
+                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_SCORE})")
                     continue
 
                 if not breakout and not pre_breakout and dist_ma > 3.8:
