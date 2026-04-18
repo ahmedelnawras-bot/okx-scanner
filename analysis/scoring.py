@@ -191,7 +191,7 @@ def calculate_long_score(
         score += 0.4
         reasons.append("هيمنة داعمة للألت")
     elif btc_dominance_proxy == "🔴 ضد الألت":
-        score -= 0.4
+        score -= 0.9  # زيادة الخصم بناءً على بيانات الخسائر
         reasons.append("هيمنة ضد الألت (ضغط على العملات)")
 
     if funding < -0.0005:
@@ -267,6 +267,11 @@ def calculate_long_score(
 
     if score >= 8.5 and vol_ratio < 1.15:
         fake_signal = True
+
+    # لو هيمنة ضد الألت بدون breakout → رفع الحد الأدنى للسكور
+    if btc_dominance_proxy == "🔴 ضد الألت" and not breakout and not pre_breakout:
+        if score < 7.3:  # بدل 6.3 العادي
+            fake_signal = True
 
     return {
         "score": score,
