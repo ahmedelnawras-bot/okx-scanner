@@ -1137,10 +1137,60 @@ def diversify_candidates(candidates, max_alerts=3):
     return diversified[:max_alerts]
 
 
+def normalize_reason(reason: str) -> str:
+    mapping = {
+        "فوق MA": "فوق المتوسط",
+        "فوليوم انفجار": "فوليوم انفجاري",
+        "RSI صحي": "RSI في منطقة صحية",
+        "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
+        "هيمنة داعمة": "هيمنة داعمة للألت",
+        "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
+        "RSI عالي": "RSI عالي (تشبع شراء)",
+        "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
+        "اختراق مبكر جداً": "اختراق مبكر",
+    }
+    return mapping.get(reason, reason)
+
+
+def sort_reasons(reasons):
+    priority = {
+        "فوق المتوسط": 1,
+        "بداية ترند مبكرة": 2,
+        "اختراق": 3,
+        "اختراق مبكر": 4,
+        "اختراق قوي مؤكد": 5,
+        "زخم مبكر تحت المقاومة 🎯": 6,
+        "فوليوم داعم": 7,
+        "فوليوم قوي": 8,
+        "فوليوم انفجاري": 9,
+        "شمعة جيدة": 10,
+        "شمعة قوية": 11,
+        "RSI في منطقة صحية": 12,
+        "RSI جيد": 13,
+        "RSI صاعد بقوة": 14,
+        "RSI مرتفع بزخم": 15,
+        "تأكيد فريم الساعة": 16,
+        "BTC داعم": 17,
+        "هيمنة داعمة للألت": 18,
+        "تمويل سلبي (داعم للشراء)": 19,
+        "عملة جديدة": 20,
+
+        "RSI عالي (تشبع شراء)": 101,
+        "بعيد عن المتوسط (دخول متأخر)": 102,
+        "ممتد زيادة": 103,
+        "اختراق متأخر": 104,
+        "هيمنة ضد الألت": 105,
+    }
+
+    normalized = [normalize_reason(r) for r in reasons]
+    deduped = list(dict.fromkeys(normalized))
+    return sorted(deduped, key=lambda x: priority.get(x, 999))
+
+
 def classify_reasons(reasons):
     warning_keywords = [
         "RSI عالي",
-        "بعيد عن MA",
+        "بعيد عن المتوسط",
         "ممتد",
         "اختراق متأخر",
         "هيمنة ضد",
@@ -1158,6 +1208,14 @@ def classify_reasons(reasons):
     return bullish, warnings
 
 
+def get_risk_label(warnings_count: int) -> str:
+    if warnings_count <= 0:
+        return "🟢 منخفضة"
+    if warnings_count == 1:
+        return "🟡 متوسطة"
+    return "🔴 مرتفعة"
+
+
 def build_message(
     symbol,
     price,
@@ -1171,7 +1229,8 @@ def build_message(
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
-    bullish, warnings = classify_reasons(score_result.get("reasons", []))
+    sorted_reasons = sort_reasons(score_result.get("reasons", []))
+    bullish, warnings = classify_reasons(sorted_reasons)
 
     bullish_text = "\n".join(f"• {html.escape(r)}" for r in bullish) if bullish else "• زخم مبكر"
     warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
@@ -1196,8 +1255,8 @@ def build_message(
     safe_tv_link = html.escape(tv_link, quote=True)
 
     change_24h_text = f"{change_24h:+.2f}%"
-
     warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
+    risk_label = get_risk_label(len(warnings))
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
@@ -1216,6 +1275,8 @@ def build_message(
 
 📊 <b>أسباب الدخول:</b>
 {bullish_text}{warnings_block}
+
+⚖️ <b>المخاطرة:</b> {risk_label}
 
 🔗 <a href="{safe_tv_link}">Open Chart</a>"""
 
