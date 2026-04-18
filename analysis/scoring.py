@@ -1,78 +1,3 @@
-def _safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-        if value != value:  # NaN
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def _get_signal_and_prev_rows(df):
-    if df is None or df.empty or len(df) < 3:
-        return None, None
-
-    try:
-        if "confirm" in df.columns:
-            last_confirm = str(int(_safe_float(df.iloc[-1]["confirm"], 0)))
-            signal_idx = len(df) - 1 if last_confirm == "1" else len(df) - 2
-        else:
-            signal_idx = len(df) - 2
-
-        prev_idx = max(0, signal_idx - 1)
-        return df.iloc[signal_idx], df.iloc[prev_idx]
-    except Exception:
-        return None, None
-
-
-def is_breakout(df, lookback=20):
-    try:
-        if df is None or len(df) < lookback + 2:
-            return False
-
-        signal_row, _ = _get_signal_and_prev_rows(df)
-        if signal_row is None:
-            return False
-
-        idx = int(signal_row.name)
-        if idx <= lookback:
-            return False
-
-        close = _safe_float(signal_row["close"])
-        recent_high = _safe_float(
-            df["high"].iloc[:idx].rolling(lookback).max().iloc[-1]
-        )
-
-        return close > recent_high and recent_high > 0
-    except Exception:
-        return False
-
-
-def classify_funding_simple(funding):
-    if funding < -0.0005:
-        return "🟢 سلبي"
-    elif funding > 0.0005:
-        return "🔴 إيجابي"
-    return "🟡 محايد"
-
-
-def classify_signal(score):
-    if score >= 8.7:
-        return "🔥 نار"
-    elif score >= 7.0:
-        return "✅ جيد"
-    return "⚡ عادي"
-
-
-def get_btc_dominance_proxy(btc_mode: str) -> str:
-    if "🔴 هابط" in btc_mode:
-        return "🟢 داعم للألت"
-    if "🟢 صاعد" in btc_mode:
-        return "🔴 ضد الألت"
-    return "🟡 محايد"
-
-
 def calculate_long_score(
     df,
     mtf_confirmed,
@@ -94,6 +19,8 @@ def calculate_long_score(
         return {
             "score": 0.0,
             "reasons": [],
+            "warning_reasons": [],
+            "risk_level": "🟢 منخفضة",
             "fake_signal": True,
             "signal": False,
             "funding_label": funding_label,
@@ -102,6 +29,7 @@ def calculate_long_score(
 
     score = 0.0
     reasons = []
+    warning_reasons = []
 
     close = _safe_float(signal_row["close"])
     open_ = _safe_float(signal_row["open"])
@@ -140,6 +68,7 @@ def calculate_long_score(
     elif rsi > 72:
         score -= 0.9
         reasons.append("RSI عالي (تشبع شراء)")
+        warning_reasons.append("RSI عالي (تشبع شراء)")
     elif rsi < 48:
         score -= 0.7
 
@@ -158,6 +87,7 @@ def calculate_long_score(
         reasons.append("فوق المتوسط")
     else:
         score -= 0.8
+        warning_reasons.append("أسفل المتوسط")
 
     if candle_strength >= 0.65:
         score += 1.4
@@ -168,9 +98,10 @@ def calculate_long_score(
 
     if rejection:
         score -= 1.0
+        warning_reasons.append("رفض سعري علوي")
 
     if breakout:
-        score += 1.5  # خُفض من 2.2 — الـ breakout وحده بيخسر أكتر من الـ standard
+        score += 1.5
         reasons.append("اختراق")
 
     if pre_breakout and not breakout:
@@ -186,19 +117,22 @@ def calculate_long_score(
         reasons.append("BTC داعم")
     elif "🔴" in btc_mode:
         score -= 0.5
+        warning_reasons.append("BTC غير داعم")
 
     if btc_dominance_proxy == "🟢 داعم للألت":
         score += 0.4
         reasons.append("هيمنة داعمة للألت")
     elif btc_dominance_proxy == "🔴 ضد الألت":
-        score -= 0.9  # زيادة الخصم بناءً على بيانات الخسائر
+        score -= 0.9
         reasons.append("هيمنة ضد الألت (ضغط على العملات)")
+        warning_reasons.append("هيمنة ضد الألت (ضغط على العملات)")
 
     if funding < -0.0005:
         score += 0.6
         reasons.append("تمويل سلبي (داعم للشراء)")
     elif funding > 0.0005:
         score -= 0.5
+        warning_reasons.append("تمويل إيجابي (ضغط محتمل)")
 
     if is_new:
         score += 0.3
@@ -213,10 +147,12 @@ def calculate_long_score(
     elif dist_ma > 4.5:
         score -= 0.8
         reasons.append("بعيد عن المتوسط (دخول متأخر)")
+        warning_reasons.append("بعيد عن المتوسط (دخول متأخر)")
 
     if dist_ma > 6.0:
         score -= 1.2
         reasons.append("ممتد زيادة")
+        warning_reasons.append("ممتد زيادة")
 
     if breakout:
         try:
@@ -235,11 +171,12 @@ def calculate_long_score(
                 elif ext > 3.5:
                     score -= 0.7
                     reasons.append("اختراق متأخر")
+                    warning_reasons.append("اختراق متأخر")
         except Exception:
             pass
 
     if breakout and mtf_confirmed and vol_ratio >= 1.6 and candle_strength >= 0.45:
-        score += 1.2  # رُفع من 0.5 — الـ breakout القوي المؤكد يستحق مكافأة أكبر
+        score += 1.2
         reasons.append("اختراق قوي مؤكد")
 
     if score >= 8.8:
@@ -268,14 +205,36 @@ def calculate_long_score(
     if score >= 8.5 and vol_ratio < 1.15:
         fake_signal = True
 
-    # لو هيمنة ضد الألت بدون breakout → رفع الحد الأدنى للسكور
     if btc_dominance_proxy == "🔴 ضد الألت" and not breakout and not pre_breakout:
-        if score < 7.3:  # بدل 6.3 العادي
+        if score < 7.3:
             fake_signal = True
+
+    # ===================== Risk Level (display only) =====================
+    unique_warnings = list(dict.fromkeys(warning_reasons))
+
+    risk_points = len(unique_warnings)
+
+    if rejection:
+        risk_points += 1
+    if funding > 0.0005:
+        risk_points += 1
+    if btc_dominance_proxy == "🔴 ضد الألت":
+        risk_points += 1
+    if dist_ma > 6.0:
+        risk_points += 1
+
+    if risk_points >= 3:
+        risk_level = "🔴 عالية"
+    elif risk_points >= 1:
+        risk_level = "🟡 متوسطة"
+    else:
+        risk_level = "🟢 منخفضة"
 
     return {
         "score": score,
         "reasons": list(dict.fromkeys(reasons)),
+        "warning_reasons": unique_warnings,
+        "risk_level": risk_level,
         "fake_signal": fake_signal,
         "signal": score >= 5.5,
         "funding_label": funding_label,
