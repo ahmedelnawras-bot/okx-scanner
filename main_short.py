@@ -69,10 +69,15 @@ NEW_LISTING_MAX_PER_RUN = 1
 
 # Overextended reversal
 OVEREXTENDED_REVERSAL_ENABLED = True
-OVEREXTENDED_REVERSAL_MIN_DIST_MA = 5.8
+OVEREXTENDED_REVERSAL_HTF = "4H"
+OVEREXTENDED_REVERSAL_CONFIRM_TF = "1H"
+OVEREXTENDED_REVERSAL_TRIGGER_TF = "15m"
+
+OVEREXTENDED_REVERSAL_MIN_DIST_MA_4H = 7.0
+OVEREXTENDED_REVERSAL_MIN_RSI_4H = 70.0
 OVEREXTENDED_REVERSAL_MIN_24H_CHANGE = 12.0
-OVEREXTENDED_REVERSAL_MIN_RSI = 68.0
-OVEREXTENDED_REVERSAL_MIN_VOL_RATIO = 1.05
+OVEREXTENDED_REVERSAL_MIN_VOL_RATIO_15M = 1.03
+
 OVEREXTENDED_REVERSAL_SCORE_BONUS = 0.35
 OVEREXTENDED_REVERSAL_MIN_SCORE = 6.2
 
@@ -589,7 +594,8 @@ def build_help_message() -> str:
         "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير",
         "• فيه فلتر إضافي لمنع الدخول المتأخر بعد نهاية الحركة",
         "• Smart Early Priority بيفرق بين الـ early القوي والضعيف",
-        "• فيه تمييز خاص لفرص Overextended Reversal",
+        "• Overextended Reversal لا يظهر إلا عند:",
+        "  4H Overextended + 1H Weakening + 15m Trigger",
     ]
 
     if other_commands:
@@ -624,13 +630,16 @@ def build_how_it_work_message() -> str:
 • RSI
 • موقع السعر من المتوسط
 • Breakdown / Pre-Breakdown
-• Overextended Reversal
 • تأكيد 1H
 • حالة السوق العامة
 5. فلتر خاص لمنع الدخول بعد انتهاء الحركة
 6. Smart Early Priority للإشارات المبكرة
-7. إعطاء Score من 10
-8. إرسال فقط الفرص المقبولة نهائيًا
+7. Overextended Reversal لا يظهر إلا عند:
+   • 4H Overextended
+   • 1H Weakening
+   • 15m Trigger
+8. إعطاء Score من 10
+9. إرسال فقط الفرص المقبولة نهائيًا
 
 📌 <b>زر Track:</b>
 يعرض لاحقًا:
@@ -677,7 +686,7 @@ def classify_entry_timing_short(
 ) -> str:
     try:
         if is_reverse:
-            return "♻️ عكسي ممتد (منطقة ارتداد)"
+            return "♻️ 15m Trigger بعد 4H/1H تأكيد"
         if dist_ma > 5.0:
             return "🔴 متأخر (قرب النهاية)"
         if (pre_breakdown or breakdown) and dist_ma <= 3.0 and vol_ratio >= 1.15:
@@ -745,18 +754,70 @@ def _safe_float(value, default=0.0):
         return default
 
 
-def is_overextended_reversal_short(
-    df,
-    dist_ma: float,
-    change_24h: float,
-    vol_ratio: float,
-    funding: float = 0.0,
-) -> bool:
+def get_df_distance_from_ma_percent(df) -> float:
+    try:
+        signal_row = get_signal_row(df)
+        close = _safe_float(signal_row["close"], 0)
+        ma_value = _safe_float(signal_row.get("ma"), 0)
+        if ma_value <= 0:
+            return 0.0
+        return round(((close - ma_value) / ma_value) * 100, 4)
+    except Exception:
+        return 0.0
+
+
+def is_overextended_on_4h(symbol: str, change_24h: float) -> bool:
     try:
         if not OVEREXTENDED_REVERSAL_ENABLED:
             return False
 
-        if df is None or df.empty or len(df) < 25:
+        candles = get_candles(symbol, OVEREXTENDED_REVERSAL_HTF, 120)
+        df = to_dataframe(candles)
+        if df is None or df.empty or len(df) < 30:
+            return False
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 3:
+            return False
+
+        dist_ma_4h = get_df_distance_from_ma_percent(df)
+        rsi_4h = _safe_float(signal_row.get("rsi"), 50)
+
+        last_3 = df.iloc[idx - 3:idx + 1]
+        green_count = sum(
+            1 for _, row in last_3.iterrows()
+            if _safe_float(row["close"]) >= _safe_float(row["open"])
+        )
+
+        near_high = _safe_float(signal_row["high"]) > 0 and (
+            _safe_float(signal_row["close"]) >= (_safe_float(signal_row["high"]) * 0.985)
+        )
+
+        checks = 0
+        if dist_ma_4h >= OVEREXTENDED_REVERSAL_MIN_DIST_MA_4H:
+            checks += 1
+        if rsi_4h >= OVEREXTENDED_REVERSAL_MIN_RSI_4H:
+            checks += 1
+        if change_24h >= OVEREXTENDED_REVERSAL_MIN_24H_CHANGE:
+            checks += 1
+        if green_count >= 3:
+            checks += 1
+        if near_high:
+            checks += 1
+
+        return checks >= 4
+
+    except Exception as e:
+        logger.error(f"is_overextended_on_4h error on {symbol}: {e}")
+        return False
+
+
+def is_1h_reversal_weakening(symbol: str) -> bool:
+    try:
+        candles = get_candles(symbol, OVEREXTENDED_REVERSAL_CONFIRM_TF, 120)
+        df = to_dataframe(candles)
+        if df is None or df.empty or len(df) < 20:
             return False
 
         signal_row = get_signal_row(df)
@@ -767,50 +828,119 @@ def is_overextended_reversal_short(
         last = df.iloc[idx]
         prev = df.iloc[idx - 1]
 
+        close_now = _safe_float(last["close"])
+        open_now = _safe_float(last["open"])
+        high_now = _safe_float(last["high"])
+        low_now = _safe_float(last["low"])
+        close_prev = _safe_float(prev["close"])
+        rsi_now = _safe_float(last.get("rsi"), 50)
+        rsi_prev = _safe_float(prev.get("rsi"), 50)
+        ma_now = _safe_float(last.get("ma"), 0)
+
+        candle_range = high_now - low_now
+        weak_close_position = candle_range > 0 and ((close_now - low_now) / candle_range) <= 0.45
+        bearish_close = close_now < open_now
+        lower_close = close_now <= close_prev
+        rsi_turning_down = rsi_now <= rsi_prev
+        not_near_high = high_now > 0 and close_now < (high_now * 0.995)
+        lost_ma = ma_now > 0 and close_now < ma_now
+
+        checks = sum([
+            bearish_close,
+            lower_close,
+            rsi_turning_down,
+            weak_close_position,
+            not_near_high,
+            lost_ma,
+        ])
+
+        return checks >= 3
+
+    except Exception as e:
+        logger.error(f"is_1h_reversal_weakening error on {symbol}: {e}")
+        return False
+
+
+def is_15m_reverse_trigger(df, early_signal: bool, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> bool:
+    try:
+        if df is None or df.empty or len(df) < 10:
+            return False
+
+        if breakdown or pre_breakdown or early_signal:
+            return True
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 1:
+            return False
+
+        last = df.iloc[idx]
+        prev = df.iloc[idx - 1]
+
         open_ = _safe_float(last["open"])
         close = _safe_float(last["close"])
         high = _safe_float(last["high"])
         low = _safe_float(last["low"])
-
         prev_close = _safe_float(prev["close"])
-        prev_rsi = _safe_float(prev.get("rsi"), 50)
         rsi_now = _safe_float(last.get("rsi"), 50)
+        rsi_prev = _safe_float(prev.get("rsi"), 50)
 
         candle_range = high - low
-        body = abs(close - open_)
-        body_ratio = (body / candle_range) if candle_range > 0 else 0.0
-
-        bearish_close = close < open_
-        lost_momentum = close <= prev_close
-        rsi_turning = rsi_now >= OVEREXTENDED_REVERSAL_MIN_RSI and rsi_now <= prev_rsi
         weak_close_position = candle_range > 0 and ((close - low) / candle_range) <= 0.45
-        decent_body = body_ratio >= 0.28
-        positive_funding = funding > 0
+        bearish_close = close < open_
+        lower_close = close <= prev_close
+        rsi_turning_down = rsi_now <= rsi_prev
 
         checks = 0
-
-        if dist_ma >= OVEREXTENDED_REVERSAL_MIN_DIST_MA:
-            checks += 1
-        if change_24h >= OVEREXTENDED_REVERSAL_MIN_24H_CHANGE:
-            checks += 1
-        if vol_ratio >= OVEREXTENDED_REVERSAL_MIN_VOL_RATIO:
-            checks += 1
         if bearish_close:
-            checks += 1
-        if lost_momentum:
-            checks += 1
-        if rsi_turning:
             checks += 1
         if weak_close_position:
             checks += 1
-        if decent_body:
+        if lower_close:
             checks += 1
-        if positive_funding:
+        if rsi_turning_down:
+            checks += 1
+        if vol_ratio >= OVEREXTENDED_REVERSAL_MIN_VOL_RATIO_15M:
             checks += 1
 
-        return checks >= 6
+        return checks >= 3
 
     except Exception:
+        return False
+
+
+def is_overextended_reversal_short(
+    symbol: str,
+    df,
+    change_24h: float,
+    vol_ratio: float,
+    early_signal: bool,
+    breakdown: bool,
+    pre_breakdown: bool,
+) -> bool:
+    try:
+        if not OVEREXTENDED_REVERSAL_ENABLED:
+            return False
+
+        overextended_4h = is_overextended_on_4h(symbol, change_24h)
+        weakening_1h = is_1h_reversal_weakening(symbol)
+        trigger_15m = is_15m_reverse_trigger(
+            df=df,
+            early_signal=early_signal,
+            breakdown=breakdown,
+            pre_breakdown=pre_breakdown,
+            vol_ratio=vol_ratio,
+        )
+
+        logger.info(
+            f"{symbol} → reverse_check | 4h_overextended={overextended_4h} | "
+            f"1h_weakening={weakening_1h} | 15m_trigger={trigger_15m}"
+        )
+
+        return bool(overextended_4h and weakening_1h and trigger_15m)
+
+    except Exception as e:
+        logger.error(f"is_overextended_reversal_short error on {symbol}: {e}")
         return False
 
 
@@ -822,7 +952,7 @@ def get_reverse_banner_short(is_reverse: bool) -> str:
 
 def get_reverse_style_note_short(is_reverse: bool) -> str:
     if is_reverse:
-        return "⚠️ <b>تنبيه خاص:</b> الفرصة من نوع ارتداد عكسي بعد امتداد قوي"
+        return "⚠️ <b>تنبيه خاص:</b> 4H Overextended | 1H Weakening | 15m Trigger"
     return ""
 
 
@@ -1231,7 +1361,7 @@ def build_track_message(alert: dict) -> str:
 
         reverse_note = ""
         if alert.get("is_reverse"):
-            reverse_note = "\nالنمط: Overextended Reversal"
+            reverse_note = "\nالنمط: 4H Overextended | 1H Weakening | 15m Trigger"
 
         return (
             f"📌 <b>Alert Track</b>\n\n"
@@ -1457,6 +1587,8 @@ def get_candle_cache_ttl(timeframe: str) -> int:
     if tf == "15m":
         return CANDLE_CACHE_TTL_15M
     if tf == "1h":
+        return CANDLE_CACHE_TTL_1H
+    if tf == "4h":
         return CANDLE_CACHE_TTL_1H
     return CANDLE_CACHE_TTL_DEFAULT
 
@@ -2056,8 +2188,7 @@ def get_momentum_priority(
         elif dist_ma > 4.2:
             priority -= 0.25
     else:
-        if dist_ma >= OVEREXTENDED_REVERSAL_MIN_DIST_MA:
-            priority += 0.35
+        priority += 0.45
 
     if losing_strength:
         priority += 0.20
@@ -2248,14 +2379,14 @@ def normalize_reason(reason: str) -> str:
         "فوق المتوسط": "فوق المتوسط",
         "رفض سعري سفلي": "رفض سعري سفلي",
         "أخبار اقتصادية مهمة قريبة": "أخبار اقتصادية مهمة قريبة",
-        "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه": "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه",
+        "♻️ 4H Overextended + 1H Weakening + 15m Trigger": "♻️ 4H Overextended + 1H Weakening + 15m Trigger",
     }
     return mapping.get(reason, reason)
 
 
 def sort_reasons(reasons):
     priority = {
-        "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه": 0,
+        "♻️ 4H Overextended + 1H Weakening + 15m Trigger": 0,
         "تحت المتوسط": 1,
         "زخم هابط مبكر": 2,
         "زخم هابط مبكر 🎯": 3,
@@ -2328,7 +2459,7 @@ def classify_reasons(reasons):
 
 def format_bearish_reasons(bearish):
     highlight_keywords = [
-        "Overextended reversal",
+        "4H Overextended",
         "كسر دعم",
         "زخم هابط",
         "فوليوم",
@@ -2471,7 +2602,7 @@ def build_message(
     warnings = sort_reasons(warnings)
 
     if is_reverse:
-        reverse_reason = "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه"
+        reverse_reason = "♻️ 4H Overextended + 1H Weakening + 15m Trigger"
         if reverse_reason not in bearish:
             bearish = [reverse_reason] + bearish
 
@@ -2724,11 +2855,13 @@ def run_scanner_loop():
                 losing_strength = is_losing_intraday_strength(df)
 
                 is_reverse = is_overextended_reversal_short(
+                    symbol=symbol,
                     df=df,
-                    dist_ma=dist_ma,
                     change_24h=change_24h,
                     vol_ratio=vol_ratio,
-                    funding=funding,
+                    early_signal=early_signal,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
                 )
 
                 if vol_ratio < 1.08 and not breakdown and not pre_breakdown and not early_signal and not is_reverse:
@@ -3122,8 +3255,9 @@ def run_scanner_loop():
 
                     trade_reasons = list(candidate["reasons"] or [])
                     if candidate.get("is_reverse"):
-                        if "OVEREXTENDED_REVERSAL" not in trade_reasons:
-                            trade_reasons.append("OVEREXTENDED_REVERSAL")
+                        reverse_tag = "OVEREXTENDED_REVERSAL_4H_1H_15M"
+                        if reverse_tag not in trade_reasons:
+                            trade_reasons.append(reverse_tag)
 
                     register_trade(
                         redis_client=r,
