@@ -555,6 +555,7 @@ def build_help_message() -> str:
         "• الفلاتر متوازنة أكتر علشان تقلل الخنق الزيادة",
         "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير",
         "• فيه فلتر إضافي لمنع الدخول المتأخر بعد نهاية الحركة",
+        "• Smart Early Priority بيفرق بين الـ early القوي والضعيف",
     ]
 
     if other_commands:
@@ -592,8 +593,9 @@ def build_how_it_work_message() -> str:
 • تأكيد 1H
 • حالة السوق العامة
 5. فلتر خاص لمنع الدخول بعد انتهاء الحركة
-6. إعطاء Score من 10
-7. إرسال فقط الفرص المقبولة نهائيًا
+6. Smart Early Priority للإشارات المبكرة
+7. إعطاء Score من 10
+8. إرسال فقط الفرص المقبولة نهائيًا
 
 📌 <b>زر Track:</b>
 يعرض لاحقًا:
@@ -720,6 +722,96 @@ def is_exhausted_short_move(
         return False
     except Exception:
         return False
+
+
+def classify_early_priority_short(
+    early_signal: bool,
+    breakdown: bool,
+    pre_breakdown: bool,
+    dist_ma: float,
+    vol_ratio: float,
+    candle_strength: float,
+    mtf_confirmed: bool,
+    losing_strength: bool,
+    market_state: str,
+) -> str:
+    try:
+        if not early_signal or breakdown or pre_breakdown:
+            return "none"
+
+        score = 0
+
+        if dist_ma <= 2.8:
+            score += 2
+        elif dist_ma <= 3.5:
+            score += 1
+
+        if vol_ratio >= 1.35:
+            score += 2
+        elif vol_ratio >= 1.15:
+            score += 1
+
+        if candle_strength >= 0.55:
+            score += 2
+        elif candle_strength >= 0.42:
+            score += 1
+
+        if mtf_confirmed:
+            score += 2
+
+        if losing_strength:
+            score += 1
+
+        if market_state in ("risk_off", "btc_leading", "mixed"):
+            score += 1
+        elif market_state in ("bull_market", "alt_season"):
+            score -= 1
+
+        if score >= 7:
+            return "strong"
+        if score >= 4:
+            return "medium"
+        return "weak"
+    except Exception:
+        return "none"
+
+
+def get_early_priority_score_bonus(priority: str) -> float:
+    if priority == "strong":
+        return 0.25
+    if priority == "medium":
+        return 0.10
+    if priority == "weak":
+        return -0.10
+    return 0.0
+
+
+def get_early_priority_threshold_adjustment(priority: str) -> float:
+    if priority == "strong":
+        return -0.25
+    if priority == "medium":
+        return -0.10
+    if priority == "weak":
+        return 0.10
+    return 0.0
+
+
+def get_early_priority_min_score_adjustment(priority: str) -> float:
+    if priority == "strong":
+        return -0.20
+    if priority == "medium":
+        return -0.10
+    return 0.0
+
+
+def get_early_priority_momentum_bonus(priority: str) -> float:
+    if priority == "strong":
+        return 0.35
+    if priority == "medium":
+        return 0.15
+    if priority == "weak":
+        return -0.10
+    return 0.0
 
 
 # =========================
@@ -1776,6 +1868,7 @@ def get_momentum_priority(
     pre_breakdown: bool = False,
     dist_ma: float = 0.0,
     losing_strength: bool = False,
+    early_priority: str = "none",
 ) -> float:
     priority = float(score)
 
@@ -1800,6 +1893,8 @@ def get_momentum_priority(
     if losing_strength:
         priority += 0.20
 
+    priority += get_early_priority_momentum_bonus(early_priority)
+
     return round(priority, 2)
 
 
@@ -1810,6 +1905,8 @@ def get_candidate_bucket(candidate: dict) -> str:
         return "pre_breakdown"
     if candidate["breakdown"]:
         return "breakdown"
+    if candidate.get("early_priority") == "strong":
+        return "early_strong"
     if candidate["vol_ratio"] >= 1.8:
         return "volume"
     return "standard"
@@ -1883,7 +1980,7 @@ def diversify_candidates(candidates, max_alerts=3):
     diversified = []
     used_patterns = set()
 
-    for bucket_name in ["new_breakdown", "pre_breakdown", "breakdown", "volume", "standard"]:
+    for bucket_name in ["new_breakdown", "pre_breakdown", "breakdown", "early_strong", "volume", "standard"]:
         if bucket_name not in buckets or not buckets[bucket_name]:
             continue
 
@@ -1893,6 +1990,7 @@ def diversify_candidates(candidates, max_alerts=3):
             candidate.get("pre_breakdown", False),
             round(candidate["vol_ratio"], 1),
             candidate["is_new"],
+            candidate.get("early_priority", "none"),
         )
 
         if pattern not in used_patterns:
@@ -1926,6 +2024,7 @@ def diversify_candidates(candidates, max_alerts=3):
                 candidate.get("pre_breakdown", False),
                 round(candidate["vol_ratio"], 1),
                 candidate["is_new"],
+                candidate.get("early_priority", "none"),
             )
 
             if pattern in used_patterns:
@@ -2422,9 +2521,7 @@ def run_scanner_loop():
                     breakdown=breakdown,
                     pre_breakdown=pre_breakdown,
                 ):
-                    logger.info(
-                        f"{symbol} → skipped (late short entry | dist_ma={dist_ma:.2f})"
-                    )
+                    logger.info(f"{symbol} → skipped (late short entry | dist_ma={dist_ma:.2f})")
                     continue
 
                 if is_exhausted_short_move(
@@ -2439,6 +2536,18 @@ def run_scanner_loop():
                         f"vol_ratio={vol_ratio:.2f} | candle_strength={candle_strength:.2f})"
                     )
                     continue
+
+                early_priority = classify_early_priority_short(
+                    early_signal=early_signal,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                    dist_ma=dist_ma,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                    mtf_confirmed=mtf_confirmed,
+                    losing_strength=losing_strength,
+                    market_state=market_state,
+                )
 
                 try:
                     score_result = calculate_short_score(
@@ -2466,7 +2575,7 @@ def run_scanner_loop():
                     if breakdown or pre_breakdown:
                         effective_score -= 0.20
                     elif early_signal:
-                        effective_score -= 0.35
+                        effective_score -= 0.15
                     else:
                         effective_score -= 0.55
 
@@ -2479,6 +2588,7 @@ def run_scanner_loop():
                 if dist_ma > 4.2 and candle_strength < 0.52 and not breakdown and not pre_breakdown:
                     effective_score -= 0.20
 
+                effective_score += get_early_priority_score_bonus(early_priority)
                 score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
@@ -2496,7 +2606,13 @@ def run_scanner_loop():
                 if candle_strength < 0.45 and dist_ma > 4.0 and not breakdown and not pre_breakdown:
                     dynamic_threshold += 0.10
 
+                dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
+
+                strong_early_override = (
+                    early_priority == "strong"
+                    and score_result["score"] >= max(6.0, dynamic_threshold - 0.20)
+                )
 
                 if not early_signal and not pre_breakdown and not breakdown:
                     if score_result["score"] < dynamic_threshold:
@@ -2505,6 +2621,14 @@ def run_scanner_loop():
                             f"vol={vol_ratio} | dist_ma={dist_ma})"
                         )
                         continue
+                else:
+                    if not strong_early_override and not pre_breakdown and not breakdown:
+                        if score_result["score"] < dynamic_threshold and early_priority == "weak":
+                            logger.info(
+                                f"{symbol} → rejected weak early (score<{dynamic_threshold} | "
+                                f"early_priority={early_priority})"
+                            )
+                            continue
 
                 if has_high_impact_news:
                     if "warning_reasons" not in score_result:
@@ -2530,12 +2654,16 @@ def run_scanner_loop():
                 )
                 timing_penalty = get_entry_timing_penalty(entry_timing)
                 effective_required_min_score = required_min_score + timing_penalty
+                effective_required_min_score += get_early_priority_min_score_adjustment(early_priority)
+                effective_required_min_score = round(effective_required_min_score, 2)
 
                 logger.info(
                     f"{symbol} → early_signal: {early_signal} | "
+                    f"early_priority={early_priority} | "
                     f"pre_b={pre_breakdown} | "
                     f"score={score_result['score']} | "
                     f"min_required={effective_required_min_score} | "
+                    f"dyn={dynamic_threshold} | "
                     f"fake={score_result.get('fake_signal')} | "
                     f"mtf={mtf_confirmed} | "
                     f"market={market_state} | dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f}"
@@ -2621,6 +2749,7 @@ def run_scanner_loop():
                     pre_breakdown=pre_breakdown,
                     dist_ma=dist_ma,
                     losing_strength=losing_strength,
+                    early_priority=early_priority,
                 )
 
                 alert_id = build_alert_id(symbol, candle_time)
@@ -2635,6 +2764,7 @@ def run_scanner_loop():
                     "candle_strength": candle_strength,
                     "is_new": is_new,
                     "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
+                    "early_priority": early_priority,
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -2675,6 +2805,7 @@ def run_scanner_loop():
                         "btc_mode": btc_mode,
                         "entry_timing": entry_timing,
                         "opportunity_type": opportunity_type,
+                        "early_priority": early_priority,
                     },
                     "candle_time": candle_time,
                     "now": now,
@@ -2775,6 +2906,7 @@ def run_scanner_loop():
                         f"SENT SHORT → {symbol} | score: {candidate['score']} | "
                         f"momentum: {candidate['momentum_priority']} | "
                         f"bucket: {candidate['bucket']} | new={candidate['is_new']} | "
+                        f"early_priority={candidate.get('early_priority', 'none')} | "
                         f"market={candidate['market_state']} | alt={candidate['alt_mode']} | "
                         f"alert_id={candidate['alert_id']}"
                     )
