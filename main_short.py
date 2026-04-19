@@ -297,10 +297,7 @@ def format_news_warning(events: list) -> str:
     calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
 
     if not events:
-        return (
-            f'📰 <b>الأخبار:</b> لا توجد أخبار High-Impact قريبة\n'
-            f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
-        )
+        return f'📰 <b>الأخبار:</b> لا توجد أخبار High-Impact قريبة | <a href="{calendar_link}">Economic Calendar</a>'
 
     parts = []
     for event in events[:2]:
@@ -309,11 +306,7 @@ def format_news_warning(events: list) -> str:
         parts.append(f'<a href="{link}">{title}</a>')
 
     events_text = " | ".join(parts)
-
-    return (
-        f'📰 <b>تنويه أخبار:</b> {events_text}\n'
-        f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
-    )
+    return f'📰 <b>الأخبار:</b> {events_text} | <a href="{calendar_link}">Economic Calendar</a>'
 
 
 # =========================
@@ -491,6 +484,7 @@ def get_telegram_updates(offset: int = 0):
 
 TELEGRAM_COMMANDS = {
     "/help": "عرض كل الأوامر المتاحة",
+    "/how_it_work": "شرح طريقة عمل البوت",
     "/report_1h": "آخر ساعة",
     "/report_today": "اليوم",
     "/report_all": "كل الصفقات",
@@ -562,7 +556,137 @@ def build_help_message() -> str:
     return "\n".join(lines)
 
 
-def reset_stats(chat_id: str):
+def build_how_it_work_message() -> str:
+    return """📘 <b>كيف يعمل بوت الشورت؟</b>
+
+🤖 <b>فكرة البوت:</b>
+البوت متخصص في البحث عن فرص <b>Short Futures</b> على منصة OKX،
+ويعتمد على فلترة تدريجية لتقليل الإشارات الضعيفة ورفع جودة التنبيه.
+
+🔍 <b>منطق العمل:</b>
+1. اختيار العملات الأعلى ارتفاعاً وسيولة
+2. تحليل الشموع على فريم <b>15 دقيقة</b>
+3. تقييم عدة عوامل:
+• الزخم البيعي
+• الفوليوم
+• موقع السعر بالنسبة للمتوسط
+• كسر الدعم أو الضغط قبل الكسر
+• تأكيد فريم الساعة (1H)
+• حالة السوق العامة
+• قوة سوق الألت من السوق الفعلي
+4. إعطاء كل فرصة <b>Score من 10</b>
+5. إرسال فقط الفرص التي تتجاوز الشروط النهائية
+
+📊 <b>متى تعتبر الإشارة قوية؟</b>
+• فوليوم بيعي أعلى من الطبيعي
+• شمعة هبوطية نظيفة
+• RSI في منطقة ضعف
+• كسر دعم أو ضغط بيعي واضح
+• توافق مع السوق العام
+
+⚠️ <b>متى تكون الإشارة فيها مخاطرة؟</b>
+• الألت قوي بشكل عام (Alt Season)
+• RSI منخفض جداً (تشبع بيع)
+• السوق صاعد بقوة
+• فوليوم غير كافٍ
+• وجود أخبار اقتصادية قريبة
+
+🧠 <b>شرح رسالة البوت:</b>
+
+🔴 <b>العملة</b>
+الزوج الذي تم رصد إشارة الشورت عليه
+
+💰 <b>السعر</b>
+سعر الدخول التقريبي
+
+⭐ <b>السكور</b>
+تقييم من 10 — كلما زاد جودة أعلى
+
+🎯 <b>TP1 / TP2</b>
+أهداف الربح للشورت (أسفل السعر الحالي)
+
+🛑 <b>SL</b>
+مستوى وقف الخسارة (فوق السعر الحالي)
+
+🧠 <b>نوع الفرصة</b>
+• Breakdown مبكر
+• Breakdown
+• استمرار هبوطي
+
+📍 <b>الدخول</b>
+• 🟢 مبكر (بداية الحركة)
+• 🟡 متوسط (نص الحركة)
+• 🔴 متأخر (قرب النهاية)
+
+⚖️ <b>المخاطرة</b>
+تقييم عام للفرصة: منخفضة / متوسطة / عالية
+
+📌 <b>مهم جدًا:</b>
+• البوت أداة مساعدة وليس قرار نهائي
+• لا تعتمد عليه بدون مراجعة الشارت
+• الشورت أصعب من اللونج في سوق صاعد
+• السوق دائمًا له الكلمة الأخيرة
+
+✅ <b>أفضل استخدام:</b>
+استخدم البوت كفلتر ذكي يوفر وقتك،
+ثم خذ القرار بعد مراجعة سريعة للسوق والشارت."""
+
+
+def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_ma: float, mtf_confirmed: bool) -> str:
+    try:
+        if pre_breakdown and not breakdown:
+            return "Breakdown مبكر"
+        if breakdown:
+            return "Breakdown"
+        if dist_ma <= 1.2 and mtf_confirmed:
+            return "Pullback هبوطي"
+        return "استمرار هبوطي"
+    except Exception:
+        return "استمرار هبوطي"
+
+
+def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> str:
+    try:
+        if (pre_breakdown or breakdown) and dist_ma <= 2.8 and vol_ratio >= 1.3:
+            return "🟢 مبكر (بداية الحركة)"
+        if breakdown and 2.8 < dist_ma <= 4.0 and vol_ratio >= 1.5:
+            return "🟡 متوسط (نص الحركة)"
+        if 2.8 < dist_ma <= 4.5 and vol_ratio >= 1.2:
+            return "🟡 متوسط (نص الحركة)"
+        return "🔴 متأخر (قرب النهاية)"
+    except Exception:
+        return "🟡 متوسط (نص الحركة)"
+
+
+def get_base_risk_label_short(score_result: dict, warnings_count: int) -> str:
+    risk_level = score_result.get("risk_level")
+    if risk_level:
+        return risk_level
+    if warnings_count == 0:
+        return "🟢 منخفضة"
+    if warnings_count == 1:
+        return "🟡 متوسطة"
+    return "🔴 عالية"
+
+
+def adjust_risk_with_entry_timing_short(base_risk: str, entry_timing: str) -> str:
+    try:
+        if "🔴 متأخر" in entry_timing:
+            return "🔴 عالية"
+        if "🟡 متوسط" in entry_timing and base_risk == "🟢 منخفضة":
+            return "🟡 متوسطة"
+        return base_risk
+    except Exception:
+        return base_risk
+
+
+def build_market_summary_short(btc_mode: str, alt_mode: str) -> str:
+    safe_alt = alt_mode if alt_mode else "🟡 متماسك"
+    safe_btc = btc_mode if btc_mode else "🟡 محايد"
+    return f"{safe_alt} | BTC: {safe_btc}"
+
+
+
     if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
         send_telegram_reply(chat_id, "⛔ غير مسموح")
         return
@@ -634,6 +758,7 @@ def stats_since_reset(chat_id: str):
 
 COMMAND_HANDLERS = {
     "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
+    "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
     "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
@@ -1729,6 +1854,9 @@ def build_message(
     market_bias_label=None,
     alt_mode=None,
     news_warning="",
+    opportunity_type="استمرار هبوطي",
+    entry_timing="🟡 متوسط (نص الحركة)",
+    display_risk="🟡 متوسطة",
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -1756,55 +1884,45 @@ def build_message(
     tp1_pct = round(((price - tp1) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((price - tp2) / price) * 100, 2) if price else 0.0
 
-    risk_level = score_result.get("risk_level")
-    if not risk_level:
-        if len(warnings) == 0:
-            risk_level = "🟢 منخفضة"
-        elif len(warnings) == 1:
-            risk_level = "🟡 متوسطة"
-        else:
-            risk_level = "🔴 عالية"
-
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
     safe_symbol = html.escape(symbol_clean)
-    safe_btc = html.escape(btc_mode)
-    safe_flow = html.escape(market_bias_label or btc_short_bias)
-    safe_market = html.escape(market_state_label or "🟡 Mixed")
-    safe_alt_mode = html.escape(alt_mode or "🟡 متماسك")
+    safe_market = html.escape(build_market_summary_short(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
+    safe_opportunity_type = html.escape(opportunity_type)
+    safe_entry_timing = html.escape(entry_timing)
+    safe_display_risk = html.escape(display_risk)
 
     change_24h_text = f"{change_24h:+.2f}%"
 
-    warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
+    warnings_block = f"\n\n⚠️ <b>ملاحظات:</b>\n{warnings_text}" if warnings_text else ""
     news_block = f"\n\n{news_warning}" if news_warning else ""
 
     return f"""🔴 <b>شورت فيوتشر | {safe_symbol}</b>
 
 💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
 ⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
-🛑 <b>SL:</b> {stop_loss:.6f} (+{sl_pct}%)
 
 🎯 <b>TP1:</b> {tp1:.6f} (-{tp1_pct}%)
 🏁 <b>TP2:</b> {tp2:.6f} (-{tp2_pct}%)
+🛑 <b>SL:</b> {stop_loss:.6f} (+{sl_pct}%)
 
-🏷 <b>التصنيف:</b> {safe_rating}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}
 
-🪙 <b>BTC:</b> {safe_btc}
-🌐 <b>السوق:</b> {safe_market}
-📊 <b>حالة الألت:</b> {safe_alt_mode}
-👑 <b>السيولة:</b> {safe_flow}
+🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير 24H:</b> {change_24h_text}{new_tag}
 
 📊 <b>أسباب الدخول:</b>
 {bearish_text}{warnings_block}{news_block}
 
-⚖️ <b>المخاطرة:</b> {risk_level}
+📍 <b>الدخول:</b> {safe_entry_timing}
+⚖️ <b>المخاطرة:</b> {safe_display_risk}
 
-🔗 <a href="{safe_tv_link}">Open Chart</a>"""
+🏷 <b>التصنيف:</b> {safe_rating}
+🔗 <a href="{safe_tv_link}">Open Chart (15m / 1H)</a>"""
 
 
 def run_command_poller():
@@ -2037,6 +2155,25 @@ def run_scanner_loop():
                 stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
                 tv_link = build_tradingview_link(symbol)
 
+                opportunity_type = classify_opportunity_type_short(
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                    dist_ma=dist_ma,
+                    mtf_confirmed=mtf_confirmed,
+                )
+                entry_timing = classify_entry_timing_short(
+                    dist_ma=dist_ma,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                    vol_ratio=vol_ratio,
+                )
+
+                explicit_warnings = score_result.get("warning_reasons") or []
+                _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
+                warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
+                base_risk = get_base_risk_label_short(score_result, warnings_count)
+                display_risk = adjust_risk_with_entry_timing_short(base_risk, entry_timing)
+
                 momentum_priority = get_momentum_priority(
                     score=float(score_result["score"]),
                     breakdown=breakdown,
@@ -2069,6 +2206,9 @@ def run_scanner_loop():
                         market_bias_label=market_bias_label,
                         alt_mode=alt_mode,
                         news_warning=news_warning_text,
+                        opportunity_type=opportunity_type,
+                        entry_timing=entry_timing,
+                        display_risk=display_risk,
                     ),
                     "candle_time": candle_time,
                     "now": now,
