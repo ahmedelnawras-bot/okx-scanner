@@ -554,6 +554,7 @@ def build_help_message() -> str:
         "• البوت بيبعت إشارات Short Futures",
         "• الفلاتر متوازنة أكتر علشان تقلل الخنق الزيادة",
         "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير",
+        "• فيه فلتر إضافي لمنع الدخول المتأخر بعد نهاية الحركة",
     ]
 
     if other_commands:
@@ -590,8 +591,9 @@ def build_how_it_work_message() -> str:
 • Breakdown / Pre-Breakdown
 • تأكيد 1H
 • حالة السوق العامة
-5. إعطاء Score من 10
-6. إرسال فقط الفرص المقبولة نهائيًا
+5. فلتر خاص لمنع الدخول بعد انتهاء الحركة
+6. إعطاء Score من 10
+7. إرسال فقط الفرص المقبولة نهائيًا
 
 📌 <b>زر Track:</b>
 يعرض لاحقًا:
@@ -623,6 +625,8 @@ def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_m
 
 def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> str:
     try:
+        if dist_ma > 5.0:
+            return "🔴 متأخر (قرب النهاية)"
         if (pre_breakdown or breakdown) and dist_ma <= 3.0 and vol_ratio >= 1.15:
             return "🟢 مبكر (بداية الحركة)"
         if breakdown and 3.0 < dist_ma <= 4.4 and vol_ratio >= 1.25:
@@ -682,6 +686,40 @@ def _safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def is_late_short_entry(dist_ma: float, breakdown: bool, pre_breakdown: bool) -> bool:
+    try:
+        if breakdown or pre_breakdown:
+            return False
+        return dist_ma > 5.0
+    except Exception:
+        return False
+
+
+def is_exhausted_short_move(
+    dist_ma: float,
+    vol_ratio: float,
+    candle_strength: float,
+    breakdown: bool,
+    pre_breakdown: bool,
+) -> bool:
+    try:
+        if breakdown or pre_breakdown:
+            return False
+
+        if dist_ma > 4.5 and vol_ratio < 1.30:
+            return True
+
+        if dist_ma > 5.0 and candle_strength < 0.50:
+            return True
+
+        if dist_ma > 5.5 and vol_ratio < 1.45 and candle_strength < 0.55:
+            return True
+
+        return False
+    except Exception:
+        return False
 
 
 # =========================
@@ -1755,9 +1793,9 @@ def get_momentum_priority(
         priority += 0.4
 
     if dist_ma > 5.2:
-        priority -= 0.5
+        priority -= 0.7
     elif dist_ma > 4.2:
-        priority -= 0.2
+        priority -= 0.25
 
     if losing_strength:
         priority += 0.20
@@ -2379,6 +2417,29 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
 
+                if is_late_short_entry(
+                    dist_ma=dist_ma,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                ):
+                    logger.info(
+                        f"{symbol} → skipped (late short entry | dist_ma={dist_ma:.2f})"
+                    )
+                    continue
+
+                if is_exhausted_short_move(
+                    dist_ma=dist_ma,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                ):
+                    logger.info(
+                        f"{symbol} → skipped (exhausted move | dist_ma={dist_ma:.2f} | "
+                        f"vol_ratio={vol_ratio:.2f} | candle_strength={candle_strength:.2f})"
+                    )
+                    continue
+
                 try:
                     score_result = calculate_short_score(
                         df=df,
@@ -2412,6 +2473,12 @@ def run_scanner_loop():
                 if not losing_strength and not breakdown and not pre_breakdown:
                     effective_score -= 0.15
 
+                if dist_ma > 4.6 and not breakdown and not pre_breakdown:
+                    effective_score -= 0.25
+
+                if dist_ma > 4.2 and candle_strength < 0.52 and not breakdown and not pre_breakdown:
+                    effective_score -= 0.20
+
                 score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
@@ -2423,10 +2490,19 @@ def run_scanner_loop():
                     losing_strength=losing_strength,
                 )
 
+                if dist_ma > 4.4 and not breakdown and not pre_breakdown:
+                    dynamic_threshold += 0.15
+
+                if candle_strength < 0.45 and dist_ma > 4.0 and not breakdown and not pre_breakdown:
+                    dynamic_threshold += 0.10
+
+                dynamic_threshold = round(dynamic_threshold, 2)
+
                 if not early_signal and not pre_breakdown and not breakdown:
                     if score_result["score"] < dynamic_threshold:
                         logger.info(
-                            f"{symbol} → rejected (score<{dynamic_threshold} | market={market_state} | vol={vol_ratio})"
+                            f"{symbol} → rejected (score<{dynamic_threshold} | market={market_state} | "
+                            f"vol={vol_ratio} | dist_ma={dist_ma})"
                         )
                         continue
 
@@ -2462,7 +2538,7 @@ def run_scanner_loop():
                     f"min_required={effective_required_min_score} | "
                     f"fake={score_result.get('fake_signal')} | "
                     f"mtf={mtf_confirmed} | "
-                    f"market={market_state}"
+                    f"market={market_state} | dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f}"
                 )
 
                 if score_result["score"] < effective_required_min_score:
@@ -2472,7 +2548,7 @@ def run_scanner_loop():
                     )
                     continue
 
-                if not breakdown and not pre_breakdown and dist_ma > 5.2:
+                if not breakdown and not pre_breakdown and dist_ma > 5.0:
                     logger.info(f"{symbol} → rejected (late move without breakdown/pre-breakdown)")
                     continue
 
