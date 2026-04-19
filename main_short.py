@@ -589,6 +589,7 @@ def build_help_message() -> str:
         "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير",
         "• فيه فلتر إضافي لمنع الدخول المتأخر بعد نهاية الحركة",
         "• Smart Early Priority بيفرق بين الـ early القوي والضعيف",
+        "• فيه تمييز خاص لفرص Overextended Reversal",
     ]
 
     if other_commands:
@@ -623,6 +624,7 @@ def build_how_it_work_message() -> str:
 • RSI
 • موقع السعر من المتوسط
 • Breakdown / Pre-Breakdown
+• Overextended Reversal
 • تأكيد 1H
 • حالة السوق العامة
 5. فلتر خاص لمنع الدخول بعد انتهاء الحركة
@@ -666,8 +668,16 @@ def classify_opportunity_type_short(
         return "استمرار هبوطي"
 
 
-def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> str:
+def classify_entry_timing_short(
+    dist_ma: float,
+    breakdown: bool,
+    pre_breakdown: bool,
+    vol_ratio: float,
+    is_reverse: bool = False,
+) -> str:
     try:
+        if is_reverse:
+            return "♻️ عكسي ممتد (منطقة ارتداد)"
         if dist_ma > 5.0:
             return "🔴 متأخر (قرب النهاية)"
         if (pre_breakdown or breakdown) and dist_ma <= 3.0 and vol_ratio >= 1.15:
@@ -683,6 +693,8 @@ def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: 
 
 def get_entry_timing_penalty(entry_timing: str) -> float:
     try:
+        if "♻️" in entry_timing:
+            return 0.0
         if "🔴 متأخر" in entry_timing:
             return 0.25
         if "🟡 متوسط" in entry_timing:
@@ -705,6 +717,8 @@ def get_base_risk_label_short(score_result: dict, warnings_count: int) -> str:
 
 def adjust_risk_with_entry_timing_short(base_risk: str, entry_timing: str) -> str:
     try:
+        if "♻️" in entry_timing:
+            return base_risk
         if "🔴 متأخر" in entry_timing:
             return "🔴 عالية"
         if "🟡 متوسط" in entry_timing and base_risk == "🟢 منخفضة":
@@ -980,7 +994,6 @@ def reset_stats(chat_id: str):
     try:
         deleted = 0
 
-        # امسح فقط بيانات الأداء / التقارير
         for key in r.scan_iter("trade:futures:short:*"):
             r.delete(key)
             deleted += 1
@@ -1216,11 +1229,16 @@ def build_track_message(alert: dict) -> str:
         if entry > 0 and current_price > 0:
             current_move = round(((entry - current_price) / entry) * 100, 2)
 
+        reverse_note = ""
+        if alert.get("is_reverse"):
+            reverse_note = "\nالنمط: Overextended Reversal"
+
         return (
             f"📌 <b>Alert Track</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
             f"النوع: Short\n"
-            f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
+            f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}"
+            f"{reverse_note}\n\n"
             f"Entry: {entry:.6f}\n"
             f"SL: {sl:.6f}\n"
             f"TP1: {tp1:.6f}\n"
@@ -2015,6 +2033,7 @@ def get_momentum_priority(
     dist_ma: float = 0.0,
     losing_strength: bool = False,
     early_priority: str = "none",
+    is_reverse: bool = False,
 ) -> float:
     priority = float(score)
 
@@ -2031,10 +2050,14 @@ def get_momentum_priority(
     if is_new and vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
         priority += 0.4
 
-    if dist_ma > 5.2:
-        priority -= 0.7
-    elif dist_ma > 4.2:
-        priority -= 0.25
+    if not is_reverse:
+        if dist_ma > 5.2:
+            priority -= 0.7
+        elif dist_ma > 4.2:
+            priority -= 0.25
+    else:
+        if dist_ma >= OVEREXTENDED_REVERSAL_MIN_DIST_MA:
+            priority += 0.35
 
     if losing_strength:
         priority += 0.20
@@ -2139,6 +2162,7 @@ def diversify_candidates(candidates, max_alerts=3):
             round(candidate["vol_ratio"], 1),
             candidate["is_new"],
             candidate.get("early_priority", "none"),
+            candidate.get("is_reverse", False),
         )
 
         if pattern not in used_patterns:
@@ -2173,6 +2197,7 @@ def diversify_candidates(candidates, max_alerts=3):
                 round(candidate["vol_ratio"], 1),
                 candidate["is_new"],
                 candidate.get("early_priority", "none"),
+                candidate.get("is_reverse", False),
             )
 
             if pattern in used_patterns:
@@ -2223,12 +2248,14 @@ def normalize_reason(reason: str) -> str:
         "فوق المتوسط": "فوق المتوسط",
         "رفض سعري سفلي": "رفض سعري سفلي",
         "أخبار اقتصادية مهمة قريبة": "أخبار اقتصادية مهمة قريبة",
+        "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه": "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه",
     }
     return mapping.get(reason, reason)
 
 
 def sort_reasons(reasons):
     priority = {
+        "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه": 0,
         "تحت المتوسط": 1,
         "زخم هابط مبكر": 2,
         "زخم هابط مبكر 🎯": 3,
@@ -2301,6 +2328,7 @@ def classify_reasons(reasons):
 
 def format_bearish_reasons(bearish):
     highlight_keywords = [
+        "Overextended reversal",
         "كسر دعم",
         "زخم هابط",
         "فوليوم",
@@ -2340,6 +2368,7 @@ def enforce_min_sl_percent(entry: float, sl: float, signal_type="standard") -> f
         "standard": 1.3,
         "pre_breakdown": 1.6,
         "new_listing": 2.0,
+        "reverse": 1.6,
     }
 
     min_pct = floors.get(signal_type, 1.3)
@@ -2366,6 +2395,8 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
             atr_mult = 1.75
         elif signal_type == "new_listing":
             atr_mult = 2.10
+        elif signal_type == "reverse":
+            atr_mult = 1.90
         else:
             atr_mult = 1.55
 
@@ -2394,6 +2425,8 @@ def get_rr_targets(signal_type="standard", entry_timing=""):
         return 1.7, 2.8
     if signal_type == "new_listing":
         return 1.9, 3.2
+    if signal_type == "reverse":
+        return 1.5, 2.5
     if "🔴 متأخر" in entry_timing:
         return 1.7, 2.8
     return 1.4, 2.4
@@ -2438,7 +2471,7 @@ def build_message(
     warnings = sort_reasons(warnings)
 
     if is_reverse:
-        reverse_reason = "Overextended reversal بعد صعود/امتداد مبالغ فيه"
+        reverse_reason = "♻️ Overextended reversal بعد صعود/امتداد مبالغ فيه"
         if reverse_reason not in bearish:
             bearish = [reverse_reason] + bearish
 
@@ -2698,7 +2731,7 @@ def run_scanner_loop():
                     funding=funding,
                 )
 
-                if vol_ratio < 1.08 and not breakdown and not pre_breakdown and not early_signal:
+                if vol_ratio < 1.08 and not breakdown and not pre_breakdown and not early_signal and not is_reverse:
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
 
@@ -2765,13 +2798,13 @@ def run_scanner_loop():
                     else:
                         effective_score -= 0.55
 
-                if not losing_strength and not breakdown and not pre_breakdown:
+                if not losing_strength and not breakdown and not pre_breakdown and not is_reverse:
                     effective_score -= 0.15
 
-                if dist_ma > 4.6 and not breakdown and not pre_breakdown:
+                if dist_ma > 4.6 and not breakdown and not pre_breakdown and not is_reverse:
                     effective_score -= 0.25
 
-                if dist_ma > 4.2 and candle_strength < 0.52 and not breakdown and not pre_breakdown:
+                if dist_ma > 4.2 and candle_strength < 0.52 and not breakdown and not pre_breakdown and not is_reverse:
                     effective_score -= 0.20
 
                 effective_score += get_early_priority_score_bonus(early_priority)
@@ -2790,13 +2823,17 @@ def run_scanner_loop():
                     losing_strength=losing_strength,
                 )
 
-                if dist_ma > 4.4 and not breakdown and not pre_breakdown:
+                if dist_ma > 4.4 and not breakdown and not pre_breakdown and not is_reverse:
                     dynamic_threshold += 0.15
 
-                if candle_strength < 0.45 and dist_ma > 4.0 and not breakdown and not pre_breakdown:
+                if candle_strength < 0.45 and dist_ma > 4.0 and not breakdown and not pre_breakdown and not is_reverse:
                     dynamic_threshold += 0.10
 
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
+
+                if is_reverse:
+                    dynamic_threshold = min(dynamic_threshold, OVEREXTENDED_REVERSAL_MIN_SCORE + 0.20)
+
                 dynamic_threshold = round(dynamic_threshold, 2)
 
                 strong_early_override = (
@@ -2805,7 +2842,7 @@ def run_scanner_loop():
                 )
 
                 if not early_signal and not pre_breakdown and not breakdown:
-                    if score_result["score"] < dynamic_threshold:
+                    if score_result["score"] < dynamic_threshold and not is_reverse:
                         logger.info(
                             f"{symbol} → rejected (score<{dynamic_threshold} | market={market_state} | "
                             f"vol={vol_ratio} | dist_ma={dist_ma})"
@@ -2813,7 +2850,7 @@ def run_scanner_loop():
                         continue
                 else:
                     if not strong_early_override and not pre_breakdown and not breakdown:
-                        if score_result["score"] < dynamic_threshold and early_priority == "weak":
+                        if score_result["score"] < dynamic_threshold and early_priority == "weak" and not is_reverse:
                             logger.info(
                                 f"{symbol} → rejected weak early (score<{dynamic_threshold} | "
                                 f"early_priority={early_priority})"
@@ -2842,6 +2879,7 @@ def run_scanner_loop():
                     breakdown=breakdown,
                     pre_breakdown=pre_breakdown,
                     vol_ratio=vol_ratio,
+                    is_reverse=is_reverse,
                 )
                 timing_penalty = get_entry_timing_penalty(entry_timing)
                 effective_required_min_score = required_min_score + timing_penalty
@@ -2855,6 +2893,7 @@ def run_scanner_loop():
                     f"{symbol} → early_signal: {early_signal} | "
                     f"early_priority={early_priority} | "
                     f"pre_b={pre_breakdown} | "
+                    f"reverse={is_reverse} | "
                     f"score={score_result['score']} | "
                     f"min_required={effective_required_min_score} | "
                     f"dyn={dynamic_threshold} | "
@@ -2914,7 +2953,9 @@ def run_scanner_loop():
                 signal_row = get_signal_row(df)
                 price = _safe_float(signal_row["close"], 0)
 
-                if breakdown:
+                if is_reverse:
+                    sl_type = "reverse"
+                elif breakdown:
                     sl_type = "breakdown"
                 elif pre_breakdown:
                     sl_type = "pre_breakdown"
@@ -2944,6 +2985,7 @@ def run_scanner_loop():
                     dist_ma=dist_ma,
                     losing_strength=losing_strength,
                     early_priority=early_priority,
+                    is_reverse=is_reverse,
                 )
 
                 alert_id = build_alert_id(symbol, candle_time)
@@ -3078,6 +3120,11 @@ def run_scanner_loop():
                     message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
                     save_alert_snapshot(candidate.get("alert_snapshot", {}), message_id=message_id)
 
+                    trade_reasons = list(candidate["reasons"] or [])
+                    if candidate.get("is_reverse"):
+                        if "OVEREXTENDED_REVERSAL" not in trade_reasons:
+                            trade_reasons.append("OVEREXTENDED_REVERSAL")
+
                     register_trade(
                         redis_client=r,
                         symbol=symbol,
@@ -3090,7 +3137,7 @@ def run_scanner_loop():
                         timeframe=TIMEFRAME,
                         btc_mode=btc_mode,
                         funding_label=candidate["funding_label"],
-                        reasons=candidate["reasons"],
+                        reasons=trade_reasons,
                         pre_breakout=candidate["pre_breakdown"],
                         breakout=candidate["breakdown"],
                         vol_ratio=candidate["vol_ratio"],
