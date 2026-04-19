@@ -48,7 +48,7 @@ SCAN_LIMIT = 150
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-FINAL_MIN_SCORE = 6.3
+FINAL_MIN_SCORE = 7.0
 PRE_BREAKDOWN_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 3
 
@@ -61,7 +61,7 @@ MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
 TOP_MOMENTUM_PERCENT = 0.20
-TOP_MOMENTUM_MIN_SCORE = 7.0
+TOP_MOMENTUM_MIN_SCORE = 7.5
 TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
 
 NEW_LISTING_MIN_VOL_RATIO = 1.8
@@ -2031,6 +2031,11 @@ def run_scanner_loop():
                 funding = get_funding_rate(symbol)
                 vol_ratio = get_volume_ratio(df)
                 dist_ma = get_distance_from_ma_percent(df)
+
+                # فلتر الفوليوم الأدنى — مش هيدخل الـ scoring إلا لو في زخم بيعي حقيقي
+                if vol_ratio < 1.3 and not breakdown and not pre_breakdown:
+                    logger.info(f"{symbol} → skipped (vol_ratio too low: {vol_ratio:.2f})")
+                    continue
 
                 try:
                     score_result = calculate_short_score(
