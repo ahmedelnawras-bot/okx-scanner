@@ -93,8 +93,14 @@ NEWS_WINDOW_HOURS = 2
 ECONOMIC_CALENDAR_URL = "https://www.tradingview.com/economic-calendar/"
 
 # Admin / stats reset
-ADMIN_CHAT_ID = str(CHAT_ID) if CHAT_ID else ""
 STATS_RESET_TS_KEY = "stats:last_reset_ts:short"
+EXTRA_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+
+ADMIN_CHAT_IDS = set()
+if CHAT_ID:
+    ADMIN_CHAT_IDS.add(str(CHAT_ID))
+if EXTRA_ADMIN_CHAT_ID:
+    ADMIN_CHAT_IDS.add(str(EXTRA_ADMIN_CHAT_ID))
 
 # Candle cache
 CANDLE_CACHE_TTL_15M = 25
@@ -686,9 +692,10 @@ def build_market_summary_short(btc_mode: str, alt_mode: str) -> str:
     return f"{safe_alt} | BTC: {safe_btc}"
 
 
-
-    if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
-        send_telegram_reply(chat_id, "⛔ غير مسموح")
+def reset_stats(chat_id: str):
+    if ADMIN_CHAT_IDS and str(chat_id) not in ADMIN_CHAT_IDS:
+        send_telegram_reply(chat_id, f"⛔ غير مسموح\nchat_id={chat_id}")
+        logger.warning(f"RESET BLOCKED | chat_id={chat_id} | allowed={sorted(ADMIN_CHAT_IDS)}")
         return
 
     if not r:
@@ -697,31 +704,42 @@ def build_market_summary_short(btc_mode: str, alt_mode: str) -> str:
 
     try:
         deleted = 0
+
         for key in r.scan_iter("trade:futures:short:*"):
             r.delete(key)
             deleted += 1
 
-        try:
-            r.delete("open_trades:futures:short")
-            r.delete("stats:futures:short")
-        except Exception:
-            pass
+        extra_keys = [
+            "open_trades:futures:short",
+            "stats:futures:short",
+            STATS_RESET_TS_KEY,
+        ]
+
+        for key in extra_keys:
+            try:
+                r.delete(key)
+            except Exception:
+                pass
 
         reset_ts = int(time.time())
         r.set(STATS_RESET_TS_KEY, str(reset_ts))
+        saved_reset = r.get(STATS_RESET_TS_KEY)
 
         send_telegram_reply(
             chat_id,
             f"🧹 تم تصفير بيانات الشورت بنجاح\n"
             f"📊 عدد المفاتيح المحذوفة: {deleted}\n"
-            f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}"
+            f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}\n"
+            f"✅ reset_key={saved_reset}"
         )
 
-        logger.info(f"RESET SHORT STATS → deleted keys: {deleted} | reset_ts={reset_ts}")
+        logger.info(
+            f"RESET SHORT STATS → deleted={deleted} | reset_ts={reset_ts} | saved={saved_reset}"
+        )
 
     except Exception as e:
         logger.error(f"Reset stats error: {e}")
-        send_telegram_reply(chat_id, "❌ حصل خطأ أثناء التصفير")
+        send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء التصفير\n{html.escape(str(e))}")
 
 
 def stats_since_reset(chat_id: str):
@@ -745,15 +763,19 @@ def stats_since_reset(chat_id: str):
             since_ts=reset_ts,
         )
 
-        header = f"📊 <b>Short Stats Since Reset</b>\n🕒 منذ: {html.escape(reset_time_text)}\n\n"
         body = format_period_summary("Since Reset", summary)
 
-        send_telegram_reply(chat_id, header + body)
+        send_telegram_reply(
+            chat_id,
+            f"📊 <b>Short Stats Since Reset</b>\n"
+            f"🕒 منذ: {html.escape(reset_time_text)}\n\n"
+            f"{body}"
+        )
         logger.info(f"SHORT STATS SINCE RESET → reset_ts={reset_ts}")
 
     except Exception as e:
         logger.error(f"stats_since_reset error: {e}")
-        send_telegram_reply(chat_id, "❌ حصل خطأ أثناء جلب التقرير")
+        send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء جلب التقرير\n{html.escape(str(e))}")
 
 
 COMMAND_HANDLERS = {
@@ -2032,7 +2054,6 @@ def run_scanner_loop():
                 vol_ratio = get_volume_ratio(df)
                 dist_ma = get_distance_from_ma_percent(df)
 
-                # فلتر الفوليوم الأدنى — مش هيدخل الـ scoring إلا لو في زخم بيعي حقيقي
                 if vol_ratio < 1.3 and not breakdown and not pre_breakdown:
                     logger.info(f"{symbol} → skipped (vol_ratio too low: {vol_ratio:.2f})")
                     continue
@@ -2222,7 +2243,7 @@ def run_scanner_loop():
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
                     "reasons": score_result.get("reasons", []),
                     "mtf_confirmed": mtf_confirmed,
-                    "btc_short_bias": market_bias_label,
+                    "btc_short_bias": btc_short_bias,
                     "change_24h": change_24h,
                     "market_state": market_state,
                     "alt_mode": alt_mode,
