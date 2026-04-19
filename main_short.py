@@ -509,6 +509,18 @@ TELEGRAM_COMMANDS = {
 }
 
 
+def get_local_day_start_ts() -> int:
+    try:
+        now = time.localtime()
+        return int(time.mktime((
+            now.tm_year, now.tm_mon, now.tm_mday,
+            0, 0, 0,
+            now.tm_wday, now.tm_yday, now.tm_isdst
+        )))
+    except Exception:
+        return int(time.time()) - 86400
+
+
 def build_report_message(period: str) -> str:
     title_map = {
         "1h": "Short Report - Last 1H",
@@ -516,14 +528,26 @@ def build_report_message(period: str) -> str:
         "all": "Short Report - All Time",
     }
 
-    summary = get_period_summary(
-        redis_client=r,
-        period=period,
-        market_type="futures",
-        side="short",
-    )
+    try:
+        if period == "today":
+            summary = get_trade_summary(
+                redis_client=r,
+                market_type="futures",
+                side="short",
+                since_ts=get_local_day_start_ts(),
+            )
+            return format_period_summary(title_map["today"], summary)
 
-    return format_period_summary(title_map.get(period, "Short Report"), summary)
+        summary = get_period_summary(
+            redis_client=r,
+            period=period,
+            market_type="futures",
+            side="short",
+        )
+        return format_period_summary(title_map.get(period, "Short Report"), summary)
+    except Exception as e:
+        logger.error(f"build_report_message error on period={period}: {e}")
+        return "❌ حصل خطأ أثناء بناء التقرير"
 
 
 def build_deep_report_message() -> str:
@@ -812,6 +836,22 @@ def get_early_priority_momentum_bonus(priority: str) -> float:
     if priority == "weak":
         return -0.10
     return 0.0
+
+
+def get_hybrid_label(score: float, winrate: float, trades: int) -> str:
+    try:
+        if trades < 10:
+            return f"⚪ HYBRID (No Data | {trades} trades)"
+
+        if winrate >= 70 and score >= 7.0:
+            return f"🔥 ELITE ({winrate:.0f}% | {trades} trades)"
+
+        if winrate >= 55 and score >= 6.5:
+            return f"🟢 GOOD ({winrate:.0f}% | {trades} trades)"
+
+        return f"⚠️ AVOID ({winrate:.0f}% | {trades} trades)"
+    except Exception:
+        return "⚪ HYBRID (Unknown)"
 
 
 # =========================
@@ -2268,6 +2308,8 @@ def build_message(
     opportunity_type="استمرار هبوطي",
     entry_timing="🟡 متوسط (نص الحركة)",
     display_risk="🟡 متوسطة",
+    winrate=0.0,
+    total_trades=0,
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -2307,11 +2349,21 @@ def build_message(
 
     warnings_block = f"\n\n⚠️ <b>ملاحظات:</b>\n{warnings_text}" if warnings_text else ""
     news_block = f"\n\n{news_warning}" if news_warning else ""
+    hybrid_label = html.escape(
+        get_hybrid_label(
+            score=float(score_result.get("score", 0)),
+            winrate=float(winrate or 0),
+            trades=int(total_trades or 0),
+        )
+    )
 
-    return f"""🔴 <b>شورت فيوتشر | {safe_symbol}</b>
+    return f"""{hybrid_label}
+
+🔴 <b>شورت فيوتشر | {safe_symbol}</b>
 
 💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
 ⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
+🏷 <b>التصنيف:</b> {safe_rating}
 
 🎯 <b>TP1:</b> {tp1:.6f} (-{tp1_pct}% | {rr1}R)
 🏁 <b>TP2:</b> {tp2:.6f} (-{tp2_pct}% | {rr2}R)
@@ -2329,7 +2381,6 @@ def build_message(
 📍 <b>الدخول:</b> {safe_entry_timing}
 ⚖️ <b>المخاطرة:</b> {safe_display_risk}
 
-🏷 <b>التصنيف:</b> {safe_rating}
 🔗 <a href="{safe_tv_link}">Open Chart (15m / 1H)</a>"""
 
 
@@ -2438,6 +2489,13 @@ def run_scanner_loop():
             update_open_trades(r, market_type="futures", side="short", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, market_type="futures", side="short")
             logger.info(format_winrate_summary(winrate_summary))
+
+            global_winrate = float(winrate_summary.get("winrate", 0) or 0)
+            global_closed = int(
+                winrate_summary.get("closed", 0)
+                or winrate_summary.get("total_closed", 0)
+                or 0
+            )
 
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
@@ -2782,6 +2840,8 @@ def run_scanner_loop():
                         opportunity_type=opportunity_type,
                         entry_timing=entry_timing,
                         display_risk=display_risk,
+                        winrate=global_winrate,
+                        total_trades=global_closed,
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
