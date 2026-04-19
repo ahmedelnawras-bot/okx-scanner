@@ -297,10 +297,7 @@ def format_news_warning(events: list) -> str:
     calendar_link = html.escape(ECONOMIC_CALENDAR_URL, quote=True)
 
     if not events:
-        return (
-            f'📰 <b>الأخبار:</b> لا توجد أخبار High-Impact قريبة\n'
-            f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
-        )
+        return f'📰 <b>الأخبار:</b> لا توجد أخبار High-Impact قريبة | <a href="{calendar_link}">Economic Calendar</a>'
 
     parts = []
     for event in events[:2]:
@@ -309,11 +306,7 @@ def format_news_warning(events: list) -> str:
         parts.append(f'<a href="{link}">{title}</a>')
 
     events_text = " | ".join(parts)
-
-    return (
-        f'📰 <b>تنويه أخبار:</b> {events_text}\n'
-        f'📅 <a href="{calendar_link}">Open Economic Calendar</a>'
-    )
+    return f'📰 <b>الأخبار:</b> {events_text} | <a href="{calendar_link}">Economic Calendar</a>'
 
 
 # =========================
@@ -568,7 +561,7 @@ def build_how_it_work_message() -> str:
 
 🤖 <b>فكرة البوت:</b>
 البوت متخصص في البحث عن فرص <b>Long Futures</b> على منصة OKX،
-ولا يرسل إشارات عشوائية، بل يعتمد على نظام فلترة قوي لتقليل الإشارات الضعيفة.
+ويعتمد على فلترة تدريجية لتقليل الإشارات الضعيفة ورفع جودة التنبيه.
 
 🔍 <b>منطق العمل:</b>
 1. اختيار العملات الأعلى سيولة وحجم تداول
@@ -580,6 +573,7 @@ def build_how_it_work_message() -> str:
 • الاختراق أو الزخم قبل الاختراق
 • تأكيد فريم الساعة (1H)
 • حالة السوق العامة
+• قوة سوق الألت نفسها من السوق الفعلي، وليس من BTC فقط
 4. إعطاء كل فرصة <b>Score من 10</b>
 5. إرسال فقط الفرص التي تتجاوز الشروط النهائية
 
@@ -591,10 +585,10 @@ def build_how_it_work_message() -> str:
 • توافق مع السوق العام
 
 ⚠️ <b>متى تكون الإشارة فيها مخاطرة؟</b>
-• الحركة متأخرة (السعر بعيد عن المتوسط)
+• الحركة متأخرة نسبيًا
 • RSI عالي جدًا (تشبع شراء)
 • السوق ضعيف أو غير واضح
-• فوليوم ضعيف
+• فوليوم غير كافٍ
 • وجود أخبار اقتصادية قريبة
 
 🧠 <b>شرح رسالة البوت:</b>
@@ -609,52 +603,48 @@ def build_how_it_work_message() -> str:
 تقييم من 10
 كلما زاد → جودة أعلى، لكن ليس ضمان ربح
 
-🛑 <b>Stop Loss</b>
-مستوى وقف الخسارة
-
 🎯 <b>TP1 / TP2</b>
 أهداف الربح
-TP1 = هدف قريب
+TP1 = هدف أقرب
 TP2 = هدف أبعد
 
-🏷 <b>التصنيف</b>
-نوع الإشارة مثل:
-• اختراق
-• زخم
-• بداية ترند
+🛑 <b>SL</b>
+مستوى وقف الخسارة
 
-🪙 <b>BTC</b>
-حالة بيتكوين، وهي مهمة لأنها تؤثر على السوق
+🧠 <b>نوع الفرصة</b>
+يشرح شكل الفرصة مثل:
+• Breakout مبكر
+• استمرار
+• Pullback
 
-🌐 <b>السوق</b>
-حالة السوق العامة:
-• صاعد
-• مختلط
-• ضعيف
-
-📊 <b>الألت</b>
-قوة أو ضعف سوق العملات البديلة
-
-👑 <b>السيولة</b>
-اتجاه تدفق الأموال وهل هو داعم للألت أم لا
-
-💸 <b>التمويل</b>
-يعطي تصورًا عن الضغط أو الدعم في الحركة
-
-📈 <b>24H</b>
-تغير السعر خلال آخر 24 ساعة
+🌍 <b>السوق</b>
+ملخص سريع يجمع:
+• حالة الألت
+• اتجاه BTC
 
 📊 <b>أسباب الدخول</b>
-أهم الأسباب التي جعلت البوت يرسل الإشارة
+أهم النقاط الإيجابية التي جعلت البوت يرسل الإشارة
 
-⚠️ <b>تحذيرات</b>
-مخاطر إضافية يجب الانتباه لها
+⚠️ <b>ملاحظات</b>
+أي تنبيهات أو نقاط تستحق الحذر
+
+📰 <b>الأخبار</b>
+تنويه مختصر لو في أخبار اقتصادية High-Impact قريبة
+
+📍 <b>الدخول</b>
+توقيت الدخول بالنسبة للحركة:
+• 🟢 مبكر (بداية الحركة)
+• 🟡 متوسط (نص الحركة)
+• 🔴 متأخر (قرب النهاية)
 
 ⚖️ <b>المخاطرة</b>
-تقييم عام:
+تقييم عام للفرصة:
 • منخفضة
 • متوسطة
 • عالية
+
+🔗 <b>الشارت</b>
+لينك مباشر على TradingView لمراجعة الشارت بسرعة
 
 📌 <b>مهم جدًا:</b>
 • البوت أداة مساعدة وليس قرار نهائي
@@ -1029,7 +1019,7 @@ def get_signal_candle_time(df):
         signal_row = get_signal_row(df)
         ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
-            ts = ts // 1000
+            return ts // 1000
         return ts
     except Exception:
         return int(time.time() // (15 * 60))
@@ -1811,6 +1801,69 @@ def format_bullish_reasons(bullish):
     return "\n".join(formatted)
 
 
+def classify_opportunity_type(breakout: bool, pre_breakout: bool, dist_ma: float, mtf_confirmed: bool) -> str:
+    try:
+        if pre_breakout and not breakout:
+            return "Breakout مبكر"
+        if breakout:
+            return "Breakout"
+        if dist_ma <= 1.2 and mtf_confirmed:
+            return "Pullback"
+        return "استمرار"
+    except Exception:
+        return "استمرار"
+
+
+def classify_entry_timing(dist_ma: float, breakout: bool, pre_breakout: bool, vol_ratio: float) -> str:
+    try:
+        # breakout أو pre_breakout مبكر
+        if (pre_breakout or breakout) and dist_ma <= 2.8 and vol_ratio >= 1.3:
+            return "🟢 مبكر (بداية الحركة)"
+
+        # breakout بس dist_ma أكبر شوية — لسه مقبول لو vol قوي
+        if breakout and 2.8 < dist_ma <= 4.0 and vol_ratio >= 1.5:
+            return "🟡 متوسط (نص الحركة)"
+
+        # تحرك عادي في المنطقة المتوسطة
+        if 2.8 < dist_ma <= 4.5 and vol_ratio >= 1.2:
+            return "🟡 متوسط (نص الحركة)"
+
+        return "🔴 متأخر (قرب النهاية)"
+    except Exception:
+        return "🟡 متوسط (نص الحركة)"
+
+
+def get_base_risk_label(score_result: dict, warnings_count: int) -> str:
+    risk_level = score_result.get("risk_level")
+    if risk_level:
+        return risk_level
+
+    if warnings_count == 0:
+        return "🟢 منخفضة"
+    if warnings_count == 1:
+        return "🟡 متوسطة"
+    return "🔴 عالية"
+
+
+def adjust_risk_with_entry_timing(base_risk: str, entry_timing: str) -> str:
+    try:
+        if "🔴 متأخر" in entry_timing:
+            return "🔴 عالية"
+
+        if "🟡 متوسط" in entry_timing and base_risk == "🟢 منخفضة":
+            return "🟡 متوسطة"
+
+        return base_risk
+    except Exception:
+        return base_risk
+
+
+def build_market_summary(btc_mode: str, alt_mode: str) -> str:
+    safe_alt = alt_mode if alt_mode else "🟡 متماسك"
+    safe_btc = btc_mode if btc_mode else "🟡 محايد"
+    return f"{safe_alt} | BTC: {safe_btc}"
+
+
 def build_message(
     symbol,
     price,
@@ -1825,6 +1878,9 @@ def build_message(
     market_bias_label=None,
     alt_mode=None,
     news_warning="",
+    opportunity_type="استمرار",
+    entry_timing="🟡 متوسط (نص الحركة)",
+    display_risk="🟡 متوسطة",
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -1852,55 +1908,45 @@ def build_message(
     tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
 
-    risk_level = score_result.get("risk_level")
-    if not risk_level:
-        if len(warnings) == 0:
-            risk_level = "🟢 منخفضة"
-        elif len(warnings) == 1:
-            risk_level = "🟡 متوسطة"
-        else:
-            risk_level = "🔴 عالية"
-
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
 
     safe_symbol = html.escape(symbol_clean)
-    safe_btc = html.escape(btc_mode)
-    safe_dom = html.escape(market_bias_label or btc_dominance_proxy)
-    safe_market = html.escape(market_state_label or "🟡 Mixed")
-    safe_alt_mode = html.escape(alt_mode or "🟡 متماسك")
+    safe_market = html.escape(build_market_summary(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
     safe_funding = html.escape(funding_text)
     safe_rating = html.escape(signal_rating)
     safe_tv_link = html.escape(tv_link, quote=True)
+    safe_opportunity_type = html.escape(opportunity_type)
+    safe_entry_timing = html.escape(entry_timing)
+    safe_display_risk = html.escape(display_risk)
 
     change_24h_text = f"{change_24h:+.2f}%"
 
-    warnings_block = f"\n\n⚠️ <b>تحذيرات:</b>\n{warnings_text}" if warnings_text else ""
+    warnings_block = f"\n\n⚠️ <b>ملاحظات:</b>\n{warnings_text}" if warnings_text else ""
     news_block = f"\n\n{news_warning}" if news_warning else ""
 
     return f"""🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
 💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
 ⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
-🛑 <b>SL:</b> {stop_loss:.6f} (-{sl_pct}%)
 
 🎯 <b>TP1:</b> {tp1:.6f} (+{tp1_pct}%)
 🏁 <b>TP2:</b> {tp2:.6f} (+{tp2_pct}%)
+🛑 <b>SL:</b> {stop_loss:.6f} (-{sl_pct}%)
 
-🏷 <b>التصنيف:</b> {safe_rating}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}
 
-🪙 <b>BTC:</b> {safe_btc}
-🌐 <b>السوق:</b> {safe_market}
-📊 <b>حالة الألت:</b> {safe_alt_mode}
-👑 <b>السيولة:</b> {safe_dom}
+🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير 24H:</b> {change_24h_text}{new_tag}
 
 📊 <b>أسباب الدخول:</b>
 {bullish_text}{warnings_block}{news_block}
 
-⚖️ <b>المخاطرة:</b> {risk_level}
+📍 <b>الدخول:</b> {safe_entry_timing}
+⚖️ <b>المخاطرة:</b> {safe_display_risk}
 
-🔗 <a href="{safe_tv_link}">Open Chart</a>"""
+🏷 <b>التصنيف:</b> {safe_rating}
+🔗 <a href="{safe_tv_link}">Open Chart (15m / 1H)</a>"""
 
 
 def run_command_poller():
@@ -2134,6 +2180,25 @@ def run_scanner_loop():
                 stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
                 tv_link = build_tradingview_link(symbol)
 
+                opportunity_type = classify_opportunity_type(
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    dist_ma=dist_ma,
+                    mtf_confirmed=mtf_confirmed,
+                )
+                entry_timing = classify_entry_timing(
+                    dist_ma=dist_ma,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    vol_ratio=vol_ratio,
+                )
+
+                explicit_warnings = score_result.get("warning_reasons") or []
+                _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
+                warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
+                base_risk = get_base_risk_label(score_result, warnings_count)
+                display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
+
                 momentum_priority = get_momentum_priority(
                     score=float(score_result["score"]),
                     breakout=breakout,
@@ -2166,6 +2231,9 @@ def run_scanner_loop():
                         market_bias_label=market_bias_label,
                         alt_mode=alt_mode,
                         news_warning=news_warning_text,
+                        opportunity_type=opportunity_type,
+                        entry_timing=entry_timing,
+                        display_risk=display_risk,
                     ),
                     "candle_time": candle_time,
                     "now": now,
