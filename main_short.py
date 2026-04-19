@@ -19,8 +19,6 @@ from tracking.performance import (
     get_period_summary,
     get_trade_summary,
     format_period_summary,
-    calc_tp1,
-    calc_tp2,
 )
 
 # =========================
@@ -43,17 +41,18 @@ REDIS_URL = os.getenv("REDIS_URL")
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
 OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
+OKX_TICKER_SINGLE_URL = "https://www.okx.com/api/v5/market/ticker"
 
 SCAN_LIMIT = 150
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-FINAL_MIN_SCORE = 7.0
-PRE_BREAKDOWN_EXTRA_SCORE = 0.2
+FINAL_MIN_SCORE = 7.1
+PRE_BREAKDOWN_EXTRA_SCORE = 0.3
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
-LOCAL_RECENT_SEND_SECONDS = 2700   # 45 دقيقة
+LOCAL_RECENT_SEND_SECONDS = 2700
 GLOBAL_COOLDOWN_SECONDS = 300
 COMMAND_POLL_INTERVAL = 3
 
@@ -61,15 +60,15 @@ MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
 TOP_MOMENTUM_PERCENT = 0.20
-TOP_MOMENTUM_MIN_SCORE = 7.5
-TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
+TOP_MOMENTUM_MIN_SCORE = 7.2
+TOP_MOMENTUM_NEW_MIN_SCORE = 6.2
 
 NEW_LISTING_MIN_VOL_RATIO = 1.8
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
 NEW_LISTING_MAX_PER_RUN = 1
 
 PRE_BREAKDOWN_LOOKBACK = 20
-PRE_BREAKDOWN_PROXIMITY_MAX = 1.035
+PRE_BREAKDOWN_PROXIMITY_MAX = 1.03
 PRE_BREAKDOWN_VOLUME_SIGNIFICANCE = 1.20
 PRE_BREAKDOWN_RECENT_VOL_BARS = 3
 PRE_BREAKDOWN_BASELINE_VOL_BARS = 12
@@ -107,9 +106,14 @@ CANDLE_CACHE_TTL_15M = 25
 CANDLE_CACHE_TTL_1H = 90
 CANDLE_CACHE_TTL_DEFAULT = 20
 
-# Alt snapshot cache — نفس key اللونج عشان نشارك الـ cache
+# Alt snapshot cache
 ALT_SNAPSHOT_CACHE_KEY = "cache:alt_snapshot"
-ALT_SNAPSHOT_CACHE_TTL = 600  # 10 دقايق
+ALT_SNAPSHOT_CACHE_TTL = 600
+
+# Alert tracking
+ALERT_KEY_PREFIX = "alert:short"
+ALERT_BY_MESSAGE_KEY_PREFIX = "alertmsg:short"
+ALERT_TTL_SECONDS = 14 * 24 * 3600
 
 # =========================
 # REDIS
@@ -145,6 +149,14 @@ def get_same_candle_key(symbol: str, candle_time: int, signal_type: str = "short
 def get_symbol_cooldown_key(symbol: str, signal_type: str = "short") -> str:
     clean = clean_symbol_for_message(symbol)
     return f"cooldown:{signal_type}:{clean}"
+
+
+def get_alert_key(alert_id: str) -> str:
+    return f"{ALERT_KEY_PREFIX}:{alert_id}"
+
+
+def get_alert_by_message_key(message_id: str) -> str:
+    return f"{ALERT_BY_MESSAGE_KEY_PREFIX}:{message_id}"
 
 
 def already_sent_same_candle(symbol: str, candle_time: int, signal_type: str = "short") -> bool:
@@ -316,7 +328,7 @@ def format_news_warning(events: list) -> str:
 
 
 # =========================
-# TELEGRAM OFFSET (Redis-persisted)
+# TELEGRAM OFFSET
 # =========================
 def get_telegram_offset() -> int:
     if not r:
@@ -395,36 +407,50 @@ def clear_webhook() -> None:
         logger.error(f"Webhook clear error: {e}")
 
 
-def send_telegram_message(message: str) -> bool:
+def telegram_api_call(method: str, payload: dict) -> dict:
+    if not BOT_TOKEN:
+        return {"ok": False, "error": "missing_bot_token"}
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code != 200:
+            logger.error(f"Telegram {method} HTTP Error: {response.text}")
+            return {"ok": False, "error": response.text}
+
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(f"Telegram {method} API Error: {data}")
+        return data
+    except Exception as e:
+        logger.error(f"Telegram {method} Exception: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+    if not callback_query_id:
+        return
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    telegram_api_call("answerCallbackQuery", payload)
+
+
+def send_telegram_message(message: str, reply_markup: dict | None = None) -> dict:
     if not BOT_TOKEN or not CHAT_ID:
         logger.error("❌ Telegram config missing")
-        return False
+        return {"ok": False}
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
-    try:
-        response = requests.post(url, json=payload, timeout=15)
-
-        if response.status_code != 200:
-            logger.error(f"❌ Telegram HTTP Error: {response.text}")
-            return False
-
-        data = response.json()
-        if not data.get("ok"):
-            logger.error(f"❌ Telegram API Error: {data}")
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Telegram Exception: {e}")
-        return False
+    return telegram_api_call("sendMessage", payload)
 
 
 def send_telegram_reply(chat_id: str, message: str) -> bool:
@@ -432,31 +458,14 @@ def send_telegram_reply(chat_id: str, message: str) -> bool:
         logger.error("❌ Telegram reply config missing")
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-
-    try:
-        response = requests.post(url, json=payload, timeout=15)
-
-        if response.status_code != 200:
-            logger.error(f"❌ Telegram reply HTTP Error: {response.text}")
-            return False
-
-        data = response.json()
-        if not data.get("ok"):
-            logger.error(f"❌ Telegram reply API Error: {data}")
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Telegram reply Exception: {e}")
-        return False
+    data = telegram_api_call("sendMessage", payload)
+    return bool(data.get("ok"))
 
 
 def get_telegram_updates(offset: int = 0):
@@ -543,7 +552,8 @@ def build_help_message() -> str:
         "",
         "⚙️ <b>معلومات:</b>",
         "• البوت بيبعت إشارات Short Futures",
-        "• بيركز على العملات المرتفعة بزخم ضعيف أو كسر دعم",
+        "• بيركز على العملات المرتفعة مع بداية ضعف حقيقي أو كسر دعم",
+        "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير بعد الإرسال",
     ]
 
     if other_commands:
@@ -572,7 +582,8 @@ def build_how_it_work_message() -> str:
 🔍 <b>منطق العمل:</b>
 1. اختيار العملات الأعلى ارتفاعاً وسيولة
 2. تحليل الشموع على فريم <b>15 دقيقة</b>
-3. تقييم عدة عوامل:
+3. قياس هل العملة بدأت تفقد الزخم فعلاً أم لا
+4. تقييم عدة عوامل:
 • الزخم البيعي
 • الفوليوم
 • موقع السعر بالنسبة للمتوسط
@@ -580,8 +591,8 @@ def build_how_it_work_message() -> str:
 • تأكيد فريم الساعة (1H)
 • حالة السوق العامة
 • قوة سوق الألت من السوق الفعلي
-4. إعطاء كل فرصة <b>Score من 10</b>
-5. إرسال فقط الفرص التي تتجاوز الشروط النهائية
+5. إعطاء كل فرصة <b>Score من 10</b>
+6. إرسال فقط الفرص التي تتجاوز الشروط النهائية
 
 📊 <b>متى تعتبر الإشارة قوية؟</b>
 • فوليوم بيعي أعلى من الطبيعي
@@ -589,6 +600,7 @@ def build_how_it_work_message() -> str:
 • RSI في منطقة ضعف
 • كسر دعم أو ضغط بيعي واضح
 • توافق مع السوق العام
+• بداية فقدان زخم بعد صعود قوي
 
 ⚠️ <b>متى تكون الإشارة فيها مخاطرة؟</b>
 • الألت قوي بشكل عام (Alt Season)
@@ -596,6 +608,7 @@ def build_how_it_work_message() -> str:
 • السوق صاعد بقوة
 • فوليوم غير كافٍ
 • وجود أخبار اقتصادية قريبة
+• دخول متأخر بعد هبوط ممتد
 
 🧠 <b>شرح رسالة البوت:</b>
 
@@ -614,30 +627,30 @@ def build_how_it_work_message() -> str:
 🛑 <b>SL</b>
 مستوى وقف الخسارة (فوق السعر الحالي)
 
-🧠 <b>نوع الفرصة</b>
-• Breakdown مبكر
-• Breakdown
-• استمرار هبوطي
-
 📍 <b>الدخول</b>
-• 🟢 مبكر (بداية الحركة)
-• 🟡 متوسط (نص الحركة)
-• 🔴 متأخر (قرب النهاية)
+• 🟢 مبكر
+• 🟡 متوسط
+• 🔴 متأخر
 
 ⚖️ <b>المخاطرة</b>
-تقييم عام للفرصة: منخفضة / متوسطة / عالية
+تقييم عام للفرصة
 
-📌 <b>مهم جدًا:</b>
-• البوت أداة مساعدة وليس قرار نهائي
-• لا تعتمد عليه بدون مراجعة الشارت
-• الشورت أصعب من اللونج في سوق صاعد
-• السوق دائمًا له الكلمة الأخيرة
+📌 <b>زر Track</b>
+يعرض نتيجة التحذير لاحقًا:
+• الحالة
+• السعر الحالي
+• أقصى هبوط لصالح الصفقة
+• أقصى صعود ضد الصفقة
+• المدة
 
 ✅ <b>أفضل استخدام:</b>
 استخدم البوت كفلتر ذكي يوفر وقتك،
 ثم خذ القرار بعد مراجعة سريعة للسوق والشارت."""
 
 
+# =========================
+# HELPERS
+# =========================
 def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_ma: float, mtf_confirmed: bool) -> str:
     try:
         if pre_breakdown and not breakdown:
@@ -653,15 +666,26 @@ def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_m
 
 def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> str:
     try:
-        if (pre_breakdown or breakdown) and dist_ma <= 2.8 and vol_ratio >= 1.3:
+        if (pre_breakdown or breakdown) and dist_ma <= 2.6 and vol_ratio >= 1.3:
             return "🟢 مبكر (بداية الحركة)"
-        if breakdown and 2.8 < dist_ma <= 4.0 and vol_ratio >= 1.5:
+        if breakdown and 2.6 < dist_ma <= 3.8 and vol_ratio >= 1.4:
             return "🟡 متوسط (نص الحركة)"
-        if 2.8 < dist_ma <= 4.5 and vol_ratio >= 1.2:
+        if 2.6 < dist_ma <= 4.2 and vol_ratio >= 1.2:
             return "🟡 متوسط (نص الحركة)"
         return "🔴 متأخر (قرب النهاية)"
     except Exception:
         return "🟡 متوسط (نص الحركة)"
+
+
+def get_entry_timing_penalty(entry_timing: str) -> float:
+    try:
+        if "🔴 متأخر" in entry_timing:
+            return 0.40
+        if "🟡 متوسط" in entry_timing:
+            return 0.15
+        return 0.0
+    except Exception:
+        return 0.0
 
 
 def get_base_risk_label_short(score_result: dict, warnings_count: int) -> str:
@@ -692,6 +716,20 @@ def build_market_summary_short(btc_mode: str, alt_mode: str) -> str:
     return f"{safe_alt} | BTC: {safe_btc}"
 
 
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if value != value:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+# =========================
+# RESET / STATS
+# =========================
 def reset_stats(chat_id: str):
     if ADMIN_CHAT_IDS and str(chat_id) not in ADMIN_CHAT_IDS:
         send_telegram_reply(chat_id, f"⛔ غير مسموح\nchat_id={chat_id}")
@@ -708,6 +746,11 @@ def reset_stats(chat_id: str):
         for key in r.scan_iter("trade:futures:short:*"):
             r.delete(key)
             deleted += 1
+
+        for key in r.scan_iter(f"{ALERT_KEY_PREFIX}:*"):
+            r.delete(key)
+        for key in r.scan_iter(f"{ALERT_BY_MESSAGE_KEY_PREFIX}:*"):
+            r.delete(key)
 
         extra_keys = [
             "open_trades:futures:short",
@@ -728,7 +771,7 @@ def reset_stats(chat_id: str):
         send_telegram_reply(
             chat_id,
             f"🧹 تم تصفير بيانات الشورت بنجاح\n"
-            f"📊 عدد المفاتيح المحذوفة: {deleted}\n"
+            f"📊 عدد مفاتيح الصفقات المحذوفة: {deleted}\n"
             f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}\n"
             f"✅ reset_key={saved_reset}"
         )
@@ -790,64 +833,224 @@ COMMAND_HANDLERS = {
 }
 
 
-def bootstrap_telegram_offset_once():
-    if is_telegram_bootstrap_done():
-        return
+# =========================
+# ALERT TRACKING
+# =========================
+def build_alert_id(symbol: str, candle_time: int) -> str:
+    return f"{clean_symbol_for_message(symbol)}:{int(candle_time)}"
 
-    if not acquire_telegram_poll_lock():
+
+def save_alert_snapshot(alert_data: dict, message_id: str | None = None) -> None:
+    if not r or not alert_data:
         return
 
     try:
-        updates = get_telegram_updates(offset=0)
-        if updates:
-            latest_offset = updates[-1]["update_id"] + 1
-            save_telegram_offset(latest_offset)
-            logger.info(f"Telegram bootstrap offset set to {latest_offset}")
-        else:
-            logger.info("Telegram bootstrap: no pending updates")
+        alert_id = alert_data.get("alert_id")
+        if not alert_id:
+            return
 
-        mark_telegram_bootstrap_done()
+        payload = dict(alert_data)
+        if message_id is not None:
+            payload["message_id"] = str(message_id)
+
+        r.set(get_alert_key(alert_id), json.dumps(payload), ex=ALERT_TTL_SECONDS)
+        if message_id:
+            r.set(get_alert_by_message_key(str(message_id)), alert_id, ex=ALERT_TTL_SECONDS)
     except Exception as e:
-        logger.error(f"Telegram bootstrap error: {e}")
-    finally:
-        release_telegram_poll_lock()
+        logger.error(f"save_alert_snapshot error: {e}")
 
 
-def handle_telegram_commands():
-    if not acquire_telegram_poll_lock():
-        return
-
+def load_alert_snapshot(alert_id: str) -> dict | None:
+    if not r or not alert_id:
+        return None
     try:
-        offset = get_telegram_offset()
-        updates = get_telegram_updates(offset=offset)
+        raw = r.get(get_alert_key(alert_id))
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.error(f"load_alert_snapshot error: {e}")
+        return None
 
-        latest_offset = offset
 
-        for update in updates:
-            try:
-                latest_offset = update["update_id"] + 1
+def get_last_price(symbol: str) -> float:
+    try:
+        res = requests.get(OKX_TICKER_SINGLE_URL, params={"instId": symbol}, timeout=10).json()
+        data = res.get("data", [])
+        if not data:
+            return 0.0
+        return _safe_float(data[0].get("last"), 0.0)
+    except Exception as e:
+        logger.error(f"get_last_price error on {symbol}: {e}")
+        return 0.0
 
-                message = update.get("message") or {}
-                text = (message.get("text") or "").strip()
-                chat = message.get("chat") or {}
-                chat_id = str(chat.get("id", ""))
 
-                if not text or not chat_id:
-                    continue
+def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str = "short") -> tuple[float, float]:
+    """
+    Returns:
+    favorable_pct, adverse_pct
+    for short:
+    favorable = max drop from entry
+    adverse = max rise above entry
+    """
+    try:
+        candles = get_candles(symbol, TIMEFRAME, 100)
+        df = to_dataframe(candles)
+        if df is None or df.empty:
+            return 0.0, 0.0
 
-                command = text.split()[0].split("@")[0]
-                handler = COMMAND_HANDLERS.get(command)
-                if handler:
-                    handler(chat_id)
+        work = df[df["ts"] >= (since_ts * 1000 if since_ts < 10_000_000_000 else since_ts)].copy()
+        if work.empty:
+            work = df.tail(20).copy()
 
-            except Exception as e:
-                logger.error(f"handle_telegram_commands error: {e}")
+        lows = work["low"].astype(float)
+        highs = work["high"].astype(float)
 
-        if latest_offset != offset:
-            save_telegram_offset(latest_offset)
+        if lows.empty or highs.empty or entry <= 0:
+            return 0.0, 0.0
 
-    finally:
-        release_telegram_poll_lock()
+        if side == "short":
+            favorable_pct = round(((entry - float(lows.min())) / entry) * 100, 2)
+            adverse_pct = round(((float(highs.max()) - entry) / entry) * 100, 2)
+            return favorable_pct, adverse_pct
+
+        favorable_pct = round(((float(highs.max()) - entry) / entry) * 100, 2)
+        adverse_pct = round(((entry - float(lows.min())) / entry) * 100, 2)
+        return favorable_pct, adverse_pct
+
+    except Exception as e:
+        logger.error(f"get_max_move_since_alert error on {symbol}: {e}")
+        return 0.0, 0.0
+
+
+def get_alert_status(alert: dict) -> str:
+    try:
+        symbol = alert["symbol"]
+        entry = _safe_float(alert.get("entry"), 0)
+        sl = _safe_float(alert.get("sl"), 0)
+        tp1 = _safe_float(alert.get("tp1"), 0)
+        tp2 = _safe_float(alert.get("tp2"), 0)
+        candle_time = int(_safe_float(alert.get("candle_time"), 0))
+
+        favorable_pct, adverse_pct = get_max_move_since_alert(
+            symbol=symbol,
+            since_ts=candle_time,
+            entry=entry,
+            side="short",
+        )
+
+        if entry <= 0:
+            return "غير معروف"
+
+        if adverse_pct >= round(((sl - entry) / entry) * 100, 4):
+            return "SL Hit ❌"
+
+        if favorable_pct >= round(((entry - tp2) / entry) * 100, 4):
+            return "TP2 Hit 🎯"
+
+        if favorable_pct >= round(((entry - tp1) / entry) * 100, 4):
+            return "TP1 Hit ✅"
+
+        return "Open ⏳"
+
+    except Exception as e:
+        logger.error(f"get_alert_status error: {e}")
+        return "غير معروف"
+
+
+def build_track_message(alert: dict) -> str:
+    try:
+        symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
+        entry = _safe_float(alert.get("entry"), 0.0)
+        sl = _safe_float(alert.get("sl"), 0.0)
+        tp1 = _safe_float(alert.get("tp1"), 0.0)
+        tp2 = _safe_float(alert.get("tp2"), 0.0)
+        candle_time = int(_safe_float(alert.get("candle_time"), 0))
+        created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
+        current_price = get_last_price(alert.get("symbol", ""))
+
+        favorable_pct, adverse_pct = get_max_move_since_alert(
+            symbol=alert.get("symbol", ""),
+            since_ts=candle_time,
+            entry=entry,
+            side="short",
+        )
+
+        status = get_alert_status(alert)
+        duration_seconds = max(0, int(time.time()) - created_ts)
+        duration_h = duration_seconds // 3600
+        duration_m = (duration_seconds % 3600) // 60
+
+        current_move = 0.0
+        if entry > 0 and current_price > 0:
+            current_move = round(((entry - current_price) / entry) * 100, 2)
+
+        return (
+            f"📌 <b>Alert Track</b>\n\n"
+            f"العملة: {html.escape(symbol)}\n"
+            f"النوع: Short\n"
+            f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
+            f"Entry: {entry:.6f}\n"
+            f"SL: {sl:.6f}\n"
+            f"TP1: {tp1:.6f}\n"
+            f"TP2: {tp2:.6f}\n\n"
+            f"الحالة: {html.escape(status)}\n"
+            f"السعر الحالي: {current_price:.6f}\n"
+            f"الحركة الحالية: {current_move:+.2f}%\n"
+            f"أقصى هبوط: +{favorable_pct:.2f}%\n"
+            f"أقصى صعود ضدك: +{adverse_pct:.2f}%\n"
+            f"المدة: {duration_h}h {duration_m}m"
+        )
+    except Exception as e:
+        logger.error(f"build_track_message error: {e}")
+        return "❌ حصل خطأ أثناء متابعة الإشارة"
+
+
+def build_track_reply_markup(alert_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📌 Track",
+                    "callback_data": f"track_short:{alert_id}"
+                }
+            ]
+        ]
+    }
+
+
+def handle_callback_query(callback_query: dict):
+    try:
+        callback_id = callback_query.get("id", "")
+        data = callback_query.get("data", "") or ""
+        message = callback_query.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id", "") or "")
+
+        if not data.startswith("track_short:"):
+            answer_callback_query(callback_id, "زر غير مدعوم")
+            return
+
+        alert_id = data.split(":", 1)[1].strip()
+        alert = load_alert_snapshot(alert_id)
+
+        if not alert:
+            answer_callback_query(callback_id, "التحذير غير موجود أو انتهت صلاحيته")
+            if chat_id:
+                send_telegram_reply(chat_id, "ℹ️ لا يمكن العثور على بيانات هذا التحذير")
+            return
+
+        answer_callback_query(callback_id, "جارِ جلب نتيجة الإشارة...")
+        if chat_id:
+            send_telegram_reply(chat_id, build_track_message(alert))
+
+    except Exception as e:
+        logger.error(f"handle_callback_query error: {e}")
+        try:
+            callback_id = callback_query.get("id", "")
+            answer_callback_query(callback_id, "حصل خطأ")
+        except Exception:
+            pass
 
 
 # =========================
@@ -1089,23 +1292,34 @@ def early_bearish_signal(df):
             return False
 
         signal_row = get_signal_row(df)
-        signal_idx = signal_row.name
-
-        if signal_idx is None or signal_idx < 1:
+        idx = signal_row.name
+        if idx is None or idx < 2:
             return False
 
-        last = df.iloc[signal_idx]
-        prev = df.iloc[signal_idx - 1]
+        last = df.iloc[idx]
+        prev = df.iloc[idx - 1]
 
-        score = 0
-        if float(last["close"]) < float(last["open"]):
-            score += 1
-        if "rsi" in df.columns and float(last["rsi"]) < 50:
-            score += 1
-        if float(last["volume"]) > float(prev["volume"]):
-            score += 1
+        open_ = _safe_float(last["open"])
+        close = _safe_float(last["close"])
+        high = _safe_float(last["high"])
+        low = _safe_float(last["low"])
+        rsi_now = _safe_float(last.get("rsi"), 50)
+        rsi_prev = _safe_float(prev.get("rsi"), 50)
 
-        return score >= 2
+        candle_range = high - low
+        body = abs(close - open_)
+        body_ratio = (body / candle_range) if candle_range > 0 else 0.0
+
+        avg_vol = _safe_float(df.iloc[max(0, idx - 10):idx]["volume"].mean(), 0)
+        vol_ok = avg_vol > 0 and _safe_float(last["volume"]) >= avg_vol * 1.15
+
+        bearish_close = close < open_
+        weak_close_position = candle_range > 0 and ((close - low) / candle_range) <= 0.35
+        rsi_weakening = rsi_now < 50 and rsi_now <= rsi_prev
+        real_body = body_ratio >= 0.45
+
+        checks = sum([bearish_close, weak_close_position, rsi_weakening, vol_ok, real_body])
+        return checks >= 3
 
     except Exception:
         return False
@@ -1125,24 +1339,19 @@ def is_higher_timeframe_confirmed(symbol):
         if idx is None or idx < 3:
             return False
 
-        checks = 0
-
         ma_value = signal_row.get("ma", None)
-        if ma_value is not None and float(signal_row["close"]) < float(ma_value):
-            checks += 1
+        below_ma = ma_value is not None and _safe_float(signal_row["close"]) < _safe_float(ma_value)
 
-        if float(signal_row.get("rsi", 50)) <= 48:
-            checks += 1
+        low_rsi = _safe_float(signal_row.get("rsi"), 50) <= 48
 
         last_3 = df.iloc[idx - 3:idx]
         red_candles = sum(
             1 for _, row in last_3.iterrows()
-            if float(row["close"]) < float(row["open"])
+            if _safe_float(row["close"]) < _safe_float(row["open"])
         )
-        if red_candles >= 2:
-            checks += 1
+        structure_weak = red_candles >= 2
 
-        return checks >= 2
+        return bool(below_ma and (low_rsi or structure_weak))
 
     except Exception as e:
         logger.error(f"MTF error on {symbol}: {e}")
@@ -1159,12 +1368,12 @@ def get_btc_mode():
 
         signal_row = get_signal_row(df)
         ma_value = signal_row.get("ma", None)
-        rsi_value = float(signal_row.get("rsi", 50))
+        rsi_value = _safe_float(signal_row.get("rsi"), 50)
 
         if ma_value is not None:
-            if float(signal_row["close"]) > float(ma_value) and rsi_value >= 55:
+            if _safe_float(signal_row["close"]) > _safe_float(ma_value) and rsi_value >= 55:
                 return "🟢 صاعد"
-            if float(signal_row["close"]) < float(ma_value) and rsi_value <= 45:
+            if _safe_float(signal_row["close"]) < _safe_float(ma_value) and rsi_value <= 45:
                 return "🔴 هابط"
 
         return "🟡 محايد"
@@ -1180,6 +1389,29 @@ def get_btc_short_bias(btc_mode: str) -> str:
     if "🟢 صاعد" in btc_mode:
         return "🔴 ضد الشورت"
     return "🟡 محايد"
+
+
+def is_losing_intraday_strength(df) -> bool:
+    try:
+        if df is None or df.empty or len(df) < 5:
+            return False
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 2:
+            return False
+
+        last = df.iloc[idx]
+        prev = df.iloc[idx - 1]
+
+        lower_close = _safe_float(last["close"]) <= _safe_float(prev["close"])
+        weaker_rsi = _safe_float(last.get("rsi"), 50) < _safe_float(prev.get("rsi"), 50)
+        not_near_high = _safe_float(last["close"]) < (_safe_float(last["high"]) * 0.995)
+
+        checks = sum([lower_close, weaker_rsi, not_near_high])
+        return checks >= 2
+    except Exception:
+        return False
 
 
 def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
@@ -1221,9 +1453,9 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
 
             try:
                 signal_row = get_signal_row(df)
-                close = float(signal_row["close"])
-                ma_value = float(signal_row.get("ma", 0) or 0)
-                rsi_value = float(signal_row.get("rsi", 50) or 50)
+                close = _safe_float(signal_row["close"])
+                ma_value = _safe_float(signal_row.get("ma"), 0)
+                rsi_value = _safe_float(signal_row.get("rsi"), 50)
 
                 valid += 1
 
@@ -1351,6 +1583,7 @@ def get_dynamic_entry_threshold(
     vol_ratio: float,
     mtf_confirmed: bool,
     is_new: bool,
+    losing_strength: bool,
 ) -> float:
     if market_state == "risk_off":
         threshold = 6.2
@@ -1376,30 +1609,19 @@ def get_dynamic_entry_threshold(
     if is_new:
         threshold += 0.2
 
+    if not losing_strength:
+        threshold += 0.2
+
     if score_result.get("fake_signal"):
         threshold += 0.2
 
-    threshold = max(5.9, min(7.1, threshold))
+    threshold = max(5.9, min(7.2, threshold))
     return round(threshold, 2)
-
-
-def calculate_stop_loss(price, atr_value, signal_type="standard"):
-    multipliers = {
-        "breakdown": 1.0,
-        "pre_breakdown": 1.5,
-        "new_listing": 1.8,
-        "standard": 1.2,
-    }
-    multiplier = multipliers.get(signal_type, 1.2)
-    try:
-        return round(float(price) + (float(atr_value) * multiplier), 6)
-    except Exception:
-        return round(float(price), 6)
 
 
 def calculate_sl_percent(entry, sl):
     try:
-        return round(((sl - entry) / entry) * 100, 2)
+        return round(((float(sl) - float(entry)) / float(entry)) * 100, 2)
     except Exception:
         return 0.0
 
@@ -1420,10 +1642,10 @@ def build_tradingview_link(symbol):
 def get_candle_strength_ratio(df) -> float:
     try:
         signal_row = get_signal_row(df)
-        high = float(signal_row["high"])
-        low = float(signal_row["low"])
-        open_ = float(signal_row["open"])
-        close = float(signal_row["close"])
+        high = _safe_float(signal_row["high"])
+        low = _safe_float(signal_row["low"])
+        open_ = _safe_float(signal_row["open"])
+        close = _safe_float(signal_row["close"])
 
         full = high - low
         if full <= 0:
@@ -1443,8 +1665,8 @@ def get_volume_ratio(df) -> float:
             return 1.0
 
         start_idx = max(0, idx - 20)
-        avg_volume = float(df.iloc[start_idx:idx]["volume"].mean())
-        last_volume = float(signal_row["volume"])
+        avg_volume = _safe_float(df.iloc[start_idx:idx]["volume"].mean(), 0)
+        last_volume = _safe_float(signal_row["volume"], 0)
 
         if avg_volume <= 0:
             return 1.0
@@ -1457,8 +1679,8 @@ def get_volume_ratio(df) -> float:
 def get_distance_from_ma_percent(df) -> float:
     try:
         signal_row = get_signal_row(df)
-        close = float(signal_row["close"])
-        ma_value = float(signal_row.get("ma", 0) or 0)
+        close = _safe_float(signal_row["close"], 0)
+        ma_value = _safe_float(signal_row.get("ma"), 0)
         if ma_value <= 0:
             return 0.0
         return round(((ma_value - close) / ma_value) * 100, 4)
@@ -1481,9 +1703,9 @@ def is_pre_breakdown(df, lookback=PRE_BREAKDOWN_LOOKBACK) -> bool:
         if idx is None or idx < max(lookback, PRE_BREAKDOWN_BASELINE_VOL_BARS + PRE_BREAKDOWN_RECENT_VOL_BARS):
             return False
 
-        close = float(signal_row["close"])
-        ma_value = float(signal_row.get("ma", close) or close)
-        recent_low = float(df["low"].iloc[idx - lookback:idx].min())
+        close = _safe_float(signal_row["close"])
+        ma_value = _safe_float(signal_row.get("ma"), close)
+        recent_low = _safe_float(df["low"].iloc[idx - lookback:idx].min())
 
         if recent_low <= 0 or close <= 0:
             return False
@@ -1514,13 +1736,32 @@ def is_pre_breakdown(df, lookback=PRE_BREAKDOWN_LOOKBACK) -> bool:
 
         volume_significant = recent_avg_vol >= baseline_avg_vol * PRE_BREAKDOWN_VOLUME_SIGNIFICANCE
 
-        recent_atr = float(signal_row.get("atr", 0) or 0)
-        prev_atr = float(df["atr"].iloc[idx - 5:idx].mean() or 0)
+        recent_atr = _safe_float(signal_row.get("atr"), 0)
+        prev_atr = _safe_float(df["atr"].iloc[idx - 5:idx].mean(), 0)
         compressed = prev_atr > 0 and recent_atr > 0 and recent_atr < prev_atr * 0.90
 
         below_ma = close < ma_value
 
-        return vol_increasing and volume_significant and compressed and below_ma
+        recent_highs = df["high"].iloc[max(0, idx - 4):idx].astype(float).tolist()
+        lower_highs = len(recent_highs) >= 3 and all(
+            recent_highs[i] >= recent_highs[i + 1] for i in range(len(recent_highs) - 1)
+        )
+
+        high = _safe_float(signal_row["high"])
+        low = _safe_float(signal_row["low"])
+        open_ = _safe_float(signal_row["open"])
+        lower_wick = min(open_, close) - low
+        full_range = high - low
+        weak_lower_rejection = full_range > 0 and (lower_wick / full_range) <= 0.25
+
+        return (
+            vol_increasing
+            and volume_significant
+            and compressed
+            and below_ma
+            and lower_highs
+            and weak_lower_rejection
+        )
 
     except Exception:
         return False
@@ -1562,7 +1803,15 @@ def get_effective_min_score(is_new: bool) -> float:
     return TOP_MOMENTUM_NEW_MIN_SCORE if is_new else TOP_MOMENTUM_MIN_SCORE
 
 
-def get_momentum_priority(score: float, breakdown: bool, vol_ratio: float, is_new: bool, pre_breakdown: bool = False) -> float:
+def get_momentum_priority(
+    score: float,
+    breakdown: bool,
+    vol_ratio: float,
+    is_new: bool,
+    pre_breakdown: bool = False,
+    dist_ma: float = 0.0,
+    losing_strength: bool = False,
+) -> float:
     priority = float(score)
 
     if breakdown:
@@ -1577,6 +1826,14 @@ def get_momentum_priority(score: float, breakdown: bool, vol_ratio: float, is_ne
 
     if is_new and vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
         priority += 0.5
+
+    if dist_ma > 4.2:
+        priority -= 0.8
+    elif dist_ma > 3.5:
+        priority -= 0.4
+
+    if losing_strength:
+        priority += 0.25
 
     return round(priority, 2)
 
@@ -1809,11 +2066,11 @@ def classify_reasons(reasons):
     bearish = []
     warnings = []
 
-    for r in normalized:
-        if any(k in r for k in warning_keywords):
-            warnings.append(r)
+    for rr in normalized:
+        if any(k in rr for k in warning_keywords):
+            warnings.append(rr)
         else:
-            bearish.append(r)
+            bearish.append(rr)
 
     bearish = list(dict.fromkeys(bearish))
     warnings = list(dict.fromkeys(warnings))
@@ -1843,23 +2100,91 @@ def format_bearish_reasons(bearish):
     used = set()
 
     for kw in highlight_keywords:
-        for r in bearish:
-            if kw in r and r not in used:
-                highlighted.append(r)
-                used.add(r)
+        for rr in bearish:
+            if kw in rr and rr not in used:
+                highlighted.append(rr)
+                used.add(rr)
                 break
         if len(highlighted) >= 2:
             break
 
     formatted = []
-    for r in bearish:
-        safe = html.escape(r)
+    for rr in bearish:
+        safe = html.escape(rr)
         line = f"• {safe}"
-        if r in highlighted:
+        if rr in highlighted:
             line = f"• <b>{safe}</b>"
         formatted.append(line)
 
     return "\n".join(formatted)
+
+
+# =========================
+# SL / TP LOGIC
+# =========================
+def enforce_min_sl_percent(entry: float, sl: float, signal_type="standard") -> float:
+    floors = {
+        "breakdown": 1.2,
+        "standard": 1.4,
+        "pre_breakdown": 1.8,
+        "new_listing": 2.2,
+    }
+
+    min_pct = floors.get(signal_type, 1.4)
+    current_pct = ((float(sl) - float(entry)) / float(entry)) * 100 if entry > 0 else 0
+
+    if current_pct >= min_pct:
+        return round(float(sl), 6)
+
+    adjusted_sl = float(entry) * (1 + (min_pct / 100))
+    return round(adjusted_sl, 6)
+
+
+def calculate_stop_loss_short(df, entry, signal_type="standard"):
+    try:
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        atr_value = _safe_float(signal_row.get("atr"), 0)
+
+        recent_high = _safe_float(df["high"].iloc[max(0, idx - 4):idx + 1].max(), entry)
+
+        if signal_type == "breakdown":
+            atr_mult = 1.2
+        elif signal_type == "pre_breakdown":
+            atr_mult = 1.8
+        elif signal_type == "new_listing":
+            atr_mult = 2.2
+        else:
+            atr_mult = 1.5
+
+        atr_stop = float(entry) + (atr_value * atr_mult)
+        structure_buffer = atr_value * 0.25
+        structure_stop = recent_high + structure_buffer
+
+        stop_loss = max(atr_stop, structure_stop)
+        stop_loss = enforce_min_sl_percent(entry, stop_loss, signal_type=signal_type)
+
+        return round(stop_loss, 6)
+
+    except Exception:
+        return round(float(entry), 6)
+
+
+def calc_tp_short(entry: float, sl: float, rr: float) -> float:
+    risk = float(sl) - float(entry)
+    return round(float(entry) - (risk * rr), 6)
+
+
+def get_rr_targets(signal_type="standard", entry_timing=""):
+    if signal_type == "breakdown":
+        return 1.5, 2.5
+    if signal_type == "pre_breakdown":
+        return 1.8, 3.0
+    if signal_type == "new_listing":
+        return 2.0, 3.5
+    if "🔴 متأخر" in entry_timing:
+        return 1.8, 3.0
+    return 1.5, 2.5
 
 
 def build_message(
@@ -1867,6 +2192,10 @@ def build_message(
     price,
     score_result,
     stop_loss,
+    tp1,
+    tp2,
+    rr1,
+    rr2,
     btc_mode,
     btc_short_bias,
     tv_link,
@@ -1900,9 +2229,6 @@ def build_message(
     signal_rating = score_result.get("signal_rating", "⚡ عادي")
     sl_pct = calculate_sl_percent(price, stop_loss)
 
-    tp1 = calc_tp1(price, stop_loss, side="short")
-    tp2 = calc_tp2(price, stop_loss, side="short")
-
     tp1_pct = round(((price - tp1) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((price - tp2) / price) * 100, 2) if price else 0.0
 
@@ -1927,8 +2253,8 @@ def build_message(
 💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
 ⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
 
-🎯 <b>TP1:</b> {tp1:.6f} (-{tp1_pct}%)
-🏁 <b>TP2:</b> {tp2:.6f} (-{tp2_pct}%)
+🎯 <b>TP1:</b> {tp1:.6f} (-{tp1_pct}% | {rr1}R)
+🏁 <b>TP2:</b> {tp2:.6f} (-{tp2_pct}% | {rr2}R)
 🛑 <b>SL:</b> {stop_loss:.6f} (+{sl_pct}%)
 
 🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}
@@ -1947,6 +2273,76 @@ def build_message(
 🔗 <a href="{safe_tv_link}">Open Chart (15m / 1H)</a>"""
 
 
+# =========================
+# TELEGRAM LOOP
+# =========================
+def bootstrap_telegram_offset_once():
+    if is_telegram_bootstrap_done():
+        return
+
+    if not acquire_telegram_poll_lock():
+        return
+
+    try:
+        updates = get_telegram_updates(offset=0)
+        if updates:
+            latest_offset = updates[-1]["update_id"] + 1
+            save_telegram_offset(latest_offset)
+            logger.info(f"Telegram bootstrap offset set to {latest_offset}")
+        else:
+            logger.info("Telegram bootstrap: no pending updates")
+
+        mark_telegram_bootstrap_done()
+    except Exception as e:
+        logger.error(f"Telegram bootstrap error: {e}")
+    finally:
+        release_telegram_poll_lock()
+
+
+def handle_telegram_commands():
+    if not acquire_telegram_poll_lock():
+        return
+
+    try:
+        offset = get_telegram_offset()
+        updates = get_telegram_updates(offset=offset)
+
+        latest_offset = offset
+
+        for update in updates:
+            try:
+                latest_offset = update["update_id"] + 1
+
+                if update.get("callback_query"):
+                    handle_callback_query(update["callback_query"])
+                    continue
+
+                message = update.get("message") or {}
+                text = (message.get("text") or "").strip()
+                chat = message.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+
+                if not text or not chat_id:
+                    continue
+
+                command = text.split()[0].split("@")[0]
+                handler = COMMAND_HANDLERS.get(command)
+                if handler:
+                    handler(chat_id)
+
+            except Exception as e:
+                logger.error(f"handle_telegram_commands error: {e}")
+
+        if latest_offset != offset:
+            save_telegram_offset(latest_offset)
+
+    finally:
+        release_telegram_poll_lock()
+
+
+# =========================
+# MAIN LOOP
+# =========================
 def run_command_poller():
     bootstrap_telegram_offset_once()
 
@@ -2046,16 +2442,21 @@ def run_scanner_loop():
 
                 early_signal = early_bearish_signal(df)
                 pre_breakdown = is_pre_breakdown(df)
-
                 breakdown = is_breakdown(df)
                 mtf_confirmed = is_higher_timeframe_confirmed(symbol)
                 is_new = is_new_listing_by_candles(candles)
                 funding = get_funding_rate(symbol)
                 vol_ratio = get_volume_ratio(df)
                 dist_ma = get_distance_from_ma_percent(df)
+                candle_strength = get_candle_strength_ratio(df)
+                losing_strength = is_losing_intraday_strength(df)
 
-                if vol_ratio < 1.3 and not breakdown and not pre_breakdown:
-                    logger.info(f"{symbol} → skipped (vol_ratio too low: {vol_ratio:.2f})")
+                if vol_ratio < 1.15 and not breakdown and not pre_breakdown and not early_signal:
+                    logger.info(f"{symbol} → skipped (hard floor vol_ratio: {vol_ratio:.2f})")
+                    continue
+
+                if not losing_strength and not breakdown and not pre_breakdown and change_24h > 5:
+                    logger.info(f"{symbol} → skipped (still strong intraday, no real weakness)")
                     continue
 
                 try:
@@ -2077,18 +2478,19 @@ def run_scanner_loop():
                     logger.error(f"{symbol} → calculate_short_score failed: {score_err}")
                     continue
 
-                if not early_signal and not pre_breakdown and vol_ratio < 1.3:
-                    dynamic_threshold = get_dynamic_entry_threshold(
-                        market_state=market_state,
-                        score_result=score_result,
-                        vol_ratio=vol_ratio,
-                        mtf_confirmed=mtf_confirmed,
-                        is_new=is_new,
-                    )
+                dynamic_threshold = get_dynamic_entry_threshold(
+                    market_state=market_state,
+                    score_result=score_result,
+                    vol_ratio=vol_ratio,
+                    mtf_confirmed=mtf_confirmed,
+                    is_new=is_new,
+                    losing_strength=losing_strength,
+                )
+
+                if not early_signal and not pre_breakdown and not breakdown:
                     if score_result["score"] < dynamic_threshold:
                         logger.info(
-                            f"{symbol} → rejected (no early_signal / no pre_breakdown / "
-                            f"score<{dynamic_threshold} | market={market_state} | vol={vol_ratio})"
+                            f"{symbol} → rejected (score<{dynamic_threshold} | market={market_state} | vol={vol_ratio})"
                         )
                         continue
 
@@ -2102,15 +2504,30 @@ def run_scanner_loop():
                 pre_breakdown_only = pre_breakdown and not early_signal
                 required_min_score = FINAL_MIN_SCORE + PRE_BREAKDOWN_EXTRA_SCORE if pre_breakdown_only else FINAL_MIN_SCORE
 
+                opportunity_type = classify_opportunity_type_short(
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                    dist_ma=dist_ma,
+                    mtf_confirmed=mtf_confirmed,
+                )
+                entry_timing = classify_entry_timing_short(
+                    dist_ma=dist_ma,
+                    breakdown=breakdown,
+                    pre_breakdown=pre_breakdown,
+                    vol_ratio=vol_ratio,
+                )
+                timing_penalty = get_entry_timing_penalty(entry_timing)
+                effective_required_min_score = required_min_score + timing_penalty
+
                 logger.info(
                     f"{symbol} → early_signal: {early_signal} | "
                     f"pre_breakdown: {pre_breakdown} | "
                     f"score: {score_result['score']} | "
-                    f"min_required: {required_min_score} | "
-                    f"score_signal: {score_result.get('signal')} | "
+                    f"min_required: {effective_required_min_score} | "
                     f"fake: {score_result.get('fake_signal')} | "
                     f"mtf: {mtf_confirmed} | "
                     f"new: {is_new} | "
+                    f"losing_strength={losing_strength} | "
                     f"market={market_state}"
                 )
 
@@ -2118,8 +2535,11 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → rejected by fake signal")
                     continue
 
-                if score_result["score"] < required_min_score:
-                    logger.info(f"{symbol} → rejected by final min score ({score_result['score']} < {required_min_score})")
+                if score_result["score"] < effective_required_min_score:
+                    logger.info(
+                        f"{symbol} → rejected by effective min score "
+                        f"({score_result['score']} < {effective_required_min_score})"
+                    )
                     continue
 
                 if not breakdown and not pre_breakdown and dist_ma > 3.8:
@@ -2153,8 +2573,6 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → skipped (cooldown active)")
                     continue
 
-                candle_strength = get_candle_strength_ratio(df)
-
                 if is_new:
                     if not passes_new_listing_filter(
                         score=float(score_result["score"]),
@@ -2166,8 +2584,7 @@ def run_scanner_loop():
                         continue
 
                 signal_row = get_signal_row(df)
-                price = float(signal_row["close"])
-                atr_value = float(signal_row["atr"])
+                price = _safe_float(signal_row["close"], 0)
 
                 if breakdown:
                     sl_type = "breakdown"
@@ -2178,21 +2595,11 @@ def run_scanner_loop():
                 else:
                     sl_type = "standard"
 
-                stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
+                stop_loss = calculate_stop_loss_short(df, price, signal_type=sl_type)
+                rr1, rr2 = get_rr_targets(signal_type=sl_type, entry_timing=entry_timing)
+                tp1 = calc_tp_short(price, stop_loss, rr=rr1)
+                tp2 = calc_tp_short(price, stop_loss, rr=rr2)
                 tv_link = build_tradingview_link(symbol)
-
-                opportunity_type = classify_opportunity_type_short(
-                    breakdown=breakdown,
-                    pre_breakdown=pre_breakdown,
-                    dist_ma=dist_ma,
-                    mtf_confirmed=mtf_confirmed,
-                )
-                entry_timing = classify_entry_timing_short(
-                    dist_ma=dist_ma,
-                    breakdown=breakdown,
-                    pre_breakdown=pre_breakdown,
-                    vol_ratio=vol_ratio,
-                )
 
                 explicit_warnings = score_result.get("warning_reasons") or []
                 _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -2206,7 +2613,11 @@ def run_scanner_loop():
                     vol_ratio=vol_ratio,
                     is_new=is_new,
                     pre_breakdown=pre_breakdown,
+                    dist_ma=dist_ma,
+                    losing_strength=losing_strength,
                 )
+
+                alert_id = build_alert_id(symbol, candle_time)
 
                 candidate = {
                     "symbol": symbol,
@@ -2223,6 +2634,10 @@ def run_scanner_loop():
                         price=price,
                         score_result=score_result,
                         stop_loss=stop_loss,
+                        tp1=tp1,
+                        tp2=tp2,
+                        rr1=rr1,
+                        rr2=rr2,
                         btc_mode=btc_mode,
                         btc_short_bias=btc_short_bias,
                         tv_link=tv_link,
@@ -2236,10 +2651,31 @@ def run_scanner_loop():
                         entry_timing=entry_timing,
                         display_risk=display_risk,
                     ),
+                    "reply_markup": build_track_reply_markup(alert_id),
+                    "alert_id": alert_id,
+                    "alert_snapshot": {
+                        "alert_id": alert_id,
+                        "symbol": symbol,
+                        "timeframe": TIMEFRAME,
+                        "entry": price,
+                        "sl": stop_loss,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "score": float(score_result["score"]),
+                        "candle_time": candle_time,
+                        "created_ts": int(time.time()),
+                        "market_state": market_state,
+                        "alt_mode": alt_mode,
+                        "btc_mode": btc_mode,
+                        "entry_timing": entry_timing,
+                        "opportunity_type": opportunity_type,
+                    },
                     "candle_time": candle_time,
                     "now": now,
                     "entry": price,
                     "sl": stop_loss,
+                    "tp1": tp1,
+                    "tp2": tp2,
                     "funding_label": score_result.get("funding_label", "🟡 محايد"),
                     "reasons": score_result.get("reasons", []),
                     "mtf_confirmed": mtf_confirmed,
@@ -2291,14 +2727,20 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → skipped (reserve failed / duplicate)")
                     continue
 
-                sent_ok = send_telegram_message(candidate["message"])
+                sent_data = send_telegram_message(
+                    candidate["message"],
+                    reply_markup=candidate.get("reply_markup"),
+                )
 
-                if sent_ok:
+                if sent_data.get("ok"):
                     sent_symbols_this_run.add(symbol)
                     sent_count += 1
                     sent_cache[symbol] = time.time()
                     last_candle_cache[symbol] = candidate["candle_time"]
                     last_global_send_ts = time.time()
+
+                    message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
+                    save_alert_snapshot(candidate.get("alert_snapshot", {}), message_id=message_id)
 
                     register_trade(
                         redis_client=r,
@@ -2327,7 +2769,8 @@ def run_scanner_loop():
                         f"SENT SHORT → {symbol} | score: {candidate['score']} | "
                         f"momentum: {candidate['momentum_priority']} | "
                         f"bucket: {candidate['bucket']} | new={candidate['is_new']} | "
-                        f"market={candidate['market_state']} | alt={candidate['alt_mode']}"
+                        f"market={candidate['market_state']} | alt={candidate['alt_mode']} | "
+                        f"alert_id={candidate['alert_id']}"
                     )
                 else:
                     release_signal_slot(
