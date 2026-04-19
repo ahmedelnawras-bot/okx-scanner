@@ -830,19 +830,14 @@ def reset_stats(chat_id: str):
     try:
         deleted = 0
 
+        # امسح فقط بيانات الأداء / التقارير
         for key in r.scan_iter("trade:futures:short:*"):
             r.delete(key)
             deleted += 1
 
-        for key in r.scan_iter(f"{ALERT_KEY_PREFIX}:*"):
-            r.delete(key)
-        for key in r.scan_iter(f"{ALERT_BY_MESSAGE_KEY_PREFIX}:*"):
-            r.delete(key)
-
         extra_keys = [
             "open_trades:futures:short",
             "stats:futures:short",
-            STATS_RESET_TS_KEY,
         ]
 
         for key in extra_keys:
@@ -857,14 +852,15 @@ def reset_stats(chat_id: str):
 
         send_telegram_reply(
             chat_id,
-            f"🧹 تم تصفير بيانات الشورت بنجاح\n"
+            f"🧹 تم تصفير إحصائيات الشورت بنجاح\n"
             f"📊 عدد مفاتيح الصفقات المحذوفة: {deleted}\n"
             f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}\n"
+            f"📌 Tracking القديم ما زال محفوظًا\n"
             f"✅ reset_key={saved_reset}"
         )
 
         logger.info(
-            f"RESET SHORT STATS → deleted={deleted} | reset_ts={reset_ts} | saved={saved_reset}"
+            f"RESET SHORT STATS ONLY → deleted={deleted} | reset_ts={reset_ts} | saved={saved_reset}"
         )
 
     except Exception as e:
