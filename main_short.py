@@ -67,6 +67,15 @@ NEW_LISTING_MIN_VOL_RATIO = 1.6
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.40
 NEW_LISTING_MAX_PER_RUN = 1
 
+# Overextended reversal
+OVEREXTENDED_REVERSAL_ENABLED = True
+OVEREXTENDED_REVERSAL_MIN_DIST_MA = 5.8
+OVEREXTENDED_REVERSAL_MIN_24H_CHANGE = 12.0
+OVEREXTENDED_REVERSAL_MIN_RSI = 68.0
+OVEREXTENDED_REVERSAL_MIN_VOL_RATIO = 1.05
+OVEREXTENDED_REVERSAL_SCORE_BONUS = 0.35
+OVEREXTENDED_REVERSAL_MIN_SCORE = 6.2
+
 PRE_BREAKDOWN_LOOKBACK = 20
 PRE_BREAKDOWN_PROXIMITY_MAX = 1.035
 PRE_BREAKDOWN_VOLUME_SIGNIFICANCE = 1.15
@@ -636,8 +645,16 @@ def build_how_it_work_message() -> str:
 # =========================
 # HELPERS
 # =========================
-def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_ma: float, mtf_confirmed: bool) -> str:
+def classify_opportunity_type_short(
+    breakdown: bool,
+    pre_breakdown: bool,
+    dist_ma: float,
+    mtf_confirmed: bool,
+    is_reverse: bool = False,
+) -> str:
     try:
+        if is_reverse:
+            return "Overextended Reversal"
         if pre_breakdown and not breakdown:
             return "Breakdown مبكر"
         if breakdown:
@@ -712,6 +729,99 @@ def _safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def is_overextended_reversal_short(
+    df,
+    dist_ma: float,
+    change_24h: float,
+    vol_ratio: float,
+    funding: float = 0.0,
+) -> bool:
+    try:
+        if not OVEREXTENDED_REVERSAL_ENABLED:
+            return False
+
+        if df is None or df.empty or len(df) < 25:
+            return False
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 2:
+            return False
+
+        last = df.iloc[idx]
+        prev = df.iloc[idx - 1]
+
+        open_ = _safe_float(last["open"])
+        close = _safe_float(last["close"])
+        high = _safe_float(last["high"])
+        low = _safe_float(last["low"])
+
+        prev_close = _safe_float(prev["close"])
+        prev_rsi = _safe_float(prev.get("rsi"), 50)
+        rsi_now = _safe_float(last.get("rsi"), 50)
+
+        candle_range = high - low
+        body = abs(close - open_)
+        body_ratio = (body / candle_range) if candle_range > 0 else 0.0
+
+        bearish_close = close < open_
+        lost_momentum = close <= prev_close
+        rsi_turning = rsi_now >= OVEREXTENDED_REVERSAL_MIN_RSI and rsi_now <= prev_rsi
+        weak_close_position = candle_range > 0 and ((close - low) / candle_range) <= 0.45
+        decent_body = body_ratio >= 0.28
+        positive_funding = funding > 0
+
+        checks = 0
+
+        if dist_ma >= OVEREXTENDED_REVERSAL_MIN_DIST_MA:
+            checks += 1
+        if change_24h >= OVEREXTENDED_REVERSAL_MIN_24H_CHANGE:
+            checks += 1
+        if vol_ratio >= OVEREXTENDED_REVERSAL_MIN_VOL_RATIO:
+            checks += 1
+        if bearish_close:
+            checks += 1
+        if lost_momentum:
+            checks += 1
+        if rsi_turning:
+            checks += 1
+        if weak_close_position:
+            checks += 1
+        if decent_body:
+            checks += 1
+        if positive_funding:
+            checks += 1
+
+        return checks >= 6
+
+    except Exception:
+        return False
+
+
+def get_reverse_banner_short(is_reverse: bool) -> str:
+    if is_reverse:
+        return "♻️ <b>OVEREXTENDED REVERSAL</b>"
+    return ""
+
+
+def get_reverse_style_note_short(is_reverse: bool) -> str:
+    if is_reverse:
+        return "⚠️ <b>تنبيه خاص:</b> الفرصة من نوع ارتداد عكسي بعد امتداد قوي"
+    return ""
+
+
+def get_effective_min_score_with_reverse(
+    base_min_score: float,
+    is_reverse: bool,
+) -> float:
+    try:
+        if is_reverse:
+            return round(min(base_min_score, OVEREXTENDED_REVERSAL_MIN_SCORE), 2)
+        return round(base_min_score, 2)
+    except Exception:
+        return round(base_min_score, 2)
 
 
 def is_late_short_entry(dist_ma: float, breakdown: bool, pre_breakdown: bool) -> bool:
@@ -1935,6 +2045,8 @@ def get_momentum_priority(
 
 
 def get_candidate_bucket(candidate: dict) -> str:
+    if candidate.get("is_reverse"):
+        return "reverse"
     if candidate["is_new"] and candidate["breakdown"]:
         return "new_breakdown"
     if candidate.get("pre_breakdown") and not candidate["breakdown"]:
@@ -2016,7 +2128,7 @@ def diversify_candidates(candidates, max_alerts=3):
     diversified = []
     used_patterns = set()
 
-    for bucket_name in ["new_breakdown", "pre_breakdown", "breakdown", "early_strong", "volume", "standard"]:
+    for bucket_name in ["reverse", "new_breakdown", "pre_breakdown", "breakdown", "early_strong", "volume", "standard"]:
         if bucket_name not in buckets or not buckets[bucket_name]:
             continue
 
@@ -2310,6 +2422,7 @@ def build_message(
     display_risk="🟡 متوسطة",
     winrate=0.0,
     total_trades=0,
+    is_reverse=False,
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -2324,6 +2437,11 @@ def build_message(
     warnings = list(dict.fromkeys(warnings))
     warnings = sort_reasons(warnings)
 
+    if is_reverse:
+        reverse_reason = "Overextended reversal بعد صعود/امتداد مبالغ فيه"
+        if reverse_reason not in bearish:
+            bearish = [reverse_reason] + bearish
+
     bearish_text = format_bearish_reasons(bearish) if bearish else "• زخم هابط"
     warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
 
@@ -2335,6 +2453,8 @@ def build_message(
     tp2_pct = round(((price - tp2) / price) * 100, 2) if price else 0.0
 
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
+    reverse_banner = get_reverse_banner_short(is_reverse)
+    reverse_note = get_reverse_style_note_short(is_reverse)
 
     safe_symbol = html.escape(symbol_clean)
     safe_market = html.escape(build_market_summary_short(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
@@ -2349,6 +2469,8 @@ def build_message(
 
     warnings_block = f"\n\n⚠️ <b>ملاحظات:</b>\n{warnings_text}" if warnings_text else ""
     news_block = f"\n\n{news_warning}" if news_warning else ""
+    reverse_block = f"\n{reverse_note}" if reverse_note else ""
+
     hybrid_label = html.escape(
         get_hybrid_label(
             score=float(score_result.get("score", 0)),
@@ -2357,9 +2479,11 @@ def build_message(
         )
     )
 
-    return f"""{hybrid_label}
+    header_block = f"{hybrid_label}\n\n" if hybrid_label else ""
+    if reverse_banner:
+        header_block += f"{reverse_banner}\n\n"
 
-🔴 <b>شورت فيوتشر | {safe_symbol}</b>
+    return f"""{header_block}🔴 <b>شورت فيوتشر | {safe_symbol}</b>
 
 💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
 ⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
@@ -2369,7 +2493,7 @@ def build_message(
 🏁 <b>TP2:</b> {tp2:.6f} (-{tp2_pct}% | {rr2}R)
 🛑 <b>SL:</b> {stop_loss:.6f} (+{sl_pct}%)
 
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}
 
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
@@ -2566,6 +2690,14 @@ def run_scanner_loop():
                 candle_strength = get_candle_strength_ratio(df)
                 losing_strength = is_losing_intraday_strength(df)
 
+                is_reverse = is_overextended_reversal_short(
+                    df=df,
+                    dist_ma=dist_ma,
+                    change_24h=change_24h,
+                    vol_ratio=vol_ratio,
+                    funding=funding,
+                )
+
                 if vol_ratio < 1.08 and not breakdown and not pre_breakdown and not early_signal:
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
@@ -2574,7 +2706,7 @@ def run_scanner_loop():
                     dist_ma=dist_ma,
                     breakdown=breakdown,
                     pre_breakdown=pre_breakdown,
-                ):
+                ) and not is_reverse:
                     logger.info(f"{symbol} → skipped (late short entry | dist_ma={dist_ma:.2f})")
                     continue
 
@@ -2584,7 +2716,7 @@ def run_scanner_loop():
                     candle_strength=candle_strength,
                     breakdown=breakdown,
                     pre_breakdown=pre_breakdown,
-                ):
+                ) and not is_reverse:
                     logger.info(
                         f"{symbol} → skipped (exhausted move | dist_ma={dist_ma:.2f} | "
                         f"vol_ratio={vol_ratio:.2f} | candle_strength={candle_strength:.2f})"
@@ -2643,6 +2775,10 @@ def run_scanner_loop():
                     effective_score -= 0.20
 
                 effective_score += get_early_priority_score_bonus(early_priority)
+
+                if is_reverse:
+                    effective_score += OVEREXTENDED_REVERSAL_SCORE_BONUS
+
                 score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
@@ -2699,6 +2835,7 @@ def run_scanner_loop():
                     pre_breakdown=pre_breakdown,
                     dist_ma=dist_ma,
                     mtf_confirmed=mtf_confirmed,
+                    is_reverse=is_reverse,
                 )
                 entry_timing = classify_entry_timing_short(
                     dist_ma=dist_ma,
@@ -2709,7 +2846,10 @@ def run_scanner_loop():
                 timing_penalty = get_entry_timing_penalty(entry_timing)
                 effective_required_min_score = required_min_score + timing_penalty
                 effective_required_min_score += get_early_priority_min_score_adjustment(early_priority)
-                effective_required_min_score = round(effective_required_min_score, 2)
+                effective_required_min_score = get_effective_min_score_with_reverse(
+                    effective_required_min_score,
+                    is_reverse=is_reverse,
+                )
 
                 logger.info(
                     f"{symbol} → early_signal: {early_signal} | "
@@ -2730,7 +2870,7 @@ def run_scanner_loop():
                     )
                     continue
 
-                if not breakdown and not pre_breakdown and dist_ma > 5.0:
+                if not breakdown and not pre_breakdown and dist_ma > 5.0 and not is_reverse:
                     logger.info(f"{symbol} → rejected (late move without breakdown/pre-breakdown)")
                     continue
 
@@ -2842,6 +2982,7 @@ def run_scanner_loop():
                         display_risk=display_risk,
                         winrate=global_winrate,
                         total_trades=global_closed,
+                        is_reverse=is_reverse,
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
@@ -2862,6 +3003,7 @@ def run_scanner_loop():
                         "entry_timing": entry_timing,
                         "opportunity_type": opportunity_type,
                         "early_priority": early_priority,
+                        "is_reverse": is_reverse,
                     },
                     "candle_time": candle_time,
                     "now": now,
@@ -2876,6 +3018,7 @@ def run_scanner_loop():
                     "change_24h": change_24h,
                     "market_state": market_state,
                     "alt_mode": alt_mode,
+                    "is_reverse": is_reverse,
                 }
                 candidate["bucket"] = get_candidate_bucket(candidate)
 
@@ -2961,7 +3104,8 @@ def run_scanner_loop():
                     logger.info(
                         f"SENT SHORT → {symbol} | score: {candidate['score']} | "
                         f"momentum: {candidate['momentum_priority']} | "
-                        f"bucket: {candidate['bucket']} | new={candidate['is_new']} | "
+                        f"bucket: {candidate['bucket']} | reverse={candidate.get('is_reverse', False)} | "
+                        f"new={candidate['is_new']} | "
                         f"early_priority={candidate.get('early_priority', 'none')} | "
                         f"market={candidate['market_state']} | alt={candidate['alt_mode']} | "
                         f"alert_id={candidate['alert_id']}"
