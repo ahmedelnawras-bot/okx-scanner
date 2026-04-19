@@ -47,8 +47,8 @@ SCAN_LIMIT = 150
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-FINAL_MIN_SCORE = 7.1
-PRE_BREAKDOWN_EXTRA_SCORE = 0.3
+FINAL_MIN_SCORE = 6.5
+PRE_BREAKDOWN_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
@@ -59,17 +59,17 @@ COMMAND_POLL_INTERVAL = 3
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
-TOP_MOMENTUM_PERCENT = 0.20
-TOP_MOMENTUM_MIN_SCORE = 7.2
-TOP_MOMENTUM_NEW_MIN_SCORE = 6.2
+TOP_MOMENTUM_PERCENT = 0.22
+TOP_MOMENTUM_MIN_SCORE = 6.8
+TOP_MOMENTUM_NEW_MIN_SCORE = 5.8
 
-NEW_LISTING_MIN_VOL_RATIO = 1.8
-NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
+NEW_LISTING_MIN_VOL_RATIO = 1.6
+NEW_LISTING_MIN_CANDLE_STRENGTH = 0.40
 NEW_LISTING_MAX_PER_RUN = 1
 
 PRE_BREAKDOWN_LOOKBACK = 20
-PRE_BREAKDOWN_PROXIMITY_MAX = 1.03
-PRE_BREAKDOWN_VOLUME_SIGNIFICANCE = 1.20
+PRE_BREAKDOWN_PROXIMITY_MAX = 1.035
+PRE_BREAKDOWN_VOLUME_SIGNIFICANCE = 1.15
 PRE_BREAKDOWN_RECENT_VOL_BARS = 3
 PRE_BREAKDOWN_BASELINE_VOL_BARS = 12
 
@@ -436,7 +436,7 @@ def answer_callback_query(callback_query_id: str, text: str = "") -> None:
     telegram_api_call("answerCallbackQuery", payload)
 
 
-def send_telegram_message(message: str, reply_markup: dict | None = None) -> dict:
+def send_telegram_message(message: str, reply_markup=None) -> dict:
     if not BOT_TOKEN or not CHAT_ID:
         logger.error("❌ Telegram config missing")
         return {"ok": False}
@@ -552,8 +552,8 @@ def build_help_message() -> str:
         "",
         "⚙️ <b>معلومات:</b>",
         "• البوت بيبعت إشارات Short Futures",
-        "• بيركز على العملات المرتفعة مع بداية ضعف حقيقي أو كسر دعم",
-        "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير بعد الإرسال",
+        "• الفلاتر متوازنة أكتر علشان تقلل الخنق الزيادة",
+        "• فيه زر 📌 Track لمتابعة نتيجة أي تحذير",
     ]
 
     if other_commands:
@@ -576,76 +576,33 @@ def build_how_it_work_message() -> str:
     return """📘 <b>كيف يعمل بوت الشورت؟</b>
 
 🤖 <b>فكرة البوت:</b>
-البوت متخصص في البحث عن فرص <b>Short Futures</b> على منصة OKX،
-ويعتمد على فلترة تدريجية لتقليل الإشارات الضعيفة ورفع جودة التنبيه.
+البوت يبحث عن فرص <b>Short Futures</b> على OKX،
+لكن بفلترة متوازنة حتى لا يخنق الإشارات الجيدة.
 
 🔍 <b>منطق العمل:</b>
 1. اختيار العملات الأعلى ارتفاعاً وسيولة
-2. تحليل الشموع على فريم <b>15 دقيقة</b>
-3. قياس هل العملة بدأت تفقد الزخم فعلاً أم لا
-4. تقييم عدة عوامل:
-• الزخم البيعي
+2. تحليل فريم 15m
+3. قياس ضعف الزخم الحقيقي
+4. تقييم:
 • الفوليوم
-• موقع السعر بالنسبة للمتوسط
-• كسر الدعم أو الضغط قبل الكسر
-• تأكيد فريم الساعة (1H)
+• RSI
+• موقع السعر من المتوسط
+• Breakdown / Pre-Breakdown
+• تأكيد 1H
 • حالة السوق العامة
-• قوة سوق الألت من السوق الفعلي
-5. إعطاء كل فرصة <b>Score من 10</b>
-6. إرسال فقط الفرص التي تتجاوز الشروط النهائية
+5. إعطاء Score من 10
+6. إرسال فقط الفرص المقبولة نهائيًا
 
-📊 <b>متى تعتبر الإشارة قوية؟</b>
-• فوليوم بيعي أعلى من الطبيعي
-• شمعة هبوطية نظيفة
-• RSI في منطقة ضعف
-• كسر دعم أو ضغط بيعي واضح
-• توافق مع السوق العام
-• بداية فقدان زخم بعد صعود قوي
-
-⚠️ <b>متى تكون الإشارة فيها مخاطرة؟</b>
-• الألت قوي بشكل عام (Alt Season)
-• RSI منخفض جداً (تشبع بيع)
-• السوق صاعد بقوة
-• فوليوم غير كافٍ
-• وجود أخبار اقتصادية قريبة
-• دخول متأخر بعد هبوط ممتد
-
-🧠 <b>شرح رسالة البوت:</b>
-
-🔴 <b>العملة</b>
-الزوج الذي تم رصد إشارة الشورت عليه
-
-💰 <b>السعر</b>
-سعر الدخول التقريبي
-
-⭐ <b>السكور</b>
-تقييم من 10 — كلما زاد جودة أعلى
-
-🎯 <b>TP1 / TP2</b>
-أهداف الربح للشورت (أسفل السعر الحالي)
-
-🛑 <b>SL</b>
-مستوى وقف الخسارة (فوق السعر الحالي)
-
-📍 <b>الدخول</b>
-• 🟢 مبكر
-• 🟡 متوسط
-• 🔴 متأخر
-
-⚖️ <b>المخاطرة</b>
-تقييم عام للفرصة
-
-📌 <b>زر Track</b>
-يعرض نتيجة التحذير لاحقًا:
+📌 <b>زر Track:</b>
+يعرض لاحقًا:
 • الحالة
 • السعر الحالي
 • أقصى هبوط لصالح الصفقة
 • أقصى صعود ضد الصفقة
-• المدة
+• مدة الصفقة
 
 ✅ <b>أفضل استخدام:</b>
-استخدم البوت كفلتر ذكي يوفر وقتك،
-ثم خذ القرار بعد مراجعة سريعة للسوق والشارت."""
+راجع الشارت بسرعة وخد القرار بعد التأكد من السياق العام."""
 
 
 # =========================
@@ -657,7 +614,7 @@ def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_m
             return "Breakdown مبكر"
         if breakdown:
             return "Breakdown"
-        if dist_ma <= 1.2 and mtf_confirmed:
+        if dist_ma <= 1.4 and mtf_confirmed:
             return "Pullback هبوطي"
         return "استمرار هبوطي"
     except Exception:
@@ -666,11 +623,11 @@ def classify_opportunity_type_short(breakdown: bool, pre_breakdown: bool, dist_m
 
 def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: bool, vol_ratio: float) -> str:
     try:
-        if (pre_breakdown or breakdown) and dist_ma <= 2.6 and vol_ratio >= 1.3:
+        if (pre_breakdown or breakdown) and dist_ma <= 3.0 and vol_ratio >= 1.15:
             return "🟢 مبكر (بداية الحركة)"
-        if breakdown and 2.6 < dist_ma <= 3.8 and vol_ratio >= 1.4:
+        if breakdown and 3.0 < dist_ma <= 4.4 and vol_ratio >= 1.25:
             return "🟡 متوسط (نص الحركة)"
-        if 2.6 < dist_ma <= 4.2 and vol_ratio >= 1.2:
+        if 3.0 < dist_ma <= 5.0 and vol_ratio >= 1.10:
             return "🟡 متوسط (نص الحركة)"
         return "🔴 متأخر (قرب النهاية)"
     except Exception:
@@ -680,9 +637,9 @@ def classify_entry_timing_short(dist_ma: float, breakdown: bool, pre_breakdown: 
 def get_entry_timing_penalty(entry_timing: str) -> float:
     try:
         if "🔴 متأخر" in entry_timing:
-            return 0.40
+            return 0.25
         if "🟡 متوسط" in entry_timing:
-            return 0.15
+            return 0.10
         return 0.0
     except Exception:
         return 0.0
@@ -840,7 +797,7 @@ def build_alert_id(symbol: str, candle_time: int) -> str:
     return f"{clean_symbol_for_message(symbol)}:{int(candle_time)}"
 
 
-def save_alert_snapshot(alert_data: dict, message_id: str | None = None) -> None:
+def save_alert_snapshot(alert_data: dict, message_id=None) -> None:
     if not r or not alert_data:
         return
 
@@ -860,7 +817,7 @@ def save_alert_snapshot(alert_data: dict, message_id: str | None = None) -> None
         logger.error(f"save_alert_snapshot error: {e}")
 
 
-def load_alert_snapshot(alert_id: str) -> dict | None:
+def load_alert_snapshot(alert_id: str):
     if not r or not alert_id:
         return None
     try:
@@ -886,14 +843,7 @@ def get_last_price(symbol: str) -> float:
         return 0.0
 
 
-def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str = "short") -> tuple[float, float]:
-    """
-    Returns:
-    favorable_pct, adverse_pct
-    for short:
-    favorable = max drop from entry
-    adverse = max rise above entry
-    """
+def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str = "short"):
     try:
         candles = get_candles(symbol, TIMEFRAME, 100)
         df = to_dataframe(candles)
@@ -943,13 +893,17 @@ def get_alert_status(alert: dict) -> str:
         if entry <= 0:
             return "غير معروف"
 
-        if adverse_pct >= round(((sl - entry) / entry) * 100, 4):
+        sl_pct = round(((sl - entry) / entry) * 100, 4) if sl > 0 else 0
+        tp1_pct = round(((entry - tp1) / entry) * 100, 4) if tp1 > 0 else 0
+        tp2_pct = round(((entry - tp2) / entry) * 100, 4) if tp2 > 0 else 0
+
+        if adverse_pct >= sl_pct > 0:
             return "SL Hit ❌"
 
-        if favorable_pct >= round(((entry - tp2) / entry) * 100, 4):
+        if favorable_pct >= tp2_pct > 0:
             return "TP2 Hit 🎯"
 
-        if favorable_pct >= round(((entry - tp1) / entry) * 100, 4):
+        if favorable_pct >= tp1_pct > 0:
             return "TP1 Hit ✅"
 
         return "Open ⏳"
@@ -1311,12 +1265,12 @@ def early_bearish_signal(df):
         body_ratio = (body / candle_range) if candle_range > 0 else 0.0
 
         avg_vol = _safe_float(df.iloc[max(0, idx - 10):idx]["volume"].mean(), 0)
-        vol_ok = avg_vol > 0 and _safe_float(last["volume"]) >= avg_vol * 1.15
+        vol_ok = avg_vol > 0 and _safe_float(last["volume"]) >= avg_vol * 1.08
 
         bearish_close = close < open_
-        weak_close_position = candle_range > 0 and ((close - low) / candle_range) <= 0.35
-        rsi_weakening = rsi_now < 50 and rsi_now <= rsi_prev
-        real_body = body_ratio >= 0.45
+        weak_close_position = candle_range > 0 and ((close - low) / candle_range) <= 0.45
+        rsi_weakening = rsi_now < 52 and rsi_now <= rsi_prev
+        real_body = body_ratio >= 0.32
 
         checks = sum([bearish_close, weak_close_position, rsi_weakening, vol_ok, real_body])
         return checks >= 3
@@ -1342,7 +1296,7 @@ def is_higher_timeframe_confirmed(symbol):
         ma_value = signal_row.get("ma", None)
         below_ma = ma_value is not None and _safe_float(signal_row["close"]) < _safe_float(ma_value)
 
-        low_rsi = _safe_float(signal_row.get("rsi"), 50) <= 48
+        low_rsi = _safe_float(signal_row.get("rsi"), 50) <= 50
 
         last_3 = df.iloc[idx - 3:idx]
         red_candles = sum(
@@ -1351,7 +1305,7 @@ def is_higher_timeframe_confirmed(symbol):
         )
         structure_weak = red_candles >= 2
 
-        return bool(below_ma and (low_rsi or structure_weak))
+        return bool((below_ma and low_rsi) or (below_ma and structure_weak) or (low_rsi and structure_weak))
 
     except Exception as e:
         logger.error(f"MTF error on {symbol}: {e}")
@@ -1383,14 +1337,6 @@ def get_btc_mode():
         return "🟡 محايد"
 
 
-def get_btc_short_bias(btc_mode: str) -> str:
-    if "🔴 هابط" in btc_mode:
-        return "🟢 داعم للشورت"
-    if "🟢 صاعد" in btc_mode:
-        return "🔴 ضد الشورت"
-    return "🟡 محايد"
-
-
 def is_losing_intraday_strength(df) -> bool:
     try:
         if df is None or df.empty or len(df) < 5:
@@ -1405,8 +1351,8 @@ def is_losing_intraday_strength(df) -> bool:
         prev = df.iloc[idx - 1]
 
         lower_close = _safe_float(last["close"]) <= _safe_float(prev["close"])
-        weaker_rsi = _safe_float(last.get("rsi"), 50) < _safe_float(prev.get("rsi"), 50)
-        not_near_high = _safe_float(last["close"]) < (_safe_float(last["high"]) * 0.995)
+        weaker_rsi = _safe_float(last.get("rsi"), 50) <= _safe_float(prev.get("rsi"), 50)
+        not_near_high = _safe_float(last["close"]) < (_safe_float(last["high"]) * 0.998)
 
         checks = sum([lower_close, weaker_rsi, not_near_high])
         return checks >= 2
@@ -1586,36 +1532,36 @@ def get_dynamic_entry_threshold(
     losing_strength: bool,
 ) -> float:
     if market_state == "risk_off":
-        threshold = 6.2
+        threshold = 6.0
     elif market_state == "btc_leading":
-        threshold = 6.6
+        threshold = 6.3
     elif market_state == "mixed":
-        threshold = 6.5
+        threshold = 6.2
     elif market_state == "bull_market":
-        threshold = 6.9
+        threshold = 6.6
     elif market_state == "alt_season":
-        threshold = 6.8
-    else:
         threshold = 6.5
+    else:
+        threshold = 6.2
 
     if mtf_confirmed:
-        threshold -= 0.1
+        threshold -= 0.10
 
-    if vol_ratio >= 2.0:
-        threshold -= 0.2
-    elif vol_ratio >= 1.5:
-        threshold -= 0.1
+    if vol_ratio >= 1.8:
+        threshold -= 0.20
+    elif vol_ratio >= 1.35:
+        threshold -= 0.10
 
     if is_new:
-        threshold += 0.2
+        threshold += 0.10
 
     if not losing_strength:
-        threshold += 0.2
+        threshold += 0.10
 
     if score_result.get("fake_signal"):
-        threshold += 0.2
+        threshold += 0.15
 
-    threshold = max(5.9, min(7.2, threshold))
+    threshold = max(5.8, min(6.9, threshold))
     return round(threshold, 2)
 
 
@@ -1738,30 +1684,11 @@ def is_pre_breakdown(df, lookback=PRE_BREAKDOWN_LOOKBACK) -> bool:
 
         recent_atr = _safe_float(signal_row.get("atr"), 0)
         prev_atr = _safe_float(df["atr"].iloc[idx - 5:idx].mean(), 0)
-        compressed = prev_atr > 0 and recent_atr > 0 and recent_atr < prev_atr * 0.90
+        compressed = prev_atr > 0 and recent_atr > 0 and recent_atr < prev_atr * 0.95
 
         below_ma = close < ma_value
 
-        recent_highs = df["high"].iloc[max(0, idx - 4):idx].astype(float).tolist()
-        lower_highs = len(recent_highs) >= 3 and all(
-            recent_highs[i] >= recent_highs[i + 1] for i in range(len(recent_highs) - 1)
-        )
-
-        high = _safe_float(signal_row["high"])
-        low = _safe_float(signal_row["low"])
-        open_ = _safe_float(signal_row["open"])
-        lower_wick = min(open_, close) - low
-        full_range = high - low
-        weak_lower_rejection = full_range > 0 and (lower_wick / full_range) <= 0.25
-
-        return (
-            vol_increasing
-            and volume_significant
-            and compressed
-            and below_ma
-            and lower_highs
-            and weak_lower_rejection
-        )
+        return vol_increasing and volume_significant and compressed and below_ma
 
     except Exception:
         return False
@@ -1815,25 +1742,25 @@ def get_momentum_priority(
     priority = float(score)
 
     if breakdown:
-        priority += 1.0
+        priority += 0.9
     elif pre_breakdown:
-        priority += 0.7
+        priority += 0.6
 
-    if vol_ratio >= 2.0:
-        priority += 1.0
-    elif vol_ratio >= 1.5:
-        priority += 0.5
+    if vol_ratio >= 1.8:
+        priority += 0.8
+    elif vol_ratio >= 1.35:
+        priority += 0.4
 
     if is_new and vol_ratio >= NEW_LISTING_MIN_VOL_RATIO:
-        priority += 0.5
+        priority += 0.4
 
-    if dist_ma > 4.2:
-        priority -= 0.8
-    elif dist_ma > 3.5:
-        priority -= 0.4
+    if dist_ma > 5.2:
+        priority -= 0.5
+    elif dist_ma > 4.2:
+        priority -= 0.2
 
     if losing_strength:
-        priority += 0.25
+        priority += 0.20
 
     return round(priority, 2)
 
@@ -1845,7 +1772,7 @@ def get_candidate_bucket(candidate: dict) -> str:
         return "pre_breakdown"
     if candidate["breakdown"]:
         return "breakdown"
-    if candidate["vol_ratio"] >= 2.0:
+    if candidate["vol_ratio"] >= 1.8:
         return "volume"
     return "standard"
 
@@ -1874,7 +1801,7 @@ def apply_top_momentum_filter(candidates):
         reverse=True,
     )
 
-    top_n = max(3, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
+    top_n = max(4, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
     filtered = strong_candidates[:top_n]
 
     final_candidates = []
@@ -2124,13 +2051,13 @@ def format_bearish_reasons(bearish):
 # =========================
 def enforce_min_sl_percent(entry: float, sl: float, signal_type="standard") -> float:
     floors = {
-        "breakdown": 1.2,
-        "standard": 1.4,
-        "pre_breakdown": 1.8,
-        "new_listing": 2.2,
+        "breakdown": 1.1,
+        "standard": 1.3,
+        "pre_breakdown": 1.6,
+        "new_listing": 2.0,
     }
 
-    min_pct = floors.get(signal_type, 1.4)
+    min_pct = floors.get(signal_type, 1.3)
     current_pct = ((float(sl) - float(entry)) / float(entry)) * 100 if entry > 0 else 0
 
     if current_pct >= min_pct:
@@ -2149,16 +2076,16 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
         recent_high = _safe_float(df["high"].iloc[max(0, idx - 4):idx + 1].max(), entry)
 
         if signal_type == "breakdown":
-            atr_mult = 1.2
+            atr_mult = 1.35
         elif signal_type == "pre_breakdown":
-            atr_mult = 1.8
+            atr_mult = 1.75
         elif signal_type == "new_listing":
-            atr_mult = 2.2
+            atr_mult = 2.10
         else:
-            atr_mult = 1.5
+            atr_mult = 1.55
 
         atr_stop = float(entry) + (atr_value * atr_mult)
-        structure_buffer = atr_value * 0.25
+        structure_buffer = atr_value * 0.20
         structure_stop = recent_high + structure_buffer
 
         stop_loss = max(atr_stop, structure_stop)
@@ -2177,14 +2104,14 @@ def calc_tp_short(entry: float, sl: float, rr: float) -> float:
 
 def get_rr_targets(signal_type="standard", entry_timing=""):
     if signal_type == "breakdown":
-        return 1.5, 2.5
+        return 1.4, 2.3
     if signal_type == "pre_breakdown":
-        return 1.8, 3.0
+        return 1.7, 2.8
     if signal_type == "new_listing":
-        return 2.0, 3.5
+        return 1.9, 3.2
     if "🔴 متأخر" in entry_timing:
-        return 1.8, 3.0
-    return 1.5, 2.5
+        return 1.7, 2.8
+    return 1.4, 2.4
 
 
 def build_message(
@@ -2373,7 +2300,7 @@ def run_scanner_loop():
                 time.sleep(30)
                 continue
 
-            logger.info(f"SHORT RUN START | pid={os.getpid()} | ts={int(time.time())}")
+            logger.info(f"SHORT RUN START | pid={os.getpid()}")
 
             update_open_trades(r, market_type="futures", side="short", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, market_type="futures", side="short")
@@ -2410,9 +2337,6 @@ def run_scanner_loop():
             upcoming_events = get_upcoming_high_impact_events()
             has_high_impact_news = len(upcoming_events) > 0
             news_warning_text = format_news_warning(upcoming_events)
-
-            if has_high_impact_news:
-                logger.info(f"⚠️ High-impact events detected: {[e['title'] for e in upcoming_events]}")
 
             logger.info(
                 f"SHORT MARKET STATE | btc={btc_mode} | alt={alt_mode} | "
@@ -2451,12 +2375,8 @@ def run_scanner_loop():
                 candle_strength = get_candle_strength_ratio(df)
                 losing_strength = is_losing_intraday_strength(df)
 
-                if vol_ratio < 1.15 and not breakdown and not pre_breakdown and not early_signal:
-                    logger.info(f"{symbol} → skipped (hard floor vol_ratio: {vol_ratio:.2f})")
-                    continue
-
-                if not losing_strength and not breakdown and not pre_breakdown and change_24h > 5:
-                    logger.info(f"{symbol} → skipped (still strong intraday, no real weakness)")
+                if vol_ratio < 1.08 and not breakdown and not pre_breakdown and not early_signal:
+                    logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
 
                 try:
@@ -2477,6 +2397,22 @@ def run_scanner_loop():
                 except Exception as score_err:
                     logger.error(f"{symbol} → calculate_short_score failed: {score_err}")
                     continue
+
+                raw_score = float(score_result.get("score", 0))
+                effective_score = raw_score
+
+                if score_result.get("fake_signal"):
+                    if breakdown or pre_breakdown:
+                        effective_score -= 0.20
+                    elif early_signal:
+                        effective_score -= 0.35
+                    else:
+                        effective_score -= 0.55
+
+                if not losing_strength and not breakdown and not pre_breakdown:
+                    effective_score -= 0.15
+
+                score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
                     market_state=market_state,
@@ -2521,19 +2457,13 @@ def run_scanner_loop():
 
                 logger.info(
                     f"{symbol} → early_signal: {early_signal} | "
-                    f"pre_breakdown: {pre_breakdown} | "
-                    f"score: {score_result['score']} | "
-                    f"min_required: {effective_required_min_score} | "
-                    f"fake: {score_result.get('fake_signal')} | "
-                    f"mtf: {mtf_confirmed} | "
-                    f"new: {is_new} | "
-                    f"losing_strength={losing_strength} | "
+                    f"pre_b={pre_breakdown} | "
+                    f"score={score_result['score']} | "
+                    f"min_required={effective_required_min_score} | "
+                    f"fake={score_result.get('fake_signal')} | "
+                    f"mtf={mtf_confirmed} | "
                     f"market={market_state}"
                 )
-
-                if score_result.get("fake_signal") and not pre_breakdown:
-                    logger.info(f"{symbol} → rejected by fake signal")
-                    continue
 
                 if score_result["score"] < effective_required_min_score:
                     logger.info(
@@ -2542,7 +2472,7 @@ def run_scanner_loop():
                     )
                     continue
 
-                if not breakdown and not pre_breakdown and dist_ma > 3.8:
+                if not breakdown and not pre_breakdown and dist_ma > 5.2:
                     logger.info(f"{symbol} → rejected (late move without breakdown/pre-breakdown)")
                     continue
 
