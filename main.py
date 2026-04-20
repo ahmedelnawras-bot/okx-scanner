@@ -1423,7 +1423,92 @@ def is_higher_timeframe_confirmed(symbol):
         return False
 
 
-def get_btc_mode():
+def is_4h_oversold_confirmed(symbol: str) -> dict:
+    """
+    تأكيد 4H خاص للـ Oversold Reversal.
+    بيشوف:
+    1. RSI على 4H تحت 35 (oversold حقيقي)
+    2. السعر تحت MA20 على 4H (امتداد هبوطي)
+    3. آخر شمعة 4H إما هامر أو بولنجر صاعد (بداية رد)
+    يرجع dict فيه: confirmed (bool) + details للرسالة
+    """
+    try:
+        candles = get_candles(symbol, "4H", 60)
+        df = to_dataframe(candles)
+
+        if df is None or df.empty or len(df) < 20:
+            return {"confirmed": False, "checks": 0, "details": "بيانات 4H غير كافية"}
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 3:
+            return {"confirmed": False, "checks": 0, "details": "index غير كافي"}
+
+        close  = _safe_float(signal_row["close"])
+        open_  = _safe_float(signal_row["open"])
+        high   = _safe_float(signal_row["high"])
+        low    = _safe_float(signal_row["low"])
+        rsi_4h = _safe_float(signal_row.get("rsi"), 50)
+        ma_4h  = _safe_float(signal_row.get("ma"), close)
+
+        candle_range = high - low
+        body         = abs(close - open_)
+        lower_wick   = min(open_, close) - low
+        upper_wick   = high - max(open_, close)
+
+        checks = 0
+        details_parts = []
+
+        # ١. RSI oversold على 4H
+        rsi_ok = rsi_4h <= 35
+        if rsi_ok:
+            checks += 1
+            details_parts.append(f"RSI 4H={rsi_4h:.0f} ✅")
+        else:
+            details_parts.append(f"RSI 4H={rsi_4h:.0f} ⚠️")
+
+        # ٢. السعر تحت MA20 على 4H
+        below_ma = close < ma_4h
+        if below_ma:
+            checks += 1
+            details_parts.append("تحت MA20 4H ✅")
+        else:
+            details_parts.append("فوق MA20 4H ⚠️")
+
+        # ٣. شمعة رد على 4H: هامر أو بولنجر صاعد
+        hammer = (
+            candle_range > 0
+            and lower_wick >= body * 1.8
+            and upper_wick <= body * 0.6
+            and close > open_
+        )
+        bullish_engulf = (
+            close > open_
+            and candle_range > 0
+            and body >= candle_range * 0.60
+        )
+        reversal_candle = hammer or bullish_engulf
+        if reversal_candle:
+            checks += 1
+            label = "هامر" if hammer else "بولنجر صاعد"
+            details_parts.append(f"شمعة رد ({label}) 4H ✅")
+        else:
+            details_parts.append("لا شمعة رد على 4H ⚠️")
+
+        confirmed = checks >= 2
+        details   = " | ".join(details_parts)
+
+        logger.info(
+            f"4H OVERSOLD CHECK | {symbol} | "
+            f"rsi={rsi_4h:.1f} | below_ma={below_ma} | "
+            f"reversal_candle={reversal_candle} | checks={checks}/3 | confirmed={confirmed}"
+        )
+
+        return {"confirmed": confirmed, "checks": checks, "details": details}
+
+    except Exception as e:
+        logger.error(f"is_4h_oversold_confirmed error on {symbol}: {e}")
+        return {"confirmed": False, "checks": 0, "details": "خطأ في التحقق"}
     try:
         candles = get_candles("BTC-USDT-SWAP", "1H", 100)
         df = to_dataframe(candles)
@@ -1678,16 +1763,20 @@ def get_dynamic_entry_threshold(
 
 def calculate_stop_loss(price, atr_value, signal_type="standard"):
     multipliers = {
-        "breakout": 1.0,
-        "pre_breakout": 1.5,
-        "new_listing": 1.8,
-        "standard": 1.2,
+        "breakout":     2.5,   # كان 1.0 — مضاعف لتحمل leverage 20x-50x
+        "pre_breakout": 3.0,   # كان 1.5
+        "new_listing":  3.2,   # كان 1.8
+        "standard":     2.8,   # كان 1.2
     }
-    multiplier = multipliers.get(signal_type, 1.2)
+    multiplier = multipliers.get(signal_type, 2.8)
     try:
-        return round(float(price) - (float(atr_value) * multiplier), 6)
+        sl = round(float(price) - (float(atr_value) * multiplier), 6)
+        # حماية: SL لا يقل عن 1% من السعر ولا يزيد عن 4% (مناسب لـ cross 20x-50x)
+        min_sl = round(float(price) * 0.990, 6)  # أقرب من 1% = خطر على leverage عالي
+        max_sl = round(float(price) * 0.960, 6)  # أبعد من 4% = position كبير جداً
+        return max(max_sl, min(min_sl, sl))
     except Exception:
-        return round(float(price), 6)
+        return round(float(price) * 0.975, 6)
 
 
 def calculate_sl_percent(entry, sl):
@@ -2380,14 +2469,14 @@ def build_market_summary(btc_mode: str, alt_mode: str) -> str:
 # =========================
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
     if signal_type == "breakout":
-        return 1.4, 2.3
+        return 2.5, 4.0    # كان 1.4, 2.3 — رُفع لتعويض win rate 40%
     if signal_type == "pre_breakout":
-        return 1.7, 2.8
+        return 2.8, 4.5    # كان 1.7, 2.8
     if signal_type == "new_listing":
-        return 1.9, 3.2
+        return 3.0, 5.0    # كان 1.9, 3.2
     if "🔴 متأخر" in entry_timing:
-        return 1.7, 2.8
-    return 1.4, 2.4
+        return 2.5, 4.0    # كان 1.7, 2.8
+    return 2.5, 4.0        # كان 1.4, 2.4
 
 
 def calc_tp_long(entry: float, sl: float, rr: float) -> float:
@@ -2422,6 +2511,8 @@ def build_message(
     winrate=0.0,
     total_trades=0,
     is_reverse=False,
+    reversal_4h_confirmed=False,
+    reversal_4h_details="",
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -2454,6 +2545,21 @@ def build_message(
     new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
     reverse_banner = get_reverse_banner_long(is_reverse)
     reverse_note = get_reverse_style_note_long(is_reverse)
+
+    # بلوك تأكيد/تحذير 4H للـ Oversold Reversal
+    if is_reverse:
+        if reversal_4h_confirmed:
+            reversal_4h_block = (
+                f"\n✅ <b>4H مؤكد:</b> {html.escape(reversal_4h_details)}"
+            )
+        else:
+            reversal_4h_block = (
+                f"\n🔴 <b>تحذير: 4H غير مؤكد</b>\n"
+                f"• {html.escape(reversal_4h_details)}\n"
+                f"• مخاطرة أعلى — راجع شارت 4H قبل الدخول"
+            )
+    else:
+        reversal_4h_block = ""
 
     safe_symbol = html.escape(symbol_clean)
     safe_market = html.escape(build_market_summary(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
@@ -2492,7 +2598,7 @@ def build_message(
 🏁 <b>TP2:</b> {tp2:.6f} (+{tp2_pct}% | {rr2}R)
 🛑 <b>SL:</b> {stop_loss:.6f} (-{sl_pct}%)
 
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}
 
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
@@ -2696,6 +2802,17 @@ def run_scanner_loop():
                     vol_ratio=vol_ratio,
                     funding=funding,
                 )
+
+                # تأكيد 4H خاص للـ Oversold Reversal
+                reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
+                if is_reverse:
+                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
+                    if not reversal_4h_result["confirmed"]:
+                        logger.info(
+                            f"{symbol} → REVERSAL 4H NOT CONFIRMED | "
+                            f"{reversal_4h_result.get('details', '')} | "
+                            f"سيُرسل بتحذير مرتفع"
+                        )
 
                 if vol_ratio < 1.08 and not breakout and not pre_breakout and not early_signal:
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
@@ -2986,6 +3103,8 @@ def run_scanner_loop():
                         winrate=global_winrate,
                         total_trades=global_closed,
                         is_reverse=is_reverse,
+                        reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
+                        reversal_4h_details=reversal_4h_result.get("details", ""),
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
