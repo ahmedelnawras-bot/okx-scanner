@@ -1292,7 +1292,8 @@ def is_oversold_reversal_long(
 
         checks = 0
 
-        if dist_ma >= OVERSOLD_REVERSAL_MIN_DIST_MA:
+        # dist_ma لازم يكون سالب (السعر تحت MA) وبُعده كافي
+        if dist_ma <= -OVERSOLD_REVERSAL_MIN_DIST_MA:
             checks += 1
         if change_24h <= OVERSOLD_REVERSAL_MIN_24H_DROP:
             checks += 1
@@ -2797,7 +2798,7 @@ def run_scanner_loop():
 
                 is_reverse = is_oversold_reversal_long(
                     df=df,
-                    dist_ma=abs(dist_ma) if dist_ma < 0 else dist_ma,
+                    dist_ma=dist_ma,
                     change_24h=change_24h,
                     vol_ratio=vol_ratio,
                     funding=funding,
@@ -2865,6 +2866,7 @@ def run_scanner_loop():
                         market_state=market_state,
                         alt_mode=alt_mode,
                         market_bias_label=market_bias_label,
+                        is_reverse=is_reverse,
                     )
                 except Exception as score_err:
                     logger.error(f"{symbol} → calculate_long_score failed: {score_err}")
