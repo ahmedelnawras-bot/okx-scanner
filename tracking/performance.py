@@ -190,7 +190,6 @@ def register_trade(
     if reasons is None:
         reasons = []
 
-    # حقول عامة جديدة غير منحازة للونج
     pre_signal = bool(pre_breakout)
     break_signal = bool(breakout)
 
@@ -224,7 +223,7 @@ def register_trade(
         # extra fields for backtesting / analytics
         "reasons": list(reasons),
 
-        # legacy fields (للتوافق مع الملفات القديمة)
+        # legacy fields
         "pre_breakout": pre_signal,
         "breakout": break_signal,
 
@@ -314,7 +313,12 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         redis_client.srem(open_set_key, trade_key)
 
         stats_key = get_stats_key(market_type, side)
-        if result == "win":
+
+        if result == "tp1_win":
+            redis_client.hincrby(stats_key, "tp1_wins", 1)
+            redis_client.hincrby(stats_key, "wins", 1)
+        elif result == "tp2_win":
+            redis_client.hincrby(stats_key, "tp2_wins", 1)
             redis_client.hincrby(stats_key, "wins", 1)
         elif result == "loss":
             redis_client.hincrby(stats_key, "losses", 1)
@@ -373,13 +377,13 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             elif high >= tp1:
                 tp1_now = True
                 if high >= tp2:
-                    result = "win"
+                    result = "tp2_win"
         else:
             if high >= tp2:
-                result = "win"
+                result = "tp2_win"
             elif low <= sl:
-                # بعد TP1 تم نقل SL إلى entry → خروج رابح / آمن
-                result = "win"
+                result = "tp1_win"
+
     else:  # short
         if not tp1_hit:
             if high >= sl:
@@ -387,13 +391,12 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             elif low <= tp1:
                 tp1_now = True
                 if low <= tp2:
-                    result = "win"
+                    result = "tp2_win"
         else:
             if low <= tp2:
-                result = "win"
+                result = "tp2_win"
             elif high >= sl:
-                # بعد TP1 تم نقل SL إلى entry → خروج رابح / آمن
-                result = "win"
+                result = "tp1_win"
 
     return result, tp1_now
 
@@ -474,7 +477,7 @@ def update_open_trades(
                     logger.error(f"{symbol} → failed to mark TP1")
                     break
 
-                if result == "win":
+                if result == "tp2_win":
                     break
 
             if result:
@@ -491,6 +494,8 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
     if redis_client is None:
         return {
             "wins": 0,
+            "tp1_wins": 0,
+            "tp2_wins": 0,
             "losses": 0,
             "expired": 0,
             "open": 0,
@@ -509,7 +514,10 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 
     try:
         stats = redis_client.hgetall(stats_key) or {}
+
         wins = int(stats.get("wins", 0))
+        tp1_wins = int(stats.get("tp1_wins", 0))
+        tp2_wins = int(stats.get("tp2_wins", 0))
         losses = int(stats.get("losses", 0))
         expired = int(stats.get("expired", 0))
         tp1_hits = int(stats.get("tp1_hits", 0))
@@ -517,12 +525,15 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 
         decided = wins + losses
         total_closed = wins + losses + expired
+        total_signals = total_closed + open_count
 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
-        tp1_rate = round((tp1_hits / total_closed) * 100, 2) if total_closed > 0 else 0.0
+        tp1_rate = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
 
         return {
             "wins": wins,
+            "tp1_wins": tp1_wins,
+            "tp2_wins": tp2_wins,
             "losses": losses,
             "expired": expired,
             "open": open_count,
@@ -537,6 +548,8 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         logger.error(f"get_winrate_summary error: {e}")
         return {
             "wins": 0,
+            "tp1_wins": 0,
+            "tp2_wins": 0,
             "losses": 0,
             "expired": 0,
             "open": 0,
@@ -558,6 +571,8 @@ def get_trade_summary(
         return {
             "total": 0,
             "wins": 0,
+            "tp1_wins": 0,
+            "tp2_wins": 0,
             "losses": 0,
             "expired": 0,
             "open": 0,
@@ -575,6 +590,8 @@ def get_trade_summary(
         return {
             "total": 0,
             "wins": 0,
+            "tp1_wins": 0,
+            "tp2_wins": 0,
             "losses": 0,
             "expired": 0,
             "open": 0,
@@ -584,6 +601,8 @@ def get_trade_summary(
         }
 
     wins = 0
+    tp1_wins = 0
+    tp2_wins = 0
     losses = 0
     expired = 0
     open_count = 0
@@ -616,24 +635,28 @@ def get_trade_summary(
         status = trade.get("status")
         result = trade.get("result")
 
-        if status == "open" or status == "partial":
+        if status in ("open", "partial"):
             open_count += 1
-        elif result == "win":
+        elif result == "tp1_win":
             wins += 1
+            tp1_wins += 1
+        elif result == "tp2_win":
+            wins += 1
+            tp2_wins += 1
         elif result == "loss":
             losses += 1
         elif result == "expired":
             expired += 1
 
     decided = wins + losses
-    total_closed = wins + losses + expired
-
     winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
-    tp1_rate = round((tp1_hits / total_closed) * 100, 2) if total_closed > 0 else 0.0
+    tp1_rate = round((tp1_hits / total) * 100, 2) if total > 0 else 0.0
 
     return {
         "total": total,
         "wins": wins,
+        "tp1_wins": tp1_wins,
+        "tp2_wins": tp2_wins,
         "losses": losses,
         "expired": expired,
         "open": open_count,
@@ -683,6 +706,8 @@ def format_winrate_summary(summary: dict) -> str:
         f"{prefix}Win rate: {summary['winrate']}% | "
         f"TP1 Rate: {summary.get('tp1_rate', 0)}% | "
         f"Wins: {summary['wins']} | "
+        f"TP1 Wins: {summary.get('tp1_wins', 0)} | "
+        f"TP2 Wins: {summary.get('tp2_wins', 0)} | "
         f"Losses: {summary['losses']} | "
         f"TP1 Hits: {summary['tp1_hits']} | "
         f"Expired: {summary['expired']} | "
@@ -697,8 +722,10 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"📊 {title}\n"
         f"Signals: {summary['total']}\n"
         f"Closed: {decided}\n"
-        f"TP hits: {summary['wins']}\n"
-        f"SL hits: {summary['losses']}\n"
+        f"Wins: {summary['wins']}\n"
+        f"• TP1 Wins: {summary.get('tp1_wins', 0)}\n"
+        f"• TP2 Wins: {summary.get('tp2_wins', 0)}\n"
+        f"Losses: {summary['losses']}\n"
         f"TP1 hits: {summary['tp1_hits']}\n"
         f"TP1 rate: {summary.get('tp1_rate', 0)}%\n"
         f"Expired: {summary['expired']}\n"
