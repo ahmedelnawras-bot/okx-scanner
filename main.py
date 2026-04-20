@@ -19,6 +19,7 @@ from tracking.performance import (
     get_period_summary,
     get_trade_summary,
     format_period_summary,
+    get_setup_type_stats,
     calc_tp1,
     calc_tp2,
 )
@@ -55,7 +56,7 @@ MAX_ALERTS_PER_RUN = 3
 
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 2700
-GLOBAL_COOLDOWN_SECONDS = 300
+GLOBAL_COOLDOWN_SECONDS = 120
 COMMAND_POLL_INTERVAL = 3
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
@@ -655,6 +656,7 @@ def reset_stats(chat_id: str):
     try:
         deleted = 0
 
+        # يمسح trade keys العادية فقط — مش trade_history
         for key in r.scan_iter("trade:futures:long:*"):
             r.delete(key)
             deleted += 1
@@ -679,12 +681,13 @@ def reset_stats(chat_id: str):
             f"🧹 تم تصفير إحصائيات اللونج بنجاح\n"
             f"📊 عدد مفاتيح الصفقات المحذوفة: {deleted}\n"
             f"🕒 وقت التصفير: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_ts))}\n"
-            f"📌 Tracking القديم ما زال محفوظًا\n"
+            f"📌 Trade History للـ Hybrid Label محفوظ ✅\n"
             f"✅ reset_key={saved_reset}"
         )
 
         logger.info(
-            f"RESET LONG STATS ONLY → deleted={deleted} | reset_ts={reset_ts} | saved={saved_reset}"
+            f"RESET LONG STATS ONLY → deleted={deleted} | reset_ts={reset_ts} | "
+            f"saved={saved_reset} | trade_history=PRESERVED"
         )
 
     except Exception as e:
@@ -1293,21 +1296,6 @@ def is_oversold_reversal_long(
         if exhaustion_wick:
             return False
 
-        # رفض تلقائي لو مفيش consolidation — حركة مفاجئة بدون تحضير
-        try:
-            lookback_start = max(0, idx - 10)
-            if idx > lookback_start + 3:
-                recent_highs = df["high"].iloc[lookback_start:idx].astype(float)
-                recent_lows  = df["low"].iloc[lookback_start:idx].astype(float)
-                range_high = float(recent_highs.max())
-                range_low  = float(recent_lows.min())
-                if range_low > 0:
-                    range_pct = ((range_high - range_low) / range_low) * 100
-                    if range_pct > 15.0:
-                        return False
-        except Exception:
-            pass
-
         bullish_close = close > open_
         gained_momentum = close >= prev_close
         rsi_turning = rsi_now <= OVERSOLD_REVERSAL_MAX_RSI and rsi_now >= prev_rsi
@@ -1337,7 +1325,7 @@ def is_oversold_reversal_long(
         if negative_funding:
             checks += 1
 
-        return checks >= 6
+        return checks >= 5
 
     except Exception:
         return False
@@ -2064,20 +2052,65 @@ def get_early_priority_momentum_bonus(priority: str) -> float:
     return 0.0
 
 
-def get_hybrid_label(score: float, winrate: float, trades: int) -> str:
+# =========================
+# SETUP TYPE SYSTEM
+# =========================
+def get_setup_family(candidate: dict) -> str:
+    if candidate.get("is_reverse"):
+        return "reverse"
+    if candidate.get("breakout"):
+        return "breakout"
+    if candidate.get("pre_breakout"):
+        return "pre_breakout"
+    return "continuation"
+
+
+def get_setup_volume_band(vol_ratio: float) -> str:
     try:
-        if trades < 10:
-            return f"⚪ HYBRID (No Data | {trades} trades)"
-
-        if winrate >= 70 and score >= 7.0:
-            return f"🔥 ELITE ({winrate:.0f}% | {trades} trades)"
-
-        if winrate >= 55 and score >= 6.5:
-            return f"🟢 GOOD ({winrate:.0f}% | {trades} trades)"
-
-        return f"⚠️ AVOID ({winrate:.0f}% | {trades} trades)"
+        v = float(vol_ratio or 0)
+        if v >= 1.80:
+            return "vol_high"
+        if v >= 1.25:
+            return "vol_mid"
+        return "vol_low"
     except Exception:
-        return "⚪ HYBRID (Unknown)"
+        return "vol_low"
+
+
+def get_setup_market_regime(market_state: str) -> str:
+    allowed = {"bull_market", "alt_season", "mixed", "btc_leading", "risk_off"}
+    value = str(market_state or "").strip()
+    return value if value in allowed else "mixed"
+
+
+def build_setup_type(candidate: dict) -> str:
+    try:
+        family = get_setup_family(candidate)
+        mtf = "mtf_yes" if candidate.get("mtf_confirmed") else "mtf_no"
+        vol_band = get_setup_volume_band(candidate.get("vol_ratio", 1.0))
+        market_regime = get_setup_market_regime(candidate.get("market_state"))
+        return f"{family}|{mtf}|{vol_band}|{market_regime}"
+    except Exception:
+        return "unknown"
+
+
+def get_hybrid_label_from_stats(setup_stats: dict) -> str:
+    try:
+        closed = int(setup_stats.get("closed", 0) or 0)
+        winrate = float(setup_stats.get("winrate", 0) or 0)
+
+        if closed < 5:
+            return f"⚪ No Data ({closed} trades)"
+
+        if winrate >= 70 and closed >= 15:
+            return f"🔥 ELITE ({winrate:.0f}% | {closed} trades)"
+
+        if winrate >= 55 and closed >= 8:
+            return f"🟢 GOOD ({winrate:.0f}% | {closed} trades)"
+
+        return f"⚠️ WEAK ({winrate:.0f}% | {closed} trades)"
+    except Exception:
+        return "⚪ No Data (0 trades)"
 
 
 def get_momentum_priority(
@@ -2537,8 +2570,7 @@ def build_message(
     opportunity_type="استمرار",
     entry_timing="🟡 متوسط (نص الحركة)",
     display_risk="🟡 متوسطة",
-    winrate=0.0,
-    total_trades=0,
+    setup_stats=None,
     is_reverse=False,
     reversal_4h_confirmed=False,
     reversal_4h_details="",
@@ -2606,11 +2638,7 @@ def build_message(
     reverse_block = f"\n{reverse_note}" if reverse_note else ""
 
     hybrid_label = html.escape(
-        get_hybrid_label(
-            score=float(score_result.get("score", 0)),
-            winrate=float(winrate or 0),
-            trades=int(total_trades or 0),
-        )
+        get_hybrid_label_from_stats(setup_stats or {})
     )
 
     header_block = f"{hybrid_label}\n\n" if hybrid_label else ""
@@ -2747,13 +2775,6 @@ def run_scanner_loop():
             update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
             winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
             logger.info(format_winrate_summary(winrate_summary))
-
-            global_winrate = float(winrate_summary.get("winrate", 0) or 0)
-            global_closed = int(
-                winrate_summary.get("closed", 0)
-                or winrate_summary.get("total_closed", 0)
-                or 0
-            )
 
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
@@ -2914,13 +2935,16 @@ def run_scanner_loop():
                 if not gaining_strength and not breakout and not pre_breakout:
                     effective_score -= 0.15
 
-                if dist_ma < -4.6 and not breakout and not pre_breakout:
+                if dist_ma < -4.6 and not breakout and not pre_breakout and not is_reverse:
                     effective_score -= 0.25
 
-                if dist_ma < -4.2 and candle_strength < 0.52 and not breakout and not pre_breakout:
+                if dist_ma < -4.2 and candle_strength < 0.52 and not breakout and not pre_breakout and not is_reverse:
                     effective_score -= 0.20
 
                 effective_score += get_early_priority_score_bonus(early_priority)
+
+                if breakout and vol_ratio >= 1.5:
+                    effective_score += 0.30
 
                 if is_reverse:
                     effective_score += OVERSOLD_REVERSAL_SCORE_BONUS
@@ -2936,10 +2960,10 @@ def run_scanner_loop():
                     gaining_strength=gaining_strength,
                 )
 
-                if dist_ma < -4.4 and not breakout and not pre_breakout:
+                if dist_ma < -4.4 and not breakout and not pre_breakout and not is_reverse:
                     dynamic_threshold += 0.15
 
-                if candle_strength < 0.45 and dist_ma < -4.0 and not breakout and not pre_breakout:
+                if candle_strength < 0.45 and dist_ma < -4.0 and not breakout and not pre_breakout and not is_reverse:
                     dynamic_threshold += 0.10
 
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
@@ -3017,8 +3041,8 @@ def run_scanner_loop():
                     )
                     continue
 
-                if not breakout and not pre_breakout and dist_ma > 5.0 and not is_reverse:
-                    logger.info(f"{symbol} → rejected (late move without breakout/pre-breakout)")
+                if not breakout and not pre_breakout and dist_ma > 6.2 and not is_reverse:
+                    logger.info(f"{symbol} → rejected (late move without breakout/pre-breakout | dist_ma={dist_ma:.2f})")
                     continue
 
                 candle_time = get_signal_candle_time(df)
@@ -3097,6 +3121,28 @@ def run_scanner_loop():
 
                 alert_id = build_alert_id(symbol, candle_time)
 
+                # بناء setup_type واسترجاع إحصائياته
+                setup_type_candidate = {
+                    "is_reverse": is_reverse,
+                    "breakout": breakout,
+                    "pre_breakout": pre_breakout,
+                    "mtf_confirmed": mtf_confirmed,
+                    "vol_ratio": vol_ratio,
+                    "market_state": market_state,
+                }
+                setup_type = build_setup_type(setup_type_candidate)
+                setup_stats = get_setup_type_stats(
+                    redis_client=r,
+                    market_type="futures",
+                    side="long",
+                    setup_type=setup_type,
+                )
+                logger.info(
+                    f"{symbol} → setup_type={setup_type} | "
+                    f"closed={setup_stats.get('closed', 0)} | "
+                    f"winrate={setup_stats.get('winrate', 0)}%"
+                )
+
                 candidate = {
                     "symbol": symbol,
                     "score": float(score_result["score"]),
@@ -3109,6 +3155,7 @@ def run_scanner_loop():
                     "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
                     "early_priority": early_priority,
                     "is_reverse": is_reverse,
+                    "setup_type": setup_type,
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3130,8 +3177,7 @@ def run_scanner_loop():
                         opportunity_type=opportunity_type,
                         entry_timing=entry_timing,
                         display_risk=display_risk,
-                        winrate=global_winrate,
-                        total_trades=global_closed,
+                        setup_stats=setup_stats,
                         is_reverse=is_reverse,
                         reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
                         reversal_4h_details=reversal_4h_result.get("details", ""),
@@ -3156,6 +3202,7 @@ def run_scanner_loop():
                         "opportunity_type": opportunity_type,
                         "early_priority": early_priority,
                         "is_reverse": is_reverse,
+                        "setup_type": setup_type,
                     },
                     "candle_time": candle_time,
                     "now": now,
@@ -3257,12 +3304,14 @@ def run_scanner_loop():
                         is_new=candidate["is_new"],
                         btc_dominance_proxy=candidate["btc_dominance_proxy"],
                         change_24h=candidate["change_24h"],
+                        setup_type=candidate.get("setup_type", "unknown"),
                     )
 
                     logger.info(
                         f"SENT LONG → {symbol} | score: {candidate['score']} | "
                         f"momentum: {candidate['momentum_priority']} | "
                         f"bucket: {candidate['bucket']} | reverse={candidate.get('is_reverse', False)} | "
+                        f"setup_type={candidate.get('setup_type', 'unknown')} | "
                         f"new={candidate['is_new']} | "
                         f"early_priority={candidate.get('early_priority', 'none')} | "
                         f"market={candidate['market_state']} | alt={candidate['alt_mode']} | "
