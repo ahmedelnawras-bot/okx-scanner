@@ -1282,6 +1282,31 @@ def is_oversold_reversal_long(
         candle_range = high - low
         body = abs(close - open_)
         body_ratio = (body / candle_range) if candle_range > 0 else 0.0
+        upper_wick = high - max(open_, close)
+
+        # رفض تلقائي لو exhaustion wick — spike مش reversal
+        exhaustion_wick = (
+            candle_range > 0
+            and upper_wick > body * 2.0
+            and upper_wick > candle_range * 0.4
+        )
+        if exhaustion_wick:
+            return False
+
+        # رفض تلقائي لو مفيش consolidation — حركة مفاجئة بدون تحضير
+        try:
+            lookback_start = max(0, idx - 10)
+            if idx > lookback_start + 3:
+                recent_highs = df["high"].iloc[lookback_start:idx].astype(float)
+                recent_lows  = df["low"].iloc[lookback_start:idx].astype(float)
+                range_high = float(recent_highs.max())
+                range_low  = float(recent_lows.min())
+                if range_low > 0:
+                    range_pct = ((range_high - range_low) / range_low) * 100
+                    if range_pct > 15.0:
+                        return False
+        except Exception:
+            pass
 
         bullish_close = close > open_
         gained_momentum = close >= prev_close
