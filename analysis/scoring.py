@@ -131,6 +131,33 @@ def calculate_long_score(
     candle_strength = body / full if full > 0 else 0.0
     rejection = full > 0 and upper_wick > body * 1.5
 
+    # ===================== EXHAUSTION WICK CHECK =====================
+    # wick علوي أكبر من 2x الـ body = spike/pump مش momentum حقيقي
+    exhaustion_wick = (
+        full > 0
+        and upper_wick > body * 2.0
+        and upper_wick > full * 0.4
+    )
+
+    # ===================== CONSOLIDATION CHECK =====================
+    # نشوف لو في تحضير حقيقي قبل الحركة (range ضيق = كويس)
+    consolidation_ok = True
+    try:
+        lookback_start = max(0, int(signal_row.name) - 10)
+        lookback_end = int(signal_row.name)
+        if lookback_end > lookback_start + 3:
+            recent_highs = df["high"].iloc[lookback_start:lookback_end].astype(float)
+            recent_lows  = df["low"].iloc[lookback_start:lookback_end].astype(float)
+            range_high = float(recent_highs.max())
+            range_low  = float(recent_lows.min())
+            if range_low > 0:
+                range_pct = ((range_high - range_low) / range_low) * 100
+                # لو الـ range أكبر من 15% في 10 شمعات = spike مش consolidation
+                if range_pct > 15.0:
+                    consolidation_ok = False
+    except Exception:
+        consolidation_ok = True
+
     # ===================== BASIC SCORING =====================
     if 52 <= rsi <= 70 and rsi_momentum > 3:
         score += 1.8
@@ -183,6 +210,16 @@ def calculate_long_score(
     if rejection:
         score -= 1.0
         warning_reasons.append("رفض سعري علوي")
+
+    # عقوبة الـ exhaustion wick — spike بدون استمرارية
+    if exhaustion_wick:
+        score -= 1.5
+        warning_reasons.append("wick انفجاري — exhaustion محتمل")
+
+    # عقوبة غياب الـ consolidation — حركة مفاجئة بدون تحضير
+    if not consolidation_ok and not breakout and not pre_breakout:
+        score -= 1.0
+        warning_reasons.append("حركة مفاجئة بدون تحضير")
 
     if breakout:
         score += 1.5
@@ -293,6 +330,14 @@ def calculate_long_score(
         fake_signal = True
 
     if rejection and candle_strength < 0.48:
+        fake_signal = True
+
+    # spike exhaustion = fake signal تلقائي
+    if exhaustion_wick:
+        fake_signal = True
+
+    # حركة مفاجئة بدون تحضير = fake signal إلا لو breakout حقيقي
+    if not consolidation_ok and not breakout and not pre_breakout:
         fake_signal = True
 
     if close <= ma * 0.997 and not breakout and not pre_breakout:
