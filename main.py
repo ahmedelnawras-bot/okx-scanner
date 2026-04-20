@@ -3214,6 +3214,8 @@ def run_scanner_loop():
                         candle_time=candidate["candle_time"],
                         entry=candidate["entry"],
                         sl=candidate["sl"],
+                        tp1=candidate["tp1"],
+                        tp2=candidate["tp2"],
                         score=candidate["score"],
                         timeframe=TIMEFRAME,
                         btc_mode=btc_mode,
