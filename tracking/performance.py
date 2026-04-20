@@ -169,6 +169,8 @@ def register_trade(
     is_new: bool = False,
     btc_dominance_proxy: str = "🟡 محايد",
     change_24h: float = 0.0,
+    tp1: float = None,
+    tp2: float = None,
 ):
     if redis_client is None:
         return False
@@ -178,8 +180,9 @@ def register_trade(
 
     entry = round(float(entry), 6)
     sl = round(float(sl), 6)
-    tp1 = calc_tp1(entry, sl, side=side)
-    tp2 = calc_tp2(entry, sl, side=side)
+    # لو tp1/tp2 اتبعتوا من main.py نستخدمهم — لو لأ نحسبهم بالطريقة الافتراضية
+    tp1 = round(float(tp1), 6) if tp1 is not None else calc_tp1(entry, sl, side=side)
+    tp2 = round(float(tp2), 6) if tp2 is not None else calc_tp2(entry, sl, side=side)
 
     trade_key = get_trade_key(market_type, side, symbol, candle_time)
     open_set_key = get_open_trades_set_key(market_type, side)
@@ -722,12 +725,10 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"📊 {title}\n"
         f"Signals: {summary['total']}\n"
         f"Closed: {decided}\n"
-        f"Wins: {summary['wins']}\n"
-        f"• TP1 Wins: {summary.get('tp1_wins', 0)}\n"
-        f"• TP2 Wins: {summary.get('tp2_wins', 0)}\n"
+        f"Wins (TP1+): {summary['wins']}\n"
+        f"• Full Wins (TP2): {summary.get('tp2_wins', 0)}\n"
+        f"• TP1 Only: {summary.get('tp1_wins', 0)}\n"
         f"Losses: {summary['losses']}\n"
-        f"TP1 hits: {summary['tp1_hits']}\n"
-        f"TP1 rate: {summary.get('tp1_rate', 0)}%\n"
         f"Expired: {summary['expired']}\n"
         f"Open: {summary['open']}\n"
         f"Win rate: {summary['winrate']}%"
