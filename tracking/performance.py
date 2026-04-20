@@ -6,7 +6,8 @@ import requests
 logger = logging.getLogger("okx-scanner")
 
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
-TRADE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
+TRADE_TTL_SECONDS = 60 * 60 * 24 * 30       # 30 days — للتقارير العادية
+TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90  # 90 days — للـ Hybrid Label history
 
 
 def safe_float(value, default=0.0):
@@ -50,6 +51,16 @@ def get_stats_key(market_type: str = "futures", side: str = "long") -> str:
 
 def get_all_trades_set_key() -> str:
     return "trades:all"
+
+
+def get_trade_history_key(market_type: str, side: str, symbol: str, candle_time: int) -> str:
+    """
+    Key منفصل للـ Hybrid Label history.
+    لا يتأثر بـ reset_stats — TTL 90 يوم.
+    """
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+    return f"trade_history:{market_type}:{side}:{symbol}:{candle_time}"
 
 
 def calc_tp1(entry: float, sl: float, side: str = "long") -> float:
@@ -171,6 +182,7 @@ def register_trade(
     change_24h: float = 0.0,
     tp1: float = None,
     tp2: float = None,
+    setup_type: str = None,
 ):
     if redis_client is None:
         return False
@@ -180,11 +192,11 @@ def register_trade(
 
     entry = round(float(entry), 6)
     sl = round(float(sl), 6)
-    # لو tp1/tp2 اتبعتوا من main.py نستخدمهم — لو لأ نحسبهم بالطريقة الافتراضية
     tp1 = round(float(tp1), 6) if tp1 is not None else calc_tp1(entry, sl, side=side)
     tp2 = round(float(tp2), 6) if tp2 is not None else calc_tp2(entry, sl, side=side)
 
     trade_key = get_trade_key(market_type, side, symbol, candle_time)
+    history_key = get_trade_history_key(market_type, side, symbol, candle_time)
     open_set_key = get_open_trades_set_key(market_type, side)
     all_trades_key = get_all_trades_set_key()
 
@@ -241,6 +253,9 @@ def register_trade(
         "is_new": bool(is_new),
         "btc_dominance_proxy": btc_dominance_proxy,
         "change_24h": round(float(change_24h), 2),
+
+        # setup type للـ Hybrid Label
+        "setup_type": setup_type or "unknown",
     }
 
     try:
@@ -256,6 +271,29 @@ def register_trade(
 
         redis_client.sadd(open_set_key, trade_key)
         redis_client.sadd(all_trades_key, trade_key)
+
+        # كتابة trade_history — لا يتأثر بـ reset_stats
+        history_data = {
+            "symbol": symbol,
+            "market_type": market_type,
+            "side": side,
+            "setup_type": setup_type or "unknown",
+            "score": round(float(score), 2),
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "created_at": now_ts,
+            "status": "open",
+            "result": None,
+            "tp1_hit": False,
+        }
+        redis_client.set(
+            history_key,
+            json.dumps(history_data, ensure_ascii=False),
+            ex=TRADE_HISTORY_TTL_SECONDS,
+        )
+
         return True
 
     except Exception as e:
@@ -328,6 +366,26 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         elif result == "expired":
             redis_client.hincrby(stats_key, "expired", 1)
 
+        # تحديث trade_history بالنتيجة النهائية
+        try:
+            symbol = trade_data.get("symbol", "")
+            candle_time = trade_data.get("candle_time", 0)
+            history_key = get_trade_history_key(market_type, side, symbol, candle_time)
+            raw_history = redis_client.get(history_key)
+            if raw_history:
+                history_data = json.loads(raw_history)
+                history_data["status"] = "closed"
+                history_data["result"] = result
+                history_data["tp1_hit"] = bool(trade_data.get("tp1_hit", False))
+                history_data["closed_at"] = int(time.time())
+                redis_client.set(
+                    history_key,
+                    json.dumps(history_data, ensure_ascii=False),
+                    ex=TRADE_HISTORY_TTL_SECONDS,
+                )
+        except Exception as he:
+            logger.warning(f"mark_trade_closed: failed to update history key: {he}")
+
         return True
 
     except Exception as e:
@@ -354,7 +412,26 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         stats_key = get_stats_key(market_type, side)
         redis_client.hincrby(stats_key, "tp1_hits", 1)
 
-        return save_trade(redis_client, trade_key, trade_data)
+        ok = save_trade(redis_client, trade_key, trade_data)
+
+        # تحديث tp1_hit في trade_history
+        try:
+            symbol = trade_data.get("symbol", "")
+            candle_time = trade_data.get("candle_time", 0)
+            history_key = get_trade_history_key(market_type, side, symbol, candle_time)
+            raw_history = redis_client.get(history_key)
+            if raw_history:
+                history_data = json.loads(raw_history)
+                history_data["tp1_hit"] = True
+                redis_client.set(
+                    history_key,
+                    json.dumps(history_data, ensure_ascii=False),
+                    ex=TRADE_HISTORY_TTL_SECONDS,
+                )
+        except Exception as he:
+            logger.warning(f"mark_tp1_hit: failed to update history key: {he}")
+
+        return ok
     except Exception as e:
         logger.error(f"mark_tp1_hit error on {trade_key}: {e}")
         return False
@@ -491,6 +568,83 @@ def update_open_trades(
             logger.info(f"{symbol} → trade closed as {result}")
         elif state_changed:
             logger.info(f"{symbol} → trade updated")
+
+
+def get_setup_type_stats(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+    setup_type: str = None,
+) -> dict:
+    """
+    يقرأ من trade_history (مش trade) — محمي من الـ reset.
+    يرجع إحصائيات الـ setup_type للـ Hybrid Label.
+    """
+    summary = {
+        "setup_type": setup_type,
+        "total": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "expired": 0,
+        "tp1_hits": 0,
+        "winrate": 0.0,
+        "tp1_rate": 0.0,
+    }
+
+    if not redis_client or not setup_type:
+        return summary
+
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+
+    try:
+        pattern = f"trade_history:{market_type}:{side}:*"
+        for key in redis_client.scan_iter(pattern):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+
+            try:
+                trade = json.loads(raw)
+            except Exception:
+                continue
+
+            if str(trade.get("setup_type", "unknown")) != str(setup_type):
+                continue
+
+            summary["total"] += 1
+
+            status = str(trade.get("status", "")).lower().strip()
+            result = str(trade.get("result", "") or "").lower().strip()
+            tp1_hit = bool(trade.get("tp1_hit", False))
+
+            if tp1_hit:
+                summary["tp1_hits"] += 1
+
+            if result in ("tp1_win", "tp2_win", "loss", "expired"):
+                summary["closed"] += 1
+
+            if result in ("tp1_win", "tp2_win"):
+                summary["wins"] += 1
+            elif result == "loss":
+                summary["losses"] += 1
+            elif result == "expired":
+                summary["expired"] += 1
+
+        if summary["closed"] > 0:
+            summary["winrate"] = round(
+                (summary["wins"] / summary["closed"]) * 100, 2
+            )
+            summary["tp1_rate"] = round(
+                (summary["tp1_hits"] / summary["closed"]) * 100, 2
+            )
+
+        return summary
+
+    except Exception as e:
+        logger.error(f"get_setup_type_stats error: {e}")
+        return summary
 
 
 def get_winrate_summary(redis_client, market_type: str = "futures", side: str = "long"):
