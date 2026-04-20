@@ -86,6 +86,7 @@ def calculate_long_score(
     market_state=None,
     alt_mode=None,
     market_bias_label=None,
+    is_reverse=False,
 ):
     funding_label = classify_funding_simple(funding)
 
@@ -147,8 +148,11 @@ def calculate_long_score(
         score -= 0.9
         reasons.append("RSI عالي (تشبع شراء)")
         warning_reasons.append("RSI عالي (تشبع شراء)")
-    elif rsi < 48:
+    elif rsi < 48 and not is_reverse:
         score -= 0.7
+    elif rsi <= 32 and is_reverse:
+        score += 0.5   # oversold شديد على 15m = فرصة reversal أقوى
+        reasons.append("RSI oversold شديد (فرصة ارتداد)")
 
     if vol_ratio >= 2.0:
         score += 2.5
@@ -163,6 +167,8 @@ def calculate_long_score(
     if close > ma:
         score += 1.0
         reasons.append("فوق المتوسط")
+    elif is_reverse:
+        pass   # تحت MA في الـ reversal = طبيعي، مش عقوبة
     else:
         score -= 0.8
         warning_reasons.append("أسفل المتوسط")
