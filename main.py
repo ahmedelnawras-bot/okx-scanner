@@ -1510,6 +1510,9 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
     except Exception as e:
         logger.error(f"is_4h_oversold_confirmed error on {symbol}: {e}")
         return {"confirmed": False, "checks": 0, "details": "خطأ في التحقق"}
+
+
+def get_btc_mode():
     try:
         candles = get_candles("BTC-USDT-SWAP", "1H", 100)
         df = to_dataframe(candles)
