@@ -252,7 +252,7 @@ def is_global_cooldown_active() -> bool:
     if not r:
         return False
     try:
-        return bool(r.exists("global_cooldown"))
+        return bool(r.exists("global_cooldown:long"))
     except Exception:
         return False
 
@@ -261,7 +261,7 @@ def set_global_cooldown() -> None:
     if not r:
         return
     try:
-        r.set("global_cooldown", "1", ex=GLOBAL_COOLDOWN_SECONDS)
+        r.set("global_cooldown:long", "1", ex=GLOBAL_COOLDOWN_SECONDS)
     except Exception:
         pass
 
@@ -1046,18 +1046,45 @@ def get_ranked_pairs():
             item["_rank_change_24h"] = change_24h
             filtered.append(item)
 
-        # ترتيب: الأكثر هبوطاً أولاً (للكشف عن reversal) + volume
-        filtered.sort(
-            key=lambda x: (x.get("_rank_change_24h", 0), x.get("_rank_volume_24h", 0)),
-            reverse=False,
-        )
-        # خد الـ top من الأكثر هبوطاً + أضف top volume
-        bottom_n = filtered[:SCAN_LIMIT // 2]
-        top_vol = sorted(filtered, key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)[:SCAN_LIMIT // 2]
+        # توزيع متوازن: volume + momentum + reversal + new listings
+        by_volume   = sorted(filtered, key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)
+        by_momentum = sorted(filtered, key=lambda x: x.get("_rank_change_24h", 0), reverse=True)
+        by_reversal = sorted(filtered, key=lambda x: x.get("_rank_change_24h", 0), reverse=False)
+
+        n_vol      = int(SCAN_LIMIT * 0.35)
+        n_momentum = int(SCAN_LIMIT * 0.25)
+        n_reversal = int(SCAN_LIMIT * 0.25)
+        n_new      = SCAN_LIMIT - n_vol - n_momentum - n_reversal
 
         seen = set()
         merged = []
-        for item in bottom_n + top_vol:
+
+        for item in by_volume[:n_vol]:
+            sid = item.get("instId", "")
+            if sid not in seen:
+                seen.add(sid)
+                merged.append(item)
+
+        for item in by_momentum[:n_momentum * 2]:
+            if len([x for x in merged if x.get("_rank_change_24h", 0) > 0]) >= n_momentum:
+                break
+            sid = item.get("instId", "")
+            if sid not in seen and item.get("_rank_change_24h", 0) > 0:
+                seen.add(sid)
+                merged.append(item)
+
+        for item in by_reversal[:n_reversal * 2]:
+            if len([x for x in merged if x.get("_rank_change_24h", 0) < 0]) >= n_reversal:
+                break
+            sid = item.get("instId", "")
+            if sid not in seen:
+                seen.add(sid)
+                merged.append(item)
+
+        # fill remaining من top volume
+        for item in by_volume:
+            if len(merged) >= SCAN_LIMIT:
+                break
             sid = item.get("instId", "")
             if sid not in seen:
                 seen.add(sid)
@@ -2102,7 +2129,7 @@ def get_hybrid_label_from_stats(setup_stats: dict) -> str:
         closed = int(setup_stats.get("closed", 0) or 0)
         winrate = float(setup_stats.get("winrate", 0) or 0)
 
-        if closed < 5:
+        if closed < 8:
             return f"⚪ No Data ({closed} trades)"
 
         if winrate >= 70 and closed >= 15:
@@ -2887,6 +2914,16 @@ def run_scanner_loop():
             winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
             logger.info(format_winrate_summary(winrate_summary))
 
+            # جلب reset_ts لفلترة الـ Hybrid Label
+            stats_reset_ts = None
+            if r:
+                try:
+                    raw_reset = r.get(STATS_RESET_TS_KEY)
+                    if raw_reset:
+                        stats_reset_ts = int(raw_reset)
+                except Exception:
+                    pass
+
             ranked_pairs = get_ranked_pairs()
             btc_mode = get_btc_mode()
 
@@ -3256,6 +3293,7 @@ def run_scanner_loop():
                     market_type="futures",
                     side="long",
                     setup_type=setup_type,
+                    since_ts=stats_reset_ts,
                 )
                 logger.info(
                     f"{symbol} → setup_type={setup_type} | "
