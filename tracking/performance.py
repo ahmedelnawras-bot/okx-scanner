@@ -575,10 +575,12 @@ def get_setup_type_stats(
     market_type: str = "futures",
     side: str = "long",
     setup_type: str = None,
+    since_ts: int = None,
 ) -> dict:
     """
     يقرأ من trade_history (مش trade) — محمي من الـ reset.
     يرجع إحصائيات الـ setup_type للـ Hybrid Label.
+    since_ts: يفلتر الـ trades القديمة قبل آخر reset.
     """
     summary = {
         "setup_type": setup_type,
@@ -612,6 +614,12 @@ def get_setup_type_stats(
 
             if str(trade.get("setup_type", "unknown")) != str(setup_type):
                 continue
+
+            # فلتر الـ trades القديمة قبل آخر reset
+            if since_ts is not None:
+                created_at = int(trade.get("created_at", 0) or 0)
+                if created_at < since_ts:
+                    continue
 
             summary["total"] += 1
 
