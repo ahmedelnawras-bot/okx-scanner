@@ -50,7 +50,7 @@ SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-FINAL_MIN_SCORE = 6.3
+FINAL_MIN_SCORE = 6.5
 PRE_BREAKOUT_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 3
 
@@ -1441,22 +1441,29 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
     """
     تأكيد 4H خاص للـ Oversold Reversal.
     بيشوف:
-    1. RSI على 4H تحت 35 (oversold حقيقي)
-    2. السعر تحت MA20 على 4H (امتداد هبوطي)
-    3. آخر شمعة 4H إما هامر أو بولنجر صاعد (بداية رد)
-    يرجع dict فيه: confirmed (bool) + details للرسالة
+    1) RSI على 4H تحت 35
+    2) السعر تحت MA20 على 4H
+    3) آخر شمعة 4H فيها إشارة ارتداد واضحة
     """
     try:
         candles = get_candles(symbol, "4H", 60)
         df = to_dataframe(candles)
 
         if df is None or df.empty or len(df) < 20:
-            return {"confirmed": False, "checks": 0, "details": "بيانات 4H غير كافية"}
+            return {
+                "confirmed": False,
+                "checks": 0,
+                "details": f"• فريم {rtl_fix('4H')}: البيانات غير كافية"
+            }
 
         signal_row = get_signal_row(df)
         idx = signal_row.name
         if idx is None or idx < 3:
-            return {"confirmed": False, "checks": 0, "details": "index غير كافي"}
+            return {
+                "confirmed": False,
+                "checks": 0,
+                "details": f"• فريم {rtl_fix('4H')}: المؤشر الزمني غير كافٍ"
+            }
 
         close  = _safe_float(signal_row["close"])
         open_  = _safe_float(signal_row["open"])
@@ -1471,25 +1478,15 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
         upper_wick   = high - max(open_, close)
 
         checks = 0
-        details_parts = []
 
-        # ١. RSI oversold على 4H
         rsi_ok = rsi_4h <= 35
         if rsi_ok:
             checks += 1
-            details_parts.append(f"RSI 4H={rsi_4h:.0f} ✅")
-        else:
-            details_parts.append(f"RSI 4H={rsi_4h:.0f} ⚠️")
 
-        # ٢. السعر تحت MA20 على 4H
         below_ma = close < ma_4h
         if below_ma:
             checks += 1
-            details_parts.append("تحت MA20 4H ✅")
-        else:
-            details_parts.append("فوق MA20 4H ⚠️")
 
-        # ٣. شمعة رد على 4H: هامر أو بولنجر صاعد
         hammer = (
             candle_range > 0
             and lower_wick >= body * 1.8
@@ -1504,13 +1501,15 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
         reversal_candle = hammer or bullish_engulf
         if reversal_candle:
             checks += 1
-            label = "هامر" if hammer else "بولنجر صاعد"
-            details_parts.append(f"شمعة رد ({label}) 4H ✅")
-        else:
-            details_parts.append("لا شمعة رد على 4H ⚠️")
 
         confirmed = checks >= 2
-        details   = " | ".join(details_parts)
+
+        details_lines = [
+            f"• فريم {rtl_fix('4H')} RSI: {fmt_num(rsi_4h, 0)} {'✅' if rsi_ok else '⚠️'}",
+            f"• فريم {rtl_fix('4H')}: السعر {'أسفل' if below_ma else 'ليس أسفل'} {rtl_fix('MA20')} {'✅' if below_ma else '⚠️'}",
+            f"• فريم {rtl_fix('4H')}: {'توجد شمعة ارتداد واضحة' if reversal_candle else 'لا توجد شمعة ارتداد واضحة'} {'✅' if reversal_candle else '⚠️'}",
+        ]
+        details = "\n".join(details_lines)
 
         logger.info(
             f"4H OVERSOLD CHECK | {symbol} | "
@@ -1522,7 +1521,11 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
 
     except Exception as e:
         logger.error(f"is_4h_oversold_confirmed error on {symbol}: {e}")
-        return {"confirmed": False, "checks": 0, "details": "خطأ في التحقق"}
+        return {
+            "confirmed": False,
+            "checks": 0,
+            "details": f"• فريم {rtl_fix('4H')}: حدث خطأ أثناء التحقق"
+        }
 
 
 def get_btc_mode():
@@ -2527,6 +2530,100 @@ def build_market_summary(btc_mode: str, alt_mode: str) -> str:
 
 
 # =========================
+# RTL / FORMAT HELPERS
+# =========================
+def rtl_fix(text: str) -> str:
+    """
+    يضيف Right-to-Left Mark لتحسين عرض النص المختلط
+    عربي/إنجليزي داخل تيليجرام (4H / 15m / MA20 / أرقام).
+    """
+    try:
+        if text is None:
+            return ""
+        return f"\u200F{text}"
+    except Exception:
+        return str(text)
+
+
+def fmt_num(value, decimals=2) -> str:
+    """تنسيق رقم مع RTL fix."""
+    try:
+        return rtl_fix(f"{float(value):.{int(decimals)}f}")
+    except Exception:
+        return rtl_fix(str(value))
+
+
+def fmt_pct(value, decimals=2) -> str:
+    """تنسيق نسبة مئوية مع إشارة + RTL fix."""
+    try:
+        return rtl_fix(f"{float(value):+.{int(decimals)}f}%")
+    except Exception:
+        return rtl_fix(str(value))
+
+
+def get_breakout_quality(df, vol_ratio: float) -> str:
+    """
+    تقييم جودة الـ breakout: strong / ok / weak / none
+    للعرض في الرسالة كمعلومة إضافية للتريدر.
+    لا يؤثر على الـ score أو الـ filtering.
+    """
+    try:
+        if df is None or df.empty or len(df) < 5:
+            return "none"
+
+        signal_row = get_signal_row(df)
+        idx = signal_row.name
+        if idx is None or idx < 3:
+            return "none"
+
+        close  = _safe_float(signal_row["close"])
+        open_  = _safe_float(signal_row["open"])
+        high   = _safe_float(signal_row["high"])
+        low    = _safe_float(signal_row["low"])
+
+        candle_range = high - low
+        if candle_range <= 0:
+            return "none"
+
+        body = abs(close - open_)
+        upper_wick = high - max(open_, close)
+        close_position = (close - low) / candle_range
+
+        # recent high للمقارنة
+        lookback_start = max(0, idx - 20)
+        recent_high = float(df["high"].iloc[lookback_start:idx].max())
+
+        bullish_close = close > open_
+        broke_above = close > recent_high
+        strong_close = close_position >= 0.65
+        ok_close = close_position >= 0.50
+        small_wick = upper_wick <= body * 0.6
+        vol_ok = vol_ratio >= 1.3
+
+        if not bullish_close or not broke_above:
+            return "none"
+
+        score = 0
+        if strong_close:
+            score += 2
+        elif ok_close:
+            score += 1
+        if small_wick:
+            score += 1
+        if vol_ok:
+            score += 1
+
+        if score >= 4:
+            return "strong"
+        if score >= 2:
+            return "ok"
+        return "weak"
+
+    except Exception:
+        return "none"
+
+
+# =========================
 # SL / TP LOGIC
 # =========================
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
@@ -2574,6 +2671,7 @@ def build_message(
     is_reverse=False,
     reversal_4h_confirmed=False,
     reversal_4h_details="",
+    breakout_quality="none",
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -2599,7 +2697,6 @@ def build_message(
     funding_text = score_result.get("funding_label", "🟡 محايد")
     signal_rating = score_result.get("signal_rating", "⚡ عادي")
     sl_pct = calculate_sl_percent(price, stop_loss)
-
     tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
     tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
 
@@ -2607,35 +2704,49 @@ def build_message(
     reverse_banner = get_reverse_banner_long(is_reverse)
     reverse_note = get_reverse_style_note_long(is_reverse)
 
-    # بلوك تأكيد/تحذير 4H للـ Oversold Reversal
+    # RTL tokens
+    safe_4h  = rtl_fix("4H")
+    safe_15m = rtl_fix("15m")
+    safe_1h  = rtl_fix("1H")
+    safe_24h = rtl_fix("24H")
+
+    # بلوك 4H للـ Oversold Reversal
     if is_reverse:
         if reversal_4h_confirmed:
             reversal_4h_block = (
-                f"\n✅ <b>4H مؤكد:</b> {html.escape(reversal_4h_details)}"
+                f"\n✅ <b>تأكيد فريم {safe_4h}:</b>\n"
+                f"{reversal_4h_details}"
             )
         else:
             reversal_4h_block = (
-                f"\n🔴 <b>تحذير: 4H غير مؤكد</b>\n"
-                f"• {html.escape(reversal_4h_details)}\n"
-                f"• مخاطرة أعلى — راجع شارت 4H قبل الدخول"
+                f"\n🔴 <b>تحذير فريم {safe_4h}:</b> غير مؤكد\n"
+                f"{reversal_4h_details}\n"
+                f"• مخاطرة أعلى — راجع شارت {safe_4h} قبل الدخول"
             )
     else:
         reversal_4h_block = ""
 
-    safe_symbol = html.escape(symbol_clean)
-    safe_market = html.escape(build_market_summary(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
-    safe_funding = html.escape(funding_text)
-    safe_rating = html.escape(signal_rating)
-    safe_tv_link = html.escape(tv_link, quote=True)
-    safe_opportunity_type = html.escape(opportunity_type)
-    safe_entry_timing = html.escape(entry_timing)
-    safe_display_risk = html.escape(display_risk)
+    # بلوك جودة الـ breakout
+    bq_map = {
+        "strong": f"🟢 كسر قوي",
+        "ok":     f"🟡 كسر مقبول",
+        "weak":   f"🔴 كسر ضعيف — تحقق قبل الدخول",
+    }
+    bq_label = bq_map.get(breakout_quality, "")
+    breakout_quality_block = f"\n🧩 <b>جودة الكسر:</b> {bq_label}" if bq_label else ""
 
-    change_24h_text = f"{change_24h:+.2f}%"
+    safe_symbol           = html.escape(symbol_clean)
+    safe_market           = html.escape(build_market_summary(btc_mode=btc_mode, alt_mode=alt_mode or "🟡 متماسك"))
+    safe_funding          = html.escape(funding_text)
+    safe_rating           = html.escape(signal_rating)
+    safe_tv_link          = html.escape(tv_link, quote=True)
+    safe_opportunity_type = html.escape(opportunity_type)
+    safe_entry_timing     = html.escape(entry_timing)
+    safe_display_risk     = html.escape(display_risk)
 
     warnings_block = f"\n\n⚠️ <b>ملاحظات:</b>\n{warnings_text}" if warnings_text else ""
-    news_block = f"\n\n{news_warning}" if news_warning else ""
-    reverse_block = f"\n{reverse_note}" if reverse_note else ""
+    news_block     = f"\n\n{news_warning}" if news_warning else ""
+    reverse_block  = f"\n{reverse_note}" if reverse_note else ""
 
     hybrid_label = html.escape(
         get_hybrid_label_from_stats(setup_stats or {})
@@ -2645,21 +2756,21 @@ def build_message(
     if reverse_banner:
         header_block += f"{reverse_banner}\n\n"
 
-    return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
+    return f'''{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 
-💰 <b>السعر:</b> {price:.6f} | ⏱ <b>الفريم:</b> 15m
-⭐ <b>السكور:</b> {score_result["score"]:.1f} / 10
+💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
+⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
 
-🎯 <b>TP1:</b> {tp1:.6f} (+{tp1_pct}% | {rr1}R)
-🏁 <b>TP2:</b> {tp2:.6f} (+{tp2_pct}% | {rr2}R)
-🛑 <b>SL:</b> {stop_loss:.6f} (-{sl_pct}%)
+🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")})
+🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")})
+🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
 
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}
 
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
-📈 <b>تغير 24H:</b> {change_24h_text}{new_tag}
+📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
 
 📊 <b>أسباب الدخول:</b>
 {bullish_text}{warnings_block}{news_block}
@@ -2667,7 +2778,7 @@ def build_message(
 📍 <b>الدخول:</b> {safe_entry_timing}
 ⚖️ <b>المخاطرة:</b> {safe_display_risk}
 
-🔗 <a href="{safe_tv_link}">Open Chart (15m / 1H)</a>"""
+🔗 <a href="{safe_tv_link}">Open Chart ({safe_15m} / {safe_1h})</a>'''
 
 
 # =========================
@@ -2844,6 +2955,7 @@ def run_scanner_loop():
                 dist_ma = get_distance_from_ma_percent(df)
                 candle_strength = get_candle_strength_ratio(df)
                 gaining_strength = is_gaining_intraday_strength(df)
+                breakout_quality = get_breakout_quality(df, vol_ratio)
 
                 is_reverse = is_oversold_reversal_long(
                     df=df,
@@ -3107,6 +3219,14 @@ def run_scanner_loop():
                 base_risk = get_base_risk_label(score_result, warnings_count)
                 display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
 
+                # رفض الإشارات المتأخرة + عالية المخاطرة بدون breakout
+                if "🔴 متأخر" in entry_timing and "🔴 عالية" in display_risk and not breakout:
+                    logger.info(
+                        f"{symbol} → rejected (late + high risk + no breakout | "
+                        f"dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f})"
+                    )
+                    continue
+
                 momentum_priority = get_momentum_priority(
                     score=float(score_result["score"]),
                     breakout=breakout,
@@ -3181,6 +3301,7 @@ def run_scanner_loop():
                         is_reverse=is_reverse,
                         reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
                         reversal_4h_details=reversal_4h_result.get("details", ""),
+                        breakout_quality=breakout_quality,
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
