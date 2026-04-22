@@ -236,6 +236,29 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
 
         "news_titles": normalize_list(extra_fields.get("news_titles", [])),
         "warning_reasons": normalize_list(extra_fields.get("warning_reasons", [])),
+
+        # pullback fields
+        "pullback_entry": (
+            round(float(extra_fields.get("pullback_entry")), 6)
+            if extra_fields.get("pullback_entry") is not None
+            else None
+        ),
+        "pullback_low": (
+            round(float(extra_fields.get("pullback_low")), 6)
+            if extra_fields.get("pullback_low") is not None
+            else None
+        ),
+        "pullback_high": (
+            round(float(extra_fields.get("pullback_high")), 6)
+            if extra_fields.get("pullback_high") is not None
+            else None
+        ),
+        "pullback_triggered": normalize_bool(extra_fields.get("pullback_triggered", False)),
+        "effective_entry": (
+            round(float(extra_fields.get("effective_entry")), 6)
+            if extra_fields.get("effective_entry") is not None
+            else None
+        ),
     }
 
     return diagnostics
@@ -286,6 +309,13 @@ def build_history_snapshot(trade_data: dict) -> dict:
 
         "warning_reasons": normalize_list(trade_data.get("warning_reasons", [])),
         "news_titles": normalize_list(diagnostics.get("news_titles", [])),
+
+        # pullback snapshot
+        "pullback_entry": diagnostics.get("pullback_entry"),
+        "pullback_low": diagnostics.get("pullback_low"),
+        "pullback_high": diagnostics.get("pullback_high"),
+        "pullback_triggered": diagnostics.get("pullback_triggered", False),
+        "effective_entry": diagnostics.get("effective_entry"),
     }
 
 
@@ -340,6 +370,11 @@ def register_trade(
     has_high_impact_news: bool = False,
     news_titles=None,
     warning_reasons=None,
+
+    # === pullback fields ===
+    pullback_entry: float = None,
+    pullback_low: float = None,
+    pullback_high: float = None,
 ):
     if redis_client is None:
         return False
@@ -351,6 +386,10 @@ def register_trade(
     sl = round(float(sl), 6)
     tp1 = round(float(tp1), 6) if tp1 is not None else calc_tp1(entry, sl, side=side)
     tp2 = round(float(tp2), 6) if tp2 is not None else calc_tp2(entry, sl, side=side)
+
+    pullback_entry = round(float(pullback_entry), 6) if pullback_entry is not None else None
+    pullback_low = round(float(pullback_low), 6) if pullback_low is not None else None
+    pullback_high = round(float(pullback_high), 6) if pullback_high is not None else None
 
     trade_key = get_trade_key(market_type, side, symbol, candle_time)
     history_key = get_trade_history_key(market_type, side, symbol, candle_time)
@@ -390,6 +429,11 @@ def register_trade(
         "has_high_impact_news": has_high_impact_news,
         "news_titles": news_titles or [],
         "warning_reasons": warning_reasons or [],
+        "pullback_entry": pullback_entry,
+        "pullback_low": pullback_low,
+        "pullback_high": pullback_high,
+        "pullback_triggered": False,
+        "effective_entry": pullback_entry if pullback_entry is not None else entry,
     })
 
     trade_data = {
@@ -575,10 +619,13 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         if trade_data.get("tp1_hit"):
             return True
 
+        diagnostics = trade_data.get("diagnostics", {}) or {}
+        effective_entry = safe_float(diagnostics.get("effective_entry"), safe_float(trade_data.get("entry"), 0.0))
+
         trade_data["tp1_hit"] = True
         trade_data["tp1_hit_at"] = int(time.time())
         trade_data["status"] = "partial"
-        trade_data["sl"] = trade_data["entry"]
+        trade_data["sl"] = round(effective_entry, 6) if effective_entry > 0 else trade_data["entry"]
         trade_data["updated_at"] = int(time.time())
 
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
@@ -600,6 +647,11 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
 # =========================
 def evaluate_trade_on_candle(trade: dict, candle: dict):
     side = normalize_side(trade.get("side", "long"))
+    diagnostics = trade.get("diagnostics", {}) or {}
+
+    entry = safe_float(trade.get("entry"), 0.0)
+    effective_entry = safe_float(diagnostics.get("effective_entry"), entry)
+
     sl = safe_float(trade["sl"])
     tp1 = safe_float(trade["tp1"])
     tp2 = safe_float(trade["tp2"])
@@ -610,6 +662,30 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
 
     result = None
     tp1_now = False
+
+    # pullback logic
+    pullback_entry = diagnostics.get("pullback_entry")
+    pullback_high = diagnostics.get("pullback_high")
+    pullback_triggered = normalize_bool(diagnostics.get("pullback_triggered", False))
+
+    if (
+        side == "long"
+        and not pullback_triggered
+        and pullback_entry is not None
+        and pullback_high is not None
+    ):
+        pb_entry = safe_float(pullback_entry, 0.0)
+        pb_high = safe_float(pullback_high, 0.0)
+
+        if pb_entry > 0 and pb_high > 0 and low <= pb_high:
+            diagnostics["pullback_triggered"] = True
+            diagnostics["effective_entry"] = pb_entry
+            trade["diagnostics"] = diagnostics
+
+            if trade.get("tp1_hit"):
+                trade["sl"] = round(pb_entry, 6)
+
+            effective_entry = pb_entry
 
     if side == "long":
         if not tp1_hit:
@@ -639,7 +715,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             elif high >= sl:
                 result = "tp1_win"
 
-    return result, tp1_now
+    return result, tp1_now, trade
 
 
 def update_open_trades(
@@ -706,20 +782,28 @@ def update_open_trades(
             if candle_ts < created_at:
                 continue
 
-            result, tp1_now = evaluate_trade_on_candle(trade, candle)
+            result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
+            trade = updated_trade
 
             if tp1_now and not trade.get("tp1_hit"):
                 ok = mark_tp1_hit(redis_client, trade_key, trade)
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
                     state_changed = True
-                    logger.info(f"{symbol} → TP1 hit, SL moved to entry")
+                    logger.info(f"{symbol} → TP1 hit, SL moved to entry/effective entry")
                 else:
                     logger.error(f"{symbol} → failed to mark TP1")
                     break
 
                 if result == "tp2_win":
                     break
+            else:
+                # save any pullback-trigger state change
+                diagnostics = trade.get("diagnostics", {}) or {}
+                if diagnostics.get("pullback_triggered") and not state_changed:
+                    save_trade(redis_client, trade_key, trade)
+                    update_trade_history_snapshot(redis_client, trade)
+                    state_changed = True
 
             if result:
                 break
