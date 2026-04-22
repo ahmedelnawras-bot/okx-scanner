@@ -11,6 +11,13 @@ import redis
 
 from analysis.scoring import calculate_long_score, is_breakout
 from analysis.backtest import build_deep_report
+from analysis.performance_diagnostics import (
+    build_setups_report,
+    build_scores_report,
+    build_market_report,
+    build_losses_report,
+    build_full_diagnostics_report,
+)
 from tracking.performance import (
     register_trade,
     update_open_trades,
@@ -512,6 +519,11 @@ TELEGRAM_COMMANDS = {
     "/report_today": "اليوم",
     "/report_all": "كل الصفقات",
     "/report_deep": "تحليل متقدم للأداء",
+    "/report_setups": "تحليل أفضل وأسوأ أنواع الإشارات",
+    "/report_scores": "تحليل الأداء حسب السكور",
+    "/report_market": "تحليل الأداء حسب حالة السوق والدخول",
+    "/report_losses": "تحليل أسباب الخسارة",
+    "/report_diagnostics": "تقرير تشخيصي شامل",
     "/reset_stats": "تصفير نتائج البوت",
     "/stats_since_reset": "الأداء من بعد آخر تصفير",
 }
@@ -738,6 +750,26 @@ COMMAND_HANDLERS = {
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
     "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
+    "/report_setups": lambda chat_id: send_telegram_reply(
+        chat_id,
+        build_setups_report(r, market_type="futures", side="long", period="all")
+    ),
+    "/report_scores": lambda chat_id: send_telegram_reply(
+        chat_id,
+        build_scores_report(r, market_type="futures", side="long", period="all")
+    ),
+    "/report_market": lambda chat_id: send_telegram_reply(
+        chat_id,
+        build_market_report(r, market_type="futures", side="long", period="all")
+    ),
+    "/report_losses": lambda chat_id: send_telegram_reply(
+        chat_id,
+        build_losses_report(r, market_type="futures", side="long", period="all")
+    ),
+    "/report_diagnostics": lambda chat_id: send_telegram_reply(
+        chat_id,
+        build_full_diagnostics_report(r, market_type="futures", side="long", period="all")
+    ),
     "/reset_stats": lambda chat_id: reset_stats(chat_id),
     "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
 }
@@ -3322,6 +3354,21 @@ def run_scanner_loop():
                     "early_priority": early_priority,
                     "is_reverse": is_reverse,
                     "setup_type": setup_type,
+                    # حقول تحليلية جديدة
+                    "raw_score": raw_score,
+                    "dynamic_threshold": dynamic_threshold,
+                    "required_min_score": effective_required_min_score,
+                    "dist_ma": dist_ma,
+                    "entry_timing": entry_timing,
+                    "opportunity_type": opportunity_type,
+                    "market_state_label": market_state_label,
+                    "market_bias_label": market_bias_label,
+                    "breakout_quality": breakout_quality,
+                    "fake_signal": bool(score_result.get("fake_signal", False)),
+                    "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
+                    "has_high_impact_news": has_high_impact_news,
+                    "warning_reasons": score_result.get("warning_reasons", []),
+                    "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3472,6 +3519,27 @@ def run_scanner_loop():
                         btc_dominance_proxy=candidate["btc_dominance_proxy"],
                         change_24h=candidate["change_24h"],
                         setup_type=candidate.get("setup_type", "unknown"),
+                        raw_score=candidate.get("raw_score", candidate["score"]),
+                        effective_score=candidate["score"],
+                        dynamic_threshold=candidate.get("dynamic_threshold", 0.0),
+                        required_min_score=candidate.get("required_min_score", 0.0),
+                        dist_ma=candidate.get("dist_ma", 0.0),
+                        entry_timing=candidate.get("entry_timing", ""),
+                        opportunity_type=candidate.get("opportunity_type", ""),
+                        market_state=candidate.get("market_state", ""),
+                        market_state_label=candidate.get("market_state_label", ""),
+                        market_bias_label=candidate.get("market_bias_label", ""),
+                        alt_mode=candidate.get("alt_mode", ""),
+                        early_priority=candidate.get("early_priority", ""),
+                        breakout_quality=candidate.get("breakout_quality", ""),
+                        fake_signal=candidate.get("fake_signal", False),
+                        is_reverse_signal=candidate.get("is_reverse", False),
+                        reversal_4h_confirmed=candidate.get("reversal_4h_confirmed", False),
+                        rank_volume_24h=candidate.get("rank_volume_24h", 0.0),
+                        alert_id=candidate.get("alert_id", ""),
+                        has_high_impact_news=candidate.get("has_high_impact_news", False),
+                        news_titles=candidate.get("news_titles", []),
+                        warning_reasons=candidate.get("warning_reasons", []),
                     )
 
                     logger.info(
