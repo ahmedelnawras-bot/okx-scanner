@@ -57,9 +57,11 @@ SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-FINAL_MIN_SCORE = 6.5
+# MODIFIED: decreased from 6.5 to 6.2
+FINAL_MIN_SCORE = 6.2
 PRE_BREAKOUT_EXTRA_SCORE = 0.2
-MAX_ALERTS_PER_RUN = 3
+# MODIFIED: increased from 3 to 5
+MAX_ALERTS_PER_RUN = 5
 
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 2700
@@ -69,7 +71,8 @@ COMMAND_POLL_INTERVAL = 3
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
-TOP_MOMENTUM_PERCENT = 0.20
+# MODIFIED: increased from 0.20 to 0.30
+TOP_MOMENTUM_PERCENT = 0.30
 TOP_MOMENTUM_MIN_SCORE = 7.0
 TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
 
@@ -1280,7 +1283,8 @@ def is_late_long_entry(dist_ma: float, breakout: bool, pre_breakout: bool) -> bo
     try:
         if breakout or pre_breakout:
             return False
-        return dist_ma > 5.0
+        # MODIFIED: increased threshold from 5.0 to 6.2
+        return dist_ma > 6.2
     except Exception:
         return False
 
@@ -1296,7 +1300,8 @@ def is_exhausted_long_move(
         if breakout or pre_breakout:
             return False
 
-        if dist_ma > 4.5 and vol_ratio < 1.30:
+        # MODIFIED: first condition relaxed
+        if dist_ma > 5.5 and vol_ratio < 1.15:
             return True
 
         if dist_ma > 5.0 and candle_strength < 0.50:
@@ -1844,7 +1849,8 @@ def get_dynamic_entry_threshold(
     if score_result.get("fake_signal"):
         threshold += 0.15
 
-    threshold = max(5.8, min(7.0, threshold))
+    # MODIFIED: widened range from (5.8,7.0) to (5.6,6.8)
+    threshold = max(5.6, min(6.8, threshold))
     return round(threshold, 2)
 
 
@@ -2075,7 +2081,8 @@ def classify_early_priority_long(
         elif market_state in ("risk_off", "btc_leading"):
             score -= 1
 
-        if score >= 7:
+        # MODIFIED: lowered strong threshold from 7 to 6
+        if score >= 6:
             return "strong"
         if score >= 4:
             return "medium"
@@ -3053,7 +3060,8 @@ def run_scanner_loop():
                             f"سيُرسل بتحذير مرتفع"
                         )
 
-                if vol_ratio < 1.08 and not breakout and not pre_breakout and not early_signal:
+                # MODIFIED: relaxed volume hard filter from 1.08 to 1.02
+                if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal:
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
 
@@ -3119,21 +3127,27 @@ def run_scanner_loop():
                     elif early_signal:
                         effective_score -= 0.15
                     else:
-                        effective_score -= 0.55
+                        # MODIFIED: reduced penalty from 0.55 to 0.30
+                        effective_score -= 0.30
 
                 if not gaining_strength and not breakout and not pre_breakout:
                     effective_score -= 0.15
 
-                if dist_ma < -4.6 and not breakout and not pre_breakout and not is_reverse:
-                    effective_score -= 0.25
-
-                if dist_ma < -4.2 and candle_strength < 0.52 and not breakout and not pre_breakout and not is_reverse:
-                    effective_score -= 0.20
+                # MODIFIED: removed two dist_ma penalties that were killing early signals
+                # (they are commented out)
+                # if dist_ma < -4.6 and not breakout and not pre_breakout and not is_reverse:
+                #     effective_score -= 0.25
+                # if dist_ma < -4.2 and candle_strength < 0.52 and not breakout and not pre_breakout and not is_reverse:
+                #     effective_score -= 0.20
 
                 effective_score += get_early_priority_score_bonus(early_priority)
 
                 if breakout and vol_ratio >= 1.5:
                     effective_score += 0.30
+
+                # MODIFIED: added breakout boost
+                if breakout and vol_ratio >= 1.3:
+                    effective_score += 0.40
 
                 if is_reverse:
                     effective_score += OVERSOLD_REVERSAL_SCORE_BONUS
@@ -3163,21 +3177,13 @@ def run_scanner_loop():
                     and score_result["score"] >= max(6.0, dynamic_threshold - 0.20)
                 )
 
-                if not early_signal and not pre_breakout and not breakout:
-                    if score_result["score"] < dynamic_threshold:
+                # MODIFIED: simplified early signal rejection logic
+                if score_result["score"] < dynamic_threshold:
+                    if early_priority != "strong":
                         logger.info(
-                            f"{symbol} → rejected (score<{dynamic_threshold} | market={market_state} | "
-                            f"vol={vol_ratio} | dist_ma={dist_ma})"
+                            f"{symbol} → rejected (score<{dynamic_threshold} | early_priority={early_priority})"
                         )
                         continue
-                else:
-                    if not strong_early_override and not pre_breakout and not breakout:
-                        if score_result["score"] < dynamic_threshold and early_priority == "weak":
-                            logger.info(
-                                f"{symbol} → rejected weak early (score<{dynamic_threshold} | "
-                                f"early_priority={early_priority})"
-                            )
-                            continue
 
                 if has_high_impact_news:
                     if "warning_reasons" not in score_result:
@@ -3186,8 +3192,10 @@ def run_scanner_loop():
                     if "أخبار اقتصادية مهمة قريبة" not in score_result["warning_reasons"]:
                         score_result["warning_reasons"].append("أخبار اقتصادية مهمة قريبة")
 
+                # MODIFIED: reduced penalty for pre_breakout
                 pre_breakout_only = pre_breakout and not early_signal
-                required_min_score = FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE if pre_breakout_only else FINAL_MIN_SCORE
+                # changed from FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE to +0.1
+                required_min_score = FINAL_MIN_SCORE + (0.1 if pre_breakout_only else 0)
 
                 opportunity_type = classify_opportunity_type_long(
                     breakout=breakout,
@@ -3296,10 +3304,10 @@ def run_scanner_loop():
                 base_risk = get_base_risk_label(score_result, warnings_count)
                 display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
 
-                # رفض الإشارات المتأخرة + عالية المخاطرة بدون breakout
-                if "🔴 متأخر" in entry_timing and "🔴 عالية" in display_risk and not breakout:
+                # MODIFIED: added vol_ratio condition to late+high risk rejection
+                if "🔴 متأخر" in entry_timing and "🔴 عالية" in display_risk and not breakout and vol_ratio < 1.2:
                     logger.info(
-                        f"{symbol} → rejected (late + high risk + no breakout | "
+                        f"{symbol} → rejected (late + high risk + no breakout + low vol | "
                         f"dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f})"
                     )
                     continue
