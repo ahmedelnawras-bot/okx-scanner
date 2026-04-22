@@ -1292,6 +1292,14 @@ def is_oversold_reversal_long(
         if df is None or df.empty or len(df) < 25:
             return False
 
+        # شرط أساسي: السعر لازم يكون تحت MA فعلاً — مش continuation
+        if dist_ma >= 0:
+            return False
+
+        # شرط ثاني: العملة ما طلعتش كتير قبل الإشارة — مش reversal دي chase
+        if change_24h > 5.0:
+            return False
+
         signal_row = get_signal_row(df)
         idx = signal_row.name
         if idx is None or idx < 2:
