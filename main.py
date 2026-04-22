@@ -27,8 +27,8 @@ from tracking.performance import (
     get_trade_summary,
     format_period_summary,
     get_setup_type_stats,
-    calc_tp1,
-    calc_tp2,
+    # calc_tp1,  # غير مستخدمة
+    # calc_tp2,  # غير مستخدمة
 )
 
 # =========================
@@ -57,10 +57,8 @@ SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
 
-# MODIFIED: decreased from 6.5 to 6.2
 FINAL_MIN_SCORE = 6.2
 PRE_BREAKOUT_EXTRA_SCORE = 0.2
-# MODIFIED: increased from 3 to 5
 MAX_ALERTS_PER_RUN = 5
 
 COOLDOWN_SECONDS = 3600
@@ -71,7 +69,6 @@ COMMAND_POLL_INTERVAL = 3
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 
-# MODIFIED: increased from 0.20 to 0.30
 TOP_MOMENTUM_PERCENT = 0.30
 TOP_MOMENTUM_MIN_SCORE = 7.0
 TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
@@ -1283,7 +1280,6 @@ def is_late_long_entry(dist_ma: float, breakout: bool, pre_breakout: bool) -> bo
     try:
         if breakout or pre_breakout:
             return False
-        # MODIFIED: increased threshold from 5.0 to 6.2
         return dist_ma > 6.2
     except Exception:
         return False
@@ -1300,7 +1296,6 @@ def is_exhausted_long_move(
         if breakout or pre_breakout:
             return False
 
-        # MODIFIED: first condition relaxed
         if dist_ma > 5.5 and vol_ratio < 1.15:
             return True
 
@@ -1329,11 +1324,9 @@ def is_oversold_reversal_long(
         if df is None or df.empty or len(df) < 25:
             return False
 
-        # شرط أساسي: السعر لازم يكون تحت MA فعلاً — مش continuation
         if dist_ma >= 0:
             return False
 
-        # شرط ثاني: العملة ما طلعتش كتير قبل الإشارة — مش reversal دي chase
         if change_24h > 5.0:
             return False
 
@@ -1359,7 +1352,6 @@ def is_oversold_reversal_long(
         body_ratio = (body / candle_range) if candle_range > 0 else 0.0
         upper_wick = high - max(open_, close)
 
-        # رفض تلقائي لو exhaustion wick — spike مش reversal
         exhaustion_wick = (
             candle_range > 0
             and upper_wick > body * 2.0
@@ -1377,7 +1369,6 @@ def is_oversold_reversal_long(
 
         checks = 0
 
-        # dist_ma لازم يكون سالب (السعر تحت MA) وبُعده كافي
         if dist_ma <= -OVERSOLD_REVERSAL_MIN_DIST_MA:
             checks += 1
         if change_24h <= OVERSOLD_REVERSAL_MIN_24H_DROP:
@@ -1512,10 +1503,6 @@ def is_higher_timeframe_confirmed(symbol):
 def is_4h_oversold_confirmed(symbol: str) -> dict:
     """
     تأكيد 4H خاص للـ Oversold Reversal.
-    بيشوف:
-    1) RSI على 4H تحت 35
-    2) السعر تحت MA20 على 4H
-    3) آخر شمعة 4H فيها إشارة ارتداد واضحة
     """
     try:
         candles = get_candles(symbol, "4H", 60)
@@ -1849,24 +1836,22 @@ def get_dynamic_entry_threshold(
     if score_result.get("fake_signal"):
         threshold += 0.15
 
-    # MODIFIED: widened range from (5.8,7.0) to (5.6,6.8)
     threshold = max(5.6, min(6.8, threshold))
     return round(threshold, 2)
 
 
 def calculate_stop_loss(price, atr_value, signal_type="standard"):
     multipliers = {
-        "breakout":     2.5,   # كان 1.0 — مضاعف لتحمل leverage 20x-50x
-        "pre_breakout": 3.0,   # كان 1.5
-        "new_listing":  3.2,   # كان 1.8
-        "standard":     2.8,   # كان 1.2
+        "breakout":     2.5,
+        "pre_breakout": 3.0,
+        "new_listing":  3.2,
+        "standard":     2.8,
     }
     multiplier = multipliers.get(signal_type, 2.8)
     try:
         sl = round(float(price) - (float(atr_value) * multiplier), 6)
-        # حماية: SL لا يقل عن 1% من السعر ولا يزيد عن 4% (مناسب لـ cross 20x-50x)
-        min_sl = round(float(price) * 0.990, 6)  # أقرب من 1% = خطر على leverage عالي
-        max_sl = round(float(price) * 0.960, 6)  # أبعد من 4% = position كبير جداً
+        min_sl = round(float(price) * 0.990, 6)
+        max_sl = round(float(price) * 0.960, 6)
         return max(max_sl, min(min_sl, sl))
     except Exception:
         return round(float(price) * 0.975, 6)
@@ -1930,7 +1915,6 @@ def get_volume_ratio(df) -> float:
 
 
 def get_distance_from_ma_percent(df) -> float:
-    """موجب = السعر فوق MA | سالب = السعر تحت MA"""
     try:
         signal_row = get_signal_row(df)
         close = _safe_float(signal_row["close"], 0)
@@ -2081,7 +2065,6 @@ def classify_early_priority_long(
         elif market_state in ("risk_off", "btc_leading"):
             score -= 1
 
-        # MODIFIED: lowered strong threshold from 7 to 6
         if score >= 6:
             return "strong"
         if score >= 4:
@@ -2607,10 +2590,6 @@ def build_market_summary(btc_mode: str, alt_mode: str) -> str:
 # RTL / FORMAT HELPERS
 # =========================
 def rtl_fix(text: str) -> str:
-    """
-    يضيف Right-to-Left Mark لتحسين عرض النص المختلط
-    عربي/إنجليزي داخل تيليجرام (4H / 15m / MA20 / أرقام).
-    """
     try:
         if text is None:
             return ""
@@ -2620,7 +2599,6 @@ def rtl_fix(text: str) -> str:
 
 
 def fmt_num(value, decimals=2) -> str:
-    """تنسيق رقم مع RTL fix."""
     try:
         return rtl_fix(f"{float(value):.{int(decimals)}f}")
     except Exception:
@@ -2628,7 +2606,6 @@ def fmt_num(value, decimals=2) -> str:
 
 
 def fmt_pct(value, decimals=2) -> str:
-    """تنسيق نسبة مئوية مع إشارة + RTL fix."""
     try:
         return rtl_fix(f"{float(value):+.{int(decimals)}f}%")
     except Exception:
@@ -2636,11 +2613,6 @@ def fmt_pct(value, decimals=2) -> str:
 
 
 def get_breakout_quality(df, vol_ratio: float) -> str:
-    """
-    تقييم جودة الـ breakout: strong / ok / weak / none
-    للعرض في الرسالة كمعلومة إضافية للتريدر.
-    لا يؤثر على الـ score أو الـ filtering.
-    """
     try:
         if df is None or df.empty or len(df) < 5:
             return "none"
@@ -2663,7 +2635,6 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
         upper_wick = high - max(open_, close)
         close_position = (close - low) / candle_range
 
-        # recent high للمقارنة
         lookback_start = max(0, idx - 20)
         recent_high = float(df["high"].iloc[lookback_start:idx].max())
 
@@ -2702,14 +2673,14 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
 # =========================
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
     if signal_type == "breakout":
-        return 2.5, 4.0    # كان 1.4, 2.3 — رُفع لتعويض win rate 40%
+        return 2.5, 4.0
     if signal_type == "pre_breakout":
-        return 2.8, 4.5    # كان 1.7, 2.8
+        return 2.8, 4.5
     if signal_type == "new_listing":
-        return 3.0, 5.0    # كان 1.9, 3.2
+        return 3.0, 5.0
     if "🔴 متأخر" in entry_timing:
-        return 2.5, 4.0    # كان 1.7, 2.8
-    return 2.5, 4.0        # كان 1.4, 2.4
+        return 2.5, 4.0
+    return 2.5, 4.0
 
 
 def calc_tp_long(entry: float, sl: float, rr: float) -> float:
@@ -2718,7 +2689,7 @@ def calc_tp_long(entry: float, sl: float, rr: float) -> float:
 
 
 # =========================
-# BUILD MESSAGE
+# BUILD MESSAGE (UPDATED with cleaner pullback)
 # =========================
 def build_message(
     symbol,
@@ -2746,6 +2717,8 @@ def build_message(
     reversal_4h_confirmed=False,
     reversal_4h_details="",
     breakout_quality="none",
+    pullback_low=None,
+    pullback_high=None,
 ):
     symbol_clean = clean_symbol_for_message(symbol)
 
@@ -2783,6 +2756,14 @@ def build_message(
     safe_15m = rtl_fix("15m")
     safe_1h  = rtl_fix("1H")
     safe_24h = rtl_fix("24H")
+
+    # Pullback zone (cleaner formatting)
+    pullback_text = ""
+    if pullback_low is not None and pullback_high is not None:
+        pullback_text = (
+            f"📥 <b>منطقة دخول البول باك:</b> "
+            f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
+        )
 
     # بلوك 4H للـ Oversold Reversal
     if is_reverse:
@@ -2835,7 +2816,7 @@ def build_message(
 💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
-
+{pullback_text}
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")})
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")})
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
@@ -2923,7 +2904,7 @@ def handle_telegram_commands():
 
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP (UPDATED with correct order and pullback logic)
 # =========================
 def run_command_poller():
     bootstrap_telegram_offset_once()
@@ -2961,7 +2942,6 @@ def run_scanner_loop():
             winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
             logger.info(format_winrate_summary(winrate_summary))
 
-            # جلب reset_ts لفلترة الـ Hybrid Label
             stats_reset_ts = None
             if r:
                 try:
@@ -3041,6 +3021,7 @@ def run_scanner_loop():
                 gaining_strength = is_gaining_intraday_strength(df)
                 breakout_quality = get_breakout_quality(df, vol_ratio)
 
+                # --- حساب is_reverse أولاً (لأن RSI يحتاجها) ---
                 is_reverse = is_oversold_reversal_long(
                     df=df,
                     dist_ma=dist_ma,
@@ -3049,7 +3030,34 @@ def run_scanner_loop():
                     funding=funding,
                 )
 
-                # تأكيد 4H خاص للـ Oversold Reversal
+                # --- الآن RSI filters (بعد is_reverse) ---
+                signal_row = get_signal_row(df)
+                rsi_now = _safe_float(signal_row.get("rsi"), 50)
+                if rsi_now > 75 and not is_reverse:
+                    logger.info(f"{symbol} → skipped (RSI > 75 extreme peak)")
+                    continue
+                if rsi_now > 70 and dist_ma > 4:
+                    logger.info(f"{symbol} → skipped (RSI > 70 and dist_ma > 4)")
+                    continue
+                if dist_ma > 3.5:
+                    early_signal = False
+
+                # --- Pullback zone calculation (using signal_row index) ---
+                signal_idx = signal_row.name
+                lookback_start = max(0, signal_idx - 20)
+                recent_high = _safe_float(df["high"].iloc[lookback_start:signal_idx].max(), 0)
+                atr_value = _safe_float(signal_row.get("atr"), 0)
+                pullback_low = None
+                pullback_high = None
+                if atr_value > 0 and recent_high > 0:
+                    pullback_low = recent_high - (atr_value * 0.15)
+                    pullback_high = recent_high + (atr_value * 0.35)
+                # Show pullback zone only for breakout or pre_breakout
+                if not breakout and not pre_breakout:
+                    pullback_low = None
+                    pullback_high = None
+
+                # --- باقي الفلترة والتقييم ---
                 reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
                 if is_reverse:
                     reversal_4h_result = is_4h_oversold_confirmed(symbol)
@@ -3060,7 +3068,6 @@ def run_scanner_loop():
                             f"سيُرسل بتحذير مرتفع"
                         )
 
-                # MODIFIED: relaxed volume hard filter from 1.08 to 1.02
                 if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal:
                     logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
@@ -3127,25 +3134,16 @@ def run_scanner_loop():
                     elif early_signal:
                         effective_score -= 0.15
                     else:
-                        # MODIFIED: reduced penalty from 0.55 to 0.30
                         effective_score -= 0.30
 
                 if not gaining_strength and not breakout and not pre_breakout:
                     effective_score -= 0.15
-
-                # MODIFIED: removed two dist_ma penalties that were killing early signals
-                # (they are commented out)
-                # if dist_ma < -4.6 and not breakout and not pre_breakout and not is_reverse:
-                #     effective_score -= 0.25
-                # if dist_ma < -4.2 and candle_strength < 0.52 and not breakout and not pre_breakout and not is_reverse:
-                #     effective_score -= 0.20
 
                 effective_score += get_early_priority_score_bonus(early_priority)
 
                 if breakout and vol_ratio >= 1.5:
                     effective_score += 0.30
 
-                # MODIFIED: added breakout boost
                 if breakout and vol_ratio >= 1.3:
                     effective_score += 0.40
 
@@ -3172,12 +3170,7 @@ def run_scanner_loop():
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
 
-                strong_early_override = (
-                    early_priority == "strong"
-                    and score_result["score"] >= max(6.0, dynamic_threshold - 0.20)
-                )
-
-                # MODIFIED: simplified early signal rejection logic
+                # تم إزالة strong_early_override لعدم استخدامه
                 if score_result["score"] < dynamic_threshold:
                     if early_priority != "strong":
                         logger.info(
@@ -3192,9 +3185,7 @@ def run_scanner_loop():
                     if "أخبار اقتصادية مهمة قريبة" not in score_result["warning_reasons"]:
                         score_result["warning_reasons"].append("أخبار اقتصادية مهمة قريبة")
 
-                # MODIFIED: reduced penalty for pre_breakout
                 pre_breakout_only = pre_breakout and not early_signal
-                # changed from FINAL_MIN_SCORE + PRE_BREAKOUT_EXTRA_SCORE to +0.1
                 required_min_score = FINAL_MIN_SCORE + (0.1 if pre_breakout_only else 0)
 
                 opportunity_type = classify_opportunity_type_long(
@@ -3279,9 +3270,7 @@ def run_scanner_loop():
                         logger.info(f"{symbol} → rejected by balanced new listing filter")
                         continue
 
-                signal_row = get_signal_row(df)
                 price = _safe_float(signal_row["close"], 0)
-                atr_value = _safe_float(signal_row["atr"], 0)
 
                 if breakout:
                     sl_type = "breakout"
@@ -3304,7 +3293,6 @@ def run_scanner_loop():
                 base_risk = get_base_risk_label(score_result, warnings_count)
                 display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
 
-                # MODIFIED: added vol_ratio condition to late+high risk rejection
                 if "🔴 متأخر" in entry_timing and "🔴 عالية" in display_risk and not breakout and vol_ratio < 1.2:
                     logger.info(
                         f"{symbol} → rejected (late + high risk + no breakout + low vol | "
@@ -3326,7 +3314,6 @@ def run_scanner_loop():
 
                 alert_id = build_alert_id(symbol, candle_time)
 
-                # بناء setup_type واسترجاع إحصائياته
                 setup_type_candidate = {
                     "is_reverse": is_reverse,
                     "breakout": breakout,
@@ -3362,7 +3349,6 @@ def run_scanner_loop():
                     "early_priority": early_priority,
                     "is_reverse": is_reverse,
                     "setup_type": setup_type,
-                    # حقول تحليلية جديدة
                     "raw_score": raw_score,
                     "dynamic_threshold": dynamic_threshold,
                     "required_min_score": effective_required_min_score,
@@ -3377,6 +3363,8 @@ def run_scanner_loop():
                     "has_high_impact_news": has_high_impact_news,
                     "warning_reasons": score_result.get("warning_reasons", []),
                     "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
+                    "pullback_low": pullback_low,
+                    "pullback_high": pullback_high,
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3403,6 +3391,8 @@ def run_scanner_loop():
                         reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
                         reversal_4h_details=reversal_4h_result.get("details", ""),
                         breakout_quality=breakout_quality,
+                        pullback_low=pullback_low,
+                        pullback_high=pullback_high,
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
