@@ -60,6 +60,11 @@ def normalize_list(value):
     return [value]
 
 
+def normalize_text(value, default="unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
 def get_trade_key(market_type: str, side: str, symbol: str, candle_time: int) -> str:
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
@@ -212,19 +217,23 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "required_min_score": safe_float(extra_fields.get("required_min_score"), 0.0),
         "dist_ma": safe_float(extra_fields.get("dist_ma"), 0.0),
         "rank_volume_24h": safe_float(extra_fields.get("rank_volume_24h"), 0.0),
-        "market_state": str(extra_fields.get("market_state", "") or ""),
-        "market_state_label": str(extra_fields.get("market_state_label", "") or ""),
-        "market_bias_label": str(extra_fields.get("market_bias_label", "") or ""),
-        "alt_mode": str(extra_fields.get("alt_mode", "") or ""),
-        "entry_timing": str(extra_fields.get("entry_timing", "") or ""),
-        "opportunity_type": str(extra_fields.get("opportunity_type", "") or ""),
-        "early_priority": str(extra_fields.get("early_priority", "") or ""),
-        "breakout_quality": str(extra_fields.get("breakout_quality", "") or ""),
-        "alert_id": str(extra_fields.get("alert_id", "") or ""),
+
+        "market_state": normalize_text(extra_fields.get("market_state"), "unknown"),
+        "market_state_label": normalize_text(extra_fields.get("market_state_label"), "unknown"),
+        "market_bias_label": normalize_text(extra_fields.get("market_bias_label"), "unknown"),
+        "alt_mode": normalize_text(extra_fields.get("alt_mode"), "unknown"),
+        "entry_timing": normalize_text(extra_fields.get("entry_timing"), "unknown"),
+        "opportunity_type": normalize_text(extra_fields.get("opportunity_type"), "unknown"),
+        "early_priority": normalize_text(extra_fields.get("early_priority"), "unknown"),
+        "breakout_quality": normalize_text(extra_fields.get("breakout_quality"), "unknown"),
+        "risk_level": normalize_text(extra_fields.get("risk_level"), "unknown"),
+        "alert_id": normalize_text(extra_fields.get("alert_id"), ""),
+
         "fake_signal": normalize_bool(extra_fields.get("fake_signal", False)),
         "is_reverse": normalize_bool(extra_fields.get("is_reverse", False)),
         "reversal_4h_confirmed": normalize_bool(extra_fields.get("reversal_4h_confirmed", False)),
         "has_high_impact_news": normalize_bool(extra_fields.get("has_high_impact_news", False)),
+
         "news_titles": normalize_list(extra_fields.get("news_titles", [])),
         "warning_reasons": normalize_list(extra_fields.get("warning_reasons", [])),
     }
@@ -254,15 +263,29 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "result": trade_data.get("result"),
         "tp1_hit": normalize_bool(trade_data.get("tp1_hit", False)),
 
-        "market_state": diagnostics.get("market_state", ""),
-        "alt_mode": diagnostics.get("alt_mode", ""),
-        "entry_timing": diagnostics.get("entry_timing", ""),
-        "opportunity_type": diagnostics.get("opportunity_type", ""),
-        "early_priority": diagnostics.get("early_priority", ""),
-        "breakout_quality": diagnostics.get("breakout_quality", ""),
+        "market_state": diagnostics.get("market_state", "unknown"),
+        "market_state_label": diagnostics.get("market_state_label", "unknown"),
+        "market_bias_label": diagnostics.get("market_bias_label", "unknown"),
+        "alt_mode": diagnostics.get("alt_mode", "unknown"),
+        "entry_timing": diagnostics.get("entry_timing", "unknown"),
+        "opportunity_type": diagnostics.get("opportunity_type", "unknown"),
+        "early_priority": diagnostics.get("early_priority", "unknown"),
+        "breakout_quality": diagnostics.get("breakout_quality", "unknown"),
+        "risk_level": diagnostics.get("risk_level", "unknown"),
+
+        "dist_ma": safe_float(diagnostics.get("dist_ma"), 0.0),
+        "raw_score": safe_float(diagnostics.get("raw_score"), 0.0),
+        "effective_score": safe_float(diagnostics.get("effective_score"), 0.0),
+        "dynamic_threshold": safe_float(diagnostics.get("dynamic_threshold"), 0.0),
+        "required_min_score": safe_float(diagnostics.get("required_min_score"), 0.0),
+
         "fake_signal": diagnostics.get("fake_signal", False),
         "is_reverse": diagnostics.get("is_reverse", False),
         "reversal_4h_confirmed": diagnostics.get("reversal_4h_confirmed", False),
+        "has_high_impact_news": diagnostics.get("has_high_impact_news", False),
+
+        "warning_reasons": normalize_list(trade_data.get("warning_reasons", [])),
+        "news_titles": normalize_list(diagnostics.get("news_titles", [])),
     }
 
 
@@ -308,6 +331,7 @@ def register_trade(
     alt_mode: str = None,
     early_priority: str = None,
     breakout_quality: str = None,
+    risk_level: str = None,
     fake_signal: bool = False,
     is_reverse_signal: bool = False,
     reversal_4h_confirmed: bool = False,
@@ -358,6 +382,7 @@ def register_trade(
         "opportunity_type": opportunity_type,
         "early_priority": early_priority,
         "breakout_quality": breakout_quality,
+        "risk_level": risk_level,
         "alert_id": alert_id,
         "fake_signal": fake_signal,
         "is_reverse": is_reverse_signal,
@@ -611,7 +636,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
         else:
             if low <= tp2:
                 result = "tp2_win"
-            elif high <= sl:
+            elif high >= sl:
                 result = "tp1_win"
 
     return result, tp1_now
