@@ -1155,6 +1155,17 @@ def compute_atr(df, period=14):
     return tr.rolling(period).mean()
 
 
+def compute_bollinger_bands(series, period=20, std_mult=2):
+    """
+    حساب Bollinger Bands (الوسط، العلوي، السفلي)
+    """
+    ma = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = ma + (std * std_mult)
+    lower = ma - (std * std_mult)
+    return ma, upper, lower
+
+
 def to_dataframe(data):
     if not data:
         return None
@@ -1175,6 +1186,9 @@ def to_dataframe(data):
     df["ma"] = df["close"].rolling(20).mean()
     df["rsi"] = compute_rsi(df["close"])
     df["atr"] = compute_atr(df)
+
+    # ✅ إضافة Bollinger Bands
+    df["bb_mid"], df["bb_upper"], df["bb_lower"] = compute_bollinger_bands(df["close"])
 
     return df
 
@@ -1238,8 +1252,15 @@ def get_funding_rate(symbol):
 
 
 def get_signal_row(df):
+    """إرجاع صف الإشارة (آخر شمعة مكتملة) أو None في حالة الخطأ"""
     try:
-        if "confirm" not in df.columns or len(df) < 2:
+        if df is None or df.empty:
+            return None
+
+        if len(df) == 1:
+            return df.iloc[-1]
+
+        if "confirm" not in df.columns:
             return df.iloc[-2]
 
         last = df.iloc[-1]
@@ -1248,12 +1269,14 @@ def get_signal_row(df):
 
         return df.iloc[-2]
     except Exception:
-        return df.iloc[-2]
+        return None
 
 
 def get_signal_candle_time(df):
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return int(time.time() // (15 * 60))
         ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
             return ts // 1000
@@ -1274,6 +1297,39 @@ def _safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def is_above_upper_bollinger(df) -> bool:
+    """هل السعر فوق الـ Upper Bollinger Band؟"""
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
+        close = _safe_float(signal_row["close"])
+        upper = _safe_float(signal_row.get("bb_upper"), 0)
+        if upper <= 0:
+            return False
+        return close > upper
+    except Exception:
+        return False
+
+
+def get_change_4h(df) -> float:
+    """نسبة التغيير خلال آخر 4 ساعات (16 شمعة 15m)."""
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
+        idx = signal_row.name
+        if idx is None or idx < 16:
+            return 0.0
+        current = _safe_float(df.iloc[idx]["close"])
+        prev = _safe_float(df.iloc[idx - 16]["close"])
+        if prev <= 0:
+            return 0.0
+        return round(((current - prev) / prev) * 100, 2)
+    except Exception:
+        return 0.0
 
 
 def is_late_long_entry(dist_ma: float, breakout: bool, pre_breakout: bool) -> bool:
@@ -1331,6 +1387,8 @@ def is_oversold_reversal_long(
             return False
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 2:
             return False
@@ -1427,6 +1485,8 @@ def early_bullish_signal(df):
             return False
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
 
         if idx is None or idx < 2:
@@ -1470,6 +1530,8 @@ def is_higher_timeframe_confirmed(symbol):
             return False
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
 
         if idx is None or idx < 3:
@@ -1516,6 +1578,12 @@ def is_4h_oversold_confirmed(symbol: str) -> dict:
             }
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return {
+                "confirmed": False,
+                "checks": 0,
+                "details": f"• فريم {rtl_fix('4H')}: تعذر الحصول على صف الإشارة"
+            }
         idx = signal_row.name
         if idx is None or idx < 3:
             return {
@@ -1596,6 +1664,8 @@ def get_btc_mode():
             return "🟡 محايد"
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return "🟡 محايد"
         ma_value = signal_row.get("ma", None)
         rsi_value = _safe_float(signal_row.get("rsi"), 50)
 
@@ -1618,6 +1688,8 @@ def is_gaining_intraday_strength(df) -> bool:
             return False
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 2:
             return False
@@ -1674,6 +1746,8 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
 
             try:
                 signal_row = get_signal_row(df)
+                if signal_row is None:
+                    continue
                 close = _safe_float(signal_row["close"])
                 ma_value = _safe_float(signal_row.get("ma"), 0)
                 rsi_value = _safe_float(signal_row.get("rsi"), 50)
@@ -1880,6 +1954,8 @@ def build_tradingview_link(symbol):
 def get_candle_strength_ratio(df) -> float:
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
         high = _safe_float(signal_row["high"])
         low = _safe_float(signal_row["low"])
         open_ = _safe_float(signal_row["open"])
@@ -1898,6 +1974,8 @@ def get_candle_strength_ratio(df) -> float:
 def get_volume_ratio(df) -> float:
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 1.0
         idx = signal_row.name
         if idx is None or idx < 1:
             return 1.0
@@ -1917,6 +1995,8 @@ def get_volume_ratio(df) -> float:
 def get_distance_from_ma_percent(df) -> float:
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
         close = _safe_float(signal_row["close"], 0)
         ma_value = _safe_float(signal_row.get("ma"), 0)
         if ma_value <= 0:
@@ -1936,6 +2016,8 @@ def is_pre_breakout(df, lookback=PRE_BREAKOUT_LOOKBACK) -> bool:
             return False
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
 
         if idx is None or idx < max(lookback, PRE_BREAKOUT_BASELINE_VOL_BARS + PRE_BREAKOUT_RECENT_VOL_BARS):
@@ -1994,6 +2076,8 @@ def is_valid_candle_timing(df) -> bool:
         last_completed_ts = (now // candle_seconds) * candle_seconds
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         ts = int(signal_row["ts"])
 
         if ts > 10_000_000_000:
@@ -2534,15 +2618,19 @@ def classify_opportunity_type_long(
 
 def classify_entry_timing_long(dist_ma: float, breakout: bool, pre_breakout: bool, vol_ratio: float) -> str:
     try:
-        if dist_ma < -5.0:
-            return "🔴 متأخر (قرب النهاية)"
         if (pre_breakout or breakout) and dist_ma <= 2.8 and vol_ratio >= 1.15:
             return "🟢 مبكر (بداية الحركة)"
+
         if breakout and 2.8 < dist_ma <= 4.4 and vol_ratio >= 1.25:
             return "🟡 متوسط (نص الحركة)"
+
         if 2.8 < dist_ma <= 5.0 and vol_ratio >= 1.10:
             return "🟡 متوسط (نص الحركة)"
-        return "🔴 متأخر (قرب النهاية)"
+
+        if dist_ma > 5.0:
+            return "🔴 متأخر (قرب النهاية)"
+
+        return "🟡 متوسط (نص الحركة)"
     except Exception:
         return "🟡 متوسط (نص الحركة)"
 
@@ -2618,6 +2706,8 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
             return "none"
 
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return "none"
         idx = signal_row.name
         if idx is None or idx < 3:
             return "none"
@@ -2904,7 +2994,7 @@ def handle_telegram_commands():
 
 
 # =========================
-# MAIN LOOP (UPDATED with correct order and pullback logic)
+# MAIN LOOP
 # =========================
 def run_command_poller():
     bootstrap_telegram_offset_once()
@@ -3032,6 +3122,10 @@ def run_scanner_loop():
 
                 # --- الآن RSI filters (بعد is_reverse) ---
                 signal_row = get_signal_row(df)
+                if signal_row is None:
+                    logger.info(f"{symbol} → skipped (no valid signal row)")
+                    continue
+
                 rsi_now = _safe_float(signal_row.get("rsi"), 50)
                 if rsi_now > 75 and not is_reverse:
                     logger.info(f"{symbol} → skipped (RSI > 75 extreme peak)")
@@ -3041,6 +3135,20 @@ def run_scanner_loop():
                     continue
                 if dist_ma > 3.5:
                     early_signal = False
+
+                # --- PHASE 3 LITE: حساب BB و 4H change ---
+                above_upper_bb = is_above_upper_bollinger(df)
+                change_4h = get_change_4h(df)
+
+                # === FILTER 1: Bollinger (SAFE) ===
+                if above_upper_bb and not pre_breakout and not is_reverse:
+                    if not breakout or breakout_quality == "weak":
+                        logger.info(
+                            f"{symbol} → skipped (upper BB | breakout={breakout} | "
+                            f"pre_breakout={pre_breakout} | breakout_quality={breakout_quality} | "
+                            f"reverse={is_reverse})"
+                        )
+                        continue
 
                 # --- Pullback zone calculation (using signal_row index) ---
                 signal_idx = signal_row.name
@@ -3142,10 +3250,9 @@ def run_scanner_loop():
                 effective_score += get_early_priority_score_bonus(early_priority)
 
                 if breakout and vol_ratio >= 1.5:
-                    effective_score += 0.30
-
-                if breakout and vol_ratio >= 1.3:
                     effective_score += 0.40
+                elif breakout and vol_ratio >= 1.3:
+                    effective_score += 0.20
 
                 if is_reverse:
                     effective_score += OVERSOLD_REVERSAL_SCORE_BONUS
@@ -3208,6 +3315,16 @@ def run_scanner_loop():
                     effective_required_min_score,
                     is_reverse=is_reverse,
                 )
+
+                # === FILTER 2: MTF Late Trap ===
+                if mtf_confirmed and "🔴 متأخر" in entry_timing and not is_reverse:
+                    logger.info(f"{symbol} → skipped (MTF late)")
+                    continue
+
+                # === FILTER 3: MTF Chasing Move ===
+                if mtf_confirmed and change_4h > 3 and not breakout and not pre_breakout and not is_reverse:
+                    logger.info(f"{symbol} → skipped (chasing 4h move)")
+                    continue
 
                 logger.info(
                     f"{symbol} → early_signal: {early_signal} | "
@@ -3365,6 +3482,8 @@ def run_scanner_loop():
                     "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
                     "pullback_low": pullback_low,
                     "pullback_high": pullback_high,
+                    "above_upper_bb": above_upper_bb,
+                    "change_4h": change_4h,
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3415,6 +3534,8 @@ def run_scanner_loop():
                         "early_priority": early_priority,
                         "is_reverse": is_reverse,
                         "setup_type": setup_type,
+                        "above_upper_bb": above_upper_bb,
+                        "change_4h": change_4h,
                     },
                     "candle_time": candle_time,
                     "now": now,
