@@ -17,6 +17,7 @@ TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90   # 90 days — للـ Hybrid Labe
 REPORT_ACCOUNT_BALANCE_USD = 1000.0
 REPORT_MAX_CAPITAL_USAGE_PCT = 35.0
 REPORT_DAILY_MAX_DRAWDOWN_PCT = 20.0
+REPORT_ACTIVE_TRADE_SLOTS = 10          # عدد الصفقات المفتوحة المُفترض وجودها في نفس الوقت
 
 
 # =========================
@@ -132,6 +133,40 @@ def calc_tp2(entry: float, sl: float, side: str = "long") -> float:
     return round(float(entry) + (risk * 3.0), 6)
 
 
+def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> dict:
+    """
+    تعيد حساب TP1 و TP2 بناءً على effective_entry ونفس SL الأصلي.
+    تستخدم rr1/rr2 المخزنين في diagnostics إن وجدوا.
+    لو غير موجودين تستخدم الافتراضي القديم: TP1 = 1.5R و TP2 = 3R.
+    """
+    side = normalize_side(trade.get("side", "long"))
+    diagnostics = trade.get("diagnostics", {}) or {}
+
+    rr1 = safe_float(diagnostics.get("rr1"), 1.5)
+    rr2 = safe_float(diagnostics.get("rr2"), 3.0)
+    sl = safe_float(trade.get("sl"), 0.0)
+
+    if effective_entry <= 0 or sl <= 0:
+        return trade
+
+    risk = abs(effective_entry - sl)
+    if risk <= 0:
+        return trade
+
+    if side == "short":
+        trade["tp1"] = round(effective_entry - (risk * rr1), 6)
+        trade["tp2"] = round(effective_entry - (risk * rr2), 6)
+    else:
+        trade["tp1"] = round(effective_entry + (risk * rr1), 6)
+        trade["tp2"] = round(effective_entry + (risk * rr2), 6)
+
+    diagnostics["rr1"] = rr1
+    diagnostics["rr2"] = rr2
+    trade["diagnostics"] = diagnostics
+
+    return trade
+
+
 # =========================
 # دوال النسب المئوية الحقيقية للصفقة (بدون رافعة)
 # =========================
@@ -158,6 +193,11 @@ def calc_trade_result_pct(trade: dict) -> float | None:
     direction = normalize_side(direction)
 
     diagnostics = trade.get("diagnostics", {}) or {}
+
+    # إذا كانت الصفقة تعتمد على بول باك ولم يتم تفعيله بعد، لا تحسب نتيجة مالية
+    if diagnostics.get("pullback_entry") is not None and not normalize_bool(diagnostics.get("pullback_triggered", False)):
+        return None
+
     # استخدام سعر الدخول الفعلي (effective_entry) إذا وُجد
     entry = safe_float(diagnostics.get("effective_entry"), safe_float(trade.get("entry"), 0.0))
 
@@ -342,6 +382,10 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
             if extra_fields.get("effective_entry") is not None
             else None
         ),
+
+        # rr1 / rr2 للتوافق المستقبلي
+        "rr1": safe_float(extra_fields.get("rr1"), 1.5),
+        "rr2": safe_float(extra_fields.get("rr2"), 3.0),
     }
 
     return diagnostics
@@ -399,6 +443,10 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "pullback_high": diagnostics.get("pullback_high"),
         "pullback_triggered": diagnostics.get("pullback_triggered", False),
         "effective_entry": diagnostics.get("effective_entry"),
+
+        # rr snapshot
+        "rr1": safe_float(diagnostics.get("rr1"), 1.5),
+        "rr2": safe_float(diagnostics.get("rr2"), 3.0),
     }
 
 
@@ -458,6 +506,10 @@ def register_trade(
     pullback_entry: float = None,
     pullback_low: float = None,
     pullback_high: float = None,
+
+    # === RR fields (اختياري للتوافق المستقبلي) ===
+    rr1: float = 1.5,
+    rr2: float = 3.0,
 ):
     if redis_client is None:
         return False
@@ -516,7 +568,9 @@ def register_trade(
         "pullback_low": pullback_low,
         "pullback_high": pullback_high,
         "pullback_triggered": False,
-        "effective_entry": pullback_entry if pullback_entry is not None else entry,
+        "effective_entry": entry,  # يبدأ بسعر الإشارة الأصلي، لا يفترض دخول البول باك
+        "rr1": rr1,
+        "rr2": rr2,
     })
 
     trade_data = {
@@ -746,30 +800,38 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     result = None
     tp1_now = False
 
-    # pullback logic
+    # pullback logic - للـ Long فقط حاليًا
     pullback_entry = diagnostics.get("pullback_entry")
     pullback_high = diagnostics.get("pullback_high")
+    pullback_low = diagnostics.get("pullback_low")
     pullback_triggered = normalize_bool(diagnostics.get("pullback_triggered", False))
 
-    if (
+    has_pullback_plan = (
         side == "long"
-        and not pullback_triggered
         and pullback_entry is not None
         and pullback_high is not None
-    ):
+    )
+
+    if has_pullback_plan and not pullback_triggered:
         pb_entry = safe_float(pullback_entry, 0.0)
         pb_high = safe_float(pullback_high, 0.0)
 
-        if pb_entry > 0 and pb_high > 0 and low <= pb_high:
-            diagnostics["pullback_triggered"] = True
-            diagnostics["effective_entry"] = pb_entry
-            trade["diagnostics"] = diagnostics
+        # السعر لم يلمس منطقة البول باك بعد → لا دخول ولا نتيجة
+        if not (pb_entry > 0 and pb_high > 0 and low <= pb_high):
+            return None, False, trade
 
-            if trade.get("tp1_hit"):
-                trade["sl"] = round(pb_entry, 6)
+        # السعر لمس منطقة البول باك → تفعيل الدخول وإعادة حساب الأهداف
+        diagnostics["pullback_triggered"] = True
+        diagnostics["effective_entry"] = pb_entry
+        trade["diagnostics"] = diagnostics
 
-            effective_entry = pb_entry
+        # إعادة حساب TP1 / TP2 من effective_entry الجديد (باستخدام rr1/rr2 المخزنة)
+        trade = recalc_targets_from_effective_entry(trade, pb_entry)
+        effective_entry = pb_entry
+        tp1 = safe_float(trade["tp1"])
+        tp2 = safe_float(trade["tp2"])
 
+    # تقييم النتيجة بناءً على السعر الفعلي
     if side == "long":
         if not tp1_hit:
             if low <= sl:
@@ -881,7 +943,7 @@ def update_open_trades(
                 if result == "tp2_win":
                     break
             else:
-                # save any pullback-trigger state change
+                # حفظ أي تغيير في حالة البول باك أو غيره
                 diagnostics = trade.get("diagnostics", {}) or {}
                 if diagnostics.get("pullback_triggered") and not state_changed:
                     save_trade(redis_client, trade_key, trade)
@@ -985,8 +1047,8 @@ def _finalize_summary(summary: dict):
     if losses_count > 0:
         summary["avg_loss_pct"] = summary["gross_loss_pct"] / losses_count
 
-    # === حالة المخاطرة: تُحسب على تأثير المحفظة الفعلي ===
-    wallet_pnl_pct = summary["realized_pnl_pct"] * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
+    # === حالة المخاطرة: تُحسب على تأثير المحفظة الفعلي بالنظام الجديد ===
+    wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
 
     if wallet_pnl_pct <= -REPORT_DAILY_MAX_DRAWDOWN_PCT:
         summary["risk_status"] = "danger"
@@ -999,19 +1061,47 @@ def _finalize_summary(summary: dict):
 
 
 # =========================
-# تقدير العائد على المحفظة
+# دوال حساب حجم الصفقة والأرباح الجديدة
 # =========================
+def get_position_sizing_plan():
+    capital_used_usd = REPORT_ACCOUNT_BALANCE_USD * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
+    per_trade_usd = capital_used_usd / REPORT_ACTIVE_TRADE_SLOTS if REPORT_ACTIVE_TRADE_SLOTS > 0 else 0.0
+
+    return {
+        "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
+        "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
+        "capital_used_usd": capital_used_usd,
+        "active_trade_slots": REPORT_ACTIVE_TRADE_SLOTS,
+        "per_trade_usd": per_trade_usd,
+    }
+
+
 def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> tuple:
     """
-    تحسب الأثر التقديري على المحفظة بناءً على صافي حركة الصفقات
-    وحد استخدام المحفظة.
-    ترجع (نسبة التأثير على المحفظة %, القيمة بالدولار)
+    تقدير تأثير الصفقات المغلقة على المحفظة بنظام 10 صفقات مفتوحة كحد أقصى.
+
+    الفكرة:
+    - لا نحسب كأن كل صفقة استخدمت 35% من المحفظة.
+    - نحسب أن 35% من المحفظة موزعة على 10 صفقات.
+    - حجم الصفقة الواحدة = رأس المال المستخدم / عدد الصفقات النشطة.
     """
     if max_capital_usage_pct is None:
         max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
-    realized = summary.get("realized_pnl_pct", 0.0)
-    wallet_pnl_pct = realized * (max_capital_usage_pct / 100.0)
-    wallet_pnl_usd = REPORT_ACCOUNT_BALANCE_USD * wallet_pnl_pct / 100.0
+
+    active_slots = max(1, int(REPORT_ACTIVE_TRADE_SLOTS))
+    account_balance = float(REPORT_ACCOUNT_BALANCE_USD)
+
+    capital_used_usd = account_balance * (float(max_capital_usage_pct) / 100.0)
+    per_trade_usd = capital_used_usd / active_slots
+
+    realized_pct_sum = float(summary.get("realized_pnl_pct", 0.0) or 0.0)
+
+    # الربح بالدولار = مجموع نسب الصفقات المغلقة × حجم الصفقة الواحدة
+    wallet_pnl_usd = per_trade_usd * (realized_pct_sum / 100.0)
+
+    # تأثير الربح على إجمالي المحفظة
+    wallet_pnl_pct = (wallet_pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
+
     return wallet_pnl_pct, wallet_pnl_usd
 
 
@@ -1420,7 +1510,7 @@ def format_winrate_summary(summary: dict) -> str:
 def format_period_summary(title: str, summary: dict) -> str:
     decided = summary["wins"] + summary["losses"] + summary["expired"]
 
-    # استخراج البيانات المالية
+    # استخراج البيانات المالية بالنظام الجديد
     realized = summary.get("realized_pnl_pct", 0.0)
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
     avg_win = summary.get("avg_win_pct", 0.0)
@@ -1429,14 +1519,23 @@ def format_period_summary(title: str, summary: dict) -> str:
     worst = summary.get("worst_trade_pct", 0.0)
     risk_status = summary.get("risk_status", "normal")
 
+    # بيانات حجم الصفقات
+    sizing = get_position_sizing_plan()
+    capital_used_usd = sizing["capital_used_usd"]
+    per_trade_usd = sizing["per_trade_usd"]
+    active_trade_slots = sizing["active_trade_slots"]
+
     status_ar = {"normal": "آمن ✅", "warning": "تحذير ⚠️", "danger": "خطر 🔴"}
     status_text = status_ar.get(risk_status, risk_status)
 
     financial_block = (
         f"\n\n💰 الأداء المالي التقريبي:\n"
-        f"• صافي حركة الصفقات: {realized:+.2f}%\n"
-        f"• التأثير على المحفظة عند استخدام {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%: {wallet_pnl_pct:+.2f}%\n"
-        f"• ربح/خسارة تقديرية على محفظة {REPORT_ACCOUNT_BALANCE_USD:.0f}$: {wallet_pnl_usd:+.2f}$\n"
+        f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
+        f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
+        f"• حجم الصفقة الواحدة تقديريًا: {per_trade_usd:.2f}$\n"
+        f"• صافي حركة الصفقات المغلقة: {realized:+.2f}%\n"
+        f"• التأثير الحقيقي على المحفظة: {wallet_pnl_pct:+.2f}%\n"
+        f"• ربح/خسارة تقديرية: {wallet_pnl_usd:+.2f}$\n"
         f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
         f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%\n"
         f"• أفضل صفقة: {best:+.2f}%\n"
