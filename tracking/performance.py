@@ -12,6 +12,14 @@ TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90   # 90 days — للـ Hybrid Labe
 
 
 # =========================
+# إعدادات التقرير المالي (لا تتحكم في تنفيذ الصفقات)
+# =========================
+REPORT_ACCOUNT_BALANCE_USD = 1000.0
+REPORT_MAX_CAPITAL_USAGE_PCT = 35.0
+REPORT_DAILY_MAX_DRAWDOWN_PCT = 20.0
+
+
+# =========================
 # BASIC HELPERS
 # =========================
 def safe_float(value, default=0.0):
@@ -122,6 +130,81 @@ def calc_tp2(entry: float, sl: float, side: str = "long") -> float:
     if side == "short":
         return round(float(entry) - (risk * 3.0), 6)
     return round(float(entry) + (risk * 3.0), 6)
+
+
+# =========================
+# دوال النسب المئوية الحقيقية للصفقة (بدون رافعة)
+# =========================
+def calc_long_pct(entry: float, exit_price: float) -> float:
+    """نسبة حركة اللونج بدون رافعة"""
+    if entry <= 0:
+        return 0.0
+    return ((exit_price - entry) / entry) * 100
+
+
+def calc_short_pct(entry: float, exit_price: float) -> float:
+    """نسبة حركة الشورت بدون رافعة"""
+    if entry <= 0:
+        return 0.0
+    return ((entry - exit_price) / entry) * 100
+
+
+def calc_trade_result_pct(trade: dict) -> float | None:
+    """
+    تحسب النسبة المئوية الإجمالية لنتيجة الصفقة بعد الأخذ في الاعتبار
+    الإغلاق الجزئي 50% عند TP1 وتحريك الوقف للدخول.
+    """
+    direction = trade.get("direction", "long") if "direction" in trade else trade.get("side", "long")
+    direction = normalize_side(direction)
+
+    diagnostics = trade.get("diagnostics", {}) or {}
+    # استخدام سعر الدخول الفعلي (effective_entry) إذا وُجد
+    entry = safe_float(diagnostics.get("effective_entry"), safe_float(trade.get("entry"), 0.0))
+
+    sl = safe_float(trade.get("sl"), 0.0)
+    tp1 = safe_float(trade.get("tp1"), 0.0)
+    tp2 = safe_float(trade.get("tp2"), 0.0)
+    tp1_hit = normalize_bool(trade.get("tp1_hit", False))
+    result = str(trade.get("result", "") or "").lower().strip()
+
+    if entry <= 0 or result in ("open", "partial", "breakeven", ""):
+        return None
+
+    if result == "expired":
+        # إذا ضرب TP1 قبل expiry نعاملها كـ tp1_win (نصف ربح)
+        if tp1_hit and tp1 > 0:
+            if direction == "long":
+                return 0.5 * calc_long_pct(entry, tp1)
+            return 0.5 * calc_short_pct(entry, tp1)
+        return 0.0
+
+    if result == "loss":
+        # خسارة كاملة على SL
+        if direction == "long":
+            return calc_long_pct(entry, sl)
+        return calc_short_pct(entry, sl)
+
+    if result == "tp1_win":
+        # ضرب TP1 ثم ارتداد إلى entry → نصف الصفقة ربح TP1 والنصف الآخر تعادل
+        if tp1_hit and tp1 > 0:
+            if direction == "long":
+                return 0.5 * calc_long_pct(entry, tp1)
+            return 0.5 * calc_short_pct(entry, tp1)
+        return 0.0
+
+    if result == "tp2_win":
+        if tp1_hit and tp1 > 0:
+            # نصف عند TP1 + نصف عند TP2
+            if direction == "long":
+                return 0.5 * calc_long_pct(entry, tp1) + 0.5 * calc_long_pct(entry, tp2)
+            return 0.5 * calc_short_pct(entry, tp1) + 0.5 * calc_short_pct(entry, tp2)
+        else:
+            # ضرب TP2 مباشرة
+            if direction == "long":
+                return calc_long_pct(entry, tp2)
+            return calc_short_pct(entry, tp2)
+
+    return None
 
 
 # =========================
@@ -832,6 +915,17 @@ def _empty_summary(setup_type=None):
         "tp1_hits": 0,
         "tp1_rate": 0.0,
         "winrate": 0.0,
+
+        # === حقول مالية جديدة ===
+        "realized_pnl_pct": 0.0,
+        "gross_profit_pct": 0.0,
+        "gross_loss_pct": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "best_trade_pct": 0.0,
+        "worst_trade_pct": 0.0,
+        "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
+        "risk_status": "normal",
     }
 
 
@@ -862,6 +956,19 @@ def _apply_trade_to_summary(summary: dict, trade: dict):
     elif result == "expired":
         summary["expired"] += 1
 
+    # === حساب النسبة المئوية للصفقة وتحديث الحقول المالية ===
+    trade_pct = calc_trade_result_pct(trade)
+    if trade_pct is not None and result in ("tp1_win", "tp2_win", "loss", "expired"):
+        summary["realized_pnl_pct"] += trade_pct
+        if trade_pct > 0:
+            summary["gross_profit_pct"] += trade_pct
+            if trade_pct > summary["best_trade_pct"]:
+                summary["best_trade_pct"] = trade_pct
+        elif trade_pct < 0:
+            summary["gross_loss_pct"] += trade_pct
+            if trade_pct < summary["worst_trade_pct"]:
+                summary["worst_trade_pct"] = trade_pct
+
 
 def _finalize_summary(summary: dict):
     decided = summary["wins"] + summary["losses"]
@@ -869,7 +976,43 @@ def _finalize_summary(summary: dict):
 
     summary["winrate"] = round((summary["wins"] / decided) * 100, 2) if decided > 0 else 0.0
     summary["tp1_rate"] = round((summary["tp1_hits"] / base_for_tp1) * 100, 2) if base_for_tp1 > 0 else 0.0
+
+    # === متوسطات النسب المئوية ===
+    wins_count = summary["wins"]
+    losses_count = summary["losses"]
+    if wins_count > 0:
+        summary["avg_win_pct"] = summary["gross_profit_pct"] / wins_count
+    if losses_count > 0:
+        summary["avg_loss_pct"] = summary["gross_loss_pct"] / losses_count
+
+    # === حالة المخاطرة: تُحسب على تأثير المحفظة الفعلي ===
+    wallet_pnl_pct = summary["realized_pnl_pct"] * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
+
+    if wallet_pnl_pct <= -REPORT_DAILY_MAX_DRAWDOWN_PCT:
+        summary["risk_status"] = "danger"
+    elif wallet_pnl_pct <= -(REPORT_DAILY_MAX_DRAWDOWN_PCT / 2):
+        summary["risk_status"] = "warning"
+    else:
+        summary["risk_status"] = "normal"
+
     return summary
+
+
+# =========================
+# تقدير العائد على المحفظة
+# =========================
+def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> tuple:
+    """
+    تحسب الأثر التقديري على المحفظة بناءً على صافي حركة الصفقات
+    وحد استخدام المحفظة.
+    ترجع (نسبة التأثير على المحفظة %, القيمة بالدولار)
+    """
+    if max_capital_usage_pct is None:
+        max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
+    realized = summary.get("realized_pnl_pct", 0.0)
+    wallet_pnl_pct = realized * (max_capital_usage_pct / 100.0)
+    wallet_pnl_usd = REPORT_ACCOUNT_BALANCE_USD * wallet_pnl_pct / 100.0
+    return wallet_pnl_pct, wallet_pnl_usd
 
 
 # =========================
@@ -940,6 +1083,14 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": 0.0,
             "market_type": normalize_market_type(market_type),
             "side": normalize_side(side),
+            "realized_pnl_pct": 0.0,
+            "gross_profit_pct": 0.0,
+            "gross_loss_pct": 0.0,
+            "avg_win_pct": 0.0,
+            "avg_loss_pct": 0.0,
+            "best_trade_pct": 0.0,
+            "worst_trade_pct": 0.0,
+            "risk_status": "normal",
         }
 
     market_type = normalize_market_type(market_type)
@@ -966,6 +1117,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
         tp1_rate = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
 
+        # نستخدم get_trade_summary للحصول على الأرقام المالية لأنها غير مخزنة في الإحصائيات السريعة
+        financial_summary = get_trade_summary(redis_client, market_type=market_type, side=side)
+
         return {
             "wins": wins,
             "tp1_wins": tp1_wins,
@@ -979,6 +1133,14 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": winrate,
             "market_type": market_type,
             "side": side,
+            "realized_pnl_pct": financial_summary.get("realized_pnl_pct", 0.0),
+            "gross_profit_pct": financial_summary.get("gross_profit_pct", 0.0),
+            "gross_loss_pct": financial_summary.get("gross_loss_pct", 0.0),
+            "avg_win_pct": financial_summary.get("avg_win_pct", 0.0),
+            "avg_loss_pct": financial_summary.get("avg_loss_pct", 0.0),
+            "best_trade_pct": financial_summary.get("best_trade_pct", 0.0),
+            "worst_trade_pct": financial_summary.get("worst_trade_pct", 0.0),
+            "risk_status": financial_summary.get("risk_status", "normal"),
         }
 
     except Exception as e:
@@ -996,6 +1158,14 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": 0.0,
             "market_type": market_type,
             "side": side,
+            "realized_pnl_pct": 0.0,
+            "gross_profit_pct": 0.0,
+            "gross_loss_pct": 0.0,
+            "avg_win_pct": 0.0,
+            "avg_loss_pct": 0.0,
+            "best_trade_pct": 0.0,
+            "worst_trade_pct": 0.0,
+            "risk_status": "normal",
         }
 
 
@@ -1007,6 +1177,9 @@ def get_trade_summary(
 ):
     if redis_client is None:
         return _empty_summary()
+
+    # === تنظيف الفهرس قبل القراءة ===
+    cleanup_missing_trades_from_index(redis_client)
 
     all_trades_key = get_all_trades_set_key()
 
@@ -1247,6 +1420,33 @@ def format_winrate_summary(summary: dict) -> str:
 def format_period_summary(title: str, summary: dict) -> str:
     decided = summary["wins"] + summary["losses"] + summary["expired"]
 
+    # استخراج البيانات المالية
+    realized = summary.get("realized_pnl_pct", 0.0)
+    wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
+    avg_win = summary.get("avg_win_pct", 0.0)
+    avg_loss = summary.get("avg_loss_pct", 0.0)
+    best = summary.get("best_trade_pct", 0.0)
+    worst = summary.get("worst_trade_pct", 0.0)
+    risk_status = summary.get("risk_status", "normal")
+
+    status_ar = {"normal": "آمن ✅", "warning": "تحذير ⚠️", "danger": "خطر 🔴"}
+    status_text = status_ar.get(risk_status, risk_status)
+
+    financial_block = (
+        f"\n\n💰 الأداء المالي التقريبي:\n"
+        f"• صافي حركة الصفقات: {realized:+.2f}%\n"
+        f"• التأثير على المحفظة عند استخدام {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%: {wallet_pnl_pct:+.2f}%\n"
+        f"• ربح/خسارة تقديرية على محفظة {REPORT_ACCOUNT_BALANCE_USD:.0f}$: {wallet_pnl_usd:+.2f}$\n"
+        f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
+        f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%\n"
+        f"• أفضل صفقة: {best:+.2f}%\n"
+        f"• أسوأ صفقة: {worst:+.2f}%\n\n"
+        f"🧯 إدارة المخاطرة:\n"
+        f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%\n"
+        f"• حد إيقاف/تحذير الخسارة: -{REPORT_DAILY_MAX_DRAWDOWN_PCT:.0f}% من إجمالي المحفظة\n"
+        f"• الحالة: {status_text}\n"
+    )
+
     return (
         f"📊 {title}\n"
         f"Signals: {summary['total']}\n"
@@ -1258,4 +1458,5 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"Expired: {summary['expired']}\n"
         f"Open: {summary['open']}\n"
         f"Win rate: {summary['winrate']}%"
+        + financial_block
     )
