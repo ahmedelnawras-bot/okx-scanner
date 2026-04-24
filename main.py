@@ -528,7 +528,8 @@ TELEGRAM_COMMANDS = {
     "/help": "عرض كل الأوامر المتاحة",
     "/how_it_work": "شرح طريقة عمل البوت",
     "/report_1h": "آخر ساعة",
-    "/report_today": "اليوم",
+    "/report_today": "تقرير اليوم",
+    "/report_month": "تقرير آخر 30 يوم",
     "/report_all": "كل الصفقات",
     "/report_deep": "تحليل متقدم للأداء",
     "/report_setups": "تحليل أفضل وأسوأ أنواع الإشارات",
@@ -557,6 +558,8 @@ def build_report_message(period: str) -> str:
     title_map = {
         "1h": "Long Report - Last 1H",
         "today": "Long Report - Today",
+        "month": "Long Report - Last 30 Days",
+        "30d": "Long Report - Last 30 Days",
         "all": "Long Report - All Time",
     }
 
@@ -570,6 +573,16 @@ def build_report_message(period: str) -> str:
             )
             return format_period_summary(title_map["today"], summary)
 
+        # التقرير الشهري = آخر 30 يوم
+        if period == "month":
+            summary = get_period_summary(
+                redis_client=r,
+                period="30d",
+                market_type="futures",
+                side="long",
+            )
+            return format_period_summary(title_map["month"], summary)
+
         summary = get_period_summary(
             redis_client=r,
             period=period,
@@ -577,6 +590,7 @@ def build_report_message(period: str) -> str:
             side="long",
         )
         return format_period_summary(title_map.get(period, "Long Report"), summary)
+
     except Exception as e:
         logger.error(f"build_report_message error on period={period}: {e}")
         return "❌ حصل خطأ أثناء بناء التقرير"
@@ -612,6 +626,10 @@ def build_help_message() -> str:
         "• فيه زر 📌 Track لمتابعة نتيجة أي إشارة",
         "• Smart Early Priority للإشارات المبكرة",
         "• فيه تمييز خاص لفرص Oversold Reversal",
+        "• التقارير تعرض الأداء المالي كنسبة فقط بدون إدخال قيمة لكل صفقة",
+        "• الحساب مبني على حد استخدام 35% من المحفظة",
+        "• إدارة المخاطرة تتحذر عند الاقتراب من خسارة 20% من إجمالي المحفظة",
+        "• حساب الربح يراعي 50% عند TP1 و 50% تكمل إلى TP2 أو تعود Entry",
     ]
 
     if other_commands:
@@ -659,6 +677,14 @@ def build_how_it_work_message() -> str:
 • أقصى صعود لصالح الصفقة
 • أقصى هبوط ضد الصفقة
 • مدة الصفقة
+
+💰 <b>التقارير المالية:</b>
+• البوت لا يحتاج إدخال قيمة لكل صفقة
+• يحسب صافي حركة الصفقات كنسبة %
+• يقدر تأثيرها على المحفظة بناءً على استخدام 35% من الرصيد
+• TP1 محسوب كإغلاق 50% من الصفقة
+• بعد TP1 يتم اعتبار النصف الثاني عند Entry لو رجع السعر
+• حد المخاطرة المعروض مبني على خسارة 20% من إجمالي المحفظة
 
 ✅ <b>أفضل استخدام:</b>
 راجع الشارت بسرعة وخد القرار بعد التأكد من السياق العام."""
@@ -760,6 +786,7 @@ COMMAND_HANDLERS = {
     "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
     "/report_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
     "/report_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
+    "/report_month": lambda chat_id: send_telegram_reply(chat_id, build_report_message("month")),
     "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
     "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
     "/report_setups": lambda chat_id: send_telegram_reply(
@@ -3722,6 +3749,7 @@ def run_scanner_loop():
                     "dist_ma": dist_ma,
                     "entry_timing": entry_timing,
                     "opportunity_type": opportunity_type,
+                    "market_state": market_state,
                     "market_state_label": market_state_label,
                     "market_bias_label": market_bias_label,
                     "breakout_quality": breakout_quality,
@@ -3796,6 +3824,8 @@ def run_scanner_loop():
                         "rsi_now": rsi_now,
                         "dist_ma": dist_ma,
                         "vol_ratio": vol_ratio,
+                        "pullback_low": pullback_low,
+                        "pullback_high": pullback_high,
                     },
                     "candle_time": candle_time,
                     "now": now,
@@ -3919,6 +3949,9 @@ def run_scanner_loop():
                         has_high_impact_news=candidate.get("has_high_impact_news", False),
                         news_titles=candidate.get("news_titles", []),
                         warning_reasons=candidate.get("warning_reasons", []),
+                        pullback_low=candidate.get("pullback_low"),
+                        pullback_high=candidate.get("pullback_high"),
+                        pullback_entry=candidate.get("pullback_low"),
                     )
 
                     logger.info(
