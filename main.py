@@ -27,8 +27,6 @@ from tracking.performance import (
     get_trade_summary,
     format_period_summary,
     get_setup_type_stats,
-    # calc_tp1,  # غير مستخدمة
-    # calc_tp2,  # غير مستخدمة
 )
 
 # =========================
@@ -82,6 +80,20 @@ PRE_BREAKOUT_PROXIMITY_MIN = 0.965
 PRE_BREAKOUT_VOLUME_SIGNIFICANCE = 1.20
 PRE_BREAKOUT_RECENT_VOL_BARS = 3
 PRE_BREAKOUT_BASELINE_VOL_BARS = 12
+
+# Late pump / bull-market protection
+LATE_PUMP_DIST_MA = 4.2
+LATE_PUMP_RSI = 67.0
+LATE_PUMP_VOL_RATIO = 1.80
+LATE_PUMP_CANDLE_STRENGTH = 0.62
+
+BULL_CONTINUATION_MAX_DIST_MA = 3.2
+BULL_CONTINUATION_MAX_RSI = 66.0
+BULL_CONTINUATION_MAX_VOL_RATIO = 1.75
+
+BULL_CONTINUATION_SCORE_PENALTY = 0.45
+LATE_PUMP_SCORE_PENALTY = 0.65
+EXTREME_LATE_PUMP_SCORE_PENALTY = 0.90
 
 # Oversold reversal long
 OVERSOLD_REVERSAL_ENABLED = True
@@ -1366,6 +1378,140 @@ def is_exhausted_long_move(
         return False
 
 
+def detect_late_pump_long(
+    market_state: str,
+    opportunity_type: str,
+    dist_ma: float,
+    rsi_now: float,
+    vol_ratio: float,
+    candle_strength: float,
+    breakout: bool,
+    pre_breakout: bool,
+    breakout_quality: str,
+    change_4h: float = 0.0,
+) -> dict:
+    """
+    يكشف الدخول المتأخر بعد Pump.
+    الهدف: منع الحالات التي كانت تظهر قوية لكنها تخسر:
+    RSI عالي + فوليوم عالي + شمعة قوية + السعر بعيد عن MA.
+    """
+    try:
+        reasons = []
+
+        is_continuation = str(opportunity_type or "").strip() in ("استمرار", "continuation")
+
+        over_ma = dist_ma >= LATE_PUMP_DIST_MA
+        hot_rsi = rsi_now >= LATE_PUMP_RSI
+        pump_volume = vol_ratio >= LATE_PUMP_VOL_RATIO
+        big_candle = candle_strength >= LATE_PUMP_CANDLE_STRENGTH
+        fast_4h_move = change_4h >= 3.0
+
+        if over_ma:
+            reasons.append("overextended_from_ma")
+        if hot_rsi:
+            reasons.append("rsi_overheated")
+        if pump_volume:
+            reasons.append("volume_pump")
+        if big_candle:
+            reasons.append("strong_candle_chase")
+        if fast_4h_move:
+            reasons.append("fast_4h_move")
+
+        checks = sum([over_ma, hot_rsi, pump_volume, big_candle, fast_4h_move])
+
+        late_pump_risk = checks >= 3
+
+        extreme_late_pump = (
+            dist_ma >= 5.2
+            and rsi_now >= 70
+            and vol_ratio >= 2.0
+            and candle_strength >= 0.65
+        )
+
+        bull_continuation_risk = (
+            market_state == "bull_market"
+            and is_continuation
+            and not pre_breakout
+            and (
+                dist_ma > BULL_CONTINUATION_MAX_DIST_MA
+                or rsi_now > BULL_CONTINUATION_MAX_RSI
+                or vol_ratio > BULL_CONTINUATION_MAX_VOL_RATIO
+            )
+        )
+
+        weak_breakout_exception = (
+            breakout
+            and breakout_quality in ("none", "weak")
+            and late_pump_risk
+        )
+
+        should_block = False
+
+        # أقوى منع: استمرار في bull_market بعد امتداد واضح
+        if bull_continuation_risk and late_pump_risk:
+            should_block = True
+
+        # منع Pump عنيف جدًا حتى لو فيه breakout ضعيف
+        if extreme_late_pump and not pre_breakout:
+            should_block = True
+
+        # breakout ضعيف + late pump = غالبًا مطاردة
+        if weak_breakout_exception:
+            should_block = True
+
+        return {
+            "late_pump_risk": bool(late_pump_risk),
+            "extreme_late_pump": bool(extreme_late_pump),
+            "bull_continuation_risk": bool(bull_continuation_risk),
+            "should_block": bool(should_block),
+            "reasons": reasons,
+            "checks": checks,
+        }
+
+    except Exception:
+        return {
+            "late_pump_risk": False,
+            "extreme_late_pump": False,
+            "bull_continuation_risk": False,
+            "should_block": False,
+            "reasons": [],
+            "checks": 0,
+        }
+
+
+def append_late_pump_warnings(score_result: dict, late_guard: dict) -> dict:
+    """
+    يضيف أسباب التحذير داخل score_result بدون ما يكسر شكل الرسائل.
+    """
+    try:
+        if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
+            score_result["warning_reasons"] = []
+
+        warning_map = {
+            "overextended_from_ma": "بعيد عن المتوسط (دخول متأخر)",
+            "rsi_overheated": "RSI عالي (تشبع شراء)",
+            "volume_pump": "فوليوم انفجاري",
+            "strong_candle_chase": "شمعة قوية لكن احتمال مطاردة",
+            "fast_4h_move": "صعود سريع خلال 4 ساعات",
+        }
+
+        if late_guard.get("late_pump_risk"):
+            score_result["warning_reasons"].append("خطر مطاردة Pump متأخر")
+        if late_guard.get("bull_continuation_risk"):
+            score_result["warning_reasons"].append("استمرار في Bull Market بعد امتداد خطر")
+
+        for reason in late_guard.get("reasons", []):
+            label = warning_map.get(reason)
+            if label:
+                score_result["warning_reasons"].append(label)
+
+        score_result["warning_reasons"] = list(dict.fromkeys(score_result["warning_reasons"]))
+        return score_result
+
+    except Exception:
+        return score_result
+
+
 def is_oversold_reversal_long(
     df,
     dist_ma: float,
@@ -1887,7 +2033,7 @@ def get_dynamic_entry_threshold(
     elif market_state == "mixed":
         threshold = 6.5
     elif market_state == "bull_market":
-        threshold = 6.2
+        threshold = 6.35
     elif market_state == "alt_season":
         threshold = 6.0
     else:
@@ -1896,10 +2042,17 @@ def get_dynamic_entry_threshold(
     if mtf_confirmed:
         threshold -= 0.10
 
-    if vol_ratio >= 2.0:
-        threshold -= 0.20
-    elif vol_ratio >= 1.5:
-        threshold -= 0.10
+    # الفوليوم العالي ليس دائمًا إيجابيًا في اللونج، خصوصًا بعد الحركة
+    if market_state == "bull_market":
+        if vol_ratio >= 2.0:
+            threshold += 0.10
+        elif vol_ratio >= 1.5:
+            threshold += 0.05
+    else:
+        if vol_ratio >= 2.0:
+            threshold -= 0.10
+        elif vol_ratio >= 1.5:
+            threshold -= 0.05
 
     if is_new:
         threshold += 0.10
@@ -2482,6 +2635,10 @@ def normalize_reason(reason: str) -> str:
         "أسفل المتوسط": "أسفل المتوسط",
         "رفض سعري علوي": "رفض سعري علوي",
         "أخبار اقتصادية مهمة قريبة": "أخبار اقتصادية مهمة قريبة",
+        "Late Pump Risk": "خطر مطاردة Pump متأخر",
+        "Bull Market Continuation Risk": "استمرار في Bull Market بعد امتداد خطر",
+        "شمعة قوية لكن احتمال مطاردة": "شمعة قوية لكن احتمال مطاردة",
+        "صعود سريع خلال 4 ساعات": "صعود سريع خلال 4 ساعات",
     }
     return mapping.get(reason, reason)
 
@@ -2518,6 +2675,10 @@ def sort_reasons(reasons):
         "تمويل إيجابي (ضغط محتمل)": 108,
         "رفض سعري علوي": 109,
         "أخبار اقتصادية مهمة قريبة": 110,
+        "خطر مطاردة Pump متأخر": 111,
+        "استمرار في Bull Market بعد امتداد خطر": 112,
+        "شمعة قوية لكن احتمال مطاردة": 113,
+        "صعود سريع خلال 4 ساعات": 114,
     }
     return sorted(reasons, key=lambda x: priority.get(x, 999))
 
@@ -2616,19 +2777,46 @@ def classify_opportunity_type_long(
         return "استمرار"
 
 
-def classify_entry_timing_long(dist_ma: float, breakout: bool, pre_breakout: bool, vol_ratio: float) -> str:
+def classify_entry_timing_long(
+    dist_ma: float,
+    breakout: bool,
+    pre_breakout: bool,
+    vol_ratio: float,
+    rsi_now: float = 50.0,
+    candle_strength: float = 0.0,
+    late_pump_risk: bool = False,
+) -> str:
     try:
-        if (pre_breakout or breakout) and dist_ma <= 2.8 and vol_ratio >= 1.15:
-            return "🟢 مبكر (بداية الحركة)"
+        # أي Pump واضح لا يصح يتسمى مبكر
+        if late_pump_risk:
+            return "🔴 متأخر (مطاردة حركة)"
 
-        if breakout and 2.8 < dist_ma <= 4.4 and vol_ratio >= 1.25:
-            return "🟡 متوسط (نص الحركة)"
-
-        if 2.8 < dist_ma <= 5.0 and vol_ratio >= 1.10:
-            return "🟡 متوسط (نص الحركة)"
-
+        # امتداد واضح من المتوسط
         if dist_ma > 5.0:
             return "🔴 متأخر (قرب النهاية)"
+
+        # RSI عالي + بعيد نسبيًا = دخول متوسط/متأخر وليس مبكر
+        if rsi_now >= 68 and dist_ma > 3.2:
+            return "🔴 متأخر (RSI مرتفع)"
+
+        # فوليوم انفجاري + شمعة قوية + السعر بعيد = مطاردة
+        if vol_ratio >= 1.9 and candle_strength >= 0.62 and dist_ma > 3.5:
+            return "🔴 متأخر (Pump محتمل)"
+
+        # مبكر حقيقي: قريب من MA، RSI غير متضخم، وفوليوم داعم مش انفجاري
+        if (pre_breakout or breakout) and dist_ma <= 2.6 and 1.10 <= vol_ratio <= 1.85 and rsi_now <= 66:
+            return "🟢 مبكر (بداية الحركة)"
+
+        # Breakout مقبول لكن مش مبكر
+        if breakout and 2.6 < dist_ma <= 4.2 and vol_ratio >= 1.20 and rsi_now <= 68:
+            return "🟡 متوسط (نص الحركة)"
+
+        # استمرار قريب من المتوسط
+        if dist_ma <= 3.2 and vol_ratio >= 1.05 and rsi_now <= 66:
+            return "🟡 متوسط (نص الحركة)"
+
+        if 3.2 < dist_ma <= 5.0:
+            return "🟡 متوسط (نص الحركة)"
 
         return "🟡 متوسط (نص الحركة)"
     except Exception:
@@ -2759,18 +2947,20 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
 
 
 # =========================
-# SL / TP LOGIC
+# SL / TP LOGIC (تم تقريب TP بتقليل نسب RR)
 # =========================
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
+    # قمنا بتقليل RR لجميع الأنواع لجعل TP أقرب
     if signal_type == "breakout":
-        return 2.5, 4.0
+        return 2.2, 3.5
     if signal_type == "pre_breakout":
-        return 2.8, 4.5
+        return 2.3, 3.8
     if signal_type == "new_listing":
-        return 3.0, 5.0
-    if "🔴 متأخر" in entry_timing:
         return 2.5, 4.0
-    return 2.5, 4.0
+    if "🔴 متأخر" in entry_timing:
+        return 2.0, 3.2
+    # افتراضي
+    return 2.0, 3.2
 
 
 def calc_tp_long(entry: float, sl: float, rr: float) -> float:
@@ -3111,7 +3301,7 @@ def run_scanner_loop():
                 gaining_strength = is_gaining_intraday_strength(df)
                 breakout_quality = get_breakout_quality(df, vol_ratio)
 
-                # --- حساب is_reverse أولاً (لأن RSI يحتاجها) ---
+                # --- حساب is_reverse أولاً (لأن RSI تحتاجها) ---
                 is_reverse = is_oversold_reversal_long(
                     df=df,
                     dist_ma=dist_ma,
@@ -3139,6 +3329,38 @@ def run_scanner_loop():
                 # --- PHASE 3 LITE: حساب BB و 4H change ---
                 above_upper_bb = is_above_upper_bollinger(df)
                 change_4h = get_change_4h(df)
+
+                # === Late Pump / Bull Market Guard ===
+                temp_opportunity_type = classify_opportunity_type_long(
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    dist_ma=dist_ma,
+                    mtf_confirmed=mtf_confirmed,
+                    is_reverse=is_reverse,
+                )
+
+                late_guard = detect_late_pump_long(
+                    market_state=market_state,
+                    opportunity_type=temp_opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    breakout_quality=breakout_quality,
+                    change_4h=change_4h,
+                )
+
+                if late_guard.get("should_block") and not is_reverse:
+                    logger.info(
+                        f"{symbol} → skipped (late/bull continuation guard | "
+                        f"market={market_state} | opp={temp_opportunity_type} | "
+                        f"dist_ma={dist_ma:.2f} | rsi={rsi_now:.1f} | "
+                        f"vol={vol_ratio:.2f} | candle={candle_strength:.2f} | "
+                        f"bq={breakout_quality} | reasons={late_guard.get('reasons')})"
+                    )
+                    continue
 
                 # === FILTER 1: Bollinger (SAFE) ===
                 if above_upper_bb and not pre_breakout and not is_reverse:
@@ -3236,6 +3458,18 @@ def run_scanner_loop():
                 raw_score = float(score_result.get("score", 0))
                 effective_score = raw_score
 
+                # أضف تحذيرات late pump داخل الرسالة والتسجيل
+                score_result = append_late_pump_warnings(score_result, late_guard)
+
+                # عقوبة للـ late pump بدل مكافأة الحركة المتأخرة
+                if late_guard.get("extreme_late_pump") and not is_reverse:
+                    effective_score -= EXTREME_LATE_PUMP_SCORE_PENALTY
+                elif late_guard.get("late_pump_risk") and not is_reverse:
+                    effective_score -= LATE_PUMP_SCORE_PENALTY
+
+                if late_guard.get("bull_continuation_risk") and not is_reverse:
+                    effective_score -= BULL_CONTINUATION_SCORE_PENALTY
+
                 if score_result.get("fake_signal"):
                     if breakout or pre_breakout:
                         effective_score -= 0.20
@@ -3249,10 +3483,12 @@ def run_scanner_loop():
 
                 effective_score += get_early_priority_score_bonus(early_priority)
 
-                if breakout and vol_ratio >= 1.5:
-                    effective_score += 0.40
-                elif breakout and vol_ratio >= 1.3:
-                    effective_score += 0.20
+                # لا نكافئ الفوليوم العالي لو فيه late pump أو bull continuation risk
+                if breakout and not late_guard.get("late_pump_risk") and not late_guard.get("bull_continuation_risk"):
+                    if vol_ratio >= 1.5:
+                        effective_score += 0.30
+                    elif vol_ratio >= 1.3:
+                        effective_score += 0.15
 
                 if is_reverse:
                     effective_score += OVERSOLD_REVERSAL_SCORE_BONUS
@@ -3307,6 +3543,9 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     vol_ratio=vol_ratio,
+                    rsi_now=rsi_now,
+                    candle_strength=candle_strength,
+                    late_pump_risk=late_guard.get("late_pump_risk", False),
                 )
                 timing_penalty = get_entry_timing_penalty(entry_timing)
                 effective_required_min_score = required_min_score + timing_penalty
@@ -3429,6 +3668,17 @@ def run_scanner_loop():
                     is_reverse=is_reverse,
                 )
 
+                # عقوبة momentum للـ late pump حتى لا تتفوق في الترتيب
+                if late_guard.get("extreme_late_pump") and not is_reverse:
+                    momentum_priority -= 0.90
+                elif late_guard.get("late_pump_risk") and not is_reverse:
+                    momentum_priority -= 0.60
+
+                if late_guard.get("bull_continuation_risk") and not is_reverse:
+                    momentum_priority -= 0.40
+
+                momentum_priority = round(momentum_priority, 2)
+
                 alert_id = build_alert_id(symbol, candle_time)
 
                 setup_type_candidate = {
@@ -3484,6 +3734,11 @@ def run_scanner_loop():
                     "pullback_high": pullback_high,
                     "above_upper_bb": above_upper_bb,
                     "change_4h": change_4h,
+                    "late_pump_risk": late_guard.get("late_pump_risk", False),
+                    "extreme_late_pump": late_guard.get("extreme_late_pump", False),
+                    "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
+                    "late_guard_reasons": late_guard.get("reasons", []),
+                    "rsi_now": rsi_now,
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3536,6 +3791,11 @@ def run_scanner_loop():
                         "setup_type": setup_type,
                         "above_upper_bb": above_upper_bb,
                         "change_4h": change_4h,
+                        "late_pump_risk": late_guard.get("late_pump_risk", False),
+                        "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
+                        "rsi_now": rsi_now,
+                        "dist_ma": dist_ma,
+                        "vol_ratio": vol_ratio,
                     },
                     "candle_time": candle_time,
                     "now": now,
