@@ -155,6 +155,8 @@ MARKET_MODE_LAST_KEY = "market_mode:long:last_mode"
 MARKET_MODE_LAST_TRANSITION_KEY = "market_mode:long:last_transition_ts"
 MARKET_MODE_LAST_RECOVERY_CHECK_KEY = "market_mode:long:last_recovery_check_ts"
 MARKET_MODE_NORMAL_CANDIDATE_KEY = "market_mode:long:normal_candidate_since"
+MARKET_MODE_BLOCK_STARTED_KEY = "market_mode:long:block_started_ts"
+MARKET_MODE_LAST_SAFE_SEEN_KEY = "market_mode:long:last_safe_seen_ts"
 
 MODE_NORMAL_LONG = "NORMAL_LONG"
 MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
@@ -852,7 +854,7 @@ COMMAND_HANDLERS = {
 
 
 # =========================
-# ALERT TRACKING
+# ALERT TRACKING (Improved)
 # =========================
 def build_alert_id(symbol: str, candle_time: int) -> str:
     return f"{clean_symbol_for_message(symbol)}:{int(candle_time)}"
@@ -865,17 +867,23 @@ def save_alert_snapshot(alert_data: dict, message_id=None) -> None:
     try:
         alert_id = alert_data.get("alert_id")
         if not alert_id:
+            logger.warning("save_alert_snapshot: missing alert_id")
             return
 
         payload = dict(alert_data)
         if message_id is not None:
             payload["message_id"] = str(message_id)
 
-        r.set(get_alert_key(alert_id), json.dumps(payload), ex=ALERT_TTL_SECONDS)
+        r.set(get_alert_key(alert_id), json.dumps(payload, ensure_ascii=False), ex=ALERT_TTL_SECONDS)
+        logger.info(f"✅ Alert snapshot saved: {alert_id}")
+
         if message_id:
-            r.set(get_alert_by_message_key(str(message_id)), alert_id, ex=ALERT_TTL_SECONDS)
+            msg_key = get_alert_by_message_key(str(message_id))
+            r.set(msg_key, alert_id, ex=ALERT_TTL_SECONDS)
+            logger.info(f"🔗 Linked message {message_id} to alert {alert_id}")
+
     except Exception as e:
-        logger.error(f"save_alert_snapshot error: {e}")
+        logger.error(f"❌ save_alert_snapshot error: {e}")
 
 
 def load_alert_snapshot(alert_id: str):
@@ -884,12 +892,47 @@ def load_alert_snapshot(alert_id: str):
     try:
         raw = r.get(get_alert_key(alert_id))
         if not raw:
+            logger.info(f"load_alert_snapshot: no data for {alert_id}")
             return None
         data = json.loads(raw)
         return data if isinstance(data, dict) else None
     except Exception as e:
         logger.error(f"load_alert_snapshot error: {e}")
         return None
+
+
+def load_alert_snapshot_by_message_id(message_id: str):
+    if not r or not message_id:
+        return None
+    try:
+        msg_key = get_alert_by_message_key(str(message_id))
+        alert_id = r.get(msg_key)
+        if not alert_id:
+            logger.info(f"load_alert_snapshot_by_message_id: no alert_id for message {message_id}")
+            return None
+        logger.info(f"Found alert_id {alert_id} via message {message_id}")
+        return load_alert_snapshot(alert_id)
+    except Exception as e:
+        logger.error(f"load_alert_snapshot_by_message_id error: {e}")
+        return None
+
+
+def should_ignore_track_callback(chat_id: str, message_id: str, alert_id: str) -> bool:
+    """
+    منع معالجة نفس زر Track عدة مرات خلال 8 ثوانٍ.
+    تعيد True إذا كان يجب تجاهل الطلب، و False إذا كان طلبًا جديدًا.
+    """
+    if not r:
+        return False
+    try:
+        lock_key = f"track:callback:lock:long:{chat_id}:{message_id}:{alert_id}"
+        locked = r.set(lock_key, "1", ex=8, nx=True)
+        if locked:
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"should_ignore_track_callback error: {e}")
+        return False
 
 
 def get_last_price(symbol: str) -> float:
@@ -1004,6 +1047,50 @@ def build_track_tradingview_link(symbol: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
 
 
+def load_registered_trade_for_alert(alert: dict):
+    if not r or not alert:
+        return None
+    try:
+        symbol = alert.get("symbol", "")
+        candle_time = int(_safe_float(alert.get("candle_time"), 0))
+        trade_key = f"trade:futures:long:{symbol}:{candle_time}"
+        raw = r.get(trade_key)
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.warning(f"load_registered_trade_for_alert error: {e}")
+        return None
+
+
+def format_official_trade_status(trade: dict) -> str:
+    if not trade:
+        return ""
+    try:
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+        tp1_hit = bool(trade.get("tp1_hit", False))
+
+        if status == "partial":
+            return "✅ TP1 Hit / الصفقة جزئية"
+        if result == "tp1_win":
+            return "✅ TP1 ثم رجوع Entry"
+        if result == "tp2_win":
+            return "🎯 TP2 Hit"
+        if result == "loss":
+            return "❌ SL Hit"
+        if result == "expired":
+            return "⏳ Expired"
+        if status == "open":
+            return "⏳ Open"
+        if tp1_hit:
+            return "✅ TP1 Hit"
+        return ""
+    except Exception:
+        return ""
+
+
 def build_track_message(alert: dict) -> str:
     try:
         symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
@@ -1057,6 +1144,9 @@ def build_track_message(alert: dict) -> str:
                 f"Avg Planned Entry: {avg_planned:.6f}"
             )
 
+        official_trade = load_registered_trade_for_alert(alert)
+        official_status = format_official_trade_status(official_trade)
+
         msg = (
             f"📌 <b>Alert Track</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
@@ -1073,6 +1163,10 @@ def build_track_message(alert: dict) -> str:
             f"TP2: {tp2:.6f}\n\n"
             f"الحالة: {state_badge}\n"
             f"نتيجة التتبع: {html.escape(status)}\n"
+        )
+        if official_status:
+            msg += f"الحالة الرسمية: {html.escape(official_status)}\n"
+        msg += (
             f"السعر الحالي: {current_price:.6f}\n"
             f"الرافعة التقديرية: {TRACK_LEVERAGE:.0f}x\n"
             f"الحركة الحالية: {current_move:+.2f}% | بعد الرافعة: {leveraged_current:+.2f}%\n"
@@ -1101,10 +1195,14 @@ def build_track_reply_markup(alert_id: str) -> dict:
 
 
 def handle_callback_query(callback_query: dict):
+    """
+    يمنع سبام زر Track ويتعامل مع انتهاء صلاحية بيانات الإشارة بدون إرسال رسائل مزعجة للشات.
+    """
     try:
         callback_id = callback_query.get("id", "")
         data = callback_query.get("data", "") or ""
         message = callback_query.get("message") or {}
+        message_id = str(message.get("message_id", ""))
         chat_id = str((message.get("chat") or {}).get("id", "") or "")
 
         if not data.startswith("track_long:"):
@@ -1112,17 +1210,31 @@ def handle_callback_query(callback_query: dict):
             return
 
         alert_id = data.split(":", 1)[1].strip()
+
+        if not r:
+            answer_callback_query(callback_id, "Redis غير متصل الآن")
+            logger.warning("handle_callback_query: Redis not available")
+            return
+
+        if should_ignore_track_callback(chat_id, message_id, alert_id):
+            answer_callback_query(callback_id, "تم استلام الطلب بالفعل")
+            logger.info(f"Ignored duplicate track: {alert_id}")
+            return
+
         alert = load_alert_snapshot(alert_id)
 
+        if not alert and message_id:
+            alert = load_alert_snapshot_by_message_id(message_id)
+
         if not alert:
-            answer_callback_query(callback_id, "الإشارة غير موجودة أو انتهت صلاحيتها")
-            if chat_id:
-                send_telegram_reply(chat_id, "ℹ️ لا يمكن العثور على بيانات هذه الإشارة")
+            answer_callback_query(callback_id, "بيانات الإشارة غير متاحة أو انتهت صلاحيتها")
+            logger.warning(f"No alert data for {alert_id} (message {message_id})")
             return
 
         answer_callback_query(callback_id, "جارِ جلب نتيجة الإشارة...")
         if chat_id:
             send_telegram_reply(chat_id, build_track_message(alert))
+            logger.info(f"Track sent for {alert_id} to chat {chat_id}")
 
     except Exception as e:
         logger.error(f"handle_callback_query error: {e}")
@@ -3437,7 +3549,76 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -
 
 
 # =========================
-# DETERMINE LONG MARKET MODE (Arabic reasons, stronger normal conditions)
+# MODE HELPER FUNCTIONS (NEW)
+# =========================
+def normalize_market_mode(mode: str) -> str:
+    allowed = {
+        MODE_NORMAL_LONG,
+        MODE_STRONG_LONG_ONLY,
+        MODE_BLOCK_LONGS,
+        MODE_RECOVERY_LONG,
+    }
+    if mode in allowed:
+        return mode
+
+    logger.warning(f"Invalid market mode '{mode}', fallback to {MODE_NORMAL_LONG}")
+    return MODE_NORMAL_LONG
+
+
+def is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode) -> bool:
+    """
+    بوابة أمان للخروج من BLOCK_LONGS إلى STRONG_LONG_ONLY
+    لو السوق لم يعد كراشًا لكنه ليس قويًا بما يكفي للـ Recovery.
+    """
+    try:
+        red_ratio = float(red_ratio or 0.0)
+        avg_change = float(avg_change or 0.0)
+        btc_change = float(btc_change or 0.0)
+
+        if alt_mode == "🔴 ضعيف" and red_ratio >= 0.58:
+            return False
+
+        return (
+            red_ratio < 0.64
+            and avg_change > -0.85
+            and btc_change > -0.50
+        )
+    except Exception:
+        return False
+
+
+def is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode) -> bool:
+    """
+    بوابة الخروج الطبيعية من BLOCK_LONGS إلى RECOVERY_LONG.
+    """
+    try:
+        return (
+            float(red_ratio or 0.0) < 0.60
+            and float(avg_change or 0.0) > -0.60
+            and float(btc_change or 0.0) > -0.35
+            and alt_mode != "🔴 ضعيف"
+        )
+    except Exception:
+        return False
+
+
+def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> bool:
+    """
+    بوابة الرجوع للوضع الطبيعي.
+    """
+    try:
+        return (
+            float(red_ratio or 0.0) < 0.52
+            and float(avg_change or 0.0) > -0.50
+            and float(btc_change or 0.0) > -0.25
+            and market_state in ("bull_market", "alt_season", "mixed")
+        )
+    except Exception:
+        return False
+
+
+# =========================
+# DETERMINE LONG MARKET MODE (UPDATED)
 # =========================
 def determine_long_market_mode(
     market_guard: dict,
@@ -3447,6 +3628,7 @@ def determine_long_market_mode(
     current_mode: str,
 ) -> dict:
     now_ts = int(time.time())
+    current_mode = normalize_market_mode(current_mode)
     red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
     avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
     btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
@@ -3485,30 +3667,81 @@ def determine_long_market_mode(
             except: pass
         return {"mode": MODE_BLOCK_LONGS, "reason": f"كراش: {crash_reason}"}
 
-    # الانتقال من BLOCK إلى RECOVERY
+    # BLOCK_LONGS exit gates
     if current_mode == MODE_BLOCK_LONGS:
         if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
             if r:
-                try: r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
-                except: pass
-            recovery_ok = (
-                red_ratio < 0.60 and avg_change > -0.60
-                and btc_change > -0.35 and alt_mode != "🔴 ضعيف"
-            )
-            if recovery_ok:
-                if r:
-                    try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
-                    except: pass
-                return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
-        return {"mode": MODE_BLOCK_LONGS, "reason": "في انتظار فحص الريكافري التالي"}
+                try:
+                    r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
+                except Exception:
+                    pass
 
-    # RECOVERY -> NORMAL بعد استقرار 5 دقائق
+            # Gateway to RECOVERY_LONG
+            if is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode):
+                if r:
+                    try:
+                        r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                        r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                    except Exception:
+                        pass
+                return {
+                    "mode": MODE_RECOVERY_LONG,
+                    "reason": "انتهى البلوك وشروط الريكافري اتحققت"
+                }
+
+            # Backup gate: crashed ended but not ready for Recovery → STRONG after 10min safety
+            if is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode):
+                safe_since = 0
+                if r:
+                    try:
+                        safe_since = int(r.get(MARKET_MODE_LAST_SAFE_SEEN_KEY) or 0)
+                    except Exception:
+                        safe_since = 0
+
+                if safe_since <= 0:
+                    if r:
+                        try:
+                            r.set(MARKET_MODE_LAST_SAFE_SEEN_KEY, str(now_ts))
+                        except Exception:
+                            pass
+                    return {
+                        "mode": MODE_BLOCK_LONGS,
+                        "reason": "الكراش هدأ، بدأ عداد الخروج الآمن من BLOCK"
+                    }
+
+                safe_duration = now_ts - safe_since
+                if safe_duration >= 600:
+                    if r:
+                        try:
+                            r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                            r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                        except Exception:
+                            pass
+                    return {
+                        "mode": MODE_STRONG_LONG_ONLY,
+                        "reason": "السوق لم يعد كراشًا لمدة 10 دقائق، خروج احتياطي إلى STRONG_LONG_ONLY"
+                    }
+
+                return {
+                    "mode": MODE_BLOCK_LONGS,
+                    "reason": f"السوق أهدأ لكن ننتظر تأكيد الخروج الآمن ({safe_duration}s/600s)"
+                }
+
+            # Crash resumed → reset safe timer
+            if r:
+                try:
+                    r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                except Exception:
+                    pass
+
+        return {
+            "mode": MODE_BLOCK_LONGS,
+            "reason": "ما زلنا داخل BLOCK أو ننتظر فحص الريكافري التالي"
+        }
+
+    # RECOVERY → NORMAL (using is_market_normal_ready)
     if current_mode == MODE_RECOVERY_LONG:
-        normal_conditions = (
-            red_ratio < 0.52 and avg_change > -0.50
-            and btc_change > -0.25 and market_state in ("bull_market", "alt_season", "mixed")
-        )
-        if normal_conditions:
+        if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
             if normal_candidate_since == 0:
                 if r:
                     try: r.set(MARKET_MODE_NORMAL_CANDIDATE_KEY, str(now_ts))
@@ -3541,11 +3774,7 @@ def determine_long_market_mode(
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق ضعيف/مختلط لكن ليس كراش"}
 
     # NORMAL_LONG
-    normal_conditions = (
-        red_ratio < 0.52 and avg_change > -0.50
-        and btc_change > -0.25 and market_state in ("bull_market", "alt_season", "mixed")
-    )
-    if normal_conditions:
+    if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
         if current_mode == MODE_NORMAL_LONG:
             if r:
                 try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
@@ -3638,6 +3867,19 @@ def handle_market_mode_transition(mode_result: dict) -> str:
             msg = format_mode_transition_message(last_mode, new_mode, reason=mode_result.get("reason", ""))
             send_telegram_message(msg)
             now_ts = int(time.time())
+
+            if new_mode == MODE_BLOCK_LONGS and last_mode != MODE_BLOCK_LONGS:
+                try:
+                    r.set(MARKET_MODE_BLOCK_STARTED_KEY, str(now_ts))
+                except Exception:
+                    pass
+
+            if new_mode != MODE_BLOCK_LONGS:
+                try:
+                    r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                except Exception:
+                    pass
+
             r.set(MARKET_MODE_LAST_KEY, new_mode)
             r.set(MARKET_MODE_LAST_TRANSITION_KEY, str(now_ts))
             logger.info(f"MODE TRANSITION: {last_mode} → {new_mode} | reason: {mode_result.get('reason')}")
@@ -3815,7 +4057,6 @@ def run_scanner_loop():
                 f"reason={mode_result.get('reason')}"
             )
 
-            # Global cooldown checked AFTER mode determination
             global_cooldown_active = is_global_cooldown_active()
             if global_cooldown_active and current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY):
                 logger.info(
