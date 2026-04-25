@@ -3446,7 +3446,7 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
 
 
 # =========================
-# DETERMINE LONG MARKET MODE (REVISED)
+# DETERMINE LONG MARKET MODE (ORDER FIXED)
 # =========================
 def determine_long_market_mode(
     market_guard: dict,
@@ -3500,23 +3500,23 @@ def determine_long_market_mode(
         return {"mode": MODE_BLOCK_LONGS, "reason": f"كراش: {crash_reason}"}
 
     if current_mode == MODE_BLOCK_LONGS:
-        if now_ts - last_recovery_check_ts < RECOVERY_CHECK_INTERVAL:
-            return {"mode": MODE_BLOCK_LONGS, "reason": "ما زلنا داخل BLOCK أو ننتظر فحص الريكافري التالي"}
-        if r:
-            try:
-                r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
-            except Exception:
-                pass
-
-        if is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode):
+        # First: check recovery readiness (if enough interval passed)
+        if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
             if r:
                 try:
-                    r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
-                    r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                    r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
                 except Exception:
                     pass
-            return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
+            if is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode):
+                if r:
+                    try:
+                        r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                        r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                    except Exception:
+                        pass
+                return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
 
+        # Second: check safe exit (no longer crashing) with timer
         if is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode):
             if safe_since == 0:
                 if r:
@@ -3536,6 +3536,7 @@ def determine_long_market_mode(
                 return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"السوق لم يعد كراشًا لمدة {safe_duration}s، خروج احتياطي إلى STRONG_LONG_ONLY"}
             return {"mode": MODE_BLOCK_LONGS, "reason": f"السوق أهدأ لكن ننتظر تأكيد الخروج الآمن ({safe_duration}s/{BLOCK_EXIT_CONFIRM_DURATION}s)"}
 
+        # Third: conditions failed, reset timer, stay in BLOCK
         if r:
             try:
                 r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
