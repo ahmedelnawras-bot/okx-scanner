@@ -163,11 +163,12 @@ MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
 MODE_BLOCK_LONGS = "BLOCK_LONGS"
 MODE_RECOVERY_LONG = "RECOVERY_LONG"
 
-MODE_TRANSITION_MIN_INTERVAL = 300           # 5 دقائق
+# Updated timing constants to 4 minutes
+MODE_TRANSITION_MIN_INTERVAL = 240          # 4 دقائق
 RECOVERY_CHECK_INTERVAL = 120               # دقيقتين
-NORMAL_CANDIDATE_DURATION = 420             # 7 دقائق استقرار
-BLOCK_EXIT_CONFIRM_DURATION = 420           # 7 دقائق بعد استقرار
-STRONG_TO_NORMAL_CONFIRM_DURATION = 420     # 7 دقائق بين STRONG و NORMAL
+NORMAL_CANDIDATE_DURATION = 240             # 4 دقائق استقرار
+BLOCK_EXIT_CONFIRM_DURATION = 240           # 4 دقائق بعد استقرار
+STRONG_TO_NORMAL_CONFIRM_DURATION = 240     # 4 دقائق بين STRONG و NORMAL
 
 # Market Crash Guard (original thresholds kept)
 MARKET_GUARD_ENABLED = True
@@ -3561,7 +3562,7 @@ def determine_long_market_mode(
                         pass
                 if time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
                     return {"mode": MODE_STRONG_LONG_ONLY, "reason": "تأكيد طبيعي لكن أقل مدة انتقال لم تمر"}
-                return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 7 دقائق، رجوع للوضع الطبيعي"}
+                return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 4 دقائق، رجوع للوضع الطبيعي"}
             return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{STRONG_TO_NORMAL_CONFIRM_DURATION}s)"}
         if r:
             try:
@@ -3597,7 +3598,7 @@ def determine_long_market_mode(
                         pass
                 if time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
                     return {"mode": MODE_STRONG_LONG_ONLY, "reason": "تأكيد طبيعي لكن أقل مدة لم تمر"}
-                return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 7 دقائق، رجوع للوضع الطبيعي"}
+                return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 4 دقائق، رجوع للوضع الطبيعي"}
             return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{STRONG_TO_NORMAL_CONFIRM_DURATION}s)"}
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": "الحالة مستقرة لكن لم تصل لشروط العادي"}
 
