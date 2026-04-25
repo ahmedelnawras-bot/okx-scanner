@@ -1079,7 +1079,7 @@ def build_track_message(alert: dict) -> str:
             f"أقصى صعود: +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
             f"أقصى هبوط ضدك: +{adverse_pct:.2f}% | بعد الرافعة: +{leveraged_adverse:.2f}%\n"
             f"المدة: {duration_h}h {duration_m}m\n\n"
-            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView</a>'
+            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
         )
         return msg
     except Exception as e:
@@ -1226,7 +1226,6 @@ def get_ranked_pairs():
         n_vol      = int(SCAN_LIMIT * 0.35)
         n_momentum = int(SCAN_LIMIT * 0.25)
         n_reversal = int(SCAN_LIMIT * 0.25)
-        n_new      = SCAN_LIMIT - n_vol - n_momentum - n_reversal
 
         seen = set()
         merged = []
@@ -3642,7 +3641,6 @@ def handle_market_mode_transition(mode_result: dict) -> str:
             r.set(MARKET_MODE_LAST_KEY, new_mode)
             r.set(MARKET_MODE_LAST_TRANSITION_KEY, str(now_ts))
             logger.info(f"MODE TRANSITION: {last_mode} → {new_mode} | reason: {mode_result.get('reason')}")
-        # احفظ المود الحالي دائمًا
         r.set(MARKET_MODE_KEY, new_mode)
     except Exception as e:
         logger.error(f"handle_market_mode_transition error: {e}")
@@ -3718,7 +3716,7 @@ def handle_telegram_commands():
 
 
 # =========================
-# MAIN LOOP (with all fixes applied)
+# MAIN LOOP
 # =========================
 def run_command_poller():
     bootstrap_telegram_offset_once()
@@ -3739,11 +3737,6 @@ def run_scanner_loop():
         scan_locked = False
 
         try:
-            if is_global_cooldown_active():
-                logger.info("GLOBAL COOLDOWN (Redis) — skipping long scan")
-                time.sleep(60)
-                continue
-
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 logger.info("Another long scan is running — skipping")
@@ -3799,7 +3792,6 @@ def run_scanner_loop():
                 alt_snapshot=alt_snapshot,
             )
 
-            # تحديد المود (لا نستخدم handle_market_guard_notifications)
             current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
             if not current_mode:
                 current_mode = MODE_NORMAL_LONG
@@ -3822,6 +3814,15 @@ def run_scanner_loop():
                 f"btc_change={market_guard.get('btc_change_15m')} | "
                 f"reason={mode_result.get('reason')}"
             )
+
+            # Global cooldown checked AFTER mode determination
+            global_cooldown_active = is_global_cooldown_active()
+            if global_cooldown_active and current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY):
+                logger.info(
+                    f"GLOBAL COOLDOWN active — market mode checked, skipping normal/strong signal sending | mode={current_mode}"
+                )
+                time.sleep(60)
+                continue
 
             if current_mode == MODE_BLOCK_LONGS:
                 logger.warning("MODE BLOCK LONGS — blocking new long signals")
@@ -4116,12 +4117,10 @@ def run_scanner_loop():
                         logger.info(f"{symbol} → skipped (upper BB)")
                         continue
 
-                # حساب تأكيد 4H للـ reverse مبكراً
                 reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
                 if is_reverse:
                     reversal_4h_result = is_4h_oversold_confirmed(symbol)
 
-                # حساب early_priority قبل فحص STRONG_LONG_ONLY
                 early_priority = classify_early_priority_long(
                     early_signal=early_signal, breakout=breakout, pre_breakout=pre_breakout,
                     dist_ma=dist_ma, vol_ratio=vol_ratio, candle_strength=candle_strength,
