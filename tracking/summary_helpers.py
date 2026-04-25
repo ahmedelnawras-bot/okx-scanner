@@ -7,6 +7,12 @@
 مهم:
 - هذا الملف لا يعتمد على tracking.performance نهائياً.
 - performance.py يمكنه استيراد الدوال من هنا، لكن العكس غير مسموح.
+
+ملاحظات مهمة:
+- حساب PnL هنا يتم كنسبة مئوية.
+- النسبة الخام realized_raw_pnl_pct = حركة السعر بدون رافعة.
+- النسبة المرفوعة realized_leveraged_pnl_pct = حركة السعر × الرافعة.
+- حسابات الدولار تتم في tracking/performance.py حسب خطة إدارة رأس المال.
 """
 
 import logging
@@ -108,24 +114,25 @@ def calc_trade_result_pct(trade: dict) -> Optional[float]:
 
     المنطق:
     - loss:
-        Long  = من entry إلى SL
-        Short = من entry إلى SL بعكس الاتجاه
+        Long  = من entry إلى initial_sl إن وجد، وإلا sl.
+        Short = من entry إلى initial_sl إن وجد، وإلا sl بعكس الاتجاه.
+        مهم: نستخدم initial_sl لأن sl قد يتحرك إلى entry بعد TP1.
 
     - tp1_win:
         يتم اعتبار 50% فقط أغلقت على TP1
-        والنصف الثاني رجع Entry، إذن الربح = نصف حركة TP1
+        والنصف الثاني رجع Entry، إذن الربح = نصف حركة TP1.
 
     - tp2_win:
         لو tp1_hit = True:
-            50% على TP1 + 50% على TP2
+            50% على TP1 + 50% على TP2.
         لو tp1_hit = False:
-            نحسب كامل الحركة إلى TP2 كحالة احتياطية
+            نحسب كامل الحركة إلى TP2 كحالة احتياطية.
 
     - expired:
         لو TP1 اتلمس قبل الانتهاء:
-            نصف ربح TP1
+            نصف ربح TP1.
         غير كده:
-            0%
+            0%.
 
     - open / partial / breakeven / نتيجة ناقصة:
         None
@@ -150,7 +157,13 @@ def calc_trade_result_pct(trade: dict) -> Optional[float]:
         safe_float(trade.get("entry"), 0.0)
     )
 
-    sl = safe_float(trade.get("sl"), 0.0)
+    # مهم جداً:
+    # في الخسارة نستخدم initial_sl لو موجود لأن sl ممكن يتحرك إلى entry بعد TP1.
+    # ده يمنع حساب خسارة غلط بعد تعديل وقف الخسارة.
+    initial_sl = safe_float(trade.get("initial_sl"), 0.0)
+    current_sl = safe_float(trade.get("sl"), 0.0)
+    sl = initial_sl if initial_sl > 0 else current_sl
+
     tp1 = safe_float(trade.get("tp1"), 0.0)
     tp2 = safe_float(trade.get("tp2"), 0.0)
 
@@ -337,7 +350,7 @@ def apply_trade_to_summary(summary: dict, trade: Optional[dict]) -> dict:
     - لا نحسب wins/losses إلا لو result واضح.
     - tp1_hits يزيد إذا:
         tp1_hit = True
-        أو result = tp1_win / tp2_win
+        أو result = tp1_win / tp2_win.
     - tp2_hits يزيد فقط إذا result = tp2_win.
     """
     if not isinstance(summary, dict):
@@ -498,8 +511,12 @@ def finalize_summary(summary: dict) -> dict:
     summary["worst_trade_pct"] = safe_float(summary.get("worst_trade_pct"), 0.0)
 
     # تقدير تأثير الصفقات على المحفظة بدون الاعتماد على performance.py
-    # المعادلة:
+    # المعادلة القديمة للونج:
     # PnL مرفوع × نسبة رأس المال المستخدمة ÷ عدد الخانات النشطة
+    #
+    # ملاحظة:
+    # في الشورت، performance.py هو المسؤول عن عرض الدولار وخطة 20$ للصفقة.
+    # هذا الملف يظل عاماً ومشتركاً ولا يعرف خطة short الخاصة حتى لا يحدث circular import.
     active_slots = max(1, safe_int(REPORT_ACTIVE_TRADE_SLOTS, 10))
     wallet_pnl_pct = (
         summary.get("realized_leveraged_pnl_pct", 0.0)
