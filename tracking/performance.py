@@ -1107,6 +1107,15 @@ def get_position_sizing_plan():
     }
 
 
+def estimate_pct_to_usd(pct_value: float) -> float:
+    """
+    يحول نسبة أداء مرفوعة إلى دولار بناءً على حجم المارجن للصفقة الواحدة.
+    """
+    sizing = get_position_sizing_plan()
+    per_trade_usd = float(sizing.get("per_trade_usd", 0.0) or 0.0)
+    return per_trade_usd * (float(pct_value or 0.0) / 100.0)
+
+
 def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> tuple:
     """
     تقدير تأثير الصفقات المغلقة على المحفظة بنظام 10 صفقات مفتوحة كحد أقصى.
@@ -1551,10 +1560,19 @@ def format_winrate_summary(summary: dict) -> str:
 def format_period_summary(title: str, summary: dict) -> str:
     decided = summary["wins"] + summary["losses"] + summary["expired"]
 
-    # استخراج البيانات المالية
-    raw_pnl = summary.get("realized_raw_pnl_pct", 0.0)
-    leveraged_pnl = summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0))
+    # استخراج القيم المالية المرفوعة
+    gross_profit = summary.get("gross_profit_pct", 0.0)
+    gross_loss = summary.get("gross_loss_pct", 0.0)
+    net_pnl = summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0))
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
+
+    # تحويل النسب المرفوعة إلى دولار
+    gross_profit_usd = estimate_pct_to_usd(gross_profit)
+    gross_loss_usd = estimate_pct_to_usd(gross_loss)
+    net_pnl_usd = estimate_pct_to_usd(net_pnl)
+
+    # قيم إضافية
+    raw_pnl = summary.get("realized_raw_pnl_pct", 0.0)
     avg_win = summary.get("avg_win_pct", 0.0)
     avg_loss = summary.get("avg_loss_pct", 0.0)
     best = summary.get("best_trade_pct", 0.0)
@@ -1571,21 +1589,27 @@ def format_period_summary(title: str, summary: dict) -> str:
     status_ar = {"normal": "آمن ✅", "warning": "تحذير ⚠️", "danger": "خطر 🔴"}
     status_text = status_ar.get(risk_status, risk_status)
 
+    # بناء الكتلة المالية بتصميم مميز
     financial_block = (
-        f"\n\n💰 الأداء المالي التقريبي:\n"
+        f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🟢 <b>إجمالي الربح:</b> {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
+        f"🔴 <b>إجمالي الخسارة:</b> {gross_loss:+.2f}% = {gross_loss_usd:+.2f}$\n"
+        f"⚖️ <b>صافي الربح/الخسارة:</b> {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
+        f"💼 <b>التأثير الحقيقي على المحفظة:</b> {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"\n⚙️ <b>إعدادات الحساب:</b>\n"
         f"• الرافعة المستخدمة: {leverage:.0f}x\n"
         f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
         f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
         f"• حجم المارجن للصفقة الواحدة تقديريًا: {per_trade_usd:.2f}$\n"
+        f"\n📊 <b>تفاصيل إضافية:</b>\n"
         f"• صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
-        f"• صافي الأداء بعد الرافعة: {leveraged_pnl:+.2f}%\n"
-        f"• التأثير الحقيقي على المحفظة بعد الرافعة: {wallet_pnl_pct:+.2f}%\n"
-        f"• ربح/خسارة تقديرية بعد الرافعة: {wallet_pnl_usd:+.2f}$\n"
         f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
         f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%\n"
         f"• أفضل صفقة: {best:+.2f}%\n"
-        f"• أسوأ صفقة: {worst:+.2f}%\n\n"
-        f"🧯 إدارة المخاطرة:\n"
+        f"• أسوأ صفقة: {worst:+.2f}%\n"
+        f"\n🧯 <b>إدارة المخاطرة:</b>\n"
         f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%\n"
         f"• حد إيقاف/تحذير الخسارة: -{REPORT_DAILY_MAX_DRAWDOWN_PCT:.0f}% من إجمالي المحفظة\n"
         f"• الحالة: {status_text}\n"
