@@ -51,10 +51,17 @@ def is_breakdown(df, lookback=20):
 
 
 def classify_funding_simple_short(funding):
+    """
+    للشورت:
+    - التمويل الإيجابي يعني اللونج يدفع للشورت غالبًا → داعم للشورت
+    - التمويل السلبي يعني الشورت يدفع للونج غالبًا → خطر Short Squeeze
+    """
+    funding = _safe_float(funding, 0.0)
+
     if funding > 0.0005:
-        return "🟢 إيجابي"
+        return "🟢 إيجابي داعم للشورت"
     elif funding < -0.0005:
-        return "🔴 سلبي"
+        return "🔴 سلبي خطر Short Squeeze"
     return "🟡 محايد"
 
 
@@ -133,128 +140,176 @@ def calculate_short_score(
 
     dist_ma = ((ma - close) / ma) * 100 if ma > 0 else 0.0
 
-    # ===================== BASIC SCORING =====================
+    # =====================
+    # BASIC SCORING
+    # =====================
     if 30 <= rsi <= 48 and rsi_momentum > 2.5:
         score += 1.7
         reasons.append("RSI هابط بقوة")
+
     elif 38 <= rsi <= 49:
         score += 1.1
-        reasons.append("RSI في منطقة ضعف")
+        reasons.append("RSI هابط")
+
     elif 32 <= rsi < 38:
         score += 0.8
         reasons.append("RSI ضعيف")
+
     elif 28 <= rsi < 32 and rsi_momentum > 3.0:
         score += 0.5
-        reasons.append("RSI منخفض بزخم")
+        reasons.append("RSI منخفض")
+
     elif rsi < 28:
         score -= 0.8
-        reasons.append("RSI منخفض جدًا (تشبع بيع)")
-        warning_reasons.append("RSI منخفض جدًا (تشبع بيع)")
+        reasons.append("RSI منخفض")
+        warning_reasons.append("RSI منخفض")
+
     elif rsi > 56:
         score -= 0.7
         warning_reasons.append("RSI غير داعم للشورت")
 
+    # =====================
+    # VOLUME
+    # =====================
     if vol_ratio >= 2.0:
         score += 2.1
-        reasons.append("فوليوم بيعي انفجاري")
+        reasons.append("فوليوم انفجاري")
+
     elif vol_ratio >= 1.5:
         score += 1.5
-        reasons.append("فوليوم بيعي قوي")
+        reasons.append("فوليوم قوي")
+
     elif vol_ratio >= 1.2:
         score += 0.8
-        reasons.append("فوليوم داعم")
+        reasons.append("فوليوم بيعي")
+
     elif vol_ratio >= 1.08:
         score += 0.3
-        reasons.append("فوليوم مقبول")
+        reasons.append("فوليوم بيعي")
 
+    # =====================
+    # MA POSITION
+    # =====================
     if close < ma:
         score += 1.0
-        reasons.append("أسفل المتوسط")
+        reasons.append("تحت MA")
     else:
         score -= 0.8
         warning_reasons.append("فوق المتوسط")
 
+    # =====================
+    # CANDLE
+    # =====================
     if candle_strength >= 0.65 and close < open_:
         score += 1.3
-        reasons.append("شمعة هبوط قوية")
+        reasons.append("شمعة بيعية قوية")
+
     elif candle_strength >= 0.45 and close < open_:
         score += 0.8
-        reasons.append("شمعة هبوط جيدة")
+        reasons.append("شمعة بيعية جيدة")
+
     elif candle_strength >= 0.30 and close < open_:
         score += 0.3
-        reasons.append("شمعة هبوط خفيفة")
+        reasons.append("شمعة بيعية جيدة")
 
     if downside_rejection:
         score -= 0.8
         warning_reasons.append("رفض سعري سفلي")
 
+    # =====================
+    # BREAKDOWN / PRE-BREAKDOWN
+    # =====================
     if breakdown:
         score += 1.5
         reasons.append("كسر دعم")
 
     if pre_breakdown and not breakdown:
         score += 1.1
-        reasons.append("ضغط بيعي تحت الدعم 🎯")
+        reasons.append("كسر دعم مبكر")
 
     if mtf_confirmed:
         score += 1.6
         reasons.append("تأكيد فريم الساعة")
 
-    # ===================== MARKET CONTEXT =====================
+    # =====================
+    # MARKET CONTEXT
+    # =====================
     if market_state == "risk_off":
         score += 0.9
-        reasons.append("السوق ضعيف ويدعم الشورت")
+        reasons.append("BTC ضاغط")
+
     elif market_state == "btc_leading":
         score += 0.5
-        reasons.append("السيولة خارجة من الألت")
+        reasons.append("هيمنة ضد الألت")
+
     elif market_state == "bull_market":
         score -= 0.7
         warning_reasons.append("السوق صاعد والشورت أصعب")
+
     elif market_state == "alt_season":
         score -= 0.8
         warning_reasons.append("الألت قوي ضد الشورت")
+
     else:
         if "🔴" in btc_mode:
             score += 0.6
-            reasons.append("BTC هابط")
+            reasons.append("BTC ضاغط")
+
         elif "🟢" in btc_mode:
             score -= 0.4
             warning_reasons.append("BTC غير داعم للشورت")
 
         if btc_short_bias_proxy == "🟢 داعم للشورت":
             score += 0.4
-            reasons.append("BTC داعم للشورت")
+            reasons.append("BTC ضاغط")
+
         elif btc_short_bias_proxy == "🔴 ضد الشورت":
             score -= 0.6
-            warning_reasons.append("BTC ضد الشورت")
+            warning_reasons.append("BTC غير داعم للشورت")
+
+    # =====================
+    # FUNDING
+    # =====================
+    funding = _safe_float(funding, 0.0)
 
     if funding > 0.0005:
         score += 0.5
-        reasons.append("تمويل إيجابي (داعم للشورت)")
+        reasons.append("تمويل إيجابي")
+
     elif funding < -0.0005:
         score -= 0.4
-        warning_reasons.append("تمويل سلبي (ضغط محتمل)")
+        warning_reasons.append("تمويل سلبي")
 
+    # =====================
+    # NEW LISTING
+    # =====================
     if is_new:
         score += 0.3
         reasons.append("عملة جديدة")
 
-    # ===================== EARLY MOVE INTELLIGENCE =====================
+    # =====================
+    # EARLY MOVE INTELLIGENCE
+    # =====================
     if 0.2 <= dist_ma <= 2.8:
         score += 0.7
-        reasons.append("بداية هبوط مبكرة")
+        reasons.append("زخم هابط مبكر")
+
     elif 2.8 < dist_ma <= 4.5:
         score += 0.1
+
     elif dist_ma > 4.5:
         score -= 0.6
-        reasons.append("بعيد عن المتوسط (دخول متأخر)")
-        warning_reasons.append("بعيد عن المتوسط (دخول متأخر)")
+        reasons.append("بعيد عن MA (هبوط متأخر)")
+        warning_reasons.append("بعيد عن MA (هبوط متأخر)")
 
     if dist_ma > 6.0:
         score -= 0.8
-        reasons.append("ممتد هبوطًا")
-        warning_reasons.append("ممتد هبوطًا")
+        reasons.append("ممتد هبوط")
+        warning_reasons.append("ممتد هبوط")
 
+    # =====================
+    # BREAKDOWN EXTENSION
+    # =====================
     if breakdown:
         try:
             idx = int(signal_row.name)
@@ -264,54 +319,55 @@ def calculate_short_score(
 
                 if ext <= 1.8:
                     score += 0.6
-                    reasons.append("كسر مبكر")
+                    reasons.append("كسر دعم مبكر")
+
                 elif 1.8 < ext <= 3.0:
                     score += 0.2
+
                 elif ext > 3.5:
                     score -= 0.5
-                    reasons.append("كسر متأخر")
-                    warning_reasons.append("كسر متأخر")
+                    reasons.append("بعيد عن MA (هبوط متأخر)")
+                    warning_reasons.append("بعيد عن MA (هبوط متأخر)")
+
         except Exception:
             pass
 
     if breakdown and mtf_confirmed and vol_ratio >= 1.45 and candle_strength >= 0.45:
         score += 1.0
-        reasons.append("كسر قوي مؤكد")
+        reasons.append("كسر دعم قوي مؤكد")
 
+    # منع تضخم السكور العالي بدون تأكيدات كافية
     if score >= 8.8:
         if not ((breakdown or pre_breakdown) and mtf_confirmed and vol_ratio >= 1.35):
             score -= 0.6
 
-    # ===================== FINAL =====================
+    # =====================
+    # FINAL SCORE
+    # =====================
     score = max(0.0, min(9.2, score))
     score = round(score, 1)
 
-    # ===================== Fake signal =====================
+    # =====================
+    # FAKE SIGNAL
+    # =====================
     fake_signal = False
 
-    # إشارات ضعيفة جدًا
     if score < 4.2:
         fake_signal = True
 
-    # رفض سفلي واضح + شمعة ضعيفة
     if downside_rejection and candle_strength < 0.42:
         fake_signal = True
 
-    # السعر فوق المتوسط بوضوح بدون أي setup قوي
     if close >= ma * 1.004 and not breakdown and not pre_breakdown:
         if rsi > 54:
             fake_signal = True
 
-    # RSI عالي ضد الشورت من غير كسر
     if rsi > 60 and not breakdown and not pre_breakdown:
         fake_signal = True
 
-    # سكور عالي بدون فوليوم كفاية = تضخم
     if score >= 8.4 and vol_ratio < 1.10:
         fake_signal = True
 
-    # لو السوق ضدك جدًا، ما نخليش ده fake مباشرة
-    # فقط في الحالات الضعيفة جدًا وغير المؤكدة
     if market_state == "bull_market" and not breakdown and not pre_breakdown:
         if score < 6.1 and not mtf_confirmed:
             fake_signal = True
@@ -324,21 +380,28 @@ def calculate_short_score(
         if score < 6.0 and rsi > 54:
             fake_signal = True
 
-    # ===================== Risk Level (display only) =====================
+    # =====================
+    # RISK LEVEL DISPLAY
+    # =====================
     unique_warnings = list(dict.fromkeys(warning_reasons))
 
     risk_points = len(unique_warnings)
 
     if downside_rejection:
         risk_points += 1
+
     if funding < -0.0005:
         risk_points += 1
+
     if btc_short_bias_proxy == "🔴 ضد الشورت":
         risk_points += 1
+
     if dist_ma > 6.0:
         risk_points += 1
+
     if market_state == "bull_market":
         risk_points += 1
+
     if market_state == "alt_season":
         risk_points += 1
 
