@@ -123,14 +123,15 @@ NORMAL_CANDIDATE_DURATION = 240
 BLOCK_EXIT_CONFIRM_DURATION = 240
 STRONG_TO_NORMAL_CONFIRM_DURATION = 240
 
+# Bull Guard – thresholds adjusted to be less sensitive
 BULL_GUARD_ENABLED = True
 BULL_GUARD_SAMPLE_SIZE = 30
 BULL_GUARD_TIMEFRAME = "15m"
 BULL_GUARD_CANDLE_LIMIT = 30
 BULL_GUARD_MIN_VALID = 12
-BULL_GUARD_GREEN_RATIO_BLOCK = 0.68
-BULL_GUARD_AVG_CHANGE_15M_BLOCK = 1.20
-BULL_GUARD_BTC_CHANGE_15M_BLOCK = 0.70
+BULL_GUARD_GREEN_RATIO_BLOCK = 0.72
+BULL_GUARD_AVG_CHANGE_15M_BLOCK = 0.85
+BULL_GUARD_BTC_CHANGE_15M_BLOCK = 0.85
 BULL_GUARD_ALT_STRONG_BLOCK = True
 
 WEAK_SETUP_TYPES = {
@@ -2288,7 +2289,7 @@ def is_short_exhaustion_trap(
 
 
 # ================================================
-# BULL RUN GUARD
+# BULL RUN GUARD (ADJUSTED)
 # ================================================
 def get_last_candle_change_pct_short(df) -> float:
     try:
@@ -2352,16 +2353,26 @@ def get_bull_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -> 
         alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك") if alt_snapshot else "🟡 متماسك"
         block = False
         reason_parts = []
-        if green_ratio >= BULL_GUARD_GREEN_RATIO_BLOCK and avg_change >= BULL_GUARD_AVG_CHANGE_15M_BLOCK:
+
+        # New stricter conditions
+        cond1 = green_ratio >= BULL_GUARD_GREEN_RATIO_BLOCK and avg_change >= BULL_GUARD_AVG_CHANGE_15M_BLOCK
+        cond2 = btc_change >= BULL_GUARD_BTC_CHANGE_15M_BLOCK and green_ratio >= 0.62 and avg_change >= 0.35
+        cond3 = (BULL_GUARD_ALT_STRONG_BLOCK and alt_mode == "🟢 قوي"
+                 and green_ratio >= 0.68 and avg_change >= 0.45)
+
+        if cond1:
             block = True
-            reason_parts.append(f"green_ratio={green_ratio:.2f} & avg_change={avg_change:.2f}")
-        elif btc_change >= BULL_GUARD_BTC_CHANGE_15M_BLOCK and green_ratio >= 0.55:
+            reason_parts.append(f"cond1: green_ratio={green_ratio:.2f} & avg_change={avg_change:.2f}")
+        elif cond2:
             block = True
-            reason_parts.append(f"btc_change={btc_change:.2f} & green_ratio={green_ratio:.2f}")
-        elif BULL_GUARD_ALT_STRONG_BLOCK and alt_mode == "🟢 قوي" and green_ratio >= 0.60:
+            reason_parts.append(f"cond2: btc_change={btc_change:.2f} & green_ratio={green_ratio:.2f} & avg_change={avg_change:.2f}")
+        elif cond3:
             block = True
-            reason_parts.append(f"alt_mode={alt_mode} & green_ratio={green_ratio:.2f}")
-        reason = " | ".join(reason_parts) if reason_parts else "market normal"
+            reason_parts.append(f"cond3: alt_mode={alt_mode} & green_ratio={green_ratio:.2f} & avg_change={avg_change:.2f}")
+        else:
+            reason_parts.append("no block condition met")
+
+        reason = " | ".join(reason_parts)
         return {
             "active": True,
             "block_shorts": block,
@@ -2380,7 +2391,7 @@ def get_bull_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -> 
 
 
 # ================================================
-# MARKET MODE TRANSITIONS (FIXED)
+# MARKET MODE TRANSITIONS (with stricter NORMAL->STRONG)
 # ================================================
 def normalize_short_market_mode(mode: str) -> str:
     allowed = {MODE_NORMAL_SHORT, MODE_STRONG_SHORT_ONLY, MODE_BLOCK_SHORTS}
@@ -2417,7 +2428,7 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                 pass
         return {"mode": MODE_BLOCK_SHORTS, "reason": bull_guard.get("reason", "bull guard block")}
 
-    # exit BLOCK to STRONG
+    # exit BLOCK to STRONG (unchanged logic)
     if current_mode == MODE_BLOCK_SHORTS:
         no_longer_danger = green_ratio < 0.62 and avg_change < 0.75 and btc_change < 0.45
         if no_longer_danger:
@@ -2445,7 +2456,7 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                     pass
             return {"mode": MODE_BLOCK_SHORTS, "reason": "still in bull run"}
 
-    # STRONG -> NORMAL
+    # STRONG -> NORMAL (unchanged)
     if current_mode == MODE_STRONG_SHORT_ONLY:
         normal_ready = green_ratio < 0.54 and avg_change < 0.45 and btc_change < 0.25
         if normal_ready:
@@ -2474,11 +2485,11 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                     pass
             return {"mode": MODE_STRONG_SHORT_ONLY, "reason": "conditions not met for normal"}
 
-    # NORMAL -> STRONG if weak but not block
+    # NORMAL -> STRONG if weak but not block (stricter)
     weak_market = (
         market_state in ("mixed", "btc_leading")
-        or (0.52 <= green_ratio < 0.68)
-        or (avg_change > 0.30)
+        or (0.58 <= green_ratio < 0.72)       # raised from 0.52-0.68
+        or (avg_change > 0.50)                # raised from >0.30
         or (btc_mode in ("🟢 صاعد", "🟡 محايد") and alt_mode == "🟢 قوي")
     )
     if weak_market and time_since_last_transition >= MODE_TRANSITION_MIN_INTERVAL:
@@ -2781,7 +2792,7 @@ def passes_new_listing_filter(score: float, breakdown: bool, vol_ratio: float, c
 
 
 # ================================================
-# MAIN SCANNER LOOP (CORRECT ORDER)
+# MAIN SCANNER LOOP (with detailed bull guard log)
 # ================================================
 def run_scanner_loop():
     global last_global_send_ts
@@ -2857,9 +2868,13 @@ def run_scanner_loop():
             # 11. handle transition (saves to Redis + sends message if changed)
             current_mode = handle_market_mode_transition(mode_result)
 
+            # Detailed bull guard log
             logger.info(
-                f"MARKET MODE: {current_mode} | bull_guard_level={bull_guard.get('level')} | "
-                f"green_ratio={bull_guard.get('green_ratio_15m')} | avg_change={bull_guard.get('avg_change_15m')}"
+                f"MARKET MODE: {current_mode} | block={bull_guard.get('block_shorts')} | "
+                f"level={bull_guard.get('level')} | green_ratio={bull_guard.get('green_ratio_15m')} | "
+                f"avg_change={bull_guard.get('avg_change_15m')} | btc_change={bull_guard.get('btc_change_15m')} | "
+                f"valid={bull_guard.get('valid_count')} | bull_reason={bull_guard.get('reason')} | "
+                f"mode_reason={mode_result.get('reason')}"
             )
 
             # 12. BLOCK SHORTS entirely if active (no signals, but commands still work)
