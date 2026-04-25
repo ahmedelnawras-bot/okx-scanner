@@ -514,6 +514,8 @@ def register_trade(
     # === RR fields (اختياري للتوافق المستقبلي) ===
     rr1: float = 1.5,
     rr2: float = 3.0,
+
+    **kwargs,
 ):
     if redis_client is None:
         return False
@@ -818,13 +820,12 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
 
     if has_pullback_plan and not pullback_triggered:
         pb_entry = safe_float(pullback_entry, 0.0)
-        pb_high = safe_float(pullback_high, 0.0)
 
-        # السعر لم يلمس منطقة البول باك بعد → لا دخول ولا نتيجة
-        if not (pb_entry > 0 and pb_high > 0 and low <= pb_high):
+        # لا نعتبر الصفقة دخلت إلا لو السعر وصل لسعر الدخول الفعلي للبول باك
+        if not (pb_entry > 0 and low <= pb_entry):
             return None, False, trade
 
-        # السعر لمس منطقة البول باك → تفعيل الدخول وإعادة حساب الأهداف
+        # السعر لمس سعر الدخول الفعلي للبول باك → تفعيل الدخول وإعادة حساب الأهداف
         diagnostics["pullback_triggered"] = True
         diagnostics["effective_entry"] = pb_entry
         trade["diagnostics"] = diagnostics
