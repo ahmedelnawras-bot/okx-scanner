@@ -146,20 +146,44 @@ ALERT_KEY_PREFIX = "alert:long"
 ALERT_BY_MESSAGE_KEY_PREFIX = "alertmsg:long"
 ALERT_TTL_SECONDS = 14 * 24 * 3600
 
-# Market Crash Guard
+# Track leverage display
+TRACK_LEVERAGE = 15.0
+
+# Market Guard / Modes
+MARKET_MODE_KEY = "market_mode:long:current"
+MARKET_MODE_LAST_KEY = "market_mode:long:last_mode"
+MARKET_MODE_LAST_TRANSITION_KEY = "market_mode:long:last_transition_ts"
+MARKET_MODE_LAST_RECOVERY_CHECK_KEY = "market_mode:long:last_recovery_check_ts"
+MARKET_MODE_NORMAL_CANDIDATE_KEY = "market_mode:long:normal_candidate_since"
+
+MODE_NORMAL_LONG = "NORMAL_LONG"
+MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
+MODE_BLOCK_LONGS = "BLOCK_LONGS"
+MODE_RECOVERY_LONG = "RECOVERY_LONG"
+
+MODE_TRANSITION_MIN_INTERVAL = 300           # 5 دقائق
+RECOVERY_CHECK_INTERVAL = 120               # دقيقتين
+NORMAL_CANDIDATE_DURATION = 300             # 5 دقائق استقرار
+
+# Market Crash Guard (original thresholds kept)
 MARKET_GUARD_ENABLED = True
 MARKET_GUARD_SAMPLE_SIZE = 30
 MARKET_GUARD_TIMEFRAME = "15m"
 MARKET_GUARD_CANDLE_LIMIT = 30
 MARKET_GUARD_MIN_VALID = 12
+
 MARKET_GUARD_RED_RATIO_BLOCK = 0.68
 MARKET_GUARD_AVG_CHANGE_15M_BLOCK = -1.20
 MARKET_GUARD_BTC_CHANGE_15M_BLOCK = -0.70
 MARKET_GUARD_ALT_WEAK_BLOCK = True
-MARKET_GUARD_WARNING_INTERVAL_SECONDS = 30 * 60
-MARKET_GUARD_STATE_KEY = "market_guard:long:state"
-MARKET_GUARD_LAST_ALERT_KEY = "market_guard:long:last_alert_ts"
-MARKET_GUARD_LAST_STATUS_KEY = "market_guard:long:last_status"
+
+# Recovery Long
+RECOVERY_MAX_ALERTS = 2
+RECOVERY_TOTAL_SIZE_PCT = 30
+RECOVERY_ENTRY1_SIZE_PCT = 15
+RECOVERY_ENTRY2_SIZE_PCT = 15
+RECOVERY_ENTRY2_ATR_MULT = 0.35
+RECOVERY_SL_ATR_MULT = 3.5
 
 # =========================
 # REDIS
@@ -588,7 +612,6 @@ def build_report_message(period: str) -> str:
             )
             return format_period_summary(title_map["today"], summary)
 
-        # التقرير الشهري = آخر 30 يوم
         if period == "month":
             summary = get_period_summary(
                 redis_client=r,
@@ -645,9 +668,6 @@ def build_help_message() -> str:
         "• الحساب مبني على حد استخدام 35% من المحفظة",
         "• إدارة المخاطرة تتحذر عند الاقتراب من خسارة 20% من إجمالي المحفظة",
         "• حساب الربح يراعي 50% عند TP1 و 50% تكمل إلى TP2 أو تعود Entry",
-        "• يوجد Market Guard يوقف إشارات اللونج مؤقتًا وقت الهبوط الجماعي",
-        "• البوت يرسل تحذير كل 30 دقيقة أثناء الخطر ويرسل رسالة عند عودة السوق للوضع الطبيعي",
-        "• إشارات الـ Breakout/Pre-Breakout يتم تتبعها كنظام Pullback Entry عند وجود منطقة بول باك",
     ]
 
     if other_commands:
@@ -696,14 +716,6 @@ def build_how_it_work_message() -> str:
 • أقصى هبوط ضد الصفقة
 • مدة الصفقة
 
-📥 <b>نظام البول باك:</b>
-• البوت لا يفترض الدخول فورًا دائمًا
-• لو توجد منطقة Pullback، التتبع المالي يعتمد على دخول البول باك بعد لمس المنطقة
-
-🚨 <b>حماية السوق:</b>
-• Market Guard يمنع إشارات اللونج وقت هبوط جماعي في السوق
-• يتم إرسال تنبيه كل 30 دقيقة إذا استمر الخطر
-
 💰 <b>التقارير المالية:</b>
 • البوت لا يحتاج إدخال قيمة لكل صفقة
 • يحسب صافي حركة الصفقات كنسبة %
@@ -732,7 +744,6 @@ def reset_stats(chat_id: str):
     try:
         deleted = 0
 
-        # يمسح trade keys العادية فقط — مش trade_history
         for key in r.scan_iter("trade:futures:long:*"):
             r.delete(key)
             deleted += 1
@@ -927,7 +938,15 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
 def get_alert_status(alert: dict) -> str:
     try:
         symbol = alert["symbol"]
+        mode = alert.get("mode") or alert.get("market_mode", "")
+        avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
         entry = _safe_float(alert.get("entry"), 0)
+        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+        if mode == MODE_RECOVERY_LONG and avg_planned > 0:
+            effective_entry = avg_planned
+        else:
+            effective_entry = pullback_entry if pullback_entry > 0 else entry
+
         sl = _safe_float(alert.get("sl"), 0)
         tp1 = _safe_float(alert.get("tp1"), 0)
         tp2 = _safe_float(alert.get("tp2"), 0)
@@ -936,16 +955,16 @@ def get_alert_status(alert: dict) -> str:
         favorable_pct, adverse_pct = get_max_move_since_alert(
             symbol=symbol,
             since_ts=candle_time,
-            entry=entry,
+            entry=effective_entry,
             side="long",
         )
 
-        if entry <= 0:
+        if effective_entry <= 0:
             return "غير معروف"
 
-        sl_pct = round(((entry - sl) / entry) * 100, 4) if sl > 0 else 0
-        tp1_pct = round(((tp1 - entry) / entry) * 100, 4) if tp1 > 0 else 0
-        tp2_pct = round(((tp2 - entry) / entry) * 100, 4) if tp2 > 0 else 0
+        sl_pct = round(((effective_entry - sl) / effective_entry) * 100, 4) if sl > 0 else 0
+        tp1_pct = round(((tp1 - effective_entry) / effective_entry) * 100, 4) if tp1 > 0 else 0
+        tp2_pct = round(((tp2 - effective_entry) / effective_entry) * 100, 4) if tp2 > 0 else 0
 
         if adverse_pct >= sl_pct > 0:
             return "SL Hit ❌"
@@ -963,26 +982,51 @@ def get_alert_status(alert: dict) -> str:
         return "غير معروف"
 
 
+def get_track_state_badge(status: str, current_move: float) -> str:
+    if "TP2" in status:
+        return "🎯 TP2 Hit"
+    if "TP1" in status:
+        return "✅ TP1 Hit"
+    if "SL" in status:
+        return "❌ SL Hit"
+    if current_move > 0.30:
+        return "🟢 رابحة الآن"
+    if current_move < -0.30:
+        return "🔴 خاسرة الآن"
+    if -0.30 <= current_move <= 0.30:
+        return "🟡 حول الدخول"
+    return "⏳ مفتوحة"
+
+
+def build_track_tradingview_link(symbol: str) -> str:
+    base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
+    tv_symbol = f"OKX:{base}USDT.P"
+    return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+
+
 def build_track_message(alert: dict) -> str:
     try:
         symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
+        mode = alert.get("mode") or alert.get("market_mode", "")
+        avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
         entry = _safe_float(alert.get("entry"), 0.0)
         sl = _safe_float(alert.get("sl"), 0.0)
         tp1 = _safe_float(alert.get("tp1"), 0.0)
         tp2 = _safe_float(alert.get("tp2"), 0.0)
-        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
-        pullback_low = _safe_float(alert.get("pullback_low"), 0.0)
-        pullback_high = _safe_float(alert.get("pullback_high"), 0.0)
-        rr1 = _safe_float(alert.get("rr1"), 0.0)
-        rr2 = _safe_float(alert.get("rr2"), 0.0)
         candle_time = int(_safe_float(alert.get("candle_time"), 0))
         created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
         current_price = get_last_price(alert.get("symbol", ""))
 
+        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+        if mode == MODE_RECOVERY_LONG and avg_planned > 0:
+            effective_entry = avg_planned
+        else:
+            effective_entry = pullback_entry if pullback_entry > 0 else entry
+
         favorable_pct, adverse_pct = get_max_move_since_alert(
             symbol=alert.get("symbol", ""),
             since_ts=candle_time,
-            entry=entry,
+            entry=effective_entry,
             side="long",
         )
 
@@ -992,33 +1036,52 @@ def build_track_message(alert: dict) -> str:
         duration_m = (duration_seconds % 3600) // 60
 
         current_move = 0.0
-        if entry > 0 and current_price > 0:
-            current_move = round(((current_price - entry) / entry) * 100, 2)
+        if effective_entry > 0 and current_price > 0:
+            current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
 
-        pullback_block = ""
-        if pullback_entry > 0 and pullback_low > 0 and pullback_high > 0:
-            pullback_block = (
-                f"\n📥 منطقة البول باك: {pullback_low:.6f} → {pullback_high:.6f}\n"
-                f"دخول البول باك التقريبي: {pullback_entry:.6f}\n"
+        state_badge = get_track_state_badge(status, current_move)
+        tv_link = build_track_tradingview_link(alert.get("symbol", ""))
+
+        leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
+        leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
+        leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
+
+        recovery_extra = ""
+        if mode == MODE_RECOVERY_LONG:
+            entry1 = _safe_float(alert.get("entry1"), entry)
+            entry2 = _safe_float(alert.get("entry2"), 0.0)
+            recovery_extra = (
+                f"\n🛟 Mode: Recovery Long\n"
+                f"Entry 1: {entry1:.6f}\n"
+                f"Entry 2: {entry2:.6f}\n"
+                f"Avg Planned Entry: {avg_planned:.6f}"
             )
 
-        return (
+        msg = (
             f"📌 <b>Alert Track</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
             f"النوع: Long\n"
-            f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
+            f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
+            f"{recovery_extra}\n"
             f"Signal Entry: {entry:.6f}\n"
-            f"{pullback_block}"
-            f"SL: {sl:.6f}\n"
-            f"TP1: {tp1:.6f}" + (f" ({rr1:.2f}R)" if rr1 > 0 else "") + "\n"
-            f"TP2: {tp2:.6f}" + (f" ({rr2:.2f}R)" if rr2 > 0 else "") + "\n\n"
-            f"الحالة: {html.escape(status)}\n"
-            f"السعر الحالي: {current_price:.6f}\n"
-            f"الحركة الحالية: {current_move:+.2f}%\n"
-            f"أقصى صعود: +{favorable_pct:.2f}%\n"
-            f"أقصى هبوط ضدك: +{adverse_pct:.2f}%\n"
-            f"المدة: {duration_h}h {duration_m}m"
         )
+        if effective_entry != entry and mode != MODE_RECOVERY_LONG:
+            msg += f"📥 Effective Entry: {effective_entry:.6f}\n"
+        msg += (
+            f"SL: {sl:.6f}\n"
+            f"TP1: {tp1:.6f}\n"
+            f"TP2: {tp2:.6f}\n\n"
+            f"الحالة: {state_badge}\n"
+            f"نتيجة التتبع: {html.escape(status)}\n"
+            f"السعر الحالي: {current_price:.6f}\n"
+            f"الرافعة التقديرية: {TRACK_LEVERAGE:.0f}x\n"
+            f"الحركة الحالية: {current_move:+.2f}% | بعد الرافعة: {leveraged_current:+.2f}%\n"
+            f"أقصى صعود: +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
+            f"أقصى هبوط ضدك: +{adverse_pct:.2f}% | بعد الرافعة: +{leveraged_adverse:.2f}%\n"
+            f"المدة: {duration_h}h {duration_m}m\n\n"
+            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView</a>'
+        )
+        return msg
     except Exception as e:
         logger.error(f"build_track_message error: {e}")
         return "❌ حصل خطأ أثناء متابعة الإشارة"
@@ -1156,7 +1219,6 @@ def get_ranked_pairs():
             item["_rank_change_24h"] = change_24h
             filtered.append(item)
 
-        # توزيع متوازن: volume + momentum + reversal + new listings
         by_volume   = sorted(filtered, key=lambda x: x.get("_rank_volume_24h", 0), reverse=True)
         by_momentum = sorted(filtered, key=lambda x: x.get("_rank_change_24h", 0), reverse=True)
         by_reversal = sorted(filtered, key=lambda x: x.get("_rank_change_24h", 0), reverse=False)
@@ -1191,7 +1253,6 @@ def get_ranked_pairs():
                 seen.add(sid)
                 merged.append(item)
 
-        # fill remaining من top volume
         for item in by_volume:
             if len(merged) >= SCAN_LIMIT:
                 break
@@ -1234,9 +1295,6 @@ def compute_atr(df, period=14):
 
 
 def compute_bollinger_bands(series, period=20, std_mult=2):
-    """
-    حساب Bollinger Bands (الوسط، العلوي، السفلي)
-    """
     ma = series.rolling(period).mean()
     std = series.rolling(period).std()
     upper = ma + (std * std_mult)
@@ -1265,7 +1323,6 @@ def to_dataframe(data):
     df["rsi"] = compute_rsi(df["close"])
     df["atr"] = compute_atr(df)
 
-    # ✅ إضافة Bollinger Bands
     df["bb_mid"], df["bb_upper"], df["bb_lower"] = compute_bollinger_bands(df["close"])
 
     return df
@@ -1330,7 +1387,6 @@ def get_funding_rate(symbol):
 
 
 def get_signal_row(df):
-    """إرجاع صف الإشارة (آخر شمعة مكتملة) أو None في حالة الخطأ"""
     try:
         if df is None or df.empty:
             return None
@@ -1378,7 +1434,6 @@ def _safe_float(value, default=0.0):
 
 
 def is_above_upper_bollinger(df) -> bool:
-    """هل السعر فوق الـ Upper Bollinger Band؟"""
     try:
         signal_row = get_signal_row(df)
         if signal_row is None:
@@ -1393,7 +1448,6 @@ def is_above_upper_bollinger(df) -> bool:
 
 
 def get_change_4h(df) -> float:
-    """نسبة التغيير خلال آخر 4 ساعات (16 شمعة 15m)."""
     try:
         signal_row = get_signal_row(df)
         if signal_row is None:
@@ -1456,11 +1510,6 @@ def detect_late_pump_long(
     breakout_quality: str,
     change_4h: float = 0.0,
 ) -> dict:
-    """
-    يكشف الدخول المتأخر بعد Pump.
-    الهدف: منع الحالات التي كانت تظهر قوية لكنها تخسر:
-    RSI عالي + فوليوم عالي + شمعة قوية + السعر بعيد عن MA.
-    """
     try:
         reasons = []
 
@@ -1513,15 +1562,12 @@ def detect_late_pump_long(
 
         should_block = False
 
-        # أقوى منع: استمرار في bull_market بعد امتداد واضح
         if bull_continuation_risk and late_pump_risk:
             should_block = True
 
-        # منع Pump عنيف جدًا حتى لو فيه breakout ضعيف
         if extreme_late_pump and not pre_breakout:
             should_block = True
 
-        # breakout ضعيف + late pump = غالبًا مطاردة
         if weak_breakout_exception:
             should_block = True
 
@@ -1546,9 +1592,6 @@ def detect_late_pump_long(
 
 
 def append_late_pump_warnings(score_result: dict, late_guard: dict) -> dict:
-    """
-    يضيف أسباب التحذير داخل score_result بدون ما يكسر شكل الرسائل.
-    """
     try:
         if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
             score_result["warning_reasons"] = []
@@ -1775,9 +1818,6 @@ def is_higher_timeframe_confirmed(symbol):
 
 
 def is_4h_oversold_confirmed(symbol: str) -> dict:
-    """
-    تأكيد 4H خاص للـ Oversold Reversal.
-    """
     try:
         candles = get_candles(symbol, "4H", 60)
         df = to_dataframe(candles)
@@ -2108,7 +2148,6 @@ def get_dynamic_entry_threshold(
     if mtf_confirmed:
         threshold -= 0.10
 
-    # الفوليوم العالي ليس دائمًا إيجابيًا في اللونج، خصوصًا بعد الحركة
     if market_state == "bull_market":
         if vol_ratio >= 2.0:
             threshold += 0.10
@@ -2853,31 +2892,24 @@ def classify_entry_timing_long(
     late_pump_risk: bool = False,
 ) -> str:
     try:
-        # أي Pump واضح لا يصح يتسمى مبكر
         if late_pump_risk:
             return "🔴 متأخر (مطاردة حركة)"
 
-        # امتداد واضح من المتوسط
         if dist_ma > 5.0:
             return "🔴 متأخر (قرب النهاية)"
 
-        # RSI عالي + بعيد نسبيًا = دخول متوسط/متأخر وليس مبكر
         if rsi_now >= 68 and dist_ma > 3.2:
             return "🔴 متأخر (RSI مرتفع)"
 
-        # فوليوم انفجاري + شمعة قوية + السعر بعيد = مطاردة
         if vol_ratio >= 1.9 and candle_strength >= 0.62 and dist_ma > 3.5:
             return "🔴 متأخر (Pump محتمل)"
 
-        # مبكر حقيقي: قريب من MA، RSI غير متضخم، وفوليوم داعم مش انجاري
         if (pre_breakout or breakout) and dist_ma <= 2.6 and 1.10 <= vol_ratio <= 1.85 and rsi_now <= 66:
             return "🟢 مبكر (بداية الحركة)"
 
-        # Breakout مقبول لكن مش مبكر
         if breakout and 2.6 < dist_ma <= 4.2 and vol_ratio >= 1.20 and rsi_now <= 68:
             return "🟡 متوسط (نص الحركة)"
 
-        # استمرار قريب من المتوسط
         if dist_ma <= 3.2 and vol_ratio >= 1.05 and rsi_now <= 66:
             return "🟡 متوسط (نص الحركة)"
 
@@ -3013,10 +3045,9 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
 
 
 # =========================
-# SL / TP LOGIC (تم تقريب TP بتقليل نسب RR)
+# SL / TP LOGIC
 # =========================
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
-    # قمنا بتقليل RR لجميع الأنواع لجعل TP أقرب
     if signal_type == "breakout":
         return 2.2, 3.5
     if signal_type == "pre_breakout":
@@ -3025,7 +3056,6 @@ def get_rr_targets_long(signal_type="standard", entry_timing=""):
         return 2.5, 4.0
     if "🔴 متأخر" in entry_timing:
         return 2.0, 3.2
-    # افتراضي
     return 2.0, 3.2
 
 
@@ -3035,7 +3065,7 @@ def calc_tp_long(entry: float, sl: float, rr: float) -> float:
 
 
 # =========================
-# BUILD MESSAGE (UPDATED with cleaner pullback)
+# BUILD MESSAGE (normal)
 # =========================
 def build_message(
     symbol,
@@ -3097,13 +3127,11 @@ def build_message(
     reverse_banner = get_reverse_banner_long(is_reverse)
     reverse_note = get_reverse_style_note_long(is_reverse)
 
-    # RTL tokens
     safe_4h  = rtl_fix("4H")
     safe_15m = rtl_fix("15m")
     safe_1h  = rtl_fix("1H")
     safe_24h = rtl_fix("24H")
 
-    # Pullback zone
     pullback_text = ""
     if pullback_low is not None and pullback_high is not None:
         pullback_text = (
@@ -3111,7 +3139,6 @@ def build_message(
             f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
         )
 
-    # 4H block
     if is_reverse:
         if reversal_4h_confirmed:
             reversal_4h_block = (
@@ -3182,6 +3209,448 @@ def build_message(
 
 
 # =========================
+# BUILD RECOVERY LONG MESSAGE
+# =========================
+def build_recovery_long_message(
+    symbol,
+    entry1,
+    entry2,
+    sl,
+    tp1,
+    tp2,
+    rr1,
+    rr2,
+    atr_value,
+    red_ratio,
+    avg_change,
+    btc_change,
+    alt_mode,
+    tv_link,
+):
+    symbol_clean = clean_symbol_for_message(symbol)
+    avg_entry = round((entry1 + entry2) / 2, 6)
+
+    sl_pct = round(((avg_entry - sl) / avg_entry) * 100, 2) if avg_entry > 0 else 0.0
+    tp1_pct = round(((tp1 - avg_entry) / avg_entry) * 100, 2) if avg_entry > 0 else 0.0
+    tp2_pct = round(((tp2 - avg_entry) / avg_entry) * 100, 2) if avg_entry > 0 else 0.0
+
+    red_ratio_pct = round(float(red_ratio or 0) * 100, 1)
+    safe_symbol = html.escape(symbol_clean)
+    safe_tv_link = html.escape(tv_link, quote=True)
+
+    return f'''🛟 <b>RECOVERY LONG MODE</b>
+<b>{safe_symbol}</b>
+
+🚨 <b>السياق:</b>
+السوق خارج من ضغط/كراش، والفرصة محاولة صيد ارتداد بحجم صغير.
+
+💼 <b>حجم الصفقة:</b>
+إجمالي الحجم: {RECOVERY_TOTAL_SIZE_PCT}% من الصفقة العادية
+• Entry 1: {RECOVERY_ENTRY1_SIZE_PCT}% عند {fmt_num(entry1, 6)}
+• Entry 2: {RECOVERY_ENTRY2_SIZE_PCT}% عند {fmt_num(entry2, 6)}
+• متوسط الدخول المخطط: {fmt_num(avg_entry, 6)}
+
+🎯 <b>الأهداف:</b>
+TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")})
+TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")})
+
+🛑 <b>وقف الخسارة:</b>
+SL: {fmt_num(sl, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
+ملاحظة: SL أوسع لأن المود Recovery بعد هبوط قوي (ATR × {RECOVERY_SL_ATR_MULT}).
+
+📊 <b>سبب الدخول:</b>
+• هبوط/امتداد زائد
+• RSI منخفض أو بدأ يرتد
+• تحسن شمعة 15m
+• الفوليوم يدعم الارتداد
+• BTC لم يعد ينهار
+
+🌍 <b>حالة السوق:</b>
+• Red Ratio 15m: {red_ratio_pct}%
+• Avg Market Change 15m: {fmt_pct(avg_change)}
+• BTC 15m: {fmt_pct(btc_change)}
+• Alt Mode: {html.escape(alt_mode)}
+
+⚠️ <b>تحذير:</b>
+هذه ليست إشارة Long عادية.
+هذه محاولة Recovery عالية المخاطر بحجم صغير.
+
+🔗 <a href="{safe_tv_link}">Open Chart</a>'''
+
+
+# =========================
+# MARKET GUARD (original, used for mode determination only)
+# =========================
+def get_last_candle_change_pct(df) -> float:
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
+
+        open_ = _safe_float(signal_row["open"], 0.0)
+        close = _safe_float(signal_row["close"], 0.0)
+
+        if open_ <= 0:
+            return 0.0
+
+        return round(((close - open_) / open_) * 100, 4)
+    except Exception:
+        return 0.0
+
+
+def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -> dict:
+    if not MARKET_GUARD_ENABLED:
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": "disabled",
+        }
+
+    if not ranked_pairs:
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": "no ranked pairs",
+        }
+
+    try:
+        sample = sorted(
+            ranked_pairs,
+            key=lambda x: x.get("_rank_volume_24h", 0),
+            reverse=True
+        )[:MARKET_GUARD_SAMPLE_SIZE]
+
+        changes = []
+        red_count = 0
+        valid = 0
+
+        for item in sample:
+            symbol = item.get("instId", "")
+            if not symbol:
+                continue
+
+            candles = get_candles(
+                symbol,
+                MARKET_GUARD_TIMEFRAME,
+                MARKET_GUARD_CANDLE_LIMIT
+            )
+            df = to_dataframe(candles)
+
+            if df is None or df.empty:
+                continue
+
+            change = get_last_candle_change_pct(df)
+
+            changes.append(change)
+            valid += 1
+
+            if change < 0:
+                red_count += 1
+
+        if valid < MARKET_GUARD_MIN_VALID:
+            return {
+                "active": False,
+                "block_longs": False,
+                "level": "normal",
+                "valid_count": valid,
+                "red_ratio_15m": 0.0,
+                "avg_change_15m": 0.0,
+                "btc_change_15m": 0.0,
+                "reason": f"valid pairs too low ({valid})",
+            }
+
+        red_ratio = round(red_count / valid, 4)
+        avg_change = round(sum(changes) / valid, 4)
+
+        btc_change = 0.0
+        try:
+            btc_candles = get_candles(
+                "BTC-USDT-SWAP",
+                MARKET_GUARD_TIMEFRAME,
+                MARKET_GUARD_CANDLE_LIMIT
+            )
+            btc_df = to_dataframe(btc_candles)
+            if btc_df is not None and not btc_df.empty:
+                btc_change = get_last_candle_change_pct(btc_df)
+        except Exception:
+            btc_change = 0.0
+
+        alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك") if alt_snapshot else "🟡 متماسك"
+
+        block = False
+        reason_parts = []
+
+        if red_ratio >= MARKET_GUARD_RED_RATIO_BLOCK and avg_change <= MARKET_GUARD_AVG_CHANGE_15M_BLOCK:
+            block = True
+            reason_parts.append(
+                f"red_ratio={red_ratio:.2f}>={MARKET_GUARD_RED_RATIO_BLOCK:.2f} "
+                f"and avg_change={avg_change:.2f}<={MARKET_GUARD_AVG_CHANGE_15M_BLOCK:.2f}"
+            )
+
+        if btc_change <= MARKET_GUARD_BTC_CHANGE_15M_BLOCK and red_ratio >= 0.55:
+            block = True
+            reason_parts.append(
+                f"btc_change={btc_change:.2f}<={MARKET_GUARD_BTC_CHANGE_15M_BLOCK:.2f} "
+                f"and red_ratio={red_ratio:.2f}>=0.55"
+            )
+
+        if MARKET_GUARD_ALT_WEAK_BLOCK and alt_mode in ("🔴 ضعيف",) and red_ratio >= 0.60:
+            block = True
+            reason_parts.append(
+                f"alt_mode={alt_mode} and red_ratio={red_ratio:.2f}>=0.60"
+            )
+
+        reason = "; ".join(reason_parts) if reason_parts else "market normal"
+
+        return {
+            "active": True,
+            "block_longs": bool(block),
+            "level": "danger" if block else "normal",
+            "valid_count": valid,
+            "red_ratio_15m": red_ratio,
+            "avg_change_15m": avg_change,
+            "btc_change_15m": btc_change,
+            "reason": reason,
+        }
+
+    except Exception as e:
+        logger.error(f"Market guard snapshot error: {e}")
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": f"error: {e}",
+        }
+
+
+# =========================
+# DETERMINE LONG MARKET MODE (Arabic reasons, stronger normal conditions)
+# =========================
+def determine_long_market_mode(
+    market_guard: dict,
+    market_state: str,
+    btc_mode: str,
+    alt_snapshot: dict,
+    current_mode: str,
+) -> dict:
+    now_ts = int(time.time())
+    red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
+    avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+    btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+    alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك") if alt_snapshot else "🟡 متماسك"
+
+    last_transition_ts = 0
+    last_recovery_check_ts = 0
+    normal_candidate_since = 0
+    if r:
+        try:
+            last_transition_ts = int(r.get(MARKET_MODE_LAST_TRANSITION_KEY) or 0)
+            last_recovery_check_ts = int(r.get(MARKET_MODE_LAST_RECOVERY_CHECK_KEY) or 0)
+            normal_candidate_since = int(r.get(MARKET_MODE_NORMAL_CANDIDATE_KEY) or 0)
+        except Exception:
+            pass
+
+    time_since_last_transition = now_ts - last_transition_ts if last_transition_ts > 0 else 999999
+
+    # شروط الكراش
+    crash_triggered = bool(market_guard.get("block_longs"))
+    crash_reason = market_guard.get("reason", "")
+    if not crash_triggered:
+        if red_ratio >= 0.68 and avg_change <= -1.20:
+            crash_triggered = True
+            crash_reason = f"red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f}"
+        elif btc_change <= -0.70 and red_ratio >= 0.55:
+            crash_triggered = True
+            crash_reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
+        elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
+            crash_triggered = True
+            crash_reason = f"alt_weak & red_ratio={red_ratio:.2f}"
+
+    if crash_triggered:
+        if r:
+            try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+            except: pass
+        return {"mode": MODE_BLOCK_LONGS, "reason": f"كراش: {crash_reason}"}
+
+    # الانتقال من BLOCK إلى RECOVERY
+    if current_mode == MODE_BLOCK_LONGS:
+        if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
+            if r:
+                try: r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
+                except: pass
+            recovery_ok = (
+                red_ratio < 0.60 and avg_change > -0.60
+                and btc_change > -0.35 and alt_mode != "🔴 ضعيف"
+            )
+            if recovery_ok:
+                if r:
+                    try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                    except: pass
+                return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
+        return {"mode": MODE_BLOCK_LONGS, "reason": "في انتظار فحص الريكافري التالي"}
+
+    # RECOVERY -> NORMAL بعد استقرار 5 دقائق
+    if current_mode == MODE_RECOVERY_LONG:
+        normal_conditions = (
+            red_ratio < 0.52 and avg_change > -0.50
+            and btc_change > -0.25 and market_state in ("bull_market", "alt_season", "mixed")
+        )
+        if normal_conditions:
+            if normal_candidate_since == 0:
+                if r:
+                    try: r.set(MARKET_MODE_NORMAL_CANDIDATE_KEY, str(now_ts))
+                    except: pass
+                return {"mode": MODE_RECOVERY_LONG, "reason": "بدأ مرشح الرجوع للوضع الطبيعي"}
+            if now_ts - normal_candidate_since >= NORMAL_CANDIDATE_DURATION:
+                if r:
+                    try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                    except: pass
+                return {"mode": MODE_NORMAL_LONG, "reason": "الريكافري استقر 5 دقائق، رجوع للوضع الطبيعي"}
+            return {"mode": MODE_RECOVERY_LONG, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{NORMAL_CANDIDATE_DURATION}s)"}
+        if r:
+            try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+            except: pass
+        return {"mode": MODE_RECOVERY_LONG, "reason": "ما زلنا في وضع الريكافري"}
+
+    # STRONG_LONG_ONLY
+    weak_market = (
+        market_state in ("mixed", "btc_leading", "risk_off")
+        or (0.52 <= red_ratio < 0.68)
+        or (avg_change < -0.30)
+        or (btc_mode in ("🟡 محايد", "🔴 هابط") and alt_mode != "🟢 قوي")
+    )
+    if weak_market:
+        if r:
+            try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+            except: pass
+        if current_mode != MODE_STRONG_LONG_ONLY and time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
+            return {"mode": current_mode, "reason": "أقل مدة انتقال لم تمر بعد"}
+        return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق ضعيف/مختلط لكن ليس كراش"}
+
+    # NORMAL_LONG
+    normal_conditions = (
+        red_ratio < 0.52 and avg_change > -0.50
+        and btc_change > -0.25 and market_state in ("bull_market", "alt_season", "mixed")
+    )
+    if normal_conditions:
+        if current_mode == MODE_NORMAL_LONG:
+            if r:
+                try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                except: pass
+            return {"mode": MODE_NORMAL_LONG, "reason": "السوق طبيعي"}
+        if normal_candidate_since == 0:
+            if r:
+                try: r.set(MARKET_MODE_NORMAL_CANDIDATE_KEY, str(now_ts))
+                except: pass
+            return {"mode": current_mode, "reason": "بدأ مرشح الرجوع للوضع الطبيعي"}
+        if now_ts - normal_candidate_since >= NORMAL_CANDIDATE_DURATION:
+            if r:
+                try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                except: pass
+            if current_mode == MODE_STRONG_LONG_ONLY and time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
+                return {"mode": current_mode, "reason": "تأكيد طبيعي لكن أقل مدة لم تمر"}
+            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 5 دقائق، رجوع للوضع الطبيعي"}
+        return {"mode": current_mode, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{NORMAL_CANDIDATE_DURATION}s)"}
+
+    if r:
+        try: r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+        except: pass
+    return {"mode": current_mode or MODE_NORMAL_LONG, "reason": "لا يوجد تغيير في المود"}
+
+
+# =========================
+# HANDLE MODE TRANSITION (always save MARKET_MODE_KEY)
+# =========================
+def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
+    transition = f"{html.escape(old_mode)} → {html.escape(new_mode)}"
+    lines = []
+    if new_mode == MODE_NORMAL_LONG:
+        lines = [
+            "🟢 <b>Mode Changed: NORMAL LONG</b>",
+            "السوق رجع طبيعي نسبيًا.",
+            "البوت رجع يرسل إشارات Long بالحجم والمنطق العادي.",
+            "",
+            f"الانتقال: {transition}",
+            "الفحص: Market Guard / 15m"
+        ]
+    elif new_mode == MODE_STRONG_LONG_ONLY:
+        lines = [
+            "🟡 <b>Mode Changed: STRONG LONG ONLY</b>",
+            "السوق غير مثالي، لكن ليس كراش.",
+            "البوت سيسمح فقط بإشارات Long القوية جدًا.",
+            "",
+            f"الانتقال: {transition}",
+            "الشروط أصبحت أقوى مؤقتًا."
+        ]
+    elif new_mode == MODE_BLOCK_LONGS:
+        lines = [
+            "🚨 <b>Mode Changed: BLOCK LONGS</b>",
+            "السوق يهبط بعنف أو فيه ضغط جماعي واضح.",
+            "تم إيقاف إشارات Long الجديدة مؤقتًا.",
+            "",
+            f"الانتقال: {transition}",
+            "الأوامر والتقارير و Track شغالة عادي."
+        ]
+    elif new_mode == MODE_RECOVERY_LONG:
+        lines = [
+            "🛟 <b>Mode Changed: RECOVERY LONG</b>",
+            "السوق بدأ يهدأ بعد ضغط/كراش.",
+            "البوت سيسمح فقط بفرص Recovery Long بشروط خاصة.",
+            "",
+            f"الانتقال: {transition}",
+            "",
+            "حجم الصفقة:",
+            f"• إجمالي الصفقة = {RECOVERY_TOTAL_SIZE_PCT}% من الحجم الطبيعي",
+            f"• Entry 1 = {RECOVERY_ENTRY1_SIZE_PCT}%",
+            f"• Entry 2 = {RECOVERY_ENTRY2_SIZE_PCT}%"
+        ]
+    else:
+        lines = [f"Mode: {new_mode}"]
+
+    if reason:
+        lines.append("")
+        lines.append(f"🧠 <b>السبب:</b> {html.escape(str(reason))}")
+
+    return "\n".join(lines)
+
+
+def handle_market_mode_transition(mode_result: dict) -> str:
+    new_mode = mode_result.get("mode", MODE_NORMAL_LONG)
+    if not r:
+        return new_mode
+
+    try:
+        last_mode = r.get(MARKET_MODE_LAST_KEY) or MODE_NORMAL_LONG
+        if new_mode != last_mode:
+            msg = format_mode_transition_message(last_mode, new_mode, reason=mode_result.get("reason", ""))
+            send_telegram_message(msg)
+            now_ts = int(time.time())
+            r.set(MARKET_MODE_LAST_KEY, new_mode)
+            r.set(MARKET_MODE_LAST_TRANSITION_KEY, str(now_ts))
+            logger.info(f"MODE TRANSITION: {last_mode} → {new_mode} | reason: {mode_result.get('reason')}")
+        # احفظ المود الحالي دائمًا
+        r.set(MARKET_MODE_KEY, new_mode)
+    except Exception as e:
+        logger.error(f"handle_market_mode_transition error: {e}")
+
+    return new_mode
+
+
+# =========================
 # TELEGRAM LOOP
 # =========================
 def bootstrap_telegram_offset_once():
@@ -3249,214 +3718,7 @@ def handle_telegram_commands():
 
 
 # =========================
-# MARKET GUARD
-# =========================
-def get_last_candle_change_pct(df) -> float:
-    """تحسب تغير آخر شمعة 15m من open إلى close."""
-    try:
-        signal_row = get_signal_row(df)
-        if signal_row is None:
-            return 0.0
-        open_ = _safe_float(signal_row["open"], 0.0)
-        close = _safe_float(signal_row["close"], 0.0)
-        if open_ <= 0:
-            return 0.0
-        return round(((close - open_) / open_) * 100, 4)
-    except Exception:
-        return 0.0
-
-
-def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict):
-    if not MARKET_GUARD_ENABLED:
-        return {
-            "active": False,
-            "block_longs": False,
-            "level": "normal",
-            "valid_count": 0,
-            "red_ratio_15m": 0.0,
-            "avg_change_15m": 0.0,
-            "btc_change_15m": 0.0,
-            "reason": "",
-        }
-
-    if not ranked_pairs:
-        return {
-            "active": False,
-            "block_longs": False,
-            "level": "normal",
-            "valid_count": 0,
-            "red_ratio_15m": 0.0,
-            "avg_change_15m": 0.0,
-            "btc_change_15m": 0.0,
-            "reason": "no ranked pairs",
-        }
-
-    try:
-        # Take top N by volume
-        sample = sorted(
-            ranked_pairs,
-            key=lambda x: x.get("_rank_volume_24h", 0),
-            reverse=True
-        )[:MARKET_GUARD_SAMPLE_SIZE]
-
-        changes = []
-        red_count = 0
-        valid = 0
-
-        for item in sample:
-            symbol = item["instId"]
-            candles = get_candles(symbol, MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT)
-            df = to_dataframe(candles)
-            if df is None or df.empty:
-                continue
-
-            change = get_last_candle_change_pct(df)
-            if change == 0.0:
-                continue
-
-            changes.append(change)
-            valid += 1
-            if change < 0:
-                red_count += 1
-
-        if valid < MARKET_GUARD_MIN_VALID:
-            return {
-                "active": False,
-                "block_longs": False,
-                "level": "normal",
-                "valid_count": valid,
-                "red_ratio_15m": 0.0,
-                "avg_change_15m": 0.0,
-                "btc_change_15m": 0.0,
-                "reason": f"valid pairs too low ({valid})",
-            }
-
-        red_ratio = round(red_count / valid, 4)
-        avg_change = round(sum(changes) / valid, 4)
-
-        # BTC change
-        btc_change = 0.0
-        try:
-            btc_candles = get_candles("BTC-USDT-SWAP", MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT)
-            btc_df = to_dataframe(btc_candles)
-            if btc_df is not None and not btc_df.empty:
-                btc_change = get_last_candle_change_pct(btc_df)
-        except Exception:
-            pass
-
-        alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك") if alt_snapshot else "🟡 متماسك"
-
-        block = False
-        reason_parts = []
-
-        # Condition 1: wide red + average move down
-        if red_ratio >= MARKET_GUARD_RED_RATIO_BLOCK and avg_change <= MARKET_GUARD_AVG_CHANGE_15M_BLOCK:
-            block = True
-            reason_parts.append(f"red_ratio={red_ratio}>=0.68 and avg_change={avg_change}<=-1.2")
-
-        # Condition 2: BTC falling hard + many reds
-        if btc_change <= MARKET_GUARD_BTC_CHANGE_15M_BLOCK and red_ratio >= 0.55:
-            block = True
-            reason_parts.append(f"btc_change={btc_change}<=-0.70 and red_ratio={red_ratio}>=0.55")
-
-        # Condition 3: alt weak + high red ratio
-        if MARKET_GUARD_ALT_WEAK_BLOCK and alt_mode in ("🔴 ضعيف",) and red_ratio >= 0.60:
-            block = True
-            reason_parts.append(f"alt_mode={alt_mode} and red_ratio={red_ratio}>=0.60")
-
-        reason = "; ".join(reason_parts) if reason_parts else "market normal"
-
-        level = "danger" if block else "normal"
-
-        return {
-            "active": True,
-            "block_longs": block,
-            "level": level,
-            "valid_count": valid,
-            "red_ratio_15m": red_ratio,
-            "avg_change_15m": avg_change,
-            "btc_change_15m": btc_change,
-            "reason": reason,
-        }
-
-    except Exception as e:
-        logger.error(f"Market guard snapshot error: {e}")
-        return {
-            "active": False,
-            "block_longs": False,
-            "level": "normal",
-            "valid_count": 0,
-            "red_ratio_15m": 0.0,
-            "avg_change_15m": 0.0,
-            "btc_change_15m": 0.0,
-            "reason": f"error: {e}",
-        }
-
-
-def format_market_guard_message(guard: dict, alt_mode: str = "", recovered: bool = False) -> str:
-    red_ratio = guard.get("red_ratio_15m", 0.0) * 100
-    avg_change = guard.get("avg_change_15m", 0.0)
-    btc_change = guard.get("btc_change_15m", 0.0)
-
-    if recovered or not guard.get("block_longs"):
-        return (
-            f"✅ <b>Market Guard Cleared</b>\n"
-            f"الوضع رجع طبيعي نسبيًا.\n"
-            f"تم السماح بإشارات اللونج مرة أخرى.\n\n"
-            f"📉 العملات الهابطة آخر 15m: {red_ratio:.1f}%\n"
-            f"📊 متوسط حركة العينة: {avg_change:+.2f}%\n"
-            f"₿ حركة BTC آخر 15m: {btc_change:+.2f}%\n"
-            f"🌍 حالة الألت: {alt_mode}"
-        )
-    else:
-        return (
-            f"🚨 <b>Market Guard Active</b>\n"
-            f"السوق يهبط بشكل جماعي الآن.\n"
-            f"تم إيقاف إشارات اللونج مؤقتًا.\n\n"
-            f"📉 العملات الهابطة آخر 15m: {red_ratio:.1f}%\n"
-            f"📊 متوسط حركة العينة: {avg_change:+.2f}%\n"
-            f"₿ حركة BTC آخر 15m: {btc_change:+.2f}%\n"
-            f"🌍 حالة الألت: {alt_mode}\n\n"
-            f"القرار: لا دخول Long جديد حتى يهدأ السوق."
-        )
-
-
-def handle_market_guard_notifications(guard: dict, alt_mode: str = "") -> None:
-    if not MARKET_GUARD_ENABLED:
-        return
-    if not r:
-        return
-
-    try:
-        now_ts = int(time.time())
-        status = "active" if guard.get("block_longs") else "normal"
-        last_status = r.get(MARKET_GUARD_LAST_STATUS_KEY) or "normal"
-        last_alert_ts = int(r.get(MARKET_GUARD_LAST_ALERT_KEY) or 0)
-
-        should_send = False
-        recovered = False
-
-        if status == "active":
-            if last_status != "active":
-                should_send = True
-            elif now_ts - last_alert_ts >= MARKET_GUARD_WARNING_INTERVAL_SECONDS:
-                should_send = True
-        elif status == "normal" and last_status == "active":
-            should_send = True
-            recovered = True
-
-        if should_send:
-            msg = format_market_guard_message(guard, alt_mode=alt_mode, recovered=recovered)
-            send_telegram_message(msg)
-            r.set(MARKET_GUARD_LAST_ALERT_KEY, str(now_ts))
-            r.set(MARKET_GUARD_LAST_STATUS_KEY, status)
-
-    except Exception as e:
-        logger.error(f"handle_market_guard_notifications error: {e}")
-
-
-# =========================
-# MAIN LOOP
+# MAIN LOOP (with all fixes applied)
 # =========================
 def run_command_poller():
     bootstrap_telegram_offset_once()
@@ -3477,6 +3739,11 @@ def run_scanner_loop():
         scan_locked = False
 
         try:
+            if is_global_cooldown_active():
+                logger.info("GLOBAL COOLDOWN (Redis) — skipping long scan")
+                time.sleep(60)
+                continue
+
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 logger.info("Another long scan is running — skipping")
@@ -3526,17 +3793,38 @@ def run_scanner_loop():
             btc_dominance_proxy = market_info["btc_dominance_proxy"]
             alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
 
-            # Market Guard snapshot and notifications
-            market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot)
-            handle_market_guard_notifications(market_guard, alt_mode=alt_mode)
+            market_guard = get_market_guard_snapshot(
+                ranked_pairs=ranked_pairs,
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+            )
 
-            if market_guard.get("block_longs"):
-                logger.warning("MARKET GUARD ACTIVE — blocking long scan")
-                time.sleep(60)
-                continue
+            # تحديد المود (لا نستخدم handle_market_guard_notifications)
+            current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
+            if not current_mode:
+                current_mode = MODE_NORMAL_LONG
 
-            if is_global_cooldown_active():
-                logger.info("GLOBAL COOLDOWN (Redis) — skipping long scan")
+            mode_result = determine_long_market_mode(
+                market_guard=market_guard,
+                market_state=market_state,
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+                current_mode=current_mode,
+            )
+
+            current_mode = handle_market_mode_transition(mode_result)
+
+            logger.info(
+                f"MARKET MODE | mode={current_mode} | "
+                f"guard_level={market_guard.get('level')} | "
+                f"red_ratio={market_guard.get('red_ratio_15m')} | "
+                f"avg_change={market_guard.get('avg_change_15m')} | "
+                f"btc_change={market_guard.get('btc_change_15m')} | "
+                f"reason={mode_result.get('reason')}"
+            )
+
+            if current_mode == MODE_BLOCK_LONGS:
+                logger.warning("MODE BLOCK LONGS — blocking new long signals")
                 time.sleep(60)
                 continue
 
@@ -3545,9 +3833,8 @@ def run_scanner_loop():
             news_warning_text = format_news_warning(upcoming_events)
 
             logger.info(
-                f"LONG MARKET STATE | btc={btc_mode} | alt={alt_mode} | "
-                f"state={market_state_label} | flow={market_bias_label} | "
-                f"market_guard={'active' if market_guard.get('block_longs') else 'clear'}"
+                f"LONG MARKET STATE | mode={current_mode} | btc={btc_mode} | alt={alt_mode} | "
+                f"state={market_state_label} | flow={market_bias_label}"
             )
 
             tested = 0
@@ -3556,7 +3843,22 @@ def run_scanner_loop():
             candidates = []
             candidates_symbols = set()
 
-            for pair_data in ranked_pairs:
+            if current_mode == MODE_RECOVERY_LONG:
+                scan_pairs = sorted(
+                    ranked_pairs,
+                    key=lambda x: x.get("_rank_volume_24h", 0),
+                    reverse=True
+                )[:50]
+                max_alerts = RECOVERY_MAX_ALERTS
+            else:
+                scan_pairs = ranked_pairs
+                max_alerts = MAX_ALERTS_PER_RUN
+
+            for pair_data in scan_pairs:
+                if sent_count >= max_alerts:
+                    logger.info(f"Reached max alerts for mode={current_mode}: {sent_count}/{max_alerts}")
+                    break
+
                 tested += 1
                 symbol = pair_data["instId"]
                 change_24h = extract_24h_change_percent(pair_data)
@@ -3583,78 +3885,264 @@ def run_scanner_loop():
                 gaining_strength = is_gaining_intraday_strength(df)
                 breakout_quality = get_breakout_quality(df, vol_ratio)
 
-                # --- حساب is_reverse أولاً (لأن RSI تحتاجها) ---
                 is_reverse = is_oversold_reversal_long(
-                    df=df,
-                    dist_ma=dist_ma,
-                    change_24h=change_24h,
-                    vol_ratio=vol_ratio,
-                    funding=funding,
+                    df=df, dist_ma=dist_ma, change_24h=change_24h,
+                    vol_ratio=vol_ratio, funding=funding,
                 )
 
-                # --- الآن RSI filters (بعد is_reverse) ---
                 signal_row = get_signal_row(df)
                 if signal_row is None:
                     logger.info(f"{symbol} → skipped (no valid signal row)")
                     continue
 
                 rsi_now = _safe_float(signal_row.get("rsi"), 50)
+
+                # ---- RECOVERY LONG ----
+                if current_mode == MODE_RECOVERY_LONG:
+                    if is_new:
+                        continue
+
+                    red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
+                    avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+                    btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+
+                    if btc_change <= -0.35 or red_ratio >= 0.60:
+                        continue
+                    if not (dist_ma <= -4.5 and 24 <= rsi_now <= 42):
+                        continue
+                    if vol_ratio < 1.10:
+                        continue
+
+                    close = _safe_float(signal_row["close"])
+                    open_ = _safe_float(signal_row["open"])
+                    high = _safe_float(signal_row["high"])
+                    low = _safe_float(signal_row["low"])
+                    candle_range = high - low
+                    if candle_range > 0:
+                        close_position = (close - low) / candle_range
+                    else:
+                        close_position = 0.5
+                    if not (close > open_ or close_position >= 0.55):
+                        continue
+
+                    price = close
+                    atr_value = _safe_float(signal_row.get("atr"), 0)
+                    if atr_value <= 0:
+                        continue
+
+                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
+
+                    entry1 = price
+                    entry2 = round(entry1 - atr_value * RECOVERY_ENTRY2_ATR_MULT, 6)
+                    avg_entry = round((entry1 + entry2) / 2, 6)
+
+                    sl = round(avg_entry - atr_value * RECOVERY_SL_ATR_MULT, 6)
+                    min_sl = round(avg_entry * 0.955, 6)
+                    max_sl = round(avg_entry * 0.92, 6)
+                    sl = max(max_sl, min(min_sl, sl))
+
+                    rr1, rr2 = get_rr_targets_long(signal_type="standard", entry_timing="")
+                    tp1 = calc_tp_long(avg_entry, sl, rr=rr1)
+                    tp2 = calc_tp_long(avg_entry, sl, rr=rr2)
+                    tv_link = build_tradingview_link(symbol)
+
+                    alert_id = build_alert_id(symbol, get_signal_candle_time(df))
+
+                    msg = build_recovery_long_message(
+                        symbol=symbol, entry1=entry1, entry2=entry2,
+                        sl=sl, tp1=tp1, tp2=tp2, rr1=rr1, rr2=rr2,
+                        atr_value=atr_value, red_ratio=red_ratio, avg_change=avg_change,
+                        btc_change=btc_change, alt_mode=alt_mode, tv_link=tv_link,
+                    )
+
+                    if not already_sent_same_candle(symbol, get_signal_candle_time(df), "long") \
+                            and not is_symbol_on_cooldown(symbol, "long"):
+                        locked = reserve_signal_slot(symbol, get_signal_candle_time(df), "long")
+                        if locked:
+                            sent_data = send_telegram_message(msg, reply_markup=build_track_reply_markup(alert_id))
+                            if sent_data.get("ok"):
+                                sent_count += 1
+                                sent_symbols_this_run.add(symbol)
+                                sent_cache[symbol] = time.time()
+                                last_candle_cache[symbol] = get_signal_candle_time(df)
+
+                                alert_snapshot = {
+                                    "alert_id": alert_id,
+                                    "symbol": symbol,
+                                    "timeframe": TIMEFRAME,
+                                    "mode": MODE_RECOVERY_LONG,
+                                    "market_mode": MODE_RECOVERY_LONG,
+                                    "entry": avg_entry,
+                                    "entry1": entry1,
+                                    "entry2": entry2,
+                                    "average_planned_entry": avg_entry,
+                                    "total_size_pct": RECOVERY_TOTAL_SIZE_PCT,
+                                    "entry1_size_pct": RECOVERY_ENTRY1_SIZE_PCT,
+                                    "entry2_size_pct": RECOVERY_ENTRY2_SIZE_PCT,
+                                    "sl": sl,
+                                    "tp1": tp1,
+                                    "tp2": tp2,
+                                    "rr1": rr1,
+                                    "rr2": rr2,
+                                    "score": 0.0,
+                                    "candle_time": get_signal_candle_time(df),
+                                    "created_ts": int(time.time()),
+                                    "market_state": market_state,
+                                    "alt_mode": alt_mode,
+                                    "btc_mode": btc_mode,
+                                    "entry_timing": "🛟 Recovery Entry",
+                                    "opportunity_type": "Recovery Long",
+                                    "is_reverse": True,
+                                    "setup_type": "recovery|mtf_yes|vol_mid|post_crash",
+                                    "rsi_now": rsi_now,
+                                    "dist_ma": dist_ma,
+                                    "vol_ratio": vol_ratio,
+                                    "pullback_entry": entry2,
+                                    "pullback_low": entry2,
+                                    "pullback_high": entry1,
+                                    "market_red_ratio_15m": red_ratio,
+                                    "market_avg_change_15m": avg_change,
+                                    "btc_change_15m": btc_change,
+                                    "recovery_reason": "Post crash rebound",
+                                    "above_upper_bb": False,
+                                    "change_4h": 0.0,
+                                    "late_pump_risk": False,
+                                    "bull_continuation_risk": False,
+                                }
+
+                                message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
+                                save_alert_snapshot(alert_snapshot, message_id=message_id)
+
+                                register_trade(
+                                    redis_client=r,
+                                    symbol=symbol,
+                                    market_type="futures",
+                                    side="long",
+                                    candle_time=get_signal_candle_time(df),
+                                    entry=avg_entry,
+                                    sl=sl,
+                                    tp1=tp1,
+                                    tp2=tp2,
+                                    score=0.0,
+                                    timeframe=TIMEFRAME,
+                                    btc_mode=btc_mode,
+                                    funding_label="🟡 محايد",
+                                    reasons=["RECOVERY_LONG", "POST_CRASH_REBOUND"],
+                                    pre_breakout=False,
+                                    breakout=False,
+                                    vol_ratio=vol_ratio,
+                                    candle_strength=candle_strength,
+                                    mtf_confirmed=mtf_confirmed,
+                                    is_new=False,
+                                    btc_dominance_proxy=btc_dominance_proxy,
+                                    change_24h=change_24h,
+                                    setup_type="recovery|mtf_yes|vol_mid|post_crash",
+                                    raw_score=0.0,
+                                    effective_score=0.0,
+                                    dynamic_threshold=0.0,
+                                    required_min_score=0.0,
+                                    dist_ma=dist_ma,
+                                    entry_timing="🛟 Recovery Entry",
+                                    opportunity_type="Recovery Long",
+                                    market_state=market_state,
+                                    market_state_label=market_state_label,
+                                    market_bias_label=market_bias_label,
+                                    alt_mode=alt_mode,
+                                    early_priority="none",
+                                    breakout_quality="none",
+                                    fake_signal=False,
+                                    is_reverse_signal=True,
+                                    reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
+                                    rank_volume_24h=float(pair_data.get("_rank_volume_24h", 0)),
+                                    alert_id=alert_id,
+                                    has_high_impact_news=has_high_impact_news,
+                                    news_titles=[],
+                                    warning_reasons=["Recovery عالي المخاطر", "حجم الصفقة 30% فقط", "دخول مقسم 15% + 15%"],
+                                    pullback_low=entry2,
+                                    pullback_high=entry1,
+                                    pullback_entry=entry2,
+                                    rr1=rr1,
+                                    rr2=rr2,
+                                )
+
+                                logger.info(f"SENT RECOVERY LONG → {symbol} | avg_entry={avg_entry}")
+                            else:
+                                release_signal_slot(symbol, get_signal_candle_time(df), "long")
+                                logger.error(f"FAILED SEND RECOVERY → {symbol}")
+                    continue
+
+                # ---- المنطق العادي (NORMAL / STRONG_LONG_ONLY) ----
                 if rsi_now > 75 and not is_reverse:
                     logger.info(f"{symbol} → skipped (RSI > 75 extreme peak)")
                     continue
-                if rsi_now > 70 and dist_ma > 4:
+                if rsi_now > 70 and dist_ma > 4 and not is_reverse:
                     logger.info(f"{symbol} → skipped (RSI > 70 and dist_ma > 4)")
                     continue
                 if dist_ma > 3.5:
                     early_signal = False
 
-                # --- PHASE 3 LITE: حساب BB و 4H change ---
                 above_upper_bb = is_above_upper_bollinger(df)
                 change_4h = get_change_4h(df)
 
-                # === Late Pump / Bull Market Guard ===
+                if above_upper_bb and rsi_now >= 68 and dist_ma >= 3.8 and not is_reverse:
+                    if breakout_quality != "strong":
+                        logger.info(
+                            f"{symbol} → skipped (upper BB peak guard | "
+                            f"rsi={rsi_now:.1f} | dist_ma={dist_ma:.2f} | "
+                            f"breakout_quality={breakout_quality})"
+                        )
+                        continue
+
                 temp_opportunity_type = classify_opportunity_type_long(
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    dist_ma=dist_ma,
-                    mtf_confirmed=mtf_confirmed,
-                    is_reverse=is_reverse,
+                    breakout=breakout, pre_breakout=pre_breakout,
+                    dist_ma=dist_ma, mtf_confirmed=mtf_confirmed, is_reverse=is_reverse,
                 )
 
                 late_guard = detect_late_pump_long(
                     market_state=market_state,
                     opportunity_type=temp_opportunity_type,
-                    dist_ma=dist_ma,
-                    rsi_now=rsi_now,
-                    vol_ratio=vol_ratio,
-                    candle_strength=candle_strength,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    breakout_quality=breakout_quality,
+                    dist_ma=dist_ma, rsi_now=rsi_now, vol_ratio=vol_ratio,
+                    candle_strength=candle_strength, breakout=breakout,
+                    pre_breakout=pre_breakout, breakout_quality=breakout_quality,
                     change_4h=change_4h,
                 )
 
                 if late_guard.get("should_block") and not is_reverse:
-                    logger.info(
-                        f"{symbol} → skipped (late/bull continuation guard | "
-                        f"market={market_state} | opp={temp_opportunity_type} | "
-                        f"dist_ma={dist_ma:.2f} | rsi={rsi_now:.1f} | "
-                        f"vol={vol_ratio:.2f} | candle={candle_strength:.2f} | "
-                        f"bq={breakout_quality} | reasons={late_guard.get('reasons')})"
-                    )
+                    logger.info(f"{symbol} → skipped (late/bull continuation guard)")
                     continue
 
-                # === FILTER 1: Bollinger (SAFE) ===
                 if above_upper_bb and not pre_breakout and not is_reverse:
                     if not breakout or breakout_quality == "weak":
-                        logger.info(
-                            f"{symbol} → skipped (upper BB | breakout={breakout} | "
-                            f"pre_breakout={pre_breakout} | breakout_quality={breakout_quality} | "
-                            f"reverse={is_reverse})"
-                        )
+                        logger.info(f"{symbol} → skipped (upper BB)")
                         continue
 
-                # --- Pullback zone calculation (using signal_row index) ---
+                # حساب تأكيد 4H للـ reverse مبكراً
+                reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
+                if is_reverse:
+                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
+
+                # حساب early_priority قبل فحص STRONG_LONG_ONLY
+                early_priority = classify_early_priority_long(
+                    early_signal=early_signal, breakout=breakout, pre_breakout=pre_breakout,
+                    dist_ma=dist_ma, vol_ratio=vol_ratio, candle_strength=candle_strength,
+                    mtf_confirmed=mtf_confirmed, gaining_strength=gaining_strength,
+                    market_state=market_state,
+                )
+
+                if current_mode == MODE_STRONG_LONG_ONLY:
+                    if not (breakout or pre_breakout or early_priority == "strong"):
+                        logger.info(f"{symbol} → skipped (STRONG_LONG_ONLY: no breakout/pre/early_strong)")
+                        continue
+                    if not mtf_confirmed and not (is_reverse and reversal_4h_result.get("confirmed")):
+                        logger.info(f"{symbol} → skipped (STRONG_LONG_ONLY: mtf not confirmed)")
+                        continue
+                    if vol_ratio < 1.25:
+                        logger.info(f"{symbol} → skipped (STRONG_LONG_ONLY: vol_ratio too low)")
+                        continue
+                    if breakout and breakout_quality == "weak":
+                        logger.info(f"{symbol} → skipped (STRONG_LONG_ONLY: weak breakout)")
+                        continue
+
                 signal_idx = signal_row.name
                 lookback_start = max(0, signal_idx - 20)
                 recent_high = _safe_float(df["high"].iloc[lookback_start:signal_idx].max(), 0)
@@ -3665,77 +4153,29 @@ def run_scanner_loop():
                 if atr_value > 0 and recent_high > 0:
                     pullback_low = recent_high - (atr_value * 0.15)
                     pullback_high = recent_high + (atr_value * 0.35)
-                    if pullback_low is not None and pullback_high is not None:
-                        pullback_entry = round((pullback_low + pullback_high) / 2, 6)
-                # Show pullback zone only for breakout or pre_breakout
+                    pullback_entry = round((pullback_low + pullback_high) / 2, 6)
                 if not breakout and not pre_breakout:
                     pullback_low = None
                     pullback_high = None
                     pullback_entry = None
 
-                # --- باقي الفلترة والتقييم ---
-                reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
-                if is_reverse:
-                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
-                    if not reversal_4h_result["confirmed"]:
-                        logger.info(
-                            f"{symbol} → REVERSAL 4H NOT CONFIRMED | "
-                            f"{reversal_4h_result.get('details', '')} | "
-                            f"سيُرسل بتحذير مرتفع"
-                        )
-
                 if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal:
-                    logger.info(f"{symbol} → skipped (hard floor vol_ratio too low: {vol_ratio:.2f})")
                     continue
-
-                if is_late_long_entry(
-                    dist_ma=dist_ma,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                ) and not is_reverse:
-                    logger.info(f"{symbol} → skipped (late long entry | dist_ma={dist_ma:.2f})")
+                if is_late_long_entry(dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout) and not is_reverse:
                     continue
-
                 if is_exhausted_long_move(
-                    dist_ma=dist_ma,
-                    vol_ratio=vol_ratio,
-                    candle_strength=candle_strength,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
+                    dist_ma=dist_ma, vol_ratio=vol_ratio, candle_strength=candle_strength,
+                    breakout=breakout, pre_breakout=pre_breakout
                 ) and not is_reverse:
-                    logger.info(
-                        f"{symbol} → skipped (exhausted move | dist_ma={dist_ma:.2f} | "
-                        f"vol_ratio={vol_ratio:.2f} | candle_strength={candle_strength:.2f})"
-                    )
                     continue
-
-                early_priority = classify_early_priority_long(
-                    early_signal=early_signal,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    dist_ma=dist_ma,
-                    vol_ratio=vol_ratio,
-                    candle_strength=candle_strength,
-                    mtf_confirmed=mtf_confirmed,
-                    gaining_strength=gaining_strength,
-                    market_state=market_state,
-                )
 
                 try:
                     score_result = calculate_long_score(
-                        df=df,
-                        vol_ratio=vol_ratio,
-                        mtf_confirmed=mtf_confirmed,
-                        btc_mode=btc_mode,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                        is_new=is_new,
-                        funding=funding,
-                        btc_dominance_proxy=btc_dominance_proxy,
-                        market_state=market_state,
-                        alt_mode=alt_mode,
-                        market_bias_label=market_bias_label,
-                        is_reverse=is_reverse,
+                        df=df, vol_ratio=vol_ratio, mtf_confirmed=mtf_confirmed,
+                        btc_mode=btc_mode, breakout=breakout, pre_breakout=pre_breakout,
+                        is_new=is_new, funding=funding, btc_dominance_proxy=btc_dominance_proxy,
+                        market_state=market_state, alt_mode=alt_mode,
+                        market_bias_label=market_bias_label, is_reverse=is_reverse,
                     )
                 except Exception as score_err:
                     logger.error(f"{symbol} → calculate_long_score failed: {score_err}")
@@ -3750,7 +4190,6 @@ def run_scanner_loop():
                     effective_score -= EXTREME_LATE_PUMP_SCORE_PENALTY
                 elif late_guard.get("late_pump_risk") and not is_reverse:
                     effective_score -= LATE_PUMP_SCORE_PENALTY
-
                 if late_guard.get("bull_continuation_risk") and not is_reverse:
                     effective_score -= BULL_CONTINUATION_SCORE_PENALTY
 
@@ -3779,34 +4218,40 @@ def run_scanner_loop():
                 score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
-                    market_state=market_state,
-                    score_result=score_result,
-                    vol_ratio=vol_ratio,
-                    mtf_confirmed=mtf_confirmed,
-                    is_new=is_new,
-                    gaining_strength=gaining_strength,
+                    market_state=market_state, score_result=score_result,
+                    vol_ratio=vol_ratio, mtf_confirmed=mtf_confirmed,
+                    is_new=is_new, gaining_strength=gaining_strength,
                 )
 
                 if dist_ma < -4.4 and not breakout and not pre_breakout and not is_reverse:
                     dynamic_threshold += 0.15
-
                 if candle_strength < 0.45 and dist_ma < -4.0 and not breakout and not pre_breakout and not is_reverse:
                     dynamic_threshold += 0.10
 
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
 
-                if score_result["score"] < dynamic_threshold:
-                    if early_priority != "strong":
-                        logger.info(
-                            f"{symbol} → rejected (score<{dynamic_threshold} | early_priority={early_priority})"
-                        )
+                if current_mode == MODE_STRONG_LONG_ONLY:
+                    effective_score -= 0.35
+                    score_result["score"] = round(effective_score, 2)
+                    dynamic_threshold += 0.25
+                    dynamic_threshold = round(dynamic_threshold, 2)
+                    entry_timing_temp = classify_entry_timing_long(
+                        dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout,
+                        vol_ratio=vol_ratio, rsi_now=rsi_now, candle_strength=candle_strength,
+                        late_pump_risk=late_guard.get("late_pump_risk", False),
+                    )
+                    if "🔴 متأخر" in entry_timing_temp:
+                        logger.info(f"{symbol} → skipped (STRONG_LONG_ONLY: late entry)")
                         continue
+
+                if score_result["score"] < dynamic_threshold and early_priority != "strong":
+                    logger.info(f"{symbol} → rejected (score<{dynamic_threshold})")
+                    continue
 
                 if has_high_impact_news:
                     if "warning_reasons" not in score_result:
                         score_result["warning_reasons"] = []
-
                     if "أخبار اقتصادية مهمة قريبة" not in score_result["warning_reasons"]:
                         score_result["warning_reasons"].append("أخبار اقتصادية مهمة قريبة")
 
@@ -3814,99 +4259,60 @@ def run_scanner_loop():
                 required_min_score = FINAL_MIN_SCORE + (0.1 if pre_breakout_only else 0)
 
                 opportunity_type = classify_opportunity_type_long(
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    dist_ma=dist_ma,
-                    mtf_confirmed=mtf_confirmed,
-                    is_reverse=is_reverse,
+                    breakout=breakout, pre_breakout=pre_breakout,
+                    dist_ma=dist_ma, mtf_confirmed=mtf_confirmed, is_reverse=is_reverse,
                 )
                 entry_timing = classify_entry_timing_long(
-                    dist_ma=dist_ma,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    vol_ratio=vol_ratio,
-                    rsi_now=rsi_now,
-                    candle_strength=candle_strength,
+                    dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout,
+                    vol_ratio=vol_ratio, rsi_now=rsi_now, candle_strength=candle_strength,
                     late_pump_risk=late_guard.get("late_pump_risk", False),
                 )
                 timing_penalty = get_entry_timing_penalty(entry_timing)
                 effective_required_min_score = required_min_score + timing_penalty
                 effective_required_min_score += get_early_priority_min_score_adjustment(early_priority)
                 effective_required_min_score = get_effective_min_score_with_reverse(
-                    effective_required_min_score,
-                    is_reverse=is_reverse,
+                    effective_required_min_score, is_reverse=is_reverse,
                 )
 
-                # === FILTER 2: MTF Late Trap ===
                 if mtf_confirmed and "🔴 متأخر" in entry_timing and not is_reverse:
                     logger.info(f"{symbol} → skipped (MTF late)")
                     continue
-
-                # === FILTER 3: MTF Chasing Move ===
                 if mtf_confirmed and change_4h > 3 and not breakout and not pre_breakout and not is_reverse:
                     logger.info(f"{symbol} → skipped (chasing 4h move)")
                     continue
 
-                logger.info(
-                    f"{symbol} → early_signal: {early_signal} | "
-                    f"early_priority={early_priority} | "
-                    f"pre_b={pre_breakout} | "
-                    f"score={score_result['score']} | "
-                    f"min_required={effective_required_min_score} | "
-                    f"dyn={dynamic_threshold} | "
-                    f"fake={score_result.get('fake_signal')} | "
-                    f"mtf={mtf_confirmed} | "
-                    f"reverse={is_reverse} | "
-                    f"market={market_state} | dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f}"
-                )
-
                 if score_result["score"] < effective_required_min_score:
-                    logger.info(
-                        f"{symbol} → rejected by effective min score "
-                        f"({score_result['score']} < {effective_required_min_score})"
-                    )
+                    logger.info(f"{symbol} → rejected by effective min score")
                     continue
 
                 if not breakout and not pre_breakout and dist_ma > 6.2 and not is_reverse:
-                    logger.info(f"{symbol} → rejected (late move without breakout/pre-breakout | dist_ma={dist_ma:.2f})")
+                    logger.info(f"{symbol} → rejected (late move without breakout)")
                     continue
 
                 candle_time = get_signal_candle_time(df)
                 now = time.time()
 
                 if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
-                    logger.info(f"{symbol} → skipped (same candle in memory)")
                     continue
-
                 if symbol in sent_cache and now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
-                    logger.info(f"{symbol} → skipped (local cooldown active)")
                     continue
-
                 if symbol in sent_symbols_this_run:
-                    logger.info(f"{symbol} → skipped (already sent this run)")
                     continue
-
                 if symbol in candidates_symbols:
-                    logger.info(f"{symbol} → skipped (already queued this run)")
                     continue
-
                 if already_sent_same_candle(symbol, candle_time, "long"):
-                    logger.info(f"{symbol} → skipped (same candle in Redis)")
                     continue
-
                 if is_symbol_on_cooldown(symbol, "long"):
-                    logger.info(f"{symbol} → skipped (cooldown active)")
                     continue
 
-                if is_new:
-                    if not passes_new_listing_filter(
-                        score=float(score_result["score"]),
-                        breakout=breakout or pre_breakout,
-                        vol_ratio=vol_ratio,
-                        candle_strength=candle_strength,
-                    ):
-                        logger.info(f"{symbol} → rejected by balanced new listing filter")
-                        continue
+                if is_new and not passes_new_listing_filter(
+                    score=float(score_result["score"]),
+                    breakout=breakout or pre_breakout,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                ):
+                    logger.info(f"{symbol} → rejected by balanced new listing filter")
+                    continue
 
                 price = _safe_float(signal_row["close"], 0)
 
@@ -3932,21 +4338,14 @@ def run_scanner_loop():
                 display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
 
                 if "🔴 متأخر" in entry_timing and "🔴 عالية" in display_risk and not breakout and vol_ratio < 1.2:
-                    logger.info(
-                        f"{symbol} → rejected (late + high risk + no breakout + low vol | "
-                        f"dist_ma={dist_ma:.2f} | vol={vol_ratio:.2f})"
-                    )
+                    logger.info(f"{symbol} → rejected (late + high risk + no breakout + low vol)")
                     continue
 
                 momentum_priority = get_momentum_priority(
                     score=float(score_result["score"]),
-                    breakout=breakout,
-                    vol_ratio=vol_ratio,
-                    is_new=is_new,
-                    pre_breakout=pre_breakout,
-                    dist_ma=dist_ma,
-                    gaining_strength=gaining_strength,
-                    early_priority=early_priority,
+                    breakout=breakout, vol_ratio=vol_ratio, is_new=is_new,
+                    pre_breakout=pre_breakout, dist_ma=dist_ma,
+                    gaining_strength=gaining_strength, early_priority=early_priority,
                     is_reverse=is_reverse,
                 )
 
@@ -3954,7 +4353,6 @@ def run_scanner_loop():
                     momentum_priority -= 0.90
                 elif late_guard.get("late_pump_risk") and not is_reverse:
                     momentum_priority -= 0.60
-
                 if late_guard.get("bull_continuation_risk") and not is_reverse:
                     momentum_priority -= 0.40
 
@@ -3972,16 +4370,8 @@ def run_scanner_loop():
                 }
                 setup_type = build_setup_type(setup_type_candidate)
                 setup_stats = get_setup_type_stats(
-                    redis_client=r,
-                    market_type="futures",
-                    side="long",
-                    setup_type=setup_type,
-                    since_ts=stats_reset_ts,
-                )
-                logger.info(
-                    f"{symbol} → setup_type={setup_type} | "
-                    f"closed={setup_stats.get('closed', 0)} | "
-                    f"winrate={setup_stats.get('winrate', 0)}%"
+                    redis_client=r, market_type="futures", side="long",
+                    setup_type=setup_type, since_ts=stats_reset_ts,
                 )
 
                 candidate = {
@@ -4024,45 +4414,34 @@ def run_scanner_loop():
                     "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
                     "late_guard_reasons": late_guard.get("reasons", []),
                     "rsi_now": rsi_now,
-                    "market_guard_active": market_guard.get("active", False),
+                    "market_guard_active": bool(market_guard.get("active", False)),
                     "market_guard_level": market_guard.get("level", "normal"),
                     "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
                     "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
                     "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
                     "message": build_message(
-                        symbol=symbol,
-                        price=price,
-                        score_result=score_result,
-                        stop_loss=stop_loss,
-                        tp1=tp1,
-                        tp2=tp2,
-                        rr1=rr1,
-                        rr2=rr2,
-                        btc_mode=btc_mode,
-                        btc_dominance_proxy=btc_dominance_proxy,
-                        tv_link=tv_link,
-                        is_new=is_new,
-                        change_24h=change_24h,
+                        symbol=symbol, price=price, score_result=score_result,
+                        stop_loss=stop_loss, tp1=tp1, tp2=tp2, rr1=rr1, rr2=rr2,
+                        btc_mode=btc_mode, btc_dominance_proxy=btc_dominance_proxy,
+                        tv_link=tv_link, is_new=is_new, change_24h=change_24h,
                         market_state_label=market_state_label,
                         market_bias_label=market_bias_label,
-                        alt_mode=alt_mode,
-                        news_warning=news_warning_text,
+                        alt_mode=alt_mode, news_warning=news_warning_text,
                         opportunity_type=opportunity_type,
-                        entry_timing=entry_timing,
-                        display_risk=display_risk,
-                        setup_stats=setup_stats,
-                        is_reverse=is_reverse,
+                        entry_timing=entry_timing, display_risk=display_risk,
+                        setup_stats=setup_stats, is_reverse=is_reverse,
                         reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
                         reversal_4h_details=reversal_4h_result.get("details", ""),
                         breakout_quality=breakout_quality,
-                        pullback_low=pullback_low,
-                        pullback_high=pullback_high,
+                        pullback_low=pullback_low, pullback_high=pullback_high,
                     ),
                     "reply_markup": build_track_reply_markup(alert_id),
                     "alert_id": alert_id,
                     "alert_snapshot": {
                         "alert_id": alert_id,
                         "symbol": symbol,
+                        "mode": current_mode,
+                        "market_mode": current_mode,
                         "timeframe": TIMEFRAME,
                         "entry": price,
                         "sl": stop_loss,
@@ -4091,7 +4470,7 @@ def run_scanner_loop():
                         "pullback_low": pullback_low,
                         "pullback_high": pullback_high,
                         "pullback_entry": pullback_entry,
-                        "market_guard_active": market_guard.get("active", False),
+                        "market_guard_active": bool(market_guard.get("active", False)),
                         "market_guard_level": market_guard.get("level", "normal"),
                         "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
                         "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
@@ -4112,7 +4491,6 @@ def run_scanner_loop():
                     "alt_mode": alt_mode,
                 }
                 candidate["bucket"] = get_candidate_bucket(candidate)
-
                 candidates.append(candidate)
                 candidates_symbols.add(symbol)
 
@@ -4121,37 +4499,23 @@ def run_scanner_loop():
             candidates = apply_top_momentum_filter(candidates)
             logger.info(f"Long candidates found after momentum filter: {len(candidates)}")
 
-            top_candidates = diversify_candidates(candidates, MAX_ALERTS_PER_RUN)
+            top_candidates = diversify_candidates(candidates, min(max_alerts, len(candidates)))
 
             for candidate in top_candidates:
+                if sent_count >= max_alerts:
+                    logger.info(f"Reached max alerts: {sent_count}/{max_alerts}, stopping send")
+                    break
+
                 symbol = candidate["symbol"]
-
                 if symbol in sent_symbols_this_run:
-                    logger.info(f"{symbol} → skipped (already sent final stage)")
                     continue
-
-                logger.info(
-                    f"FINAL CHECK | {symbol} | candle={candidate['candle_time']} | "
-                    f"same_candle={already_sent_same_candle(symbol, candidate['candle_time'], 'long')} | "
-                    f"cooldown={is_symbol_on_cooldown(symbol, 'long')}"
-                )
-
                 if already_sent_same_candle(symbol, candidate["candle_time"], "long"):
-                    logger.info(f"{symbol} → skipped (already sent this candle Redis FINAL)")
                     continue
-
                 if is_symbol_on_cooldown(symbol, "long"):
-                    logger.info(f"{symbol} → skipped (cooldown active final)")
                     continue
 
-                locked = reserve_signal_slot(
-                    symbol=symbol,
-                    candle_time=candidate["candle_time"],
-                    signal_type="long",
-                )
-
+                locked = reserve_signal_slot(symbol, candidate["candle_time"], "long")
                 if not locked:
-                    logger.info(f"{symbol} → skipped (reserve failed / duplicate)")
                     continue
 
                 sent_data = send_telegram_message(
@@ -4160,8 +4524,8 @@ def run_scanner_loop():
                 )
 
                 if sent_data.get("ok"):
-                    sent_symbols_this_run.add(symbol)
                     sent_count += 1
+                    sent_symbols_this_run.add(symbol)
                     sent_cache[symbol] = time.time()
                     last_candle_cache[symbol] = candidate["candle_time"]
                     last_global_send_ts = time.time()
@@ -4222,26 +4586,16 @@ def run_scanner_loop():
                         pullback_low=candidate.get("pullback_low"),
                         pullback_high=candidate.get("pullback_high"),
                         pullback_entry=candidate.get("pullback_entry"),
-                        rr1=candidate.get("rr1"),
-                        rr2=candidate.get("rr2"),
+                        rr1=candidate.get("rr1", 1.5),
+                        rr2=candidate.get("rr2", 3.0),
                     )
 
                     logger.info(
                         f"SENT LONG → {symbol} | score: {candidate['score']} | "
-                        f"momentum: {candidate['momentum_priority']} | "
-                        f"bucket: {candidate['bucket']} | reverse={candidate.get('is_reverse', False)} | "
-                        f"setup_type={candidate.get('setup_type', 'unknown')} | "
-                        f"new={candidate['is_new']} | "
-                        f"early_priority={candidate.get('early_priority', 'none')} | "
-                        f"market={candidate['market_state']} | alt={candidate['alt_mode']} | "
-                        f"alert_id={candidate['alert_id']}"
+                        f"mode: {current_mode} | alert_id={candidate['alert_id']}"
                     )
                 else:
-                    release_signal_slot(
-                        symbol=symbol,
-                        candle_time=candidate["candle_time"],
-                        signal_type="long",
-                    )
+                    release_signal_slot(symbol, candidate["candle_time"], "long")
                     logger.error(f"FAILED SEND → {symbol}")
 
             if sent_count > 0:
@@ -4251,7 +4605,6 @@ def run_scanner_loop():
             logger.info(f"Sent long alerts this run: {sent_count}")
             logger.info(f"Tested {tested} pairs")
             logger.info("Sleeping 60 seconds...")
-
             time.sleep(60)
 
         except Exception as e:
@@ -4267,12 +4620,9 @@ def run():
     logger.info(
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
     )
-
     clear_webhook()
-
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
-
     run_scanner_loop()
 
 
