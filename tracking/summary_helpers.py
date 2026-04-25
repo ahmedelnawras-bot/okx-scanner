@@ -17,10 +17,6 @@ logger = logging.getLogger("okx-scanner")
 # -------------------------------
 # ثوابت التقرير المالي
 # -------------------------------
-# ملاحظة:
-# لو عندك نفس الثوابت في tracking/performance.py بنفس القيم، تمام.
-# الأفضل لاحقاً نقلها إلى ملف مستقل tracking/report_config.py
-# واستيرادها من الملفين لتجنب اختلاف القيم.
 REPORT_LEVERAGE = 15.0
 REPORT_MAX_CAPITAL_USAGE_PCT = 35.0
 REPORT_DAILY_MAX_DRAWDOWN_PCT = 20.0
@@ -280,68 +276,31 @@ def normalize_trade_result(trade: Optional[Dict]) -> str:
 def build_empty_summary() -> dict:
     """
     إنشاء ملخص فارغ بالحقول الكاملة المعتمدة في التقارير.
-
-    signals:
-        عدد جميع الإشارات المسجلة.
-
-    closed:
-        الصفقات التي انتهت بنتيجة واضحة.
-
-    open:
-        الصفقات المفتوحة حالياً أو partial.
-
-    wins:
-        عدد الصفقات الرابحة: tp1_win + tp2_win.
-
-    losses:
-        عدد الصفقات الخاسرة.
-
-    expired:
-        عدد الصفقات المنتهية بالانتهاء.
-
-    tp1_hits:
-        عدد الصفقات التي لمست TP1.
-
-    tp2_hits:
-        عدد الصفقات التي لمست TP2.
-
-    winrate:
-        wins / (wins + losses).
-
-    tp1_rate:
-        tp1_hits / signals.
-
-    net_profit_pct:
-        صافي الربح/الخسارة المرفوع بالرافعة.
-
-    avg_profit_pct:
-        متوسط ربح الصفقة الرابحة، مرفوع.
-
-    avg_loss_pct:
-        متوسط خسارة الصفقة الخاسرة، مرفوع.
-
-    best_trade_pct:
-        أفضل صفقة، مرفوعة.
-
-    worst_trade_pct:
-        أسوأ صفقة، مرفوعة.
     """
     return {
         "signals": 0,
         "closed": 0,
         "open": 0,
+
         "wins": 0,
+        "tp1_wins": 0,
+        "tp2_wins": 0,
         "losses": 0,
         "expired": 0,
+
         "tp1_hits": 0,
         "tp2_hits": 0,
 
         "winrate": 0.0,
         "tp1_rate": 0.0,
+        "tp2_rate": 0.0,
 
         "net_profit_pct": 0.0,
         "avg_profit_pct": 0.0,
         "avg_loss_pct": 0.0,
+
+        # أسماء متوافقة مع performance.py
+        "avg_win_pct": 0.0,
         "best_trade_pct": 0.0,
         "worst_trade_pct": 0.0,
 
@@ -411,13 +370,11 @@ def apply_trade_to_summary(summary: dict, trade: Optional[dict]) -> dict:
 
         if result == "tp1_win":
             summary["wins"] = summary.get("wins", 0) + 1
-            if "tp1_wins" in summary:
-                summary["tp1_wins"] = summary.get("tp1_wins", 0) + 1
+            summary["tp1_wins"] = summary.get("tp1_wins", 0) + 1
 
         elif result == "tp2_win":
             summary["wins"] = summary.get("wins", 0) + 1
-            if "tp2_wins" in summary:
-                summary["tp2_wins"] = summary.get("tp2_wins", 0) + 1
+            summary["tp2_wins"] = summary.get("tp2_wins", 0) + 1
 
         elif result == "loss":
             summary["losses"] = summary.get("losses", 0) + 1
@@ -493,20 +450,34 @@ def finalize_summary(summary: dict) -> dict:
         summary = build_empty_summary()
 
     wins = safe_int(summary.get("wins", 0), 0)
+    tp1_wins = safe_int(summary.get("tp1_wins", 0), 0)
+    tp2_wins = safe_int(summary.get("tp2_wins", 0), 0)
     losses = safe_int(summary.get("losses", 0), 0)
     decided = wins + losses
 
     total_signals = safe_int(summary.get("signals", 0), 0)
     tp1_hits = safe_int(summary.get("tp1_hits", 0), 0)
+    tp2_hits = safe_int(summary.get("tp2_hits", 0), 0)
 
     summary["winrate"] = round((wins / decided) * 100, 2) if decided > 0 else 0.0
     summary["tp1_rate"] = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
+    summary["tp2_rate"] = round((tp2_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
+
+    # تأكيد وجود الحقول حتى لو جاءت من ملخص قديم
+    summary["tp1_wins"] = tp1_wins
+    summary["tp2_wins"] = tp2_wins
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0), 0.0)
     gross_loss = safe_float(summary.get("gross_loss_pct", 0.0), 0.0)
 
-    summary["avg_profit_pct"] = round(gross_profit / wins, 4) if wins > 0 else 0.0
-    summary["avg_loss_pct"] = round(gross_loss / losses, 4) if losses > 0 else 0.0
+    avg_profit = round(gross_profit / wins, 4) if wins > 0 else 0.0
+    avg_loss = round(gross_loss / losses, 4) if losses > 0 else 0.0
+
+    summary["avg_profit_pct"] = avg_profit
+    summary["avg_loss_pct"] = avg_loss
+
+    # أسماء متوافقة مع performance.py
+    summary["avg_win_pct"] = avg_profit
 
     summary["net_profit_pct"] = safe_float(
         summary.get(
@@ -515,6 +486,16 @@ def finalize_summary(summary: dict) -> dict:
         ),
         0.0
     )
+
+    # التأكد من الحقول المتوافقة القديمة
+    summary["realized_pnl_pct"] = safe_float(summary.get("realized_pnl_pct"), 0.0)
+    summary["gross_profit_pct"] = safe_float(summary.get("gross_profit_pct"), 0.0)
+    summary["gross_loss_pct"] = safe_float(summary.get("gross_loss_pct"), 0.0)
+    summary["realized_leveraged_pnl_pct"] = safe_float(summary.get("realized_leveraged_pnl_pct"), 0.0)
+    summary["realized_raw_pnl_pct"] = safe_float(summary.get("realized_raw_pnl_pct"), 0.0)
+
+    summary["best_trade_pct"] = safe_float(summary.get("best_trade_pct"), 0.0)
+    summary["worst_trade_pct"] = safe_float(summary.get("worst_trade_pct"), 0.0)
 
     # تقدير تأثير الصفقات على المحفظة بدون الاعتماد على performance.py
     # المعادلة:
