@@ -146,6 +146,21 @@ ALERT_KEY_PREFIX = "alert:long"
 ALERT_BY_MESSAGE_KEY_PREFIX = "alertmsg:long"
 ALERT_TTL_SECONDS = 14 * 24 * 3600
 
+# Market Crash Guard
+MARKET_GUARD_ENABLED = True
+MARKET_GUARD_SAMPLE_SIZE = 30
+MARKET_GUARD_TIMEFRAME = "15m"
+MARKET_GUARD_CANDLE_LIMIT = 30
+MARKET_GUARD_MIN_VALID = 12
+MARKET_GUARD_RED_RATIO_BLOCK = 0.68
+MARKET_GUARD_AVG_CHANGE_15M_BLOCK = -1.20
+MARKET_GUARD_BTC_CHANGE_15M_BLOCK = -0.70
+MARKET_GUARD_ALT_WEAK_BLOCK = True
+MARKET_GUARD_WARNING_INTERVAL_SECONDS = 30 * 60
+MARKET_GUARD_STATE_KEY = "market_guard:long:state"
+MARKET_GUARD_LAST_ALERT_KEY = "market_guard:long:last_alert_ts"
+MARKET_GUARD_LAST_STATUS_KEY = "market_guard:long:last_status"
+
 # =========================
 # REDIS
 # =========================
@@ -630,6 +645,9 @@ def build_help_message() -> str:
         "• الحساب مبني على حد استخدام 35% من المحفظة",
         "• إدارة المخاطرة تتحذر عند الاقتراب من خسارة 20% من إجمالي المحفظة",
         "• حساب الربح يراعي 50% عند TP1 و 50% تكمل إلى TP2 أو تعود Entry",
+        "• يوجد Market Guard يوقف إشارات اللونج مؤقتًا وقت الهبوط الجماعي",
+        "• البوت يرسل تحذير كل 30 دقيقة أثناء الخطر ويرسل رسالة عند عودة السوق للوضع الطبيعي",
+        "• إشارات الـ Breakout/Pre-Breakout يتم تتبعها كنظام Pullback Entry عند وجود منطقة بول باك",
     ]
 
     if other_commands:
@@ -677,6 +695,14 @@ def build_how_it_work_message() -> str:
 • أقصى صعود لصالح الصفقة
 • أقصى هبوط ضد الصفقة
 • مدة الصفقة
+
+📥 <b>نظام البول باك:</b>
+• البوت لا يفترض الدخول فورًا دائمًا
+• لو توجد منطقة Pullback، التتبع المالي يعتمد على دخول البول باك بعد لمس المنطقة
+
+🚨 <b>حماية السوق:</b>
+• Market Guard يمنع إشارات اللونج وقت هبوط جماعي في السوق
+• يتم إرسال تنبيه كل 30 دقيقة إذا استمر الخطر
 
 💰 <b>التقارير المالية:</b>
 • البوت لا يحتاج إدخال قيمة لكل صفقة
@@ -944,6 +970,11 @@ def build_track_message(alert: dict) -> str:
         sl = _safe_float(alert.get("sl"), 0.0)
         tp1 = _safe_float(alert.get("tp1"), 0.0)
         tp2 = _safe_float(alert.get("tp2"), 0.0)
+        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+        pullback_low = _safe_float(alert.get("pullback_low"), 0.0)
+        pullback_high = _safe_float(alert.get("pullback_high"), 0.0)
+        rr1 = _safe_float(alert.get("rr1"), 0.0)
+        rr2 = _safe_float(alert.get("rr2"), 0.0)
         candle_time = int(_safe_float(alert.get("candle_time"), 0))
         created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
         current_price = get_last_price(alert.get("symbol", ""))
@@ -964,15 +995,23 @@ def build_track_message(alert: dict) -> str:
         if entry > 0 and current_price > 0:
             current_move = round(((current_price - entry) / entry) * 100, 2)
 
+        pullback_block = ""
+        if pullback_entry > 0 and pullback_low > 0 and pullback_high > 0:
+            pullback_block = (
+                f"\n📥 منطقة البول باك: {pullback_low:.6f} → {pullback_high:.6f}\n"
+                f"دخول البول باك التقريبي: {pullback_entry:.6f}\n"
+            )
+
         return (
             f"📌 <b>Alert Track</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
             f"النوع: Long\n"
             f"الفريم: {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
-            f"Entry: {entry:.6f}\n"
+            f"Signal Entry: {entry:.6f}\n"
+            f"{pullback_block}"
             f"SL: {sl:.6f}\n"
-            f"TP1: {tp1:.6f}\n"
-            f"TP2: {tp2:.6f}\n\n"
+            f"TP1: {tp1:.6f}" + (f" ({rr1:.2f}R)" if rr1 > 0 else "") + "\n"
+            f"TP2: {tp2:.6f}" + (f" ({rr2:.2f}R)" if rr2 > 0 else "") + "\n\n"
             f"الحالة: {html.escape(status)}\n"
             f"السعر الحالي: {current_price:.6f}\n"
             f"الحركة الحالية: {current_move:+.2f}%\n"
@@ -2830,7 +2869,7 @@ def classify_entry_timing_long(
         if vol_ratio >= 1.9 and candle_strength >= 0.62 and dist_ma > 3.5:
             return "🔴 متأخر (Pump محتمل)"
 
-        # مبكر حقيقي: قريب من MA، RSI غير متضخم، وفوليوم داعم مش انفجاري
+        # مبكر حقيقي: قريب من MA، RSI غير متضخم، وفوليوم داعم مش انجاري
         if (pre_breakout or breakout) and dist_ma <= 2.6 and 1.10 <= vol_ratio <= 1.85 and rsi_now <= 66:
             return "🟢 مبكر (بداية الحركة)"
 
@@ -3064,7 +3103,7 @@ def build_message(
     safe_1h  = rtl_fix("1H")
     safe_24h = rtl_fix("24H")
 
-    # Pullback zone (cleaner formatting)
+    # Pullback zone
     pullback_text = ""
     if pullback_low is not None and pullback_high is not None:
         pullback_text = (
@@ -3072,7 +3111,7 @@ def build_message(
             f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
         )
 
-    # بلوك 4H للـ Oversold Reversal
+    # 4H block
     if is_reverse:
         if reversal_4h_confirmed:
             reversal_4h_block = (
@@ -3088,7 +3127,6 @@ def build_message(
     else:
         reversal_4h_block = ""
 
-    # بلوك جودة الـ breakout
     bq_map = {
         "strong": f"🟢 كسر قوي",
         "ok":     f"🟡 كسر مقبول",
@@ -3211,6 +3249,213 @@ def handle_telegram_commands():
 
 
 # =========================
+# MARKET GUARD
+# =========================
+def get_last_candle_change_pct(df) -> float:
+    """تحسب تغير آخر شمعة 15m من open إلى close."""
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
+        open_ = _safe_float(signal_row["open"], 0.0)
+        close = _safe_float(signal_row["close"], 0.0)
+        if open_ <= 0:
+            return 0.0
+        return round(((close - open_) / open_) * 100, 4)
+    except Exception:
+        return 0.0
+
+
+def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict):
+    if not MARKET_GUARD_ENABLED:
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": "",
+        }
+
+    if not ranked_pairs:
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": "no ranked pairs",
+        }
+
+    try:
+        # Take top N by volume
+        sample = sorted(
+            ranked_pairs,
+            key=lambda x: x.get("_rank_volume_24h", 0),
+            reverse=True
+        )[:MARKET_GUARD_SAMPLE_SIZE]
+
+        changes = []
+        red_count = 0
+        valid = 0
+
+        for item in sample:
+            symbol = item["instId"]
+            candles = get_candles(symbol, MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT)
+            df = to_dataframe(candles)
+            if df is None or df.empty:
+                continue
+
+            change = get_last_candle_change_pct(df)
+            if change == 0.0:
+                continue
+
+            changes.append(change)
+            valid += 1
+            if change < 0:
+                red_count += 1
+
+        if valid < MARKET_GUARD_MIN_VALID:
+            return {
+                "active": False,
+                "block_longs": False,
+                "level": "normal",
+                "valid_count": valid,
+                "red_ratio_15m": 0.0,
+                "avg_change_15m": 0.0,
+                "btc_change_15m": 0.0,
+                "reason": f"valid pairs too low ({valid})",
+            }
+
+        red_ratio = round(red_count / valid, 4)
+        avg_change = round(sum(changes) / valid, 4)
+
+        # BTC change
+        btc_change = 0.0
+        try:
+            btc_candles = get_candles("BTC-USDT-SWAP", MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT)
+            btc_df = to_dataframe(btc_candles)
+            if btc_df is not None and not btc_df.empty:
+                btc_change = get_last_candle_change_pct(btc_df)
+        except Exception:
+            pass
+
+        alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك") if alt_snapshot else "🟡 متماسك"
+
+        block = False
+        reason_parts = []
+
+        # Condition 1: wide red + average move down
+        if red_ratio >= MARKET_GUARD_RED_RATIO_BLOCK and avg_change <= MARKET_GUARD_AVG_CHANGE_15M_BLOCK:
+            block = True
+            reason_parts.append(f"red_ratio={red_ratio}>=0.68 and avg_change={avg_change}<=-1.2")
+
+        # Condition 2: BTC falling hard + many reds
+        if btc_change <= MARKET_GUARD_BTC_CHANGE_15M_BLOCK and red_ratio >= 0.55:
+            block = True
+            reason_parts.append(f"btc_change={btc_change}<=-0.70 and red_ratio={red_ratio}>=0.55")
+
+        # Condition 3: alt weak + high red ratio
+        if MARKET_GUARD_ALT_WEAK_BLOCK and alt_mode in ("🔴 ضعيف",) and red_ratio >= 0.60:
+            block = True
+            reason_parts.append(f"alt_mode={alt_mode} and red_ratio={red_ratio}>=0.60")
+
+        reason = "; ".join(reason_parts) if reason_parts else "market normal"
+
+        level = "danger" if block else "normal"
+
+        return {
+            "active": True,
+            "block_longs": block,
+            "level": level,
+            "valid_count": valid,
+            "red_ratio_15m": red_ratio,
+            "avg_change_15m": avg_change,
+            "btc_change_15m": btc_change,
+            "reason": reason,
+        }
+
+    except Exception as e:
+        logger.error(f"Market guard snapshot error: {e}")
+        return {
+            "active": False,
+            "block_longs": False,
+            "level": "normal",
+            "valid_count": 0,
+            "red_ratio_15m": 0.0,
+            "avg_change_15m": 0.0,
+            "btc_change_15m": 0.0,
+            "reason": f"error: {e}",
+        }
+
+
+def format_market_guard_message(guard: dict, alt_mode: str = "", recovered: bool = False) -> str:
+    red_ratio = guard.get("red_ratio_15m", 0.0) * 100
+    avg_change = guard.get("avg_change_15m", 0.0)
+    btc_change = guard.get("btc_change_15m", 0.0)
+
+    if recovered or not guard.get("block_longs"):
+        return (
+            f"✅ <b>Market Guard Cleared</b>\n"
+            f"الوضع رجع طبيعي نسبيًا.\n"
+            f"تم السماح بإشارات اللونج مرة أخرى.\n\n"
+            f"📉 العملات الهابطة آخر 15m: {red_ratio:.1f}%\n"
+            f"📊 متوسط حركة العينة: {avg_change:+.2f}%\n"
+            f"₿ حركة BTC آخر 15m: {btc_change:+.2f}%\n"
+            f"🌍 حالة الألت: {alt_mode}"
+        )
+    else:
+        return (
+            f"🚨 <b>Market Guard Active</b>\n"
+            f"السوق يهبط بشكل جماعي الآن.\n"
+            f"تم إيقاف إشارات اللونج مؤقتًا.\n\n"
+            f"📉 العملات الهابطة آخر 15m: {red_ratio:.1f}%\n"
+            f"📊 متوسط حركة العينة: {avg_change:+.2f}%\n"
+            f"₿ حركة BTC آخر 15m: {btc_change:+.2f}%\n"
+            f"🌍 حالة الألت: {alt_mode}\n\n"
+            f"القرار: لا دخول Long جديد حتى يهدأ السوق."
+        )
+
+
+def handle_market_guard_notifications(guard: dict, alt_mode: str = "") -> None:
+    if not MARKET_GUARD_ENABLED:
+        return
+    if not r:
+        return
+
+    try:
+        now_ts = int(time.time())
+        status = "active" if guard.get("block_longs") else "normal"
+        last_status = r.get(MARKET_GUARD_LAST_STATUS_KEY) or "normal"
+        last_alert_ts = int(r.get(MARKET_GUARD_LAST_ALERT_KEY) or 0)
+
+        should_send = False
+        recovered = False
+
+        if status == "active":
+            if last_status != "active":
+                should_send = True
+            elif now_ts - last_alert_ts >= MARKET_GUARD_WARNING_INTERVAL_SECONDS:
+                should_send = True
+        elif status == "normal" and last_status == "active":
+            should_send = True
+            recovered = True
+
+        if should_send:
+            msg = format_market_guard_message(guard, alt_mode=alt_mode, recovered=recovered)
+            send_telegram_message(msg)
+            r.set(MARKET_GUARD_LAST_ALERT_KEY, str(now_ts))
+            r.set(MARKET_GUARD_LAST_STATUS_KEY, status)
+
+    except Exception as e:
+        logger.error(f"handle_market_guard_notifications error: {e}")
+
+
+# =========================
 # MAIN LOOP
 # =========================
 def run_command_poller():
@@ -3232,11 +3477,6 @@ def run_scanner_loop():
         scan_locked = False
 
         try:
-            if is_global_cooldown_active():
-                logger.info("GLOBAL COOLDOWN (Redis) — skipping long scan")
-                time.sleep(60)
-                continue
-
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 logger.info("Another long scan is running — skipping")
@@ -3286,13 +3526,28 @@ def run_scanner_loop():
             btc_dominance_proxy = market_info["btc_dominance_proxy"]
             alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
 
+            # Market Guard snapshot and notifications
+            market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot)
+            handle_market_guard_notifications(market_guard, alt_mode=alt_mode)
+
+            if market_guard.get("block_longs"):
+                logger.warning("MARKET GUARD ACTIVE — blocking long scan")
+                time.sleep(60)
+                continue
+
+            if is_global_cooldown_active():
+                logger.info("GLOBAL COOLDOWN (Redis) — skipping long scan")
+                time.sleep(60)
+                continue
+
             upcoming_events = get_upcoming_high_impact_events()
             has_high_impact_news = len(upcoming_events) > 0
             news_warning_text = format_news_warning(upcoming_events)
 
             logger.info(
                 f"LONG MARKET STATE | btc={btc_mode} | alt={alt_mode} | "
-                f"state={market_state_label} | flow={market_bias_label}"
+                f"state={market_state_label} | flow={market_bias_label} | "
+                f"market_guard={'active' if market_guard.get('block_longs') else 'clear'}"
             )
 
             tested = 0
@@ -3406,13 +3661,17 @@ def run_scanner_loop():
                 atr_value = _safe_float(signal_row.get("atr"), 0)
                 pullback_low = None
                 pullback_high = None
+                pullback_entry = None
                 if atr_value > 0 and recent_high > 0:
                     pullback_low = recent_high - (atr_value * 0.15)
                     pullback_high = recent_high + (atr_value * 0.35)
+                    if pullback_low is not None and pullback_high is not None:
+                        pullback_entry = round((pullback_low + pullback_high) / 2, 6)
                 # Show pullback zone only for breakout or pre_breakout
                 if not breakout and not pre_breakout:
                     pullback_low = None
                     pullback_high = None
+                    pullback_entry = None
 
                 # --- باقي الفلترة والتقييم ---
                 reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
@@ -3485,10 +3744,8 @@ def run_scanner_loop():
                 raw_score = float(score_result.get("score", 0))
                 effective_score = raw_score
 
-                # أضف تحذيرات late pump داخل الرسالة والتسجيل
                 score_result = append_late_pump_warnings(score_result, late_guard)
 
-                # عقوبة للـ late pump بدل مكافأة الحركة المتأخرة
                 if late_guard.get("extreme_late_pump") and not is_reverse:
                     effective_score -= EXTREME_LATE_PUMP_SCORE_PENALTY
                 elif late_guard.get("late_pump_risk") and not is_reverse:
@@ -3510,7 +3767,6 @@ def run_scanner_loop():
 
                 effective_score += get_early_priority_score_bonus(early_priority)
 
-                # لا نكافئ الفوليوم العالي لو فيه late pump أو bull continuation risk
                 if breakout and not late_guard.get("late_pump_risk") and not late_guard.get("bull_continuation_risk"):
                     if vol_ratio >= 1.5:
                         effective_score += 0.30
@@ -3540,7 +3796,6 @@ def run_scanner_loop():
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
 
-                # تم إزالة strong_early_override لعدم استخدامه
                 if score_result["score"] < dynamic_threshold:
                     if early_priority != "strong":
                         logger.info(
@@ -3695,7 +3950,6 @@ def run_scanner_loop():
                     is_reverse=is_reverse,
                 )
 
-                # عقوبة momentum للـ late pump حتى لا تتفوق في الترتيب
                 if late_guard.get("extreme_late_pump") and not is_reverse:
                     momentum_priority -= 0.90
                 elif late_guard.get("late_pump_risk") and not is_reverse:
@@ -3760,6 +4014,9 @@ def run_scanner_loop():
                     "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
                     "pullback_low": pullback_low,
                     "pullback_high": pullback_high,
+                    "pullback_entry": pullback_entry,
+                    "rr1": rr1,
+                    "rr2": rr2,
                     "above_upper_bb": above_upper_bb,
                     "change_4h": change_4h,
                     "late_pump_risk": late_guard.get("late_pump_risk", False),
@@ -3767,6 +4024,11 @@ def run_scanner_loop():
                     "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
                     "late_guard_reasons": late_guard.get("reasons", []),
                     "rsi_now": rsi_now,
+                    "market_guard_active": market_guard.get("active", False),
+                    "market_guard_level": market_guard.get("level", "normal"),
+                    "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
+                    "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
+                    "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
                     "message": build_message(
                         symbol=symbol,
                         price=price,
@@ -3806,6 +4068,8 @@ def run_scanner_loop():
                         "sl": stop_loss,
                         "tp1": tp1,
                         "tp2": tp2,
+                        "rr1": rr1,
+                        "rr2": rr2,
                         "score": float(score_result["score"]),
                         "candle_time": candle_time,
                         "created_ts": int(time.time()),
@@ -3826,6 +4090,12 @@ def run_scanner_loop():
                         "vol_ratio": vol_ratio,
                         "pullback_low": pullback_low,
                         "pullback_high": pullback_high,
+                        "pullback_entry": pullback_entry,
+                        "market_guard_active": market_guard.get("active", False),
+                        "market_guard_level": market_guard.get("level", "normal"),
+                        "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
+                        "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
+                        "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
                     },
                     "candle_time": candle_time,
                     "now": now,
@@ -3951,7 +4221,9 @@ def run_scanner_loop():
                         warning_reasons=candidate.get("warning_reasons", []),
                         pullback_low=candidate.get("pullback_low"),
                         pullback_high=candidate.get("pullback_high"),
-                        pullback_entry=candidate.get("pullback_low"),
+                        pullback_entry=candidate.get("pullback_entry"),
+                        rr1=candidate.get("rr1"),
+                        rr2=candidate.get("rr2"),
                     )
 
                     logger.info(
