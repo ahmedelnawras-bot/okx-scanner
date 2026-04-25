@@ -8,26 +8,22 @@ from tracking.performance import (
     get_common_loss_reasons,
 )
 
+from tracking.summary_helpers import (
+    safe_float,
+    safe_int,
+    safe_bool,
+    normalize_side,
+    build_empty_summary,
+    apply_trade_to_summary,
+    finalize_summary,
+)
+
 logger = logging.getLogger("okx-scanner")
 
 
 # =========================
 # BASIC HELPERS
 # =========================
-def safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def safe_int(value, default=0):
-    try:
-        return int(float(value))
-    except Exception:
-        return default
-
-
 def normalize_market_type(market_type: str) -> str:
     market_type = (market_type or "futures").strip().lower()
     if market_type not in ("futures", "spot"):
@@ -35,19 +31,8 @@ def normalize_market_type(market_type: str) -> str:
     return market_type
 
 
-def normalize_side(side: str) -> str:
-    side = (side or "long").strip().lower()
-    if side not in ("long", "short"):
-        return "long"
-    return side
-
-
 def normalize_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "y")
-    return bool(value)
+    return safe_bool(value, default=False)
 
 
 def safe_str(value, default="unknown") -> str:
@@ -62,78 +47,133 @@ def get_period_since_ts(period: str):
 
     if period == "1h":
         return now_ts - 3600
+
     if period == "today":
         local_now = time.localtime(now_ts)
         return int(time.mktime((
-            local_now.tm_year, local_now.tm_mon, local_now.tm_mday,
-            0, 0, 0,
-            local_now.tm_wday, local_now.tm_yday, local_now.tm_isdst
+            local_now.tm_year,
+            local_now.tm_mon,
+            local_now.tm_mday,
+            0,
+            0,
+            0,
+            local_now.tm_wday,
+            local_now.tm_yday,
+            local_now.tm_isdst,
         )))
+
     if period == "1d":
         return now_ts - (24 * 3600)
+
     if period == "7d":
         return now_ts - (7 * 24 * 3600)
+
     if period == "30d":
         return now_ts - (30 * 24 * 3600)
 
     return None
 
 
+# =========================
+# SUMMARY WRAPPERS
+# =========================
 def _empty_summary(label="unknown"):
-    return {
-        "label": label,
-        "total": 0,
-        "closed": 0,
-        "wins": 0,
-        "tp1_wins": 0,
-        "tp2_wins": 0,
-        "losses": 0,
-        "expired": 0,
-        "open": 0,
-        "tp1_hits": 0,
-        "winrate": 0.0,
-        "tp1_rate": 0.0,
-    }
+    """
+    Wrapper متوافق مع التقارير التشخيصية.
+    يعتمد على build_empty_summary من tracking.summary_helpers
+    ويضيف حقول label / total / tp1_wins / tp2_wins للتوافق مع التنسيق القديم.
+    """
+    summary = build_empty_summary()
+    summary["label"] = label
+    summary["total"] = summary.get("signals", 0)
 
+    # حقول توافقية قديمة
+    summary["tp1_wins"] = summary.get("tp1_wins", 0)
+    summary["tp2_wins"] = summary.get("tp2_wins", 0)
 
-def _apply_trade_to_summary(summary: dict, trade: dict):
-    summary["total"] += 1
-
-    if normalize_bool(trade.get("tp1_hit", False)):
-        summary["tp1_hits"] += 1
-
-    status = safe_str(trade.get("status", ""), "").lower()
-    result = safe_str(trade.get("result", ""), "").lower()
-
-    if status in ("open", "partial"):
-        summary["open"] += 1
-        return
-
-    if result in ("tp1_win", "tp2_win", "loss", "expired"):
-        summary["closed"] += 1
-
-    if result == "tp1_win":
-        summary["wins"] += 1
-        summary["tp1_wins"] += 1
-    elif result == "tp2_win":
-        summary["wins"] += 1
-        summary["tp2_wins"] += 1
-    elif result == "loss":
-        summary["losses"] += 1
-    elif result == "expired":
-        summary["expired"] += 1
-
-
-def _finalize_summary(summary: dict):
-    decided = summary["wins"] + summary["losses"]
-    summary["winrate"] = round((summary["wins"] / decided) * 100, 2) if decided > 0 else 0.0
-    summary["tp1_rate"] = round((summary["tp1_hits"] / summary["total"]) * 100, 2) if summary["total"] > 0 else 0.0
     return summary
 
 
+def _apply_trade_to_summary(summary: dict, trade: dict):
+    """
+    تطبيق الصفقة على summary باستخدام helper المركزي.
+    لا نعيد حساب tp1_wins/tp2_wins هنا حتى لا يحصل Double Count.
+    """
+    if not isinstance(summary, dict):
+        return summary
+
+    if not trade or not isinstance(trade, dict):
+        return summary
+
+    # مهم: apply_trade_to_summary هي التي تزود wins/losses/tp1_hits/tp1_wins/tp2_wins لو الحقول موجودة
+    apply_trade_to_summary(summary, trade)
+
+    # compatibility field
+    summary["total"] = summary.get("signals", summary.get("total", 0))
+    summary["tp1_wins"] = summary.get("tp1_wins", 0)
+    summary["tp2_wins"] = summary.get("tp2_wins", 0)
+
+    return summary
+
+
+def _finalize_summary(summary: dict):
+    """
+    Finalize مركزي مع المحافظة على total.
+    """
+    if not isinstance(summary, dict):
+        return summary
+
+    finalize_summary(summary)
+
+    summary["total"] = summary.get("signals", summary.get("total", 0))
+    summary["tp1_wins"] = summary.get("tp1_wins", 0)
+    summary["tp2_wins"] = summary.get("tp2_wins", summary.get("tp2_hits", 0))
+
+    return summary
+
+
+def _normalize_summary_row(row: dict, label=None) -> dict:
+    """
+    يحول أي summary row سواء جاء من performance.py أو من diagnostics
+    إلى شكل موحد آمن للعرض.
+    """
+    if not isinstance(row, dict):
+        row = {}
+
+    safe_label = label
+    if safe_label is None:
+        safe_label = row.get("label", row.get("field_value", "unknown"))
+
+    signals = safe_int(row.get("signals", row.get("total", 0)), 0)
+    total = safe_int(row.get("total", signals), signals)
+
+    return {
+        "label": safe_str(safe_label, "unknown"),
+        "total": total,
+        "signals": signals,
+        "closed": safe_int(row.get("closed", 0), 0),
+        "wins": safe_int(row.get("wins", 0), 0),
+        "tp1_wins": safe_int(row.get("tp1_wins", 0), 0),
+        "tp2_wins": safe_int(row.get("tp2_wins", row.get("tp2_hits", 0)), 0),
+        "losses": safe_int(row.get("losses", 0), 0),
+        "expired": safe_int(row.get("expired", 0), 0),
+        "open": safe_int(row.get("open", 0), 0),
+        "tp1_hits": safe_int(row.get("tp1_hits", 0), 0),
+        "tp2_hits": safe_int(row.get("tp2_hits", row.get("tp2_wins", 0)), 0),
+        "winrate": round(safe_float(row.get("winrate", 0.0), 0.0), 2),
+        "tp1_rate": round(safe_float(row.get("tp1_rate", 0.0), 0.0), 2),
+    }
+
+
 def _sort_summary_rows(rows):
+    """
+    ترتيب الأفضل:
+    أعلى winrate ثم عدد closed ثم wins ثم الأقل losses.
+    """
+    normalized = [_normalize_summary_row(row) for row in (rows or [])]
+
     return sorted(
-        rows,
+        normalized,
         key=lambda x: (
             x.get("winrate", 0.0),
             x.get("closed", 0),
@@ -144,6 +184,24 @@ def _sort_summary_rows(rows):
     )
 
 
+def _sort_worst_summary_rows(rows):
+    """
+    ترتيب الأسوأ:
+    أقل winrate، ثم الأكثر خسائر، ثم الأكثر closed.
+    """
+    normalized = [_normalize_summary_row(row) for row in (rows or [])]
+
+    return sorted(
+        normalized,
+        key=lambda x: (
+            x.get("winrate", 0.0),
+            -x.get("losses", 0),
+            -x.get("closed", 0),
+            x.get("wins", 0),
+        ),
+    )
+
+
 def _format_summary_rows(title: str, rows: list, top_n: int = 8) -> str:
     if not rows:
         return f"📊 {title}\nلا توجد بيانات كافية"
@@ -151,19 +209,52 @@ def _format_summary_rows(title: str, rows: list, top_n: int = 8) -> str:
     lines = [f"📊 {title}", ""]
 
     for row in rows[:top_n]:
+        row = _normalize_summary_row(row)
         lines.append(
-            f"• {row['label']}: "
-            f"WR {row['winrate']}% | "
-            f"Closed {row['closed']} | "
-            f"W {row['wins']} | "
-            f"L {row['losses']} | "
-            f"TP1 Rate {row['tp1_rate']}%"
+            f"• {row.get('label', 'unknown')}: "
+            f"WR {row.get('winrate', 0.0)}% | "
+            f"Closed {row.get('closed', 0)} | "
+            f"W {row.get('wins', 0)} | "
+            f"L {row.get('losses', 0)} | "
+            f"TP1 Rate {row.get('tp1_rate', 0.0)}%"
         )
 
     return "\n".join(lines)
 
 
+def _format_named_rows(rows, icon="•", top_n=5):
+    if not rows:
+        return "لا توجد بيانات كافية"
+
+    lines = []
+
+    for row in rows[:top_n]:
+        row = _normalize_summary_row(row)
+        lines.append(
+            f"{icon} {row.get('label', 'unknown')}: "
+            f"WR {row.get('winrate', 0.0)}% | "
+            f"Closed {row.get('closed', 0)} | "
+            f"W {row.get('wins', 0)} | "
+            f"L {row.get('losses', 0)}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_counter_rows(rows, icon="•", empty_text="لا توجد بيانات"):
+    if not rows:
+        return empty_text
+
+    return "\n".join(
+        f"{icon} {safe_str(label, 'unknown')}: {safe_int(count, 0)}"
+        for label, count in rows
+    )
+
+
 def _diagnostics_value(trade: dict, field_name: str, default="unknown"):
+    if not isinstance(trade, dict):
+        return default
+
     if field_name in trade:
         value = trade.get(field_name)
     else:
@@ -188,6 +279,7 @@ def _bucket_score(score: float) -> str:
         return "7.0 - 7.49"
     if s < 8.0:
         return "7.5 - 7.99"
+
     return "8.0+"
 
 
@@ -208,6 +300,7 @@ def _bucket_dist_ma(dist_ma: float) -> str:
         return "2% to 4%"
     if d <= 6:
         return "4% to 6%"
+
     return "> 6%"
 
 
@@ -222,6 +315,7 @@ def _bucket_vol_ratio(vol_ratio: float) -> str:
         return "1.2 - 1.49"
     if v < 2.0:
         return "1.5 - 1.99"
+
     return "2.0+"
 
 
@@ -246,17 +340,25 @@ def summarize_trades_by_custom_bucket(
 
     grouped = defaultdict(lambda: _empty_summary())
 
-    for trade in rows:
-        label = safe_str(bucket_getter(trade), "unknown")
+    for trade in rows or []:
+        try:
+            label = safe_str(bucket_getter(trade), "unknown")
+        except Exception:
+            label = "unknown"
+
         grouped[label]["label"] = label
         _apply_trade_to_summary(grouped[label], trade)
 
     output = []
+
     for label, summary in grouped.items():
+        summary["label"] = label
         _finalize_summary(summary)
-        if summary["closed"] < min_closed:
+
+        if safe_int(summary.get("closed", 0), 0) < min_closed:
             continue
-        output.append(summary)
+
+        output.append(_normalize_summary_row(summary, label=label))
 
     return _sort_summary_rows(output)
 
@@ -279,21 +381,15 @@ def get_setup_diagnostics(
     )
 
     output = []
-    for row in rows:
-        output.append({
-            "label": row["field_value"],
-            "total": row["total"],
-            "closed": row["closed"],
-            "wins": row["wins"],
-            "tp1_wins": row["tp1_wins"],
-            "tp2_wins": row["tp2_wins"],
-            "losses": row["losses"],
-            "expired": row["expired"],
-            "open": row["open"],
-            "tp1_hits": row["tp1_hits"],
-            "winrate": row["winrate"],
-            "tp1_rate": row["tp1_rate"],
-        })
+
+    for row in rows or []:
+        label = row.get("field_value", row.get("label", "unknown"))
+        normalized = _normalize_summary_row(row, label=label)
+
+        if normalized["closed"] < min_closed:
+            continue
+
+        output.append(normalized)
 
     return _sort_summary_rows(output)
 
@@ -445,10 +541,14 @@ def get_boolean_flag_diagnostics(
     min_closed: int = 3,
 ):
     def _bucket(trade):
+        if not isinstance(trade, dict):
+            return "no"
+
         if field_name in trade:
             value = trade.get(field_name)
         else:
             value = (trade.get("diagnostics", {}) or {}).get(field_name)
+
         return "yes" if normalize_bool(value) else "no"
 
     return summarize_trades_by_custom_bucket(
@@ -480,15 +580,8 @@ def get_top_and_bottom_setups(
         min_closed=min_closed,
     )
 
-    best = rows[:top_n]
-    worst = sorted(
-        rows,
-        key=lambda x: (
-            x.get("winrate", 0.0),
-            -x.get("closed", 0),
-            x.get("losses", 0),
-        )
-    )[:top_n]
+    best = _sort_summary_rows(rows)[:top_n]
+    worst = _sort_worst_summary_rows(rows)[:top_n]
 
     return {
         "best": best,
@@ -516,10 +609,14 @@ def get_loss_clusters(
     setup_counter = Counter()
     opp_counter = Counter()
 
-    for trade in trades:
+    loss_trades = []
+
+    for trade in trades or []:
         result = safe_str(trade.get("result", ""), "").lower()
         if result != "loss":
             continue
+
+        loss_trades.append(trade)
 
         diagnostics = trade.get("diagnostics", {}) or {}
 
@@ -539,6 +636,7 @@ def get_loss_clusters(
             side=side,
             since_ts=since_ts,
             top_n=top_n,
+            trades=loss_trades,
         ),
     }
 
@@ -556,6 +654,7 @@ def build_quick_diagnostics_snapshot(
         since_ts=since_ts,
         min_closed=3,
     )
+
     market_rows = get_market_state_diagnostics(
         redis_client=redis_client,
         market_type=market_type,
@@ -563,6 +662,7 @@ def build_quick_diagnostics_snapshot(
         since_ts=since_ts,
         min_closed=3,
     )
+
     timing_rows = get_entry_timing_diagnostics(
         redis_client=redis_client,
         market_type=market_type,
@@ -571,40 +671,28 @@ def build_quick_diagnostics_snapshot(
         min_closed=3,
     )
 
+    best_score_rows = _sort_summary_rows(score_rows)
+    worst_score_rows = _sort_worst_summary_rows(score_rows)
+
+    best_market_rows = _sort_summary_rows(market_rows)
+    worst_market_rows = _sort_worst_summary_rows(market_rows)
+
+    best_timing_rows = _sort_summary_rows(timing_rows)
+    worst_timing_rows = _sort_worst_summary_rows(timing_rows)
+
     return {
-        "best_score_bucket": score_rows[0] if score_rows else None,
-        "worst_score_bucket": score_rows[-1] if score_rows else None,
-        "best_market_state": market_rows[0] if market_rows else None,
-        "worst_market_state": market_rows[-1] if market_rows else None,
-        "best_entry_timing": timing_rows[0] if timing_rows else None,
-        "worst_entry_timing": timing_rows[-1] if timing_rows else None,
+        "best_score_bucket": best_score_rows[0] if best_score_rows else None,
+        "worst_score_bucket": worst_score_rows[0] if worst_score_rows else None,
+        "best_market_state": best_market_rows[0] if best_market_rows else None,
+        "worst_market_state": worst_market_rows[0] if worst_market_rows else None,
+        "best_entry_timing": best_timing_rows[0] if best_timing_rows else None,
+        "worst_entry_timing": worst_timing_rows[0] if worst_timing_rows else None,
     }
 
 
 # =========================
-# FORMATTERS
+# REPORT BUILDERS
 # =========================
-def _format_named_rows(rows, icon="•", top_n=5):
-    if not rows:
-        return "لا توجد بيانات كافية"
-
-    lines = []
-    for row in rows[:top_n]:
-        lines.append(
-            f"{icon} {row['label']}: "
-            f"WR {row['winrate']}% | "
-            f"Closed {row['closed']} | "
-            f"W {row['wins']} | L {row['losses']}"
-        )
-    return "\n".join(lines)
-
-
-def _format_counter_rows(rows, icon="•", empty_text="لا توجد بيانات"):
-    if not rows:
-        return empty_text
-    return "\n".join(f"{icon} {label}: {count}" for label, count in rows)
-
-
 def build_setups_report(
     redis_client,
     market_type: str = "futures",
@@ -612,6 +700,7 @@ def build_setups_report(
     period: str = "all",
 ):
     since_ts = get_period_since_ts(period)
+
     data = get_top_and_bottom_setups(
         redis_client=redis_client,
         market_type=market_type,
@@ -621,8 +710,8 @@ def build_setups_report(
         top_n=5,
     )
 
-    best_text = _format_named_rows(data["best"], icon="🟢", top_n=5)
-    worst_text = _format_named_rows(data["worst"], icon="🔴", top_n=5)
+    best_text = _format_named_rows(data.get("best", []), icon="🟢", top_n=5)
+    worst_text = _format_named_rows(data.get("worst", []), icon="🔴", top_n=5)
 
     return (
         f"📊 Setup Diagnostics ({market_type}/{side})\n"
@@ -639,6 +728,7 @@ def build_scores_report(
     period: str = "all",
 ):
     since_ts = get_period_since_ts(period)
+
     rows = get_score_diagnostics(
         redis_client=redis_client,
         market_type=market_type,
@@ -646,6 +736,7 @@ def build_scores_report(
         since_ts=since_ts,
         min_closed=3,
     )
+
     return _format_summary_rows(
         title=f"Score Diagnostics ({market_type}/{side}) | {period}",
         rows=rows,
@@ -660,6 +751,7 @@ def build_market_report(
     period: str = "all",
 ):
     since_ts = get_period_since_ts(period)
+
     market_rows = get_market_state_diagnostics(
         redis_client=redis_client,
         market_type=market_type,
@@ -667,6 +759,7 @@ def build_market_report(
         since_ts=since_ts,
         min_closed=3,
     )
+
     timing_rows = get_entry_timing_diagnostics(
         redis_client=redis_client,
         market_type=market_type,
@@ -693,6 +786,7 @@ def build_losses_report(
     period: str = "all",
 ):
     since_ts = get_period_since_ts(period)
+
     clusters = get_loss_clusters(
         redis_client=redis_client,
         market_type=market_type,
@@ -701,10 +795,10 @@ def build_losses_report(
         top_n=7,
     )
 
-    market_text = _format_counter_rows(clusters["market_states"], icon="🌍")
-    timing_text = _format_counter_rows(clusters["entry_timing"], icon="⏱")
-    setup_text = _format_counter_rows(clusters["setup_types"], icon="🧩")
-    reason_text = _format_counter_rows(clusters["loss_reasons"], icon="⚠️")
+    market_text = _format_counter_rows(clusters.get("market_states", []), icon="🌍")
+    timing_text = _format_counter_rows(clusters.get("entry_timing", []), icon="⏱")
+    setup_text = _format_counter_rows(clusters.get("setup_types", []), icon="🧩")
+    reason_text = _format_counter_rows(clusters.get("loss_reasons", []), icon="⚠️")
 
     return (
         f"📉 Loss Diagnostics ({market_type}/{side})\n"
@@ -760,25 +854,49 @@ def build_full_diagnostics_report(
         f"Period: {period}",
         "",
         "🎯 Best / Worst Score Bucket:",
-        f"• Best: {best_score['label']} | WR {best_score['winrate']}%" if best_score else "• Best: لا توجد بيانات",
-        f"• Worst: {worst_score['label']} | WR {worst_score['winrate']}%" if worst_score else "• Worst: لا توجد بيانات",
+        (
+            f"• Best: {best_score.get('label')} | WR {best_score.get('winrate')}%"
+            if best_score else
+            "• Best: لا توجد بيانات"
+        ),
+        (
+            f"• Worst: {worst_score.get('label')} | WR {worst_score.get('winrate')}%"
+            if worst_score else
+            "• Worst: لا توجد بيانات"
+        ),
         "",
         "🌍 Best / Worst Market State:",
-        f"• Best: {best_market['label']} | WR {best_market['winrate']}%" if best_market else "• Best: لا توجد بيانات",
-        f"• Worst: {worst_market['label']} | WR {worst_market['winrate']}%" if worst_market else "• Worst: لا توجد بيانات",
+        (
+            f"• Best: {best_market.get('label')} | WR {best_market.get('winrate')}%"
+            if best_market else
+            "• Best: لا توجد بيانات"
+        ),
+        (
+            f"• Worst: {worst_market.get('label')} | WR {worst_market.get('winrate')}%"
+            if worst_market else
+            "• Worst: لا توجد بيانات"
+        ),
         "",
         "⏱ Best / Worst Entry Timing:",
-        f"• Best: {best_timing['label']} | WR {best_timing['winrate']}%" if best_timing else "• Best: لا توجد بيانات",
-        f"• Worst: {worst_timing['label']} | WR {worst_timing['winrate']}%" if worst_timing else "• Worst: لا توجد بيانات",
+        (
+            f"• Best: {best_timing.get('label')} | WR {best_timing.get('winrate')}%"
+            if best_timing else
+            "• Best: لا توجد بيانات"
+        ),
+        (
+            f"• Worst: {worst_timing.get('label')} | WR {worst_timing.get('winrate')}%"
+            if worst_timing else
+            "• Worst: لا توجد بيانات"
+        ),
         "",
         "🟢 Top Setups:",
-        _format_named_rows(setup_data["best"], icon="•", top_n=3),
+        _format_named_rows(setup_data.get("best", []), icon="•", top_n=3),
         "",
         "🔴 Weak Setups:",
-        _format_named_rows(setup_data["worst"], icon="•", top_n=3),
+        _format_named_rows(setup_data.get("worst", []), icon="•", top_n=3),
         "",
         "⚠️ Top Loss Reasons:",
-        _format_counter_rows(losses["loss_reasons"], icon="•"),
+        _format_counter_rows(losses.get("loss_reasons", []), icon="•"),
     ]
 
     return "\n".join(lines)
