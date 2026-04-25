@@ -3396,15 +3396,16 @@ def normalize_market_mode(mode: str) -> str:
 
 def is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode) -> bool:
     """
-    بوابة أمان للخروج من BLOCK_LONGS إلى STRONG_LONG_ONLY
-    لو السوق لم يعد كراشًا لكنه ليس قويًا بما يكفي للـ Recovery.
+    بوابة أمان للخروج من BLOCK_LONGS إلى STRONG_LONG_ONLY.
+    لا نشترط أن يكون الألت قويًا هنا.
+    يكفي أن الهبوط العنيف توقف.
+    لو الألت ضعيف، نخرج إلى STRONG_LONG_ONLY وليس NORMAL_LONG.
     """
     try:
         red_ratio = float(red_ratio or 0.0)
         avg_change = float(avg_change or 0.0)
         btc_change = float(btc_change or 0.0)
-        if alt_mode == "🔴 ضعيف":
-            return False
+
         return (
             red_ratio < 0.62
             and avg_change > -0.75
@@ -3782,125 +3783,6 @@ def handle_telegram_commands():
 
 
 # =========================
-# ARABIC REPORT WRAPPERS
-# =========================
-def arabicize_report_text(text: str) -> str:
-    if not text:
-        return "لا توجد بيانات كافية للتقرير بعد."
-    replacements = {
-        "Long Report": "تقرير اللونج",
-        "Deep Report": "تحليل متقدم للأداء",
-        "Setups Report": "تحليل أنواع الإشارات",
-        "Scores Report": "تحليل الأداء حسب السكور",
-        "Market Report": "تحليل الأداء حسب حالة السوق والدخول",
-        "Losses Report": "تحليل أسباب الخسارة",
-        "Diagnostics Report": "تقرير تشخيصي شامل",
-        "Total": "الإجمالي",
-        "Closed": "مغلقة",
-        "Open": "مفتوحة",
-        "Wins": "رابحة",
-        "Losses": "خاسرة",
-        "Expired": "منتهية",
-        "Winrate": "نسبة النجاح",
-        "TP1 Rate": "نسبة ضرب TP1",
-        "TP2": "الهدف الثاني TP2",
-        "TP1": "الهدف الأول TP1",
-        "SL": "وقف الخسارة",
-        "Score": "السكور",
-        "Setup": "نوع الإشارة",
-        "Market": "السوق",
-        "Entry Timing": "توقيت الدخول",
-        "Opportunity": "نوع الفرصة",
-        "Reasons": "الأسباب",
-        "Warnings": "التحذيرات",
-        "Best": "الأفضل",
-        "Worst": "الأسوأ",
-        "Average": "المتوسط",
-        "No Data": "لا توجد بيانات",
-        "No trades": "لا توجد صفقات",
-        "Not enough data": "البيانات غير كافية",
-        "bull_market": "سوق صاعد",
-        "alt_season": "موسم ألت",
-        "mixed": "سوق مختلط",
-        "btc_leading": "BTC يقود",
-        "risk_off": "سوق دفاعي",
-        "breakout": "اختراق",
-        "pre_breakout": "اختراق مبكر",
-        "continuation": "استمرار",
-        "reverse": "ارتداد عكسي",
-        "recovery": "ريكافري",
-        "mtf_yes": "تأكيد فريم أعلى: نعم",
-        "mtf_no": "تأكيد فريم أعلى: لا",
-        "vol_high": "فوليوم عالي",
-        "vol_mid": "فوليوم متوسط",
-        "vol_low": "فوليوم ضعيف",
-    }
-    out = str(text)
-    for en, ar in replacements.items():
-        out = out.replace(en, ar)
-    return out
-
-
-def build_deep_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_deep_report(r, market_type="futures", side="long"))
-    except Exception as e:
-        logger.error(f"build_deep_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء التحليل المتقدم للأداء"
-
-
-def build_setups_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_setups_report(r, market_type="futures", side="long", period="all"))
-    except Exception as e:
-        logger.error(f"build_setups_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء تحليل أنواع الإشارات"
-
-
-def build_scores_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_scores_report(r, market_type="futures", side="long", period="all"))
-    except Exception as e:
-        logger.error(f"build_scores_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء تحليل الأداء حسب السكور"
-
-
-def build_market_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_market_report(r, market_type="futures", side="long", period="all"))
-    except Exception as e:
-        logger.error(f"build_market_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء تحليل السوق والدخول"
-
-
-def build_losses_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_losses_report(r, market_type="futures", side="long", period="all"))
-    except Exception as e:
-        logger.error(f"build_losses_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء تحليل أسباب الخسارة"
-
-
-def build_diagnostics_report_message_ar() -> str:
-    try:
-        return arabicize_report_text(build_full_diagnostics_report(r, market_type="futures", side="long", period="all"))
-    except Exception as e:
-        logger.error(f"build_diagnostics_report_message_ar error: {e}")
-        return "❌ حصل خطأ أثناء بناء التقرير التشخيصي الشامل"
-
-
-# Override the report handlers to use Arabic wrappers
-COMMAND_HANDLERS.update({
-    "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message_ar()),
-    "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setups_report_message_ar()),
-    "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report_message_ar()),
-    "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report_message_ar()),
-    "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report_message_ar()),
-    "/report_diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_diagnostics_report_message_ar()),
-})
-
-
-# =========================
 # MAIN LOOP
 # =========================
 def run_command_poller():
@@ -3938,6 +3820,7 @@ def run_scanner_loop():
                     pass
 
             ranked_pairs = get_ranked_pairs()
+            logger.info(f"SCAN_LIMIT CONFIG = {SCAN_LIMIT} | ranked_pairs_count = {len(ranked_pairs)}")
             btc_mode = get_btc_mode()
             alt_snapshot = None
             if r:
