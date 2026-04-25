@@ -6,6 +6,10 @@
 - tracking/summary_helpers.py (دوال التلخيص الآمنة)
 
 جميع الدوال العامة محفوظة للتوافق مع main.py دون أي تغيير في أسمائها.
+
+تم التعديل لدعم تقارير الشورت بخطة إدارة رأس مال مستقلة:
+- الشورت: 10 صفقات، مارجن 20$ لكل صفقة، رافعة 15x، إجمالي مارجن 200$، تعرض اسمي 3000$.
+- اللونج: يبقى على الإعدادات القديمة (35% من رصيد 1000$).
 """
 
 import json
@@ -41,11 +45,19 @@ OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
 TRADE_TTL_SECONDS = 60 * 60 * 24 * 30            # 30 days
 TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90    # 90 days
 
+# إعدادات اللونج (لم تُغيّر)
 REPORT_ACCOUNT_BALANCE_USD = 1000.0
 REPORT_MAX_CAPITAL_USAGE_PCT = 35.0
 REPORT_DAILY_MAX_DRAWDOWN_PCT = 20.0
 REPORT_ACTIVE_TRADE_SLOTS = 10
 REPORT_LEVERAGE = 15.0
+
+# إعدادات الشورت (Short) - خطة جديدة مستقلة
+SHORT_REPORT_MARGIN_PER_TRADE_USD = 20.0          # مارجن الصفقة الواحدة
+SHORT_REPORT_ACTIVE_TRADE_SLOTS = 10              # الحد الأقصى للصفقات المفتوحة
+SHORT_REPORT_LEVERAGE = 15.0                      # الرافعة
+SHORT_REPORT_TOTAL_MARGIN_USD = 200.0             # إجمالي المارجن عند الامتلاء
+SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0       # الحجم الاسمي للصفقة الواحدة
 
 
 # ------------------------------------------------------------
@@ -157,12 +169,6 @@ def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> 
     diagnostics["rr2"] = rr2
     trade["diagnostics"] = diagnostics
     return trade
-
-
-# ------------------------------------------------------------
-# دوال النسب المئوية للصفقة (محذوفة من هنا وموجودة في summary_helpers)
-# ------------------------------------------------------------
-# calc_long_pct, calc_short_pct, calc_trade_result_pct أصبحت مستوردة من helpers
 
 
 # ------------------------------------------------------------
@@ -880,15 +886,20 @@ def get_setup_type_stats(
 def get_winrate_summary(redis_client, market_type: str = "futures", side: str = "long"):
     """
     تجميع سريع من عداد Redis stats (wins/losses/expired) ومن ثم قراءة مالية كاملة.
+    يستخدم الرافعة الصحيحة حسب side حتى في حالات الفشل.
     """
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+    leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
+
     if redis_client is None:
         return {
             "wins": 0, "tp1_wins": 0, "tp2_wins": 0,
             "losses": 0, "expired": 0, "open": 0, "closed": 0,
             "tp1_hits": 0, "tp1_rate": 0.0, "winrate": 0.0,
-            "market_type": normalize_market_type(market_type),
-            "side": normalize_side(side),
-            "leverage": REPORT_LEVERAGE,
+            "market_type": market_type,
+            "side": side,
+            "leverage": leverage,
             "realized_raw_pnl_pct": 0.0, "realized_leveraged_pnl_pct": 0.0,
             "realized_pnl_pct": 0.0, "gross_profit_pct": 0.0,
             "gross_loss_pct": 0.0, "avg_win_pct": 0.0,
@@ -896,8 +907,6 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "worst_trade_pct": 0.0, "risk_status": "normal",
         }
 
-    market_type = normalize_market_type(market_type)
-    side = normalize_side(side)
     stats_key = get_stats_key(market_type, side)
     open_set_key = get_open_trades_set_key(market_type, side)
 
@@ -933,7 +942,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": winrate,
             "market_type": market_type,
             "side": side,
-            "leverage": REPORT_LEVERAGE,
+            "leverage": leverage,
             "realized_raw_pnl_pct": financial_summary.get("realized_raw_pnl_pct", 0.0),
             "realized_leveraged_pnl_pct": financial_summary.get("realized_leveraged_pnl_pct", 0.0),
             "realized_pnl_pct": financial_summary.get("realized_pnl_pct", 0.0),
@@ -951,8 +960,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "wins": 0, "tp1_wins": 0, "tp2_wins": 0,
             "losses": 0, "expired": 0, "open": 0, "closed": 0,
             "tp1_hits": 0, "tp1_rate": 0.0, "winrate": 0.0,
-            "market_type": market_type, "side": side,
-            "leverage": REPORT_LEVERAGE,
+            "market_type": market_type,
+            "side": side,
+            "leverage": leverage,
             "realized_raw_pnl_pct": 0.0, "realized_leveraged_pnl_pct": 0.0,
             "realized_pnl_pct": 0.0, "gross_profit_pct": 0.0,
             "gross_loss_pct": 0.0, "avg_win_pct": 0.0,
@@ -969,9 +979,7 @@ def get_trade_summary(
 ) -> dict:
     """
     تجميع ملخص مالي كامل من جميع الصفقات (أو المفلترة) باستخدام load_trades مرة واحدة.
-
-    - market_type, side: None يعني تضمين الكل.
-    - since_ts: طابع زمني لتصفية الصفقات الأحدث.
+    يتضمن الآن حقول إضافية متعلقة بخطة التموضع (leverage, margin_per_trade_usd, …) حسب side.
     """
     if redis_client is None:
         return _empty_summary()
@@ -986,7 +994,19 @@ def get_trade_summary(
     )
 
     # استخدام دالة التلخيص الموحدة من helpers
-    return summarize_trades(trades)
+    summary = summarize_trades(trades)
+
+    # إضافة معلومات side و market_type
+    summary["market_type"] = market_type or "futures"
+    summary["side"] = side if side is not None else "long"
+
+    # دمج خطة التموضع حسب الاتجاه
+    plan = get_report_sizing_plan(summary["side"])
+    for key in ["leverage", "margin_per_trade_usd", "active_trade_slots",
+                "total_margin_used_usd", "notional_per_trade_usd", "total_notional_exposure_usd"]:
+        summary[key] = plan[key]
+
+    return summary
 
 
 def get_period_summary(
@@ -1181,31 +1201,64 @@ def format_winrate_summary(summary: dict) -> str:
 
 
 def format_period_summary(title: str, summary: dict) -> str:
+    """
+    تنسيق نصي لتقرير الفترة. يفرق بين long/short لعرض خطة إدارة رأس المال المناسبة.
+    """
+    side = str(summary.get("side", "long")).strip().lower()
     decided = summary["wins"] + summary["losses"] + summary["expired"]
     gross_profit = summary.get("gross_profit_pct", 0.0)
     gross_loss = summary.get("gross_loss_pct", 0.0)
     net_pnl = summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0))
-    wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
-
-    gross_profit_usd = estimate_pct_to_usd(gross_profit)
-    gross_loss_usd = estimate_pct_to_usd(gross_loss)
-    net_pnl_usd = estimate_pct_to_usd(net_pnl)
-
     raw_pnl = summary.get("realized_raw_pnl_pct", 0.0)
     avg_win = summary.get("avg_win_pct", 0.0)
     avg_loss = summary.get("avg_loss_pct", 0.0)
     best = summary.get("best_trade_pct", 0.0)
     worst = summary.get("worst_trade_pct", 0.0)
     risk_status = summary.get("risk_status", "normal")
-    leverage = summary.get("leverage", REPORT_LEVERAGE)
 
-    sizing = get_position_sizing_plan()
-    capital_used_usd = sizing["capital_used_usd"]
-    per_trade_usd = sizing["per_trade_usd"]
-    active_trade_slots = sizing["active_trade_slots"]
+    # الحصول على خطة التموضع المناسبة
+    plan = get_report_sizing_plan(side)
+    leverage = plan["leverage"]
+    active_trade_slots = plan["active_trade_slots"]
+    margin_per_trade = plan["margin_per_trade_usd"]          # يُستخدم في حسابات الدولار
+
+    # تحويل النسب إلى دولار باستخدام side
+    gross_profit_usd = estimate_pct_to_usd(gross_profit, side=side)
+    gross_loss_usd = estimate_pct_to_usd(gross_loss, side=side)
+    net_pnl_usd = estimate_pct_to_usd(net_pnl, side=side)
+
+    wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary, side=side)
+
+    # بناء جملة الإعدادات حسب الاتجاه
+    if side == "short":
+        settings_block = (
+            f"\n⚙️ <b>إعدادات حساب الشورت:</b>\n"
+            f"• عدد الصفقات القصوى: {active_trade_slots}\n"
+            f"• مارجن الصفقة الواحدة: {margin_per_trade:.2f}$\n"
+            f"• الرافعة: {leverage:.0f}x\n"
+            f"• الحجم الاسمي للصفقة: {plan['notional_per_trade_usd']:.2f}$\n"
+            f"• إجمالي المارجن عند الامتلاء: {plan['total_margin_used_usd']:.2f}$\n"
+            f"• إجمالي التعرض الاسمي: {plan['total_notional_exposure_usd']:.2f}$\n"
+        )
+    else:  # long
+        capital_used_usd = plan.get("capital_used_usd", 0.0)
+        settings_block = (
+            f"\n⚙️ <b>إعدادات الحساب:</b>\n"
+            f"• الرافعة المستخدمة: {leverage:.0f}x\n"
+            f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
+            f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
+            f"• حجم المارجن للصفقة الواحدة تقديريًا: {margin_per_trade:.2f}$\n"
+        )
 
     status_ar = {"normal": "آمن ✅", "warning": "تحذير ⚠️", "danger": "خطر 🔴"}
     status_text = status_ar.get(risk_status, risk_status)
+
+    risk_lines = [
+        f"• حد إيقاف/تحذير الخسارة: -{REPORT_DAILY_MAX_DRAWDOWN_PCT:.0f}% من إجمالي المحفظة",
+        f"• الحالة: {status_text}"
+    ]
+    if side == "long":
+        risk_lines.insert(0, f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%")
 
     financial_block = (
         f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
@@ -1215,11 +1268,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"⚖️ <b>صافي الربح/الخسارة:</b> {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
         f"💼 <b>التأثير الحقيقي على المحفظة:</b> {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
         f"━━━━━━━━━━━━━━\n"
-        f"\n⚙️ <b>إعدادات الحساب:</b>\n"
-        f"• الرافعة المستخدمة: {leverage:.0f}x\n"
-        f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
-        f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
-        f"• حجم المارجن للصفقة الواحدة تقديريًا: {per_trade_usd:.2f}$\n"
+        + settings_block +
         f"\n📊 <b>تفاصيل إضافية:</b>\n"
         f"• صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
         f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
@@ -1227,9 +1276,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• أفضل صفقة: {best:+.2f}%\n"
         f"• أسوأ صفقة: {worst:+.2f}%\n"
         f"\n🧯 <b>إدارة المخاطرة:</b>\n"
-        f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%\n"
-        f"• حد إيقاف/تحذير الخسارة: -{REPORT_DAILY_MAX_DRAWDOWN_PCT:.0f}% من إجمالي المحفظة\n"
-        f"• الحالة: {status_text}\n"
+        + "\n".join(risk_lines) + "\n"
     )
 
     return (
@@ -1248,39 +1295,85 @@ def format_period_summary(title: str, summary: dict) -> str:
 
 
 # ------------------------------------------------------------
-# POSITION SIZING & WALLET ESTIMATION
+# POSITION SIZING & WALLET ESTIMATION (تفرع حسب side)
 # ------------------------------------------------------------
-def get_position_sizing_plan():
-    capital_used_usd = REPORT_ACCOUNT_BALANCE_USD * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
-    per_trade_usd = capital_used_usd / REPORT_ACTIVE_TRADE_SLOTS if REPORT_ACTIVE_TRADE_SLOTS > 0 else 0.0
-    return {
-        "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
-        "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
-        "capital_used_usd": capital_used_usd,
-        "active_trade_slots": REPORT_ACTIVE_TRADE_SLOTS,
-        "per_trade_usd": per_trade_usd,
-        "leverage": REPORT_LEVERAGE,
-    }
+def get_report_sizing_plan(side: str = "long") -> dict:
+    """
+    تُرجع خطة التموضع الكاملة حسب الاتجاه.
+    - الشورت: 10 صفقات، مارجن 20$، رافعة 15x، إجمالي مارجن 200$، تعرض اسمي 3000$.
+    - اللونج: الإعدادات القديمة (35% من رصيد 1000$).
+
+    ملاحظات:
+    - PnL% بعد الرافعة هو مجموع نتائج الصفقات كنسبة على مارجن الصفقة الواحدة.
+    - الدولار المعروض في التقارير تقديري بناءً على مارجن الصفقة، وليس رصيد المحفظة الفعلي.
+    """
+    side = normalize_side(side)
+    if side == "short":
+        return {
+            "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
+            "margin_per_trade_usd": SHORT_REPORT_MARGIN_PER_TRADE_USD,
+            "active_trade_slots": SHORT_REPORT_ACTIVE_TRADE_SLOTS,
+            "leverage": SHORT_REPORT_LEVERAGE,
+            "total_margin_used_usd": SHORT_REPORT_TOTAL_MARGIN_USD,
+            "notional_per_trade_usd": SHORT_REPORT_NOTIONAL_PER_TRADE_USD,
+            "total_notional_exposure_usd": SHORT_REPORT_NOTIONAL_PER_TRADE_USD * SHORT_REPORT_ACTIVE_TRADE_SLOTS,
+        }
+    else:  # long (الإعدادات القديمة)
+        capital_used_usd = REPORT_ACCOUNT_BALANCE_USD * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
+        margin_per_trade = capital_used_usd / REPORT_ACTIVE_TRADE_SLOTS if REPORT_ACTIVE_TRADE_SLOTS else 0.0
+        return {
+            "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
+            "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
+            "capital_used_usd": capital_used_usd,
+            "margin_per_trade_usd": margin_per_trade,
+            "active_trade_slots": REPORT_ACTIVE_TRADE_SLOTS,
+            "leverage": REPORT_LEVERAGE,
+            "total_margin_used_usd": capital_used_usd,
+            "notional_per_trade_usd": margin_per_trade * REPORT_LEVERAGE,
+            "total_notional_exposure_usd": capital_used_usd * REPORT_LEVERAGE,
+        }
 
 
-def estimate_pct_to_usd(pct_value: float) -> float:
-    sizing = get_position_sizing_plan()
-    per_trade_usd = float(sizing.get("per_trade_usd", 0.0) or 0.0)
-    return per_trade_usd * (float(pct_value or 0.0) / 100.0)
+def get_position_sizing_plan(side: str = "long"):
+    """
+    Backward-compatible wrapper.
+    الدالة القديمة كانت بدون side، فلو أي كود قديم استدعاها هتشتغل عادي.
+    """
+    return get_report_sizing_plan(side=side)
 
 
-def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> tuple:
-    if max_capital_usage_pct is None:
-        max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
-    active_slots = max(1, int(REPORT_ACTIVE_TRADE_SLOTS))
-    account_balance = float(REPORT_ACCOUNT_BALANCE_USD)
-    capital_used_usd = account_balance * (float(max_capital_usage_pct) / 100.0)
-    per_trade_usd = capital_used_usd / active_slots
-    realized_pct_sum = float(
-        summary.get("realized_leveraged_pnl_pct",
-                    summary.get("realized_pnl_pct", 0.0)
-                    ) or 0.0
-    )
-    wallet_pnl_usd = per_trade_usd * (realized_pct_sum / 100.0)
-    wallet_pnl_pct = (wallet_pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
-    return wallet_pnl_pct, wallet_pnl_usd
+def estimate_pct_to_usd(pct_value: float, side: str = "long") -> float:
+    """
+    تحويل نسبة مئوية (مثلاً صافي الربح %) إلى دولار تقديري.
+    - للشورت: يُستخدم 20$ (مارجن الصفقة) كأساس.
+    - للونج: يُستخدم margin_per_trade من خطة اللونج.
+    """
+    plan = get_report_sizing_plan(side)
+    margin_per_trade = plan["margin_per_trade_usd"]
+    return margin_per_trade * (float(pct_value or 0.0) / 100.0)
+
+
+def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct: float = None) -> tuple:
+    """
+    حساب التأثير التقديري على المحفظة الكاملة.
+    - للشورت: wallet_pnl_usd = 20$ * (realized_leveraged_pnl_pct / 100)
+    - للونج: استخدام المنطق القديم (capital_used_usd / active_slots).
+    """
+    if side == "short":
+        realized_pct_sum = float(summary.get("realized_leveraged_pnl_pct",
+                                             summary.get("realized_pnl_pct", 0.0)) or 0.0)
+        wallet_pnl_usd = SHORT_REPORT_MARGIN_PER_TRADE_USD * (realized_pct_sum / 100.0)
+        wallet_pnl_pct = (wallet_pnl_usd / REPORT_ACCOUNT_BALANCE_USD) * 100.0 if REPORT_ACCOUNT_BALANCE_USD else 0.0
+        return wallet_pnl_pct, wallet_pnl_usd
+    else:  # long (المنطق القديم بدون تغيير)
+        if max_capital_usage_pct is None:
+            max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
+        active_slots = max(1, int(REPORT_ACTIVE_TRADE_SLOTS))
+        account_balance = float(REPORT_ACCOUNT_BALANCE_USD)
+        capital_used_usd = account_balance * (float(max_capital_usage_pct) / 100.0)
+        per_trade_usd = capital_used_usd / active_slots
+        realized_pct_sum = float(summary.get("realized_leveraged_pnl_pct",
+                                             summary.get("realized_pnl_pct", 0.0)) or 0.0)
+        wallet_pnl_usd = per_trade_usd * (realized_pct_sum / 100.0)
+        wallet_pnl_pct = (wallet_pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
+        return wallet_pnl_pct, wallet_pnl_usd
