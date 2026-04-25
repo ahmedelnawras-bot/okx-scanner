@@ -18,6 +18,7 @@ REPORT_ACCOUNT_BALANCE_USD = 1000.0
 REPORT_MAX_CAPITAL_USAGE_PCT = 35.0
 REPORT_DAILY_MAX_DRAWDOWN_PCT = 20.0
 REPORT_ACTIVE_TRADE_SLOTS = 10          # عدد الصفقات المفتوحة المُفترض وجودها في نفس الوقت
+REPORT_LEVERAGE = 15.0                  # الرافعة المالية المستخدمة في التقارير فقط
 
 
 # =========================
@@ -447,6 +448,9 @@ def build_history_snapshot(trade_data: dict) -> dict:
         # rr snapshot
         "rr1": safe_float(diagnostics.get("rr1"), 1.5),
         "rr2": safe_float(diagnostics.get("rr2"), 3.0),
+
+        # full diagnostics snapshot for history / Hybrid Label / future analytics
+        "diagnostics": diagnostics,
     }
 
 
@@ -978,7 +982,15 @@ def _empty_summary(setup_type=None):
         "tp1_rate": 0.0,
         "winrate": 0.0,
 
-        # === حقول مالية جديدة ===
+        # === حقول مالية - خام بدون رافعة ===
+        "realized_raw_pnl_pct": 0.0,
+        "realized_leveraged_pnl_pct": 0.0,
+        "gross_profit_raw_pct": 0.0,
+        "gross_loss_raw_pct": 0.0,
+        "gross_profit_leveraged_pct": 0.0,
+        "gross_loss_leveraged_pct": 0.0,
+
+        # === حقول مالية - متوافقة مع الإصدارات السابقة (تستخدم المرفوعة) ===
         "realized_pnl_pct": 0.0,
         "gross_profit_pct": 0.0,
         "gross_loss_pct": 0.0,
@@ -988,6 +1000,7 @@ def _empty_summary(setup_type=None):
         "worst_trade_pct": 0.0,
         "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
         "risk_status": "normal",
+        "leverage": REPORT_LEVERAGE,
     }
 
 
@@ -1018,18 +1031,35 @@ def _apply_trade_to_summary(summary: dict, trade: dict):
     elif result == "expired":
         summary["expired"] += 1
 
-    # === حساب النسبة المئوية للصفقة وتحديث الحقول المالية ===
-    trade_pct = calc_trade_result_pct(trade)
-    if trade_pct is not None and result in ("tp1_win", "tp2_win", "loss", "expired"):
-        summary["realized_pnl_pct"] += trade_pct
-        if trade_pct > 0:
-            summary["gross_profit_pct"] += trade_pct
-            if trade_pct > summary["best_trade_pct"]:
-                summary["best_trade_pct"] = trade_pct
-        elif trade_pct < 0:
-            summary["gross_loss_pct"] += trade_pct
-            if trade_pct < summary["worst_trade_pct"]:
-                summary["worst_trade_pct"] = trade_pct
+    # === حساب النسبة المئوية للصفقة (خام و مرفوعة) ===
+    raw_trade_pct = calc_trade_result_pct(trade)
+    if raw_trade_pct is not None and result in ("tp1_win", "tp2_win", "loss", "expired"):
+        leveraged_trade_pct = raw_trade_pct * REPORT_LEVERAGE
+
+        # تحديث الخام
+        summary["realized_raw_pnl_pct"] += raw_trade_pct
+        if raw_trade_pct > 0:
+            summary["gross_profit_raw_pct"] += raw_trade_pct
+        elif raw_trade_pct < 0:
+            summary["gross_loss_raw_pct"] += raw_trade_pct
+
+        # تحديث المرفوع
+        summary["realized_leveraged_pnl_pct"] += leveraged_trade_pct
+        if leveraged_trade_pct > 0:
+            summary["gross_profit_leveraged_pct"] += leveraged_trade_pct
+        elif leveraged_trade_pct < 0:
+            summary["gross_loss_leveraged_pct"] += leveraged_trade_pct
+
+        # الحقول القديمة (للتوافق) نستخدم المرفوعة
+        summary["realized_pnl_pct"] += leveraged_trade_pct
+        if leveraged_trade_pct > 0:
+            summary["gross_profit_pct"] += leveraged_trade_pct
+            if leveraged_trade_pct > summary["best_trade_pct"]:
+                summary["best_trade_pct"] = leveraged_trade_pct
+        elif leveraged_trade_pct < 0:
+            summary["gross_loss_pct"] += leveraged_trade_pct
+            if leveraged_trade_pct < summary["worst_trade_pct"]:
+                summary["worst_trade_pct"] = leveraged_trade_pct
 
 
 def _finalize_summary(summary: dict):
@@ -1039,7 +1069,7 @@ def _finalize_summary(summary: dict):
     summary["winrate"] = round((summary["wins"] / decided) * 100, 2) if decided > 0 else 0.0
     summary["tp1_rate"] = round((summary["tp1_hits"] / base_for_tp1) * 100, 2) if base_for_tp1 > 0 else 0.0
 
-    # === متوسطات النسب المئوية ===
+    # === متوسطات النسب المئوية (باستخدام المرفوعة) ===
     wins_count = summary["wins"]
     losses_count = summary["losses"]
     if wins_count > 0:
@@ -1047,7 +1077,7 @@ def _finalize_summary(summary: dict):
     if losses_count > 0:
         summary["avg_loss_pct"] = summary["gross_loss_pct"] / losses_count
 
-    # === حالة المخاطرة: تُحسب على تأثير المحفظة الفعلي بالنظام الجديد ===
+    # === حالة المخاطرة: تُحسب على تأثير المحفظة الفعلي باستخدام المرفوعة ===
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
 
     if wallet_pnl_pct <= -REPORT_DAILY_MAX_DRAWDOWN_PCT:
@@ -1073,17 +1103,14 @@ def get_position_sizing_plan():
         "capital_used_usd": capital_used_usd,
         "active_trade_slots": REPORT_ACTIVE_TRADE_SLOTS,
         "per_trade_usd": per_trade_usd,
+        "leverage": REPORT_LEVERAGE,
     }
 
 
 def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> tuple:
     """
     تقدير تأثير الصفقات المغلقة على المحفظة بنظام 10 صفقات مفتوحة كحد أقصى.
-
-    الفكرة:
-    - لا نحسب كأن كل صفقة استخدمت 35% من المحفظة.
-    - نحسب أن 35% من المحفظة موزعة على 10 صفقات.
-    - حجم الصفقة الواحدة = رأس المال المستخدم / عدد الصفقات النشطة.
+    تستخدم realized_leveraged_pnl_pct (إن وجد) وإلا ترجع لـ realized_pnl_pct.
     """
     if max_capital_usage_pct is None:
         max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
@@ -1094,9 +1121,14 @@ def estimate_wallet_pnl(summary: dict, max_capital_usage_pct: float = None) -> t
     capital_used_usd = account_balance * (float(max_capital_usage_pct) / 100.0)
     per_trade_usd = capital_used_usd / active_slots
 
-    realized_pct_sum = float(summary.get("realized_pnl_pct", 0.0) or 0.0)
+    # يفضل استخدام المرفوع إن وجد
+    realized_pct_sum = float(
+        summary.get("realized_leveraged_pnl_pct",
+                    summary.get("realized_pnl_pct", 0.0)
+                   ) or 0.0
+    )
 
-    # الربح بالدولار = مجموع نسب الصفقات المغلقة × حجم الصفقة الواحدة
+    # الربح بالدولار = مجموع نسب الصفقات المغلقة (مرفوعة) × حجم الصفقة الواحدة
     wallet_pnl_usd = per_trade_usd * (realized_pct_sum / 100.0)
 
     # تأثير الربح على إجمالي المحفظة
@@ -1173,6 +1205,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": 0.0,
             "market_type": normalize_market_type(market_type),
             "side": normalize_side(side),
+            "leverage": REPORT_LEVERAGE,
+            "realized_raw_pnl_pct": 0.0,
+            "realized_leveraged_pnl_pct": 0.0,
             "realized_pnl_pct": 0.0,
             "gross_profit_pct": 0.0,
             "gross_loss_pct": 0.0,
@@ -1207,7 +1242,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
         tp1_rate = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
 
-        # نستخدم get_trade_summary للحصول على الأرقام المالية لأنها غير مخزنة في الإحصائيات السريعة
+        # نستخدم get_trade_summary للحصول على الأرقام المالية المحدثة
         financial_summary = get_trade_summary(redis_client, market_type=market_type, side=side)
 
         return {
@@ -1223,6 +1258,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": winrate,
             "market_type": market_type,
             "side": side,
+            "leverage": REPORT_LEVERAGE,
+            "realized_raw_pnl_pct": financial_summary.get("realized_raw_pnl_pct", 0.0),
+            "realized_leveraged_pnl_pct": financial_summary.get("realized_leveraged_pnl_pct", 0.0),
             "realized_pnl_pct": financial_summary.get("realized_pnl_pct", 0.0),
             "gross_profit_pct": financial_summary.get("gross_profit_pct", 0.0),
             "gross_loss_pct": financial_summary.get("gross_loss_pct", 0.0),
@@ -1248,6 +1286,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "winrate": 0.0,
             "market_type": market_type,
             "side": side,
+            "leverage": REPORT_LEVERAGE,
+            "realized_raw_pnl_pct": 0.0,
+            "realized_leveraged_pnl_pct": 0.0,
             "realized_pnl_pct": 0.0,
             "gross_profit_pct": 0.0,
             "gross_loss_pct": 0.0,
@@ -1510,14 +1551,16 @@ def format_winrate_summary(summary: dict) -> str:
 def format_period_summary(title: str, summary: dict) -> str:
     decided = summary["wins"] + summary["losses"] + summary["expired"]
 
-    # استخراج البيانات المالية بالنظام الجديد
-    realized = summary.get("realized_pnl_pct", 0.0)
+    # استخراج البيانات المالية
+    raw_pnl = summary.get("realized_raw_pnl_pct", 0.0)
+    leveraged_pnl = summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0))
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary)
     avg_win = summary.get("avg_win_pct", 0.0)
     avg_loss = summary.get("avg_loss_pct", 0.0)
     best = summary.get("best_trade_pct", 0.0)
     worst = summary.get("worst_trade_pct", 0.0)
     risk_status = summary.get("risk_status", "normal")
+    leverage = summary.get("leverage", REPORT_LEVERAGE)
 
     # بيانات حجم الصفقات
     sizing = get_position_sizing_plan()
@@ -1530,12 +1573,14 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     financial_block = (
         f"\n\n💰 الأداء المالي التقريبي:\n"
+        f"• الرافعة المستخدمة: {leverage:.0f}x\n"
         f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
         f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
-        f"• حجم الصفقة الواحدة تقديريًا: {per_trade_usd:.2f}$\n"
-        f"• صافي حركة الصفقات المغلقة: {realized:+.2f}%\n"
-        f"• التأثير الحقيقي على المحفظة: {wallet_pnl_pct:+.2f}%\n"
-        f"• ربح/خسارة تقديرية: {wallet_pnl_usd:+.2f}$\n"
+        f"• حجم المارجن للصفقة الواحدة تقديريًا: {per_trade_usd:.2f}$\n"
+        f"• صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
+        f"• صافي الأداء بعد الرافعة: {leveraged_pnl:+.2f}%\n"
+        f"• التأثير الحقيقي على المحفظة بعد الرافعة: {wallet_pnl_pct:+.2f}%\n"
+        f"• ربح/خسارة تقديرية بعد الرافعة: {wallet_pnl_usd:+.2f}$\n"
         f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
         f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%\n"
         f"• أفضل صفقة: {best:+.2f}%\n"
