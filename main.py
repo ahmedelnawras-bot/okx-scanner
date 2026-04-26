@@ -8,6 +8,7 @@ import threading
 import requests
 import pandas as pd
 import redis
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from analysis.scoring import calculate_long_score, is_breakout
 from analysis.backtest import build_deep_report
@@ -111,7 +112,7 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:running"
-SCAN_LOCK_TTL = 300
+SCAN_LOCK_TTL = 600
 
 TELEGRAM_OFFSET_KEY = "telegram:offset:long"
 TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done:long"
@@ -135,6 +136,7 @@ if EXTRA_ADMIN_CHAT_ID:
 # Candle cache
 CANDLE_CACHE_TTL_15M = 25
 CANDLE_CACHE_TTL_1H = 90
+CANDLE_CACHE_TTL_4H = 600
 CANDLE_CACHE_TTL_DEFAULT = 20
 
 # Alt snapshot cache
@@ -163,7 +165,6 @@ MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
 MODE_BLOCK_LONGS = "BLOCK_LONGS"
 MODE_RECOVERY_LONG = "RECOVERY_LONG"
 
-# Updated timing constants to 4 minutes
 MODE_TRANSITION_MIN_INTERVAL = 240          # 4 دقائق
 RECOVERY_CHECK_INTERVAL = 120               # دقيقتين
 NORMAL_CANDIDATE_DURATION = 240             # 4 دقائق استقرار
@@ -189,6 +190,16 @@ RECOVERY_ENTRY1_SIZE_PCT = 15
 RECOVERY_ENTRY2_SIZE_PCT = 15
 RECOVERY_ENTRY2_ATR_MULT = 0.35
 RECOVERY_SL_ATR_MULT = 3.5
+
+# Parallel candle fetch
+MAX_CANDLE_FETCH_WORKERS = 10
+
+# Weak setup penalty (module-level constant)
+WEAK_SETUP_TYPES = {
+    "continuation|mtf_yes|vol_mid|bull_market",
+    "continuation|mtf_yes|vol_high|bull_market",
+    "breakout|mtf_yes|vol_mid|bull_market",
+}
 
 # =========================
 # REDIS
@@ -1258,6 +1269,56 @@ def extract_24h_change_percent(ticker: dict) -> float:
         return 0.0
 
 
+def _safe_float(value, default=0.0):
+    """تحويل آمن إلى float، يحمي من None و NaN."""
+    try:
+        if value is None:
+            return default
+        if value != value:  # NaN check
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_signal_row(df):
+    try:
+        if df is None or df.empty:
+            return None
+        if len(df) == 1:
+            return df.iloc[-1]
+        if "confirm" not in df.columns:
+            return df.iloc[-2]
+        last = df.iloc[-1]
+        confirm_value = _safe_float(last.get("confirm"), 0.0)
+        if int(confirm_value) == 1:
+            return last
+        return df.iloc[-2]
+    except Exception as e:
+        logger.warning(f"get_signal_row error: {e}")
+        try:
+            if df is not None and not df.empty and len(df) >= 2:
+                return df.iloc[-2]
+            if df is not None and not df.empty:
+                return df.iloc[-1]
+        except Exception:
+            pass
+        return None
+
+
+def get_signal_candle_time(df):
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return int(time.time() // (15 * 60))
+        ts = int(signal_row["ts"])
+        if ts > 10_000_000_000:
+            return ts // 1000
+        return ts
+    except Exception:
+        return int(time.time() // (15 * 60))
+
+
 def get_ranked_pairs():
     try:
         res = requests.get(
@@ -1291,25 +1352,38 @@ def get_ranked_pairs():
         n_reversal = int(SCAN_LIMIT * 0.25)
         seen = set()
         merged = []
+
+        # volume portion
         for item in by_volume[:n_vol]:
             sid = item.get("instId", "")
             if sid not in seen:
                 seen.add(sid)
                 merged.append(item)
+
+        # momentum portion with counter
+        positive_momentum_count = 0
         for item in by_momentum[:n_momentum * 2]:
-            if len([x for x in merged if x.get("_rank_change_24h", 0) > 0]) >= n_momentum:
+            if positive_momentum_count >= n_momentum:
                 break
             sid = item.get("instId", "")
             if sid not in seen and item.get("_rank_change_24h", 0) > 0:
                 seen.add(sid)
                 merged.append(item)
+                positive_momentum_count += 1
+
+        # reversal portion with counter (negative only)
+        negative_reversal_count = 0
         for item in by_reversal[:n_reversal * 2]:
-            if len([x for x in merged if x.get("_rank_change_24h", 0) < 0]) >= n_reversal:
+            if negative_reversal_count >= n_reversal:
                 break
             sid = item.get("instId", "")
-            if sid not in seen:
+            change = float(item.get("_rank_change_24h", 0) or 0)
+            if sid not in seen and change < 0:
                 seen.add(sid)
                 merged.append(item)
+                negative_reversal_count += 1
+
+        # fill up to SCAN_LIMIT from remaining by_volume
         for item in by_volume:
             if len(merged) >= SCAN_LIMIT:
                 break
@@ -1317,6 +1391,7 @@ def get_ranked_pairs():
             if sid not in seen:
                 seen.add(sid)
                 merged.append(item)
+
         merged = merged[:SCAN_LIMIT]
         logger.info(f"After liquidity filter: {len(filtered)}")
         logger.info(f"Using merged ranked pairs for long scan: {len(merged)}")
@@ -1404,6 +1479,8 @@ def get_candle_cache_ttl(timeframe: str) -> int:
         return CANDLE_CACHE_TTL_15M
     if tf == "1h":
         return CANDLE_CACHE_TTL_1H
+    if tf == "4h":
+        return CANDLE_CACHE_TTL_4H
     return CANDLE_CACHE_TTL_DEFAULT
 
 
@@ -1448,48 +1525,77 @@ def get_funding_rate(symbol):
         return 0.0
 
 
-def get_signal_row(df):
-    try:
-        if df is None or df.empty:
-            return None
-        if len(df) == 1:
-            return df.iloc[-1]
-        if "confirm" not in df.columns:
-            return df.iloc[-2]
-        last = df.iloc[-1]
-        if str(int(float(last["confirm"]))) == "1":
-            return last
-        return df.iloc[-2]
-    except Exception:
-        return None
+# =========================
+# PARALLEL CANDLE FETCH
+# =========================
+def fetch_candles_parallel(pairs, timeframe=TIMEFRAME, limit=100, max_workers=MAX_CANDLE_FETCH_WORKERS):
+    """
+    تجلب الشموع لجميع الأزواج بالتوازي باستخدام ThreadPoolExecutor.
+    ترجع dict: {symbol: candles_list, ...}
+    """
+    result = {}
+    if not pairs:
+        return result
 
+    def _fetch(pair):
+        symbol = pair.get("instId", "")
+        if not symbol:
+            return symbol, []
+        try:
+            return symbol, get_candles(symbol, timeframe, limit)
+        except Exception as e:
+            logger.warning(f"parallel candle fetch error on {symbol}: {e}")
+            return symbol, []
 
-def get_signal_candle_time(df):
-    try:
-        signal_row = get_signal_row(df)
-        if signal_row is None:
-            return int(time.time() // (15 * 60))
-        ts = int(signal_row["ts"])
-        if ts > 10_000_000_000:
-            return ts // 1000
-        return ts
-    except Exception:
-        return int(time.time() // (15 * 60))
+    workers = max(1, int(max_workers or 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_fetch, p) for p in pairs]
+        for future in as_completed(futures):
+            try:
+                symbol, candles = future.result()
+                if symbol:
+                    result[symbol] = candles or []
+            except Exception as e:
+                logger.warning(f"parallel candle future error: {e}")
+    return result
 
 
 # =========================
-# HELPERS
+# PRE-FILTER BEFORE CANDLE FETCH
 # =========================
-def _safe_float(value, default=0.0):
+def prefilter_pair_before_candles(pair_data: dict, current_mode: str) -> bool:
+    """
+    فلتر خفيف قبل طلب الشموع يعتمد فقط على بيانات التيكر.
+    """
     try:
-        if value is None:
-            return default
-        if value != value:
-            return default
-        return float(value)
-    except Exception:
-        return default
+        symbol = pair_data.get("instId", "")
+        if not symbol:
+            return False
+        if is_excluded_symbol(symbol):
+            return False
+        vol_24h = float(pair_data.get("_rank_volume_24h", 0) or 0)
+        change_24h = float(pair_data.get("_rank_change_24h", 0) or 0)
+        if vol_24h < MIN_24H_QUOTE_VOLUME:
+            return False
+        # في Recovery نسمح بالعملات الهابطة أو الهادئة، ونستبعد العملات الطايرة
+        if current_mode == MODE_RECOVERY_LONG:
+            if change_24h > 2.0:
+                return False
+            return True
+        # في الوضع العادي نستبعد الحالات الشاذة جدًا فقط
+        if change_24h <= -30.0:
+            return False
+        if change_24h >= 35.0:
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"prefilter_pair_before_candles error: {e}")
+        return True
 
+
+# =========================
+# HELPERS (moved _safe_float above)
+# =========================
 
 def is_above_upper_bollinger(df) -> bool:
     try:
@@ -1652,6 +1758,138 @@ def is_momentum_exhaustion_trap(
 
 
 # =========================
+# NEW LATE BREAKOUT GUARD
+# =========================
+def evaluate_late_breakout_guard(
+    df,
+    breakout: bool,
+    entry_timing: str,
+    dist_ma: float,
+    vol_ratio: float,
+    rsi_now: float,
+    mtf_confirmed: bool,
+    market_state: str,
+    breakout_quality: str = "",
+    pre_breakout: bool = False,
+    is_reverse: bool = False,
+) -> dict:
+    """
+    تقييم تأخر الاختراق ومخاطره حسب حالة السوق.
+    يعيد قاموساً بـ blocked, retest_required, upper_wick_ratio, reason, warning.
+    """
+    result = {
+        "blocked": False,
+        "retest_required": False,
+        "upper_wick_ratio": 0.0,
+        "reason": "",
+        "warning": "",
+    }
+
+    # لا طائل من التقييم إذا لم يكن هناك اختراق أو كان ارتداداً عكسياً
+    if not breakout or is_reverse:
+        return result
+
+    # إذا كان الاختراق قوياً والمؤشرات تؤكد القوة، قد نستثنيه من بعض العقوبات لاحقاً
+    strong_exception = (breakout_quality == "strong")
+
+    # حساب نسبة الـ wick العلوي
+    signal_row = get_signal_row(df)
+    if signal_row is None:
+        return result
+    high = _safe_float(signal_row["high"])
+    low = _safe_float(signal_row["low"])
+    open_ = _safe_float(signal_row["open"])
+    close = _safe_float(signal_row["close"])
+    candle_range = high - low
+    if candle_range <= 0:
+        return result
+    upper_wick = high - max(open_, close)
+    upper_wick_ratio = round(upper_wick / candle_range, 4) if candle_range > 0 else 0.0
+    result["upper_wick_ratio"] = upper_wick_ratio
+
+    # هل الدخول متأخر؟
+    is_late_entry = ("متأخر" in str(entry_timing)) or (dist_ma >= LATE_PUMP_DIST_MA) or (rsi_now >= 72)
+
+    # لا نطبق الحارس على فرص الـ pullback أو pre_breakout (إلا إذا كانت متأخرة بشدة)
+    if not breakout:
+        # Pullback أو continuation: نكتفي بالفلترة المعتادة
+        return result
+    if pre_breakout and not is_late_entry:
+        return result
+
+    # ------------------------------------------------
+    # القواعد حسب حالة السوق
+    # ------------------------------------------------
+    if market_state in ("bull_market", "alt_season"):
+        # سوق قوية: اختراق متأخر خطر كبير
+        if is_late_entry:
+            # اختراق متأخر في سوق صاعدة: نطلب إعادة اختبار إلا إذا كان الاختراق قوياً جداً والـ wick صغير
+            if strong_exception and upper_wick_ratio < 0.35 and vol_ratio >= 1.8 and mtf_confirmed:
+                # نسمح بمرور مع تحذير
+                result["warning"] = "اختراق متأخر لكن مؤكد بقوة في سوق صاعد"
+            else:
+                result["retest_required"] = True
+                result["reason"] = "اختراق متأخر في سوق صاعد، يحتاج Retest"
+                return result
+
+        # Wick علوي كبير: رفض أو retest
+        if upper_wick_ratio >= 0.45:
+            if strong_exception and upper_wick_ratio < 0.55 and vol_ratio >= 1.6:
+                result["warning"] = "رفض سعري علوي بعد الاختراق (مستوى خطر متوسط)"
+            else:
+                result["retest_required"] = True
+                result["reason"] = "رفض سعري علوي كبير بعد الاختراق في سوق صاعد"
+                if upper_wick_ratio >= 0.65:
+                    result["blocked"] = True
+                    result["reason"] = "رفض سعري علوي حاد جداً، إشارة ملغية"
+                return result
+
+    elif market_state == "btc_leading":
+        if is_late_entry:
+            # السماح فقط إذا كان حجم التداول كبيراً والإطار الزمني الأعلى مؤكد والـ wick صغير
+            if vol_ratio >= 1.8 and mtf_confirmed and upper_wick_ratio < 0.35:
+                result["warning"] = "اختراق متأخر في بيئة BTC Leading، لكن العوامل داعمة"
+            else:
+                result["retest_required"] = True
+                result["reason"] = "اختراق متأخر في BTC Leading، يحتاج Retest"
+                return result
+
+        if upper_wick_ratio >= 0.55:
+            result["retest_required"] = True
+            result["reason"] = "wick علوي كبير في BTC Leading"
+            if upper_wick_ratio >= 0.65 and not strong_exception:
+                result["blocked"] = True
+                result["reason"] = "رفض سعري حاد في BTC Leading"
+            return result
+
+    elif market_state == "mixed":
+        if is_late_entry:
+            if upper_wick_ratio >= 0.45 or rsi_now >= 70 or dist_ma >= 4.5:
+                result["retest_required"] = True
+                result["reason"] = "اختراق متأخر مع مؤشرات ضعف في سوق مختلط"
+                return result
+        else:
+            if upper_wick_ratio >= 0.55:
+                result["retest_required"] = True
+                result["reason"] = "wick علوي بارز في سوق مختلط"
+
+    elif market_state == "risk_off":
+        # فلترة خفيفة جداً
+        if is_late_entry and dist_ma >= 5.0 and upper_wick_ratio >= 0.55:
+            result["retest_required"] = True
+            result["reason"] = "اختراق متأخر جداً مع wick كبير في سوق دفاعي"
+
+    # إذا لم يتم المنع أو طلب إعادة الاختبار، يمكن إضافة تحذير بسيط
+    if not result["blocked"] and not result["retest_required"]:
+        if is_late_entry:
+            result["warning"] = "اختراق متأخر، يُنصح بالحذر"
+        if upper_wick_ratio >= 0.40:
+            result["warning"] = "وجود wick علوي ملحوظ بعد الاختراق"
+
+    return result
+
+
+# =========================
 # ORIGINAL HELPERS (continued)
 # =========================
 def detect_late_pump_long(
@@ -1792,7 +2030,7 @@ def is_oversold_reversal_long(
             return False
         if dist_ma >= 0:
             return False
-        if change_24h > 5.0:
+        if change_24h > -5.0:
             return False
         signal_row = get_signal_row(df)
         if signal_row is None:
@@ -2758,6 +2996,8 @@ def normalize_reason(reason: str) -> str:
         "macd_hist_falling": "زخم MACD يتراجع",
         "macd_hist_negative": "MACD سلبي",
         "Weak Historical Setup": "نوع إشارة ضعيف تاريخيًا",
+        "Late Breakout Warning": "اختراق متأخر، يُنصح بالحذر",
+        "رفض سعري علوي بعد الاختراق": "رفض سعري علوي بعد الاختراق",
     }
     return mapping.get(reason, reason)
 
@@ -2805,6 +3045,8 @@ def sort_reasons(reasons):
         "زخم MACD يتراجع": 118,
         "MACD سلبي": 119,
         "نوع إشارة ضعيف تاريخيًا": 120,
+        "اختراق متأخر، يُنصح بالحذر": 121,
+        "رفض سعري علوي بعد الاختراق": 122,
     }
     return sorted(reasons, key=lambda x: priority.get(x, 999))
 
@@ -3892,31 +4134,48 @@ def run_scanner_loop():
                 f"state={market_state_label} | flow={market_bias_label}"
             )
 
+            # Prepare scan pairs
+            if current_mode == MODE_RECOVERY_LONG:
+                scan_pairs = sorted(
+                    ranked_pairs,
+                    key=lambda x: x.get("_rank_volume_24h", 0),
+                    reverse=True
+                )[:80]
+                max_alerts = RECOVERY_MAX_ALERTS
+            else:
+                scan_pairs = ranked_pairs
+                max_alerts = MAX_ALERTS_PER_RUN
+
+            # Pre-filter and parallel candle fetch
+            filtered_scan_pairs = [
+                p for p in scan_pairs if prefilter_pair_before_candles(p, current_mode)
+            ]
+            logger.info(f"Pre-filter kept {len(filtered_scan_pairs)} of {len(scan_pairs)} pairs before candle fetch")
+
+            candles_map = fetch_candles_parallel(
+                filtered_scan_pairs,
+                timeframe=TIMEFRAME,
+                limit=100,
+                max_workers=MAX_CANDLE_FETCH_WORKERS,
+            )
+            logger.info(f"Parallel candle fetch completed: {len(candles_map)} symbols")
+
             tested = 0
             sent_count = 0
             sent_symbols_this_run = set()
             candidates = []
             candidates_symbols = set()
 
-            if current_mode == MODE_RECOVERY_LONG:
-                scan_pairs = sorted(
-                    ranked_pairs,
-                    key=lambda x: x.get("_rank_volume_24h", 0),
-                    reverse=True
-                )[:80]   # Changed from 50 to 80
-                max_alerts = RECOVERY_MAX_ALERTS
-            else:
-                scan_pairs = ranked_pairs
-                max_alerts = MAX_ALERTS_PER_RUN
-
-            for pair_data in scan_pairs:
+            for pair_data in filtered_scan_pairs:
                 if sent_count >= max_alerts:
                     logger.info(f"Reached max alerts for mode={current_mode}: {sent_count}/{max_alerts}")
                     break
                 tested += 1
                 symbol = pair_data["instId"]
                 change_24h = extract_24h_change_percent(pair_data)
-                candles = get_candles(symbol, TIMEFRAME, 100)
+                candles = candles_map.get(symbol, [])
+                if not candles:
+                    continue
                 df = to_dataframe(candles)
                 if df is None or df.empty:
                     continue
@@ -3960,7 +4219,7 @@ def run_scanner_loop():
                     btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
                     if btc_change <= -0.32 or red_ratio >= 0.58:
                         continue
-                    if not (dist_ma <= -4.3 and 24 <= rsi_now <= 42):
+                    if not (dist_ma <= -4.3 and 18 <= rsi_now <= 42):
                         continue
                     if vol_ratio < 1.10:
                         continue
@@ -4000,8 +4259,10 @@ def run_scanner_loop():
                         atr_value=atr_value, red_ratio=red_ratio, avg_change=avg_change,
                         btc_change=btc_change, alt_mode=alt_mode, tv_link=tv_link,
                     )
-                    if not already_sent_same_candle(symbol, get_signal_candle_time(df), "long") \
-                            and not is_symbol_on_cooldown(symbol, "long"):
+                    if (
+                        not already_sent_same_candle(symbol, get_signal_candle_time(df), "long")
+                        and not is_symbol_on_cooldown(symbol, "long")
+                    ):
                         locked = reserve_signal_slot(symbol, get_signal_candle_time(df), "long")
                         if locked:
                             sent_data = send_telegram_message(msg, reply_markup=build_track_reply_markup(alert_id))
@@ -4134,6 +4395,32 @@ def run_scanner_loop():
                         )
                         continue
 
+                # Define early variables needed later
+                reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
+                if is_reverse:
+                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
+
+                early_priority = classify_early_priority_long(
+                    early_signal=early_signal,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    dist_ma=dist_ma,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                    mtf_confirmed=mtf_confirmed,
+                    gaining_strength=gaining_strength,
+                    market_state=market_state,
+                )
+
+                pullback_low = None
+                pullback_high = None
+                pullback_entry = None
+
+                atr_value = _safe_float(signal_row.get("atr"), 0.0)
+                if atr_value <= 0:
+                    logger.info(f"{symbol} → skipped (ATR invalid)")
+                    continue
+
                 temp_opportunity_type = classify_opportunity_type_long(
                     breakout=breakout, pre_breakout=pre_breakout,
                     dist_ma=dist_ma, mtf_confirmed=mtf_confirmed, is_reverse=is_reverse,
@@ -4155,7 +4442,6 @@ def run_scanner_loop():
                 if late_guard.get("should_block") and not is_reverse and breakout_quality != "strong":
                     logger.info(f"{symbol} → skipped (late/bull continuation guard)")
                     continue
-                # If strong breakout, we just let it continue (with warnings later)
 
                 if above_upper_bb and not pre_breakout and not is_reverse:
                     if not breakout or breakout_quality == "weak":
@@ -4219,18 +4505,44 @@ def run_scanner_loop():
                 )
                 if trap_check["is_trap"] and not is_reverse:
                     continue
-                # soft trap penalty applied later
 
-                reversal_4h_result = {"confirmed": False, "checks": 0, "details": ""}
-                if is_reverse:
-                    reversal_4h_result = is_4h_oversold_confirmed(symbol)
-
-                early_priority = classify_early_priority_long(
-                    early_signal=early_signal, breakout=breakout, pre_breakout=pre_breakout,
-                    dist_ma=dist_ma, vol_ratio=vol_ratio, candle_strength=candle_strength,
-                    mtf_confirmed=mtf_confirmed, gaining_strength=gaining_strength,
-                    market_state=market_state,
+                # --- ENTRY TIMING TEMP ---
+                entry_timing_temp = classify_entry_timing_long(
+                    dist_ma=dist_ma,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    vol_ratio=vol_ratio,
+                    rsi_now=rsi_now,
+                    candle_strength=candle_strength,
+                    late_pump_risk=late_guard.get("late_pump_risk", False),
                 )
+
+                # --- LATE BREAKOUT GUARD (placed after entry_timing_temp) ---
+                guard = evaluate_late_breakout_guard(
+                    df=df,
+                    breakout=breakout,
+                    entry_timing=entry_timing_temp,
+                    dist_ma=dist_ma,
+                    vol_ratio=vol_ratio,
+                    rsi_now=rsi_now,
+                    mtf_confirmed=mtf_confirmed,
+                    market_state=market_state,
+                    breakout_quality=breakout_quality,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
+
+                if guard["blocked"]:
+                    logger.info(f"{symbol} → late breakout guard BLOCKED: {guard['reason']}")
+                    continue
+
+                if guard["retest_required"]:
+                    logger.info(f"{symbol} → retest required: {guard['reason']} (skipped direct alert)")
+                    continue
+
+                breakout_warning = guard.get("warning", "")
+                upper_wick_ratio = guard.get("upper_wick_ratio", 0.0)
+                late_breakout_guard_reason = guard.get("reason", "none") or "none"
 
                 if current_mode == MODE_STRONG_LONG_ONLY:
                     if not (breakout or pre_breakout or early_priority == "strong"):
@@ -4249,10 +4561,6 @@ def run_scanner_loop():
                 signal_idx = signal_row.name
                 lookback_start = max(0, signal_idx - 20)
                 recent_high = _safe_float(df["high"].iloc[lookback_start:signal_idx].max(), 0)
-                atr_value = _safe_float(signal_row.get("atr"), 0)
-                pullback_low = None
-                pullback_high = None
-                pullback_entry = None
                 if atr_value > 0 and recent_high > 0:
                     pullback_low = recent_high - (atr_value * 0.15)
                     pullback_high = recent_high + (atr_value * 0.35)
@@ -4280,7 +4588,7 @@ def run_scanner_loop():
                         btc_mode=btc_mode, breakout=breakout, pre_breakout=pre_breakout,
                         is_new=is_new, funding=funding, btc_dominance_proxy=btc_dominance_proxy,
                         market_state=market_state, alt_mode=alt_mode,
-                        market_bias_label=market_bias_label, is_reverse=is_reverse,
+                        market_bias_label=market_bias_label,
                     )
                 except Exception as score_err:
                     logger.error(f"{symbol} → calculate_long_score failed: {score_err}")
@@ -4327,6 +4635,13 @@ def run_scanner_loop():
                             score_result["warning_reasons"] = []
                         score_result["warning_reasons"].append("Momentum Exhaustion Trap")
 
+                # late breakout guard warning / penalty (after score exists)
+                if breakout_warning:
+                    if "warning_reasons" not in score_result:
+                        score_result["warning_reasons"] = []
+                    if breakout_warning not in score_result["warning_reasons"]:
+                        score_result["warning_reasons"].append(breakout_warning)
+
                 score_result["score"] = round(effective_score, 2)
 
                 dynamic_threshold = get_dynamic_entry_threshold(
@@ -4348,12 +4663,6 @@ def run_scanner_loop():
                     score_result["score"] = round(effective_score, 2)
                     dynamic_threshold += 0.25
                     dynamic_threshold = round(dynamic_threshold, 2)
-
-                entry_timing_temp = classify_entry_timing_long(
-                    dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout,
-                    vol_ratio=vol_ratio, rsi_now=rsi_now, candle_strength=candle_strength,
-                    late_pump_risk=late_guard.get("late_pump_risk", False),
-                )
 
                 # Late entry filter ONLY for STRONG_LONG_ONLY
                 if current_mode == MODE_STRONG_LONG_ONLY and "🔴 متأخر" in entry_timing_temp:
@@ -4389,8 +4698,8 @@ def run_scanner_loop():
                     effective_required_min_score, is_reverse=is_reverse,
                 )
 
-                if mtf_confirmed and "🔴 متأخر" in entry_timing and not is_reverse:
-                    logger.info(f"{symbol} → skipped (MTF late)")
+                if (not mtf_confirmed) and "🔴 متأخر" in entry_timing and not is_reverse:
+                    logger.info(f"{symbol} → skipped (late without MTF confirmation)")
                     continue
 
                 if mtf_confirmed and change_4h > 3 and not breakout and not pre_breakout and not is_reverse:
@@ -4485,11 +4794,6 @@ def run_scanner_loop():
                 setup_type = build_setup_type(setup_type_candidate)
 
                 # Setup History Penalty (with exceptions)
-                WEAK_SETUP_TYPES = {
-                    "continuation|mtf_yes|vol_mid|bull_market",
-                    "continuation|mtf_yes|vol_high|bull_market",
-                    "breakout|mtf_yes|vol_mid|bull_market",
-                }
                 if (setup_type in WEAK_SETUP_TYPES
                         and not is_reverse
                         and not pre_breakout
@@ -4560,6 +4864,9 @@ def run_scanner_loop():
                     "rsi_slope": rsi_slope,
                     "macd_hist": macd_hist,
                     "macd_hist_slope": macd_hist_slope,
+                    "upper_wick_ratio": upper_wick_ratio,
+                    "retest_required": False,  # we never reach here if retest_required was True
+                    "late_breakout_guard_reason": late_breakout_guard_reason,
                     "message": build_message(
                         symbol=symbol, price=price, score_result=score_result,
                         stop_loss=stop_loss, tp1=tp1, tp2=tp2, rr1=rr1, rr2=rr2,
@@ -4621,6 +4928,9 @@ def run_scanner_loop():
                         "rsi_slope": rsi_slope,
                         "macd_hist": macd_hist,
                         "macd_hist_slope": macd_hist_slope,
+                        "upper_wick_ratio": upper_wick_ratio,
+                        "retest_required": False,
+                        "late_breakout_guard_reason": late_breakout_guard_reason,
                     },
                     "candle_time": candle_time,
                     "now": now,
