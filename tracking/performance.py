@@ -14,6 +14,7 @@
 تعديل مهم:
 - تم استبدال التقريب الثابت round(..., 6) بدالة round_price()
   حتى لا تتحول أسعار العملات الصغيرة جداً إلى 0.000000.
+- إضافة دوال تحليل الخروج والأداء اليومي وتقارير فورية.
 """
 
 import json
@@ -38,6 +39,11 @@ from tracking.summary_helpers import (
     _empty_summary,
     _apply_trade_to_summary,
     _finalize_summary,
+    summarize_exits,
+    summarize_trades_by_day,
+    summarize_today,
+    get_trade_created_ts,
+    get_local_day_key,
 )
 
 logger = logging.getLogger("okx-scanner")
@@ -95,6 +101,15 @@ def normalize_list(value):
 def normalize_text(value, default="unknown") -> str:
     text = str(value or "").strip()
     return text if text else default
+
+
+def redis_hash_get(stats: dict, key: str, default=0):
+    """
+    يدعم Redis hgetall سواء كان decode_responses=True أو False.
+    """
+    if not isinstance(stats, dict):
+        return default
+    return stats.get(key, stats.get(key.encode(), default))
 
 
 def round_price(value, default=0.0) -> float:
@@ -465,6 +480,19 @@ def register_trade(
     now_ts = int(time.time())
     if reasons is None:
         reasons = []
+
+    # توافق مع أسماء بديلة قد يرسلها main.py
+    if "is_reverse" in kwargs and not is_reverse_signal:
+        is_reverse_signal = normalize_bool(kwargs.get("is_reverse"))
+
+    if "reverse_signal" in kwargs and not is_reverse_signal:
+        is_reverse_signal = normalize_bool(kwargs.get("reverse_signal"))
+
+    if warning_reasons is None and "warnings" in kwargs:
+        warning_reasons = normalize_list(kwargs.get("warnings"))
+
+    if not has_high_impact_news and "news_nearby" in kwargs:
+        has_high_impact_news = normalize_bool(kwargs.get("news_nearby"))
 
     pre_signal = bool(pre_breakout)
     break_signal = bool(breakout)
@@ -900,8 +928,8 @@ def load_trades(
     if redis_client is None:
         return []
 
-    mt = market_type if market_type else "*"
-    sd = side if side else "*"
+    mt = normalize_market_type(market_type) if market_type else "*"
+    sd = normalize_side(side) if side else "*"
     pattern = f"trade:{mt}:{sd}:*"
 
     trades = []
@@ -919,13 +947,10 @@ def load_trades(
                 continue
 
             if since_ts is not None:
-                ts = safe_int(
-                    trade.get(
-                        "candle_time",
-                        trade.get("created_at", trade.get("opened_at", 0))
-                    ),
-                    0
-                )
+                ts = get_trade_created_ts(trade)
+                if not ts:
+                    ts = safe_int(trade.get("candle_time", 0), 0)
+
                 if ts < since_ts:
                     continue
 
@@ -1023,6 +1048,10 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "best_trade_pct": 0.0,
             "worst_trade_pct": 0.0,
             "risk_status": "normal",
+            "tp2_hits": 0,
+            "tp2_rate": 0.0,
+            "tp1_to_tp2_rate": 0.0,
+            "net_profit_pct": 0.0,
         }
 
     stats_key = get_stats_key(market_type, side)
@@ -1031,13 +1060,28 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
     try:
         stats = redis_client.hgetall(stats_key) or {}
 
-        wins = int(stats.get("wins", 0))
-        tp1_wins = int(stats.get("tp1_wins", 0))
-        tp2_wins = int(stats.get("tp2_wins", 0))
-        losses = int(stats.get("losses", 0))
-        expired = int(stats.get("expired", 0))
-        tp1_hits = int(stats.get("tp1_hits", 0))
-        open_count = int(redis_client.scard(open_set_key) or 0)
+        wins = safe_int(redis_hash_get(stats, "wins", 0))
+        tp1_wins = safe_int(redis_hash_get(stats, "tp1_wins", 0))
+        tp2_wins = safe_int(redis_hash_get(stats, "tp2_wins", 0))
+        losses = safe_int(redis_hash_get(stats, "losses", 0))
+        expired = safe_int(redis_hash_get(stats, "expired", 0))
+        tp1_hits = safe_int(redis_hash_get(stats, "tp1_hits", 0))
+        open_count = safe_int(redis_client.scard(open_set_key) or 0)
+
+        financial_summary = get_trade_summary(
+            redis_client,
+            market_type=market_type,
+            side=side,
+        )
+
+        # financial_summary أدق لأنه مبني على الصفقات نفسها، وليس العدادات فقط.
+        wins = safe_int(financial_summary.get("wins", wins))
+        losses = safe_int(financial_summary.get("losses", losses))
+        expired = safe_int(financial_summary.get("expired", expired))
+        tp1_hits = safe_int(financial_summary.get("tp1_hits", tp1_hits))
+        tp1_wins = safe_int(financial_summary.get("tp1_wins", tp1_wins))
+        tp2_wins = safe_int(financial_summary.get("tp2_wins", tp2_wins))
+        open_count = safe_int(financial_summary.get("open", open_count))
 
         decided = wins + losses
         closed = wins + losses + expired
@@ -1045,12 +1089,6 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
         tp1_rate = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
-
-        financial_summary = get_trade_summary(
-            redis_client,
-            market_type=market_type,
-            side=side,
-        )
 
         return {
             "wins": wins,
@@ -1078,6 +1116,14 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "best_trade_pct": financial_summary.get("best_trade_pct", 0.0),
             "worst_trade_pct": financial_summary.get("worst_trade_pct", 0.0),
             "risk_status": financial_summary.get("risk_status", "normal"),
+
+            "tp2_hits": safe_int(financial_summary.get("tp2_hits", tp2_wins)),
+            "tp2_rate": safe_float(financial_summary.get("tp2_rate", 0.0)),
+            "tp1_to_tp2_rate": safe_float(financial_summary.get("tp1_to_tp2_rate", 0.0)),
+            "net_profit_pct": safe_float(financial_summary.get(
+                "net_profit_pct",
+                financial_summary.get("realized_leveraged_pnl_pct", 0.0)
+            )),
         }
 
     except Exception as e:
@@ -1106,6 +1152,10 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "best_trade_pct": 0.0,
             "worst_trade_pct": 0.0,
             "risk_status": "normal",
+            "tp2_hits": 0,
+            "tp2_rate": 0.0,
+            "tp1_to_tp2_rate": 0.0,
+            "net_profit_pct": 0.0,
         }
 
 
@@ -1150,19 +1200,23 @@ def get_trade_summary(
     return summary
 
 
-def get_period_summary(
-    redis_client,
-    period: str = "all",
-    market_type: Optional[str] = None,
-    side: Optional[str] = None,
-) -> dict:
+# ------------------------------------------------------------
+# PERIOD HELPER
+# ------------------------------------------------------------
+def get_period_since_ts(period: str) -> Optional[int]:
+    """
+    ترجع طابع زمني لبداية الفترة المطلوبة أو None لـ all.
+    تدعم: 1h, today, 1d, 7d, 30d, all
+    """
+    period = str(period or "all").strip().lower()
     now_ts = int(time.time())
 
     if period == "1h":
-        since_ts = now_ts - 3600
-    elif period == "today":
+        return now_ts - 3600
+
+    if period == "today":
         local_now = time.localtime(now_ts)
-        since_ts = int(time.mktime((
+        return int(time.mktime((
             local_now.tm_year,
             local_now.tm_mon,
             local_now.tm_mday,
@@ -1173,14 +1227,29 @@ def get_period_summary(
             local_now.tm_yday,
             local_now.tm_isdst,
         )))
-    elif period == "1d":
-        since_ts = now_ts - (24 * 3600)
-    elif period == "7d":
-        since_ts = now_ts - (7 * 24 * 3600)
-    elif period == "30d":
-        since_ts = now_ts - (30 * 24 * 3600)
-    else:
-        since_ts = None
+
+    if period == "1d":
+        return now_ts - (24 * 3600)
+
+    if period == "7d":
+        return now_ts - (7 * 24 * 3600)
+
+    if period == "30d":
+        return now_ts - (30 * 24 * 3600)
+
+    if period == "all":
+        return None
+
+    return now_ts - (24 * 3600)
+
+
+def get_period_summary(
+    redis_client,
+    period: str = "all",
+    market_type: Optional[str] = None,
+    side: Optional[str] = None,
+) -> dict:
+    since_ts = get_period_since_ts(period)
 
     return get_trade_summary(
         redis_client=redis_client,
@@ -1188,6 +1257,290 @@ def get_period_summary(
         side=side,
         since_ts=since_ts,
     )
+
+
+# ------------------------------------------------------------
+# EXIT SUMMARY
+# ------------------------------------------------------------
+def get_exit_summary(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+    since_ts: Optional[int] = None,
+    use_history: bool = False,
+) -> dict:
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+
+    logger.info(f"get_exit_summary {market_type}/{side} use_history={use_history}")
+
+    trades = get_all_trades_data(
+        redis_client,
+        market_type=market_type,
+        side=side,
+        since_ts=since_ts,
+        use_history=use_history,
+    )
+
+    exit_data = summarize_exits(trades)
+    exit_data["market_type"] = market_type
+    exit_data["side"] = side
+    exit_data["trades_count"] = len(trades)
+    exit_data["since_ts"] = since_ts
+
+    return exit_data
+
+
+def format_exit_summary(title: str, summary: dict) -> str:
+    signals = safe_int(summary.get("signals", summary.get("trades_count", 0)))
+    closed = safe_int(summary.get("closed", 0))
+    open_trades = safe_int(summary.get("open", 0))
+    tp1_hits = safe_int(summary.get("tp1_hits", 0))
+    tp2_hits = safe_int(summary.get("tp2_hits", 0))
+    tp1_rate = safe_float(summary.get("tp1_rate", 0))
+    tp2_rate = safe_float(summary.get("tp2_rate", 0))
+    tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
+    sl_before_tp1 = safe_int(summary.get("sl_before_tp1", 0))
+    sl_before_tp1_rate = safe_float(summary.get("sl_before_tp1_rate", 0))
+    tp1_only = safe_int(summary.get("tp1_only", 0))
+    expired = safe_int(summary.get("expired", 0))
+    exit_quality = summary.get("exit_quality", "unknown")
+
+    quality_ar = {
+        "good": "جيد ✅",
+        "exit_problem": "المشكلة في الخروج بعد TP1 ⚠️",
+        "entry_problem": "المشكلة في الدخول/SL قبل TP1 🔴",
+        "weak_entries": "جودة الدخول ضعيفة 🔴",
+        "mixed": "مختلط 🟡",
+        "unknown": "غير كافٍ",
+    }
+    quality_text = quality_ar.get(exit_quality, exit_quality)
+
+    lines = [f"<b>{title}</b>", ""]
+    lines.append(f"📊 Signals: {signals} | Closed: {closed} | Open: {open_trades}")
+    lines.append(f"🎯 TP1 Hits: {tp1_hits} | TP2 Hits: {tp2_hits}")
+    lines.append(f"📈 TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%")
+    lines.append(f"🔄 TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%")
+    lines.append(f"🛑 SL Before TP1: {sl_before_tp1} ({sl_before_tp1_rate:.1f}%)")
+    lines.append(f"🔄 TP1 Only / رجوع Entry: {tp1_only}")
+    lines.append(f"⏳ Expired: {expired}")
+    lines.append(f"🔍 Exit Quality: {quality_text}")
+    lines.append("")
+
+    if exit_quality == "exit_problem":
+        lines.append("ℹ️ الإشارات بتلمس TP1 كويس، لكن نسبة الوصول لـ TP2 ضعيفة. راجع إدارة الخروج أو قرب TP2.")
+    elif exit_quality == "entry_problem":
+        lines.append("ℹ️ نسبة SL قبل TP1 عالية. راجع الفلاتر قبل الدخول والـ SL.")
+    elif exit_quality == "weak_entries":
+        lines.append("ℹ️ TP1 Rate ضعيف. المشكلة غالبًا من جودة الدخول نفسها.")
+    elif exit_quality == "good":
+        lines.append("ℹ️ الخروج متوازن نسبيًا.")
+
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------
+# DAILY PERFORMANCE
+# ------------------------------------------------------------
+def get_daily_performance_summary(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+    days: int = 7,
+    use_history: bool = False,
+) -> List[dict]:
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+
+    logger.info(f"get_daily_performance_summary {market_type}/{side} days={days} history={use_history}")
+
+    trades = get_all_trades_data(
+        redis_client,
+        market_type=market_type,
+        side=side,
+        use_history=use_history,
+    )
+
+    daily = summarize_trades_by_day(trades, days=days)
+    rows = []
+
+    if isinstance(daily, dict):
+        for day_key, day_trades in daily.items():
+            if not day_trades:
+                continue
+
+            summary = summarize_trades(day_trades)
+            exit_data = summarize_exits(day_trades)
+
+            rows.append({
+                "day": day_key,
+                "summary": summary,
+                "exit_summary": exit_data,
+            })
+
+    elif isinstance(daily, list):
+        for row in daily:
+            if not isinstance(row, dict):
+                continue
+
+            day = row.get("day")
+            summary = row.get("summary") or _empty_summary()
+            exit_summary = row.get("exit_summary") or {}
+
+            if not exit_summary:
+                day_trades = row.get("trades")
+                if isinstance(day_trades, list):
+                    exit_summary = summarize_exits(day_trades)
+                else:
+                    exit_summary = summarize_exits([])
+
+            rows.append({
+                "day": day,
+                "summary": summary,
+                "exit_summary": exit_summary,
+            })
+
+    else:
+        return []
+
+    rows.sort(key=lambda r: str(r.get("day", "")))
+    return rows
+
+
+def format_daily_performance_report(title: str, rows: list, side: str = "long") -> str:
+    side = normalize_side(side)
+
+    if not rows:
+        return "لا توجد بيانات كافية"
+
+    rows = rows[-30:]
+
+    lines = [f"<b>{title}</b>", ""]
+    for row in rows:
+        day = row.get("day", "")
+        summary = row.get("summary", {}) or {}
+        exits = row.get("exit_summary", {}) or {}
+
+        signals = safe_int(summary.get("signals", 0))
+        closed = safe_int(summary.get("closed", 0))
+        open_t = safe_int(summary.get("open", 0))
+        wins = safe_int(summary.get("wins", 0))
+        losses = safe_int(summary.get("losses", 0))
+        expired = safe_int(summary.get("expired", 0))
+        winrate = safe_float(summary.get("winrate", 0))
+        tp1_rate = safe_float(summary.get("tp1_rate", 0))
+        tp2_rate = safe_float(summary.get("tp2_rate", 0))
+        net_pnl = safe_float(summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0)))
+
+        wallet_pct, wallet_usd = estimate_wallet_pnl(summary, side=side)
+
+        quality = exits.get("exit_quality", "")
+        quality_short = {
+            "good": "✅",
+            "exit_problem": "⚠️",
+            "entry_problem": "🔴",
+            "weak_entries": "🔴",
+            "mixed": "🟡",
+            "unknown": "—",
+        }.get(quality, "—")
+
+        lines.append(
+            f"📅 {day} | 🎯{signals}/{closed}/{open_t} | "
+            f"✅{wins} ❌{losses} ⏳{expired} | WR:{winrate:.0f}% | "
+            f"TP1:{tp1_rate:.0f}% TP2:{tp2_rate:.0f}% | "
+            f"Net:{net_pnl:+.1f}% | محفظة:{wallet_pct:+.1f}% {wallet_usd:+.1f}$ | "
+            f"خروج:{quality_short}"
+        )
+
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------
+# TODAY PERFORMANCE
+# ------------------------------------------------------------
+def get_today_performance_summary(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+    use_history: bool = False,
+) -> dict:
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+
+    logger.info(f"get_today_performance_summary {market_type}/{side} history={use_history}")
+
+    trades = get_all_trades_data(
+        redis_client,
+        market_type=market_type,
+        side=side,
+        use_history=use_history,
+    )
+
+    today_data = summarize_today(trades) or {}
+
+    return {
+        "day": today_data.get("day", ""),
+        "summary": today_data.get("summary", _empty_summary()),
+        "exit_summary": today_data.get("exit_summary", {}),
+        "market_type": market_type,
+        "side": side,
+    }
+
+
+def format_today_performance_report(title: str, data: dict, side: str = "long") -> str:
+    side = normalize_side(side)
+
+    summary = data.get("summary", {}) or {}
+    exit_summary = data.get("exit_summary", {}) or {}
+    day = data.get("day", "")
+
+    if not summary or safe_int(summary.get("signals", 0)) == 0:
+        return f"<b>{title}</b>\nلا توجد صفقات اليوم."
+
+    wallet_pct, wallet_usd = estimate_wallet_pnl(summary, side=side)
+
+    lines = [f"<b>{title}</b>", f"📅 {day}", ""]
+
+    signals = safe_int(summary.get("signals", 0))
+    closed = safe_int(summary.get("closed", 0))
+    open_t = safe_int(summary.get("open", 0))
+    wins = safe_int(summary.get("wins", 0))
+    losses = safe_int(summary.get("losses", 0))
+    expired = safe_int(summary.get("expired", 0))
+
+    lines.append(f"إشارات: {signals} | مغلقة: {closed} | مفتوحة: {open_t}")
+    lines.append(f"فوز: {wins} | خسارة: {losses} | منتهية: {expired}")
+    lines.append(f"نسبة الفوز: {safe_float(summary.get('winrate', 0)):.1f}%")
+    lines.append(
+        f"TP1 Rate: {safe_float(summary.get('tp1_rate', 0)):.1f}% | "
+        f"TP2 Rate: {safe_float(summary.get('tp2_rate', 0)):.1f}%"
+    )
+
+    net_pnl = safe_float(summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0)))
+    lines.append(f"صافي بعد الرافعة: {net_pnl:+.2f}%")
+    lines.append(f"تأثير المحفظة: {wallet_pct:+.2f}% = {wallet_usd:+.2f}$")
+
+    if exit_summary:
+        lines.append("")
+        lines.append("<b>🎯 تحليل الخروج:</b>")
+        quality = exit_summary.get("exit_quality", "unknown")
+        quality_ar = {
+            "good": "جيد ✅",
+            "exit_problem": "مشكلة خروج ⚠️",
+            "entry_problem": "مشكلة دخول 🔴",
+            "weak_entries": "جودة دخول ضعيفة 🔴",
+            "mixed": "مختلط 🟡",
+            "unknown": "غير كافٍ",
+        }.get(quality, quality)
+
+        lines.append(f"الجودة: {quality_ar}")
+        lines.append(
+            f"TP1: {safe_int(exit_summary.get('tp1_hits', 0))} | "
+            f"TP2: {safe_int(exit_summary.get('tp2_hits', 0))}"
+        )
+        lines.append(f"SL قبل TP1: {safe_int(exit_summary.get('sl_before_tp1', 0))}")
+
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------
@@ -1221,13 +1574,14 @@ def get_all_trades_data(
 
                 trade_market = normalize_market_type(trade.get("market_type", "futures"))
                 trade_side = normalize_side(trade.get("side", "long"))
-                created_at = safe_int(trade.get("created_at", 0), 0)
+                created_ts = get_trade_created_ts(trade)
+                ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0))
 
                 if market_type and trade_market != normalize_market_type(market_type):
                     continue
                 if side and trade_side != normalize_side(side):
                     continue
-                if since_ts and created_at < since_ts:
+                if since_ts is not None and ts_for_filter < since_ts:
                     continue
 
                 trades.append(trade)
@@ -1243,13 +1597,14 @@ def get_all_trades_data(
 
             trade_market = normalize_market_type(trade.get("market_type", "futures"))
             trade_side = normalize_side(trade.get("side", "long"))
-            created_at = safe_int(trade.get("created_at", 0), 0)
+            created_ts = get_trade_created_ts(trade)
+            ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0))
 
             if market_type and trade_market != normalize_market_type(market_type):
                 continue
             if side and trade_side != normalize_side(side):
                 continue
-            if since_ts and created_at < since_ts:
+            if since_ts is not None and ts_for_filter < since_ts:
                 continue
 
             trades.append(trade)
@@ -1349,37 +1704,59 @@ def format_winrate_summary(summary: dict) -> str:
     side = summary.get("side")
     prefix = f"[{market_type}/{side}] " if market_type and side else ""
 
+    net_pnl = safe_float(
+        summary.get(
+            "net_profit_pct",
+            summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0))
+        ),
+        0.0,
+    )
+
     return (
-        f"{prefix}Win rate: {summary['winrate']}% | "
+        f"{prefix}Win rate: {summary.get('winrate', 0)}% | "
         f"TP1 Rate: {summary.get('tp1_rate', 0)}% | "
-        f"Wins: {summary['wins']} | "
+        f"TP2 Rate: {summary.get('tp2_rate', 0)}% | "
+        f"TP1→TP2: {summary.get('tp1_to_tp2_rate', 0)}% | "
+        f"Net PnL: {net_pnl:+.2f}% | "
+        f"Wins: {summary.get('wins', 0)} | "
         f"TP1 Wins: {summary.get('tp1_wins', 0)} | "
         f"TP2 Wins: {summary.get('tp2_wins', 0)} | "
-        f"Losses: {summary['losses']} | "
-        f"TP1 Hits: {summary['tp1_hits']} | "
-        f"Expired: {summary['expired']} | "
-        f"Open: {summary['open']}"
+        f"Losses: {summary.get('losses', 0)} | "
+        f"TP1 Hits: {summary.get('tp1_hits', 0)} | "
+        f"Expired: {summary.get('expired', 0)} | "
+        f"Open: {summary.get('open', 0)}"
     )
 
 
 def format_period_summary(title: str, summary: dict) -> str:
     side = normalize_side(summary.get("side", "long"))
 
-    decided = summary["wins"] + summary["losses"] + summary["expired"]
+    wins = safe_int(summary.get("wins", 0))
+    losses = safe_int(summary.get("losses", 0))
+    expired = safe_int(summary.get("expired", 0))
+    decided = wins + losses + expired
 
-    gross_profit = summary.get("gross_profit_pct", 0.0)
-    gross_loss = summary.get("gross_loss_pct", 0.0)
-    net_pnl = summary.get(
+    gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
+    gross_loss = safe_float(summary.get("gross_loss_pct", 0.0))
+    net_pnl = safe_float(summary.get(
         "realized_leveraged_pnl_pct",
         summary.get("realized_pnl_pct", 0.0)
-    )
-    raw_pnl = summary.get("realized_raw_pnl_pct", 0.0)
+    ))
+    raw_pnl = safe_float(summary.get("realized_raw_pnl_pct", 0.0))
 
-    avg_win = summary.get("avg_win_pct", 0.0)
-    avg_loss = summary.get("avg_loss_pct", 0.0)
-    best = summary.get("best_trade_pct", 0.0)
-    worst = summary.get("worst_trade_pct", 0.0)
+    avg_win = safe_float(summary.get("avg_win_pct", 0.0))
+    avg_loss = safe_float(summary.get("avg_loss_pct", 0.0))
+    best = safe_float(summary.get("best_trade_pct", 0.0))
+    worst = safe_float(summary.get("worst_trade_pct", 0.0))
     risk_status = summary.get("risk_status", "normal")
+
+    tp1_hits = safe_int(summary.get("tp1_hits", 0))
+    tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
+    tp1_only = safe_int(summary.get("tp1_only", summary.get("tp1_wins", 0)))
+    full_wins = safe_int(summary.get("tp2_wins", tp2_hits))
+    tp1_rate = safe_float(summary.get("tp1_rate", 0))
+    tp2_rate = safe_float(summary.get("tp2_rate", 0))
+    tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
 
     plan = get_report_sizing_plan(side)
     leverage = plan["leverage"]
@@ -1424,9 +1801,16 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• حد إيقاف/تحذير الخسارة: -{REPORT_DAILY_MAX_DRAWDOWN_PCT:.0f}% من إجمالي المحفظة",
         f"• الحالة: {status_text}",
     ]
-
     if side == "long":
         risk_lines.insert(0, f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%")
+
+    performance_block = (
+        f"\n\n🎯 <b>أداء الأهداف:</b>\n"
+        f"• TP1 Hits: {tp1_hits} | TP2 Hits: {tp2_hits}\n"
+        f"• TP1 Only: {tp1_only} | Full Wins TP2: {full_wins}\n"
+        f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
+        f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%"
+    )
 
     financial_block = (
         f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
@@ -1449,15 +1833,16 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     return (
         f"📊 {title}\n"
-        f"Signals: {summary['signals']}\n"
+        f"Signals: {summary.get('signals', 0)}\n"
         f"Closed: {decided}\n"
-        f"Wins (TP1+): {summary['wins']}\n"
-        f"• Full Wins (TP2): {summary.get('tp2_wins', 0)}\n"
-        f"• TP1 Only: {summary.get('tp1_wins', 0)}\n"
-        f"Losses: {summary['losses']}\n"
-        f"Expired: {summary['expired']}\n"
-        f"Open: {summary['open']}\n"
-        f"Win rate: {summary['winrate']}%"
+        f"Wins (TP1+): {wins}\n"
+        f"• Full Wins (TP2): {full_wins}\n"
+        f"• TP1 Only: {tp1_only}\n"
+        f"Losses: {losses}\n"
+        f"Expired: {expired}\n"
+        f"Open: {summary.get('open', 0)}\n"
+        f"Win rate: {summary.get('winrate', 0)}%"
+        + performance_block
         + financial_block
     )
 
@@ -1506,34 +1891,28 @@ def estimate_pct_to_usd(pct_value: float, side: str = "long") -> float:
 
 
 def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct: float = None) -> tuple:
+    """
+    حساب تأثير المحفظة باستخدام مارجن الصفقة الواحدة.
+    تُرجع (نسبة المحفظة %, القيمة بالدولار).
+    """
     side = normalize_side(side)
 
     realized_pct_sum = safe_float(
-        summary.get(
-            "realized_leveraged_pnl_pct",
-            summary.get("realized_pnl_pct", 0.0)
-        ),
+        summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0)),
         0.0,
     )
 
     if side == "short":
-        wallet_pnl_usd = SHORT_REPORT_MARGIN_PER_TRADE_USD * (realized_pct_sum / 100.0)
-        wallet_pnl_pct = (
-            (wallet_pnl_usd / REPORT_ACCOUNT_BALANCE_USD) * 100.0
-            if REPORT_ACCOUNT_BALANCE_USD > 0
-            else 0.0
-        )
-        return wallet_pnl_pct, wallet_pnl_usd
+        margin_per_trade = SHORT_REPORT_MARGIN_PER_TRADE_USD
+    else:
+        plan = get_report_sizing_plan("long")
+        margin_per_trade = plan["margin_per_trade_usd"]
 
-    if max_capital_usage_pct is None:
-        max_capital_usage_pct = REPORT_MAX_CAPITAL_USAGE_PCT
-
-    active_slots = max(1, int(REPORT_ACTIVE_TRADE_SLOTS))
-    account_balance = float(REPORT_ACCOUNT_BALANCE_USD)
-    capital_used_usd = account_balance * (float(max_capital_usage_pct) / 100.0)
-    per_trade_usd = capital_used_usd / active_slots
-
-    wallet_pnl_usd = per_trade_usd * (realized_pct_sum / 100.0)
-    wallet_pnl_pct = (wallet_pnl_usd / account_balance) * 100.0 if account_balance > 0 else 0.0
+    wallet_pnl_usd = margin_per_trade * (realized_pct_sum / 100.0)
+    wallet_pnl_pct = (
+        (wallet_pnl_usd / REPORT_ACCOUNT_BALANCE_USD) * 100.0
+        if REPORT_ACCOUNT_BALANCE_USD > 0
+        else 0.0
+    )
 
     return wallet_pnl_pct, wallet_pnl_usd
