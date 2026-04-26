@@ -7,6 +7,7 @@ import logging
 import threading
 import requests
 import pandas as pd
+import numpy as np
 import redis
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -659,7 +660,6 @@ def reset_stats(chat_id: str):
                 pass
         reset_ts = int(time.time())
         r.set(STATS_RESET_TS_KEY, str(reset_ts))
-        # لا ندعي حفظ trade history منفصل
         send_telegram_reply(
             chat_id,
             f"🧹 تم تصفير إحصائيات الشورت الحالية بنجاح\n"
@@ -739,7 +739,6 @@ COMMAND_HANDLERS = {
 # SMART PRICE FORMATTERS
 # ================================================
 def fmt_price(value: float) -> str:
-    """Format a price dynamically based on its magnitude, avoiding excessive zeros."""
     try:
         value = float(value)
         if value == 0:
@@ -756,10 +755,6 @@ def fmt_price(value: float) -> str:
 
 
 def round_price(value: float) -> float:
-    """
-    Smart numeric rounding for small-price coins.
-    Prevents SATS/PEPE/SHIB-like prices from becoming 0.000000.
-    """
     try:
         value = float(value)
         if value <= 0:
@@ -778,7 +773,31 @@ def round_price(value: float) -> float:
 
 
 # ================================================
-# ALERT TRACKING (Enhanced with anti-spam, trade status, leverage, TV link)
+# SAFE SIGNAL ROW
+# ================================================
+def get_signal_row(df):
+    if df is None or df.empty:
+        return None
+    try:
+        if len(df) == 1:
+            return df.iloc[-1]
+        if "confirm" in df.columns:
+            confirm_value = df.iloc[-1].get("confirm", 0)
+            try:
+                is_confirmed = int(float(confirm_value)) == 1
+            except Exception:
+                is_confirmed = False
+            return df.iloc[-1] if is_confirmed else df.iloc[-2]
+        return df.iloc[-2]
+    except Exception:
+        try:
+            return df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        except Exception:
+            return None
+
+
+# ================================================
+# ALERT TRACKING (Enhanced)
 # ================================================
 def build_alert_id(symbol: str, candle_time: int) -> str:
     return f"{clean_symbol_for_message(symbol)}:{int(candle_time)}"
@@ -896,23 +915,24 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
 
 def format_official_trade_status(trade: dict) -> str:
     if not trade:
-        return "غير مسجل"
+        return "⚪ غير مسجل"
     status = str(trade.get("status", "open")).lower()
     result = str(trade.get("result", "")).lower()
     tp1_hit = bool(trade.get("tp1_hit", False))
-    if status == "partial" or tp1_hit:
-        return "✅ TP1 Hit / Partial"
-    if result == "tp1_win":
-        return "✅ TP1 Win"
-    if result == "tp2_win":
-        return "🎯 TP2 Win"
-    if result == "loss":
-        return "❌ SL Hit"
-    if result == "expired":
-        return "⏳ Expired"
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    if result in ("tp2_win", "full_win", "closed_win") or tp2_hit:
+        return "🎯 TP2 Hit | ربح كامل"
+    if result in ("tp1_win", "partial_win") or status == "partial" or tp1_hit:
+        return "✅ TP1 Hit | ربح جزئي"
+    if result in ("safe", "closed_safe") or status in ("safe", "closed_safe"):
+        return "🛡️ Safe Exit | خروج آمن"
+    if result in ("loss", "sl_hit") or status in ("loss", "closed_loss"):
+        return "❌ SL Hit | خسارة"
+    if result == "expired" or status == "expired":
+        return "⏳ Expired | انتهت المدة"
     if status == "open":
-        return "📘 Open"
-    return "Open"
+        return "⌛ Open"
+    return "⌛ Open"
 
 
 def build_track_tradingview_link(symbol: str) -> str:
@@ -922,43 +942,40 @@ def build_track_tradingview_link(symbol: str) -> str:
 
 def build_track_message(alert: dict) -> str:
     try:
-        symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
+        symbol_raw = alert.get("symbol", "")
+        symbol = clean_symbol_for_message(symbol_raw)
         official_trade = load_registered_trade_for_alert(alert)
 
-        entry = float(alert.get("entry", 0) or 0)
+        signal_entry = float(alert.get("entry", 0) or 0)
+        effective_entry = signal_entry
         sl = float(alert.get("sl", 0) or 0)
         tp1 = float(alert.get("tp1", 0) or 0)
         tp2 = float(alert.get("tp2", 0) or 0)
 
-        # fallback if alert snapshot is old or stored with zeros
         if official_trade and isinstance(official_trade, dict):
-            if entry <= 0:
-                entry = float(official_trade.get("entry", 0) or 0)
-            if sl <= 0:
-                sl = float(official_trade.get("sl", 0) or 0)
-            if tp1 <= 0:
-                tp1 = float(official_trade.get("tp1", 0) or 0)
-            if tp2 <= 0:
-                tp2 = float(official_trade.get("tp2", 0) or 0)
+            effective_entry = float(official_trade.get("entry", signal_entry) or signal_entry)
+            sl = float(official_trade.get("sl", sl) or sl)
+            tp1 = float(official_trade.get("tp1", tp1) or tp1)
+            tp2 = float(official_trade.get("tp2", tp2) or tp2)
 
-        candle_time = int(float(alert.get("candle_time", 0)))
-        created_ts = int(float(alert.get("created_ts", candle_time)))
-        current_price = get_last_price(alert.get("symbol", ""))
+        timeframe = str(alert.get("timeframe", "15m"))
+        candle_time = int(float(alert.get("candle_time", 0) or 0))
+        created_ts = int(float(alert.get("created_ts", candle_time) or candle_time))
+        current_price = get_last_price(symbol_raw)
 
         favorable_pct, adverse_pct = get_max_move_since_alert(
-            symbol=alert.get("symbol", ""),
+            symbol=symbol_raw,
             since_ts=candle_time,
-            entry=entry,
+            entry=effective_entry,
             side="short",
         )
         duration_seconds = max(0, int(time.time()) - created_ts)
         duration_h = duration_seconds // 3600
         duration_m = (duration_seconds % 3600) // 60
 
-        # Current move (short benefits from price drop)
         current_move = 0.0
-        if entry > 0 and current_price > 0:
-            current_move = round(((entry - current_price) / entry) * 100, 2)
+        if effective_entry > 0 and current_price > 0:
+            current_move = round(((effective_entry - current_price) / effective_entry) * 100, 2)
 
         leveraged_move = round(current_move * TRACK_LEVERAGE, 2)
         leveraged_fav = round(favorable_pct * TRACK_LEVERAGE, 2)
@@ -966,39 +983,44 @@ def build_track_message(alert: dict) -> str:
 
         official_status = format_official_trade_status(official_trade)
 
-        # Effective entry from diagnostics if exists
-        effective_entry = entry
-        if official_trade and isinstance(official_trade, dict):
-            diag = official_trade.get("diagnostics", {})
-            if isinstance(diag, dict) and "effective_entry" in diag:
-                effective_entry = float(diag["effective_entry"])
+        if current_price > 0 and effective_entry > 0:
+            if current_price <= tp2:
+                live_status = "🟢 رابحة الآن"
+            elif current_price <= tp1:
+                live_status = "🟢 رابحة الآن"
+            elif current_price >= sl:
+                live_status = "🔴 خاسرة الآن"
+            elif current_price < effective_entry:
+                live_status = "🟢 رابحة الآن"
+            elif current_price > effective_entry:
+                live_status = "🔴 عكس الاتجاه الآن"
+            else:
+                live_status = "🟡 محايدة"
+        else:
+            live_status = "🟡 قيد المتابعة"
 
-        tv_link = build_track_tradingview_link(alert.get("symbol", ""))
-        reverse_note = ""
-        if alert.get("is_reverse"):
-            reverse_note = "\n♻️ Overextended Reversal Type"
+        tv_link = build_track_tradingview_link(symbol_raw)
 
         msg = (
-            f"📌 <b>Alert Track (Short)</b>\n\n"
+            f"📌 <b>Alert Track</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
             f"النوع: Short\n"
-            f"الفريم: {TIMEFRAME}\n"
-            f"Signal Entry: {fmt_price(entry)}\n"
-        )
-        if effective_entry != entry:
-            msg += f"Effective Entry: {fmt_price(effective_entry)}\n"
-        msg += (
+            f"الفريم: {html.escape(timeframe)}\n\n"
+            f"Signal Entry: {fmt_price(signal_entry)}\n"
+            f"📩 Effective Entry: {fmt_price(effective_entry)}\n"
             f"SL: {fmt_price(sl)}\n"
             f"TP1: {fmt_price(tp1)}\n"
-            f"TP2: {fmt_price(tp2)}{reverse_note}\n\n"
-            f"<b>الحالة الرسمية:</b> {html.escape(official_status)}\n"
+            f"TP2: {fmt_price(tp2)}\n\n"
+            f"الحالة: {html.escape(live_status)}\n"
+            f"⌛ نسخة التتبع: Open\n"
+            f"⌛ الحالة الرسمية: {html.escape(official_status)}\n"
             f"السعر الحالي: {fmt_price(current_price)}\n"
             f"الرافعة التقديرية: {TRACK_LEVERAGE:.0f}x\n"
-            f"الحركة الحالية: {current_move:+.2f}% ({leveraged_move:+.2f}%)\n"
-            f"أقصى هبوط لصالح الصفقة: +{favorable_pct:.2f}% (+{leveraged_fav:.2f}%)\n"
-            f"أقصى صعود ضد الصفقة: +{adverse_pct:.2f}% (+{leveraged_adv:.2f}%)\n"
+            f"الحركة الحالية: {current_move:+.2f}% | بعد الرافعة: {leveraged_move:+.2f}%\n"
+            f"أقصى هبوط لصالح الصفقة: {favorable_pct:+.2f}% | بعد الرافعة: {leveraged_fav:+.2f}%\n"
+            f"أقصى صعود ضدك: {adverse_pct:+.2f}% | بعد الرافعة: {leveraged_adv:+.2f}%\n"
             f"المدة: {duration_h}h {duration_m}m\n\n"
-            f'<a href="{html.escape(tv_link, quote=True)}">📈 عرض على TradingView</a>'
+            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - {html.escape(timeframe)}</a>'
         )
         return msg
     except Exception as e:
@@ -1049,23 +1071,19 @@ def handle_callback_query(callback_query: dict):
 
 
 # ================================================
-# SAFE WRAPPERS for tracking.performance compatibility
+# SAFE WRAPPERS
 # ================================================
 def safe_get_setup_type_stats(redis_client, market_type, side, setup_type, since_ts=None):
-    """Wrapper around get_setup_type_stats that handles different signatures."""
     try:
-        # try full kwargs
         kwargs = dict(redis_client=redis_client, market_type=market_type, side=side,
                       setup_type=setup_type, since_ts=since_ts)
         return get_setup_type_stats(**kwargs)
     except TypeError:
         try:
-            # without since_ts
             kwargs.pop("since_ts", None)
             return get_setup_type_stats(**kwargs)
         except TypeError:
             try:
-                # positional
                 return get_setup_type_stats(redis_client, market_type, side, setup_type)
             except Exception:
                 return {"closed": 0, "winrate": 0.0}
@@ -1074,7 +1092,6 @@ def safe_get_setup_type_stats(redis_client, market_type, side, setup_type, since
 
 
 def safe_register_trade(**kwargs):
-    """Attempt to call register_trade with full kwargs, fall back to minimal if TypeError."""
     try:
         return register_trade(**kwargs)
     except TypeError as e:
@@ -1124,6 +1141,8 @@ def get_setup_family(candidate: dict) -> str:
         return "breakdown"
     if candidate.get("pre_breakdown"):
         return "pre_breakdown"
+    if candidate.get("pullback_short"):
+        return "pullback_short"
     return "continuation"
 
 def get_setup_volume_band(vol_ratio: float) -> str:
@@ -1206,7 +1225,7 @@ def get_breakdown_quality(df, vol_ratio: float) -> str:
 
 
 # ================================================
-# TECHNICAL INDICATORS (VWAP/MACD/RSI)
+# TECHNICAL INDICATORS (ENHANCED)
 # ================================================
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -1224,6 +1243,43 @@ def compute_atr(df, period=14):
     low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+def compute_bollinger_bands(series, period=20, std_mult=2):
+    ma = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    return ma, ma + std * std_mult, ma - std * std_mult
+
+def compute_adx(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean().replace(0, pd.NA)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    di_sum = (plus_di + minus_di).replace(0, pd.NA)
+    dx = 100 * ((plus_di - minus_di).abs() / di_sum)
+    adx = dx.rolling(period).mean()
+    return adx.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+
+def compute_stoch_rsi(df, period=14, smooth_k=3, smooth_d=3):
+    rsi = df["rsi"]
+    min_rsi = rsi.rolling(period).min()
+    max_rsi = rsi.rolling(period).max()
+    denom = (max_rsi - min_rsi).replace(0, pd.NA)
+    stoch_rsi = 100 * (rsi - min_rsi) / denom
+    stoch_rsi = stoch_rsi.fillna(50)
+    stoch_k = stoch_rsi.rolling(smooth_k).mean()
+    stoch_d = stoch_k.rolling(smooth_d).mean()
+    return stoch_k.fillna(50), stoch_d.fillna(50)
 
 def to_dataframe(data):
     if not data:
@@ -1262,29 +1318,33 @@ def to_dataframe(data):
     df["macd_signal"] = macd_signal.astype(float)
     df["macd_hist"] = macd_hist.astype(float)
 
-    # Fill only VWAP/MACD zeros, do NOT fill MA/RSI/ATR
+    # Bollinger Bands, Stoch RSI, ADX
+    df["bb_mid"], df["bb_upper"], df["bb_lower"] = compute_bollinger_bands(df["close"])
+    df["stoch_rsi_k"], df["stoch_rsi_d"] = compute_stoch_rsi(df)
+    df["adx"], df["plus_di"], df["minus_di"] = compute_adx(df)
+
+    # Fill only VWAP/MACD/BB/Stoch/ADX zeros, do NOT fill MA/RSI/ATR
     df["vwap"] = df["vwap"].fillna(0)
     df["macd"] = df["macd"].fillna(0)
     df["macd_signal"] = df["macd_signal"].fillna(0)
     df["macd_hist"] = df["macd_hist"].fillna(0)
+    df["bb_mid"] = df["bb_mid"].fillna(0)
+    df["bb_upper"] = df["bb_upper"].fillna(0)
+    df["bb_lower"] = df["bb_lower"].fillna(0)
+    df["stoch_rsi_k"] = df["stoch_rsi_k"].fillna(50)
+    df["stoch_rsi_d"] = df["stoch_rsi_d"].fillna(50)
+    df["adx"] = df["adx"].fillna(0)
+    df["plus_di"] = df["plus_di"].fillna(0)
+    df["minus_di"] = df["minus_di"].fillna(0)
 
     return df
 
 
-def get_signal_row(df):
-    try:
-        if "confirm" not in df.columns or len(df) < 2:
-            return df.iloc[-2]
-        last = df.iloc[-1]
-        if str(int(float(last["confirm"]))) == "1":
-            return last
-        return df.iloc[-2]
-    except Exception:
-        return df.iloc[-2]
-
 def get_signal_candle_time(df):
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return int(time.time() // (15 * 60))
         ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
             return ts // 1000
@@ -1295,6 +1355,8 @@ def get_signal_candle_time(df):
 def get_vwap_distance_percent(df) -> float:
     try:
         row = get_signal_row(df)
+        if row is None:
+            return 0.0
         close = float(row.get("close", 0))
         vwap = float(row.get("vwap", 0))
         if vwap <= 0:
@@ -1335,6 +1397,8 @@ def get_distance_from_ma_percent(df) -> float:
     """Short distance: positive means price below MA (favourable)."""
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
         ma = float(signal_row.get("ma", 0))
         close = float(signal_row["close"])
         if ma <= 0:
@@ -1347,6 +1411,8 @@ def get_distance_above_ma_percent(df) -> float:
     """Positive means price above MA (used for overbought reversal)."""
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
         ma = float(signal_row.get("ma", 0))
         close = float(signal_row["close"])
         if ma <= 0:
@@ -1358,6 +1424,8 @@ def get_distance_above_ma_percent(df) -> float:
 def get_volume_ratio(df) -> float:
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 1.0
         idx = signal_row.name
         if idx is None or idx < 1:
             return 1.0
@@ -1373,6 +1441,8 @@ def get_volume_ratio(df) -> float:
 def get_candle_strength_ratio(df) -> float:
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
         high = float(signal_row["high"])
         low = float(signal_row["low"])
         open_ = float(signal_row["open"])
@@ -1385,6 +1455,53 @@ def get_candle_strength_ratio(df) -> float:
     except Exception:
         return 0.0
 
+def get_candle_anatomy(df) -> Dict[str, float]:
+    """Returns candle structure ratios."""
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return {"body_ratio": 0, "upper_wick_ratio": 0, "lower_wick_ratio": 0, "close_position": 0}
+        high = float(signal_row["high"])
+        low = float(signal_row["low"])
+        open_ = float(signal_row["open"])
+        close = float(signal_row["close"])
+        full = high - low
+        if full <= 0:
+            return {"body_ratio": 0, "upper_wick_ratio": 0, "lower_wick_ratio": 0, "close_position": 0}
+        body = abs(close - open_)
+        upper_wick = high - max(open_, close)
+        lower_wick = min(open_, close) - low
+        close_position = (close - low) / full
+        return {
+            "body_ratio": round(body / full, 4),
+            "upper_wick_ratio": round(upper_wick / full, 4),
+            "lower_wick_ratio": round(lower_wick / full, 4),
+            "close_position": round(close_position, 4),
+        }
+    except Exception:
+        return {"body_ratio": 0, "upper_wick_ratio": 0, "lower_wick_ratio": 0, "close_position": 0}
+
+def get_bb_position(df) -> str:
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return "unknown"
+        close = float(signal_row["close"])
+        bb_upper = float(signal_row.get("bb_upper", 0))
+        bb_lower = float(signal_row.get("bb_lower", 0))
+        bb_mid = float(signal_row.get("bb_mid", 0))
+        if close <= bb_lower:
+            return "below_lower"
+        elif close <= bb_mid:
+            return "below_mid"
+        elif close >= bb_upper:
+            return "above_upper"
+        elif bb_mid > 0 and bb_upper > bb_mid:
+            return "inside"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
 def is_higher_timeframe_confirmed(symbol: str) -> bool:
     try:
         candles = get_candles(symbol, HTF_TIMEFRAME, 100)
@@ -1392,6 +1509,8 @@ def is_higher_timeframe_confirmed(symbol: str) -> bool:
         if df is None or df.empty or len(df) < 10:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 3:
             return False
@@ -1407,7 +1526,7 @@ def is_higher_timeframe_confirmed(symbol: str) -> bool:
 
 
 # ================================================
-# OKX DATA
+# OKX DATA (unchanged)
 # ================================================
 def get_candle_cache_key(symbol: str, timeframe: str, limit: int) -> str:
     return f"candles:short:{symbol}:{timeframe}:{limit}"
@@ -1541,6 +1660,8 @@ def get_btc_mode():
         if df is None or df.empty:
             return "🟡 محايد"
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return "🟡 محايد"
         ma_value = signal_row.get("ma", None)
         rsi_value = float(signal_row.get("rsi", 50))
         if ma_value is not None:
@@ -1622,6 +1743,8 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
             continue
         try:
             signal_row = get_signal_row(df)
+            if signal_row is None:
+                continue
             close = float(signal_row["close"])
             ma = float(signal_row.get("ma", 0))
             rsi = float(signal_row.get("rsi", 50))
@@ -1671,10 +1794,12 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
 
 def is_valid_candle_timing(df) -> bool:
     try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         now = int(time.time())
         candle_seconds = 15 * 60
         last_completed_ts = (now // candle_seconds) * candle_seconds
-        signal_row = get_signal_row(df)
         ts = int(signal_row["ts"])
         if ts > 10_000_000_000:
             ts = ts // 1000
@@ -1689,6 +1814,8 @@ def is_pre_breakdown(df, lookback=PRE_BREAKDOWN_LOOKBACK) -> bool:
         if df is None or df.empty or len(df) < min_len:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < max(lookback, PRE_BREAKDOWN_BASELINE_VOL_BARS + PRE_BREAKDOWN_RECENT_VOL_BARS):
             return False
@@ -1735,6 +1862,8 @@ def early_bearish_signal(df):
         if df is None or df.empty or len(df) < 25:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 2:
             return False
@@ -1765,6 +1894,8 @@ def is_losing_intraday_strength(df) -> bool:
         if df is None or df.empty or len(df) < 5:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 2:
             return False
@@ -1787,10 +1918,11 @@ def is_overextended_on_4h(symbol: str, change_24h: float) -> bool:
         if df is None or df.empty or len(df) < 30:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 3:
             return False
-        # Use distance ABOVE MA for overbought detection
         dist_ma_4h = get_distance_above_ma_percent(df)
         rsi_4h = float(signal_row.get("rsi", 50))
         last_3 = df.iloc[idx - 3:idx + 1]
@@ -1818,6 +1950,8 @@ def is_1h_reversal_weakening(symbol: str) -> bool:
         if df is None or df.empty or len(df) < 20:
             return False
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 2:
             return False
@@ -1850,6 +1984,8 @@ def is_15m_reverse_trigger(df, early_signal: bool, breakdown: bool, pre_breakdow
         if breakdown or pre_breakdown or early_signal:
             return True
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
         idx = signal_row.name
         if idx is None or idx < 1:
             return False
@@ -1897,7 +2033,106 @@ def is_overextended_reversal_short(
 
 
 # ================================================
-# SCORING HELPERS
+# PULLBACK SHORT LOGIC (FIXED)
+# ================================================
+def is_pullback_short(df, vol_ratio, mtf_confirmed):
+    """
+    Detect a pullback short: price under MA, pullback near MA/VWAP,
+    bearish candle, RSI rejection under 55, ADX >= 18, minus_di > plus_di,
+    volume ratio >= 1.08.
+    Returns True if at least 5 conditions satisfied.
+    """
+    try:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
+        idx = signal_row.name
+        if idx is None or idx < 2:
+            return False
+        ma = float(signal_row.get("ma", 0))
+        close = float(signal_row["close"])
+        vwap = float(signal_row.get("vwap", 0))
+        rsi = float(signal_row.get("rsi", 50))
+        adx = float(signal_row.get("adx", 0))
+        plus_di = float(signal_row.get("plus_di", 0))
+        minus_di = float(signal_row.get("minus_di", 0))
+
+        conditions = []
+        # 1. price below MA
+        conditions.append(close < ma and ma > 0)
+        # 2. price near MA or VWAP (within 2% above or 1% below)
+        near_ma = ma > 0 and abs(close - ma) / ma <= 0.02
+        near_vwap = vwap > 0 and abs(close - vwap) / vwap <= 0.02
+        conditions.append(near_ma or near_vwap)
+        # 3. bearish candle
+        conditions.append(close < float(signal_row["open"]))
+        # 4. RSI < 55
+        conditions.append(rsi < 55)
+        # 5. ADX >= 18
+        conditions.append(adx >= 18)
+        # 6. minus_di > plus_di
+        conditions.append(minus_di > plus_di)
+        # 7. volume ratio >= 1.08
+        conditions.append(vol_ratio >= 1.08)
+        # 8. mtf_confirmed as bonus (not mandatory)
+        if mtf_confirmed:
+            conditions.append(True)
+
+        satisfied = sum(conditions)
+        return satisfied >= 5
+    except Exception:
+        return False
+
+
+# ================================================
+# LATE SHORT AFTER DROP FILTER (ADJUSTED)
+# ================================================
+def is_late_short_after_drop(
+    dist_ma: float,
+    rsi_now: float,
+    rsi_slope: float,
+    vol_ratio: float,
+    candle_strength: float,
+    lower_wick_ratio: float,
+    bb_position: str,
+    is_reverse: bool,
+    breakdown_quality: str,
+    pre_breakdown: bool,
+) -> Dict[str, Any]:
+    """Reject short if it looks like entering after a large drop, 
+    with stricter threshold for strong breakdowns."""
+    if is_reverse or pre_breakdown:
+        return {"reject": False, "reasons": [], "checks": 0}
+    checks = 0
+    reasons = []
+    if dist_ma >= 3.5:
+        checks += 1
+        reasons.append("far_below_ma")
+    if rsi_now <= 35:
+        checks += 1
+        reasons.append("rsi_oversold")
+    if rsi_slope >= 0:
+        checks += 1
+        reasons.append("rsi_recovering")
+    if vol_ratio >= 1.6:
+        checks += 1
+        reasons.append("high_volume_spike")
+    if candle_strength >= 0.58:
+        checks += 1
+        reasons.append("big_red_candle")
+    if lower_wick_ratio >= 0.32:
+        checks += 1
+        reasons.append("long_lower_wick")
+    if bb_position == "below_lower":
+        checks += 1
+        reasons.append("below_lower_band")
+    reject_level = 6 if breakdown_quality == "strong" else 5
+    reject = checks >= reject_level
+    return {"reject": reject, "reasons": reasons, "checks": checks}
+
+
+# ================================================
+# SCORING HELPERS (ENHANCED)
 # ================================================
 def classify_early_priority_short(
     early_signal: bool, breakdown: bool, pre_breakdown: bool, dist_ma: float,
@@ -1973,6 +2208,8 @@ def get_early_priority_momentum_bonus(priority: str) -> float:
 def calculate_stop_loss_short(df, entry, signal_type="standard"):
     try:
         signal_row = get_signal_row(df)
+        if signal_row is None:
+            return round_price(entry)
         idx = signal_row.name
         atr_value = float(signal_row.get("atr", 0))
         recent_high = float(df["high"].iloc[max(0, idx - 4):idx + 1].max())
@@ -1985,6 +2222,8 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
             atr_mult = 2.10
         elif signal_type == "reverse":
             atr_mult = 1.90
+        elif signal_type == "pullback_short":
+            atr_mult = 1.45
         else:
             atr_mult = 1.55
 
@@ -1999,6 +2238,7 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
             "pre_breakdown": 1.6,
             "new_listing": 2.0,
             "reverse": 1.6,
+            "pullback_short": 1.2,
         }.get(signal_type, 1.3)
 
         current_pct = ((stop_loss - float(entry)) / float(entry)) * 100
@@ -2024,6 +2264,8 @@ def get_rr_targets(signal_type="standard", entry_timing=""):
         return 1.9, 3.2
     if signal_type == "reverse":
         return 1.5, 2.5
+    if signal_type == "pullback_short":
+        return 1.5, 2.5
     if "🔴 متأخر" in entry_timing:
         return 1.7, 2.8
     return 1.4, 2.4
@@ -2033,11 +2275,14 @@ def build_tradingview_link(symbol):
     return f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P"
 
 def classify_opportunity_type_short(
-    breakdown: bool, pre_breakdown: bool, dist_ma: float, mtf_confirmed: bool, is_reverse: bool = False,
+    breakdown: bool, pre_breakdown: bool, dist_ma: float, mtf_confirmed: bool,
+    is_reverse: bool = False, pullback_short: bool = False,
 ) -> str:
     try:
         if is_reverse:
             return "Overextended Reversal"
+        if pullback_short:
+            return "Pullback Short"
         if pre_breakdown and not breakdown:
             return "Pre-Breakdown"
         if breakdown:
@@ -2214,6 +2459,15 @@ def normalize_reason(reason: str) -> str:
         "rsi_oversold": "RSI منخفض / تشبع بيعي",
         "volume_spike": "فوليوم انفجاري بعد الهبوط",
         "big_red_candle": "شمعة هبوط كبيرة قد تكون متأخرة",
+        "late_short_after_drop": "دخول متأخر بعد الهبوط",
+        "pullback_short": "Pullback Short",
+        "below_lower_band": "تحت الحد السفلي لبولينجر",
+        "oversold_rsi": "تشبع بيعي RSI",
+        "long_lower_wick": "فتيل سفلي طويل",
+        "weak_adx_breakdown": "ADX ضعيف رغم الكسر",
+        "minus_di_weak": "minus_di ضعيف",
+        "high_volume_spike": "فوليوم عالي بعد الهبوط",
+        "ADX strong": "ADX قوي داعم للشورت",
     }
     return mapping.get(reason, reason)
 
@@ -2255,6 +2509,15 @@ def sort_reasons(reasons):
         "MACD إيجابي ضد الشورت": 113,
         "نوع إشارة ضعيف تاريخيًا": 114,
         "السوق صاعد بقوة ضد الشورت": 115,
+        "دخول متأخر بعد الهبوط": 116,
+        "Pullback Short": 20,
+        "تحت الحد السفلي لبولينجر": 117,
+        "تشبع بيعي RSI": 118,
+        "فتيل سفلي طويل": 119,
+        "ADX ضعيف رغم الكسر": 120,
+        "minus_di ضعيف": 121,
+        "فوليوم عالي بعد الهبوط": 122,
+        "ADX قوي داعم للشورت": 21,
     }
     return sorted(reasons, key=lambda x: priority.get(x, 999))
 
@@ -2276,6 +2539,13 @@ def classify_reasons(reasons):
         "MACD إيجابي ضد الشورت",
         "نوع إشارة ضعيف تاريخيًا",
         "السوق صاعد بقوة ضد الشورت",
+        "دخول متأخر بعد الهبوط",
+        "تحت الحد السفلي لبولينجر",
+        "تشبع بيعي RSI",
+        "فتيل سفلي طويل",
+        "ADX ضعيف رغم الكسر",
+        "minus_di ضعيف",
+        "فوليوم عالي بعد الهبوط",
     ]
     normalized = [normalize_reason(r) for r in reasons]
     bearish = []
@@ -2304,6 +2574,8 @@ def format_bearish_reasons(bearish):
         "فوليوم",
         "شمعة",
         "RSI",
+        "Pullback Short",
+        "ADX قوي داعم للشورت"
     ]
     highlighted = []
     used = set()
@@ -2443,7 +2715,6 @@ def get_bull_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -> 
         block = False
         reason_parts = []
 
-        # New stricter conditions
         cond1 = green_ratio >= BULL_GUARD_GREEN_RATIO_BLOCK and avg_change >= BULL_GUARD_AVG_CHANGE_15M_BLOCK
         cond2 = btc_change >= BULL_GUARD_BTC_CHANGE_15M_BLOCK and green_ratio >= 0.62 and avg_change >= 0.35
         cond3 = (BULL_GUARD_ALT_STRONG_BLOCK and alt_mode == "🟢 قوي"
@@ -2517,7 +2788,6 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                 pass
         return {"mode": MODE_BLOCK_SHORTS, "reason": bull_guard.get("reason", "bull guard block")}
 
-    # exit BLOCK to STRONG (unchanged logic)
     if current_mode == MODE_BLOCK_SHORTS:
         no_longer_danger = green_ratio < 0.62 and avg_change < 0.75 and btc_change < 0.45
         if no_longer_danger:
@@ -2545,7 +2815,6 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                     pass
             return {"mode": MODE_BLOCK_SHORTS, "reason": "still in bull run"}
 
-    # STRONG -> NORMAL (unchanged)
     if current_mode == MODE_STRONG_SHORT_ONLY:
         normal_ready = green_ratio < 0.54 and avg_change < 0.45 and btc_change < 0.25
         if normal_ready:
@@ -2574,11 +2843,10 @@ def determine_short_market_mode(bull_guard: dict, current_mode: str, market_stat
                     pass
             return {"mode": MODE_STRONG_SHORT_ONLY, "reason": "conditions not met for normal"}
 
-    # NORMAL -> STRONG if weak but not block (stricter)
     weak_market = (
         market_state in ("mixed", "btc_leading")
-        or (0.58 <= green_ratio < 0.72)       # raised from 0.52-0.68
-        or (avg_change > 0.50)                # raised from >0.30
+        or (0.58 <= green_ratio < 0.72)
+        or (avg_change > 0.50)
         or (btc_mode in ("🟢 صاعد", "🟡 محايد") and alt_mode == "🟢 قوي")
     )
     if weak_market and time_since_last_transition >= MODE_TRANSITION_MIN_INTERVAL:
@@ -2664,6 +2932,11 @@ def build_message_new(
     breakdown_quality="none",
     bull_guard_active=False,
     bull_guard_level="",
+    pullback_short=False,
+    bb_position="inside",
+    lower_wick_ratio=0.0,
+    stoch_rsi_k=50.0,
+    rsi_now=50.0,
 ):
     symbol_clean = clean_symbol_for_message(symbol)
     bearish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -2675,6 +2948,8 @@ def build_message_new(
         reverse_reason = "♻️ 4H Overextended + 1H Weakening + 15m Trigger"
         if reverse_reason not in bearish:
             bearish = [reverse_reason] + bearish
+    if pullback_short and "Pullback Short" not in bearish:
+        bearish.insert(0, "Pullback Short")
     bearish_text = format_bearish_reasons(bearish) if bearish else "• زخم هابط"
     warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
     sl_pct = calculate_sl_percent(price, stop_loss)
@@ -2695,6 +2970,14 @@ def build_message_new(
     header_block = hybrid_label + "\n\n" if hybrid_label else ""
     if reverse_banner:
         header_block += reverse_banner + "\n\n"
+    # Extra short note
+    extra_note = ""
+    if bb_position == "below_lower":
+        extra_note += "\n⚠️ السعر تحت Bollinger Lower"
+    if lower_wick_ratio >= 0.32:
+        extra_note += "\n⚠️ فتيل سفلي طويل"
+    if rsi_now <= 35 and stoch_rsi_k <= 15:
+        extra_note += "\n⚠️ RSI / Stoch تشبع بيعي"
     return f"""{header_block}🔴 <b>شورت فيوتشر | {html.escape(symbol_clean)}</b>
 
 💰 السعر: {fmt_price(price)} | ⏱ الفريم: 15m
@@ -2709,7 +2992,7 @@ def build_message_new(
 🧩 جودة الكسر: {bq_label}
 
 🌍 السوق: {safe_market}
-💸 التمويل: {html.escape(funding_text)}{new_tag}
+💸 التمويل: {html.escape(funding_text)}{new_tag}{extra_note}
 
 📊 <b>أسباب الدخول:</b>
 {bearish_text}{warnings_block}{news_block}
@@ -2739,12 +3022,15 @@ def get_momentum_priority(
     early_priority: str = "none",
     is_reverse: bool = False,
     soft_trap: bool = False,
+    pullback_short: bool = False,
 ) -> float:
     priority = float(score)
     if breakdown:
         priority += 0.9
     elif pre_breakdown:
         priority += 0.6
+    elif pullback_short:
+        priority += 0.5
     if vol_ratio >= 1.8:
         priority += 0.8
     elif vol_ratio >= 1.35:
@@ -2776,7 +3062,9 @@ def get_candidate_bucket(candidate: dict) -> str:
         return "breakdown"
     if candidate.get("early_priority") == "strong":
         return "early_strong"
-    if candidate["vol_ratio"] >= 1.8:
+    if candidate.get("pullback_short"):
+        return "pullback_short"
+    if candidate.get("vol_ratio") >= 1.8:
         return "volume"
     return "standard"
 
@@ -2824,7 +3112,10 @@ def diversify_candidates(candidates, max_alerts=3):
         )
     diversified = []
     used_patterns = set()
-    for bucket_name in ["reverse", "new_breakdown", "pre_breakdown", "breakdown", "early_strong", "volume", "standard"]:
+    for bucket_name in [
+        "reverse", "new_breakdown", "pre_breakdown", "breakdown",
+        "early_strong", "pullback_short", "volume", "standard"
+    ]:
         if bucket_name not in buckets or not buckets[bucket_name]:
             continue
         candidate = buckets[bucket_name][0]
@@ -2835,6 +3126,7 @@ def diversify_candidates(candidates, max_alerts=3):
             candidate["is_new"],
             candidate.get("early_priority", "none"),
             candidate.get("is_reverse", False),
+            candidate.get("pullback_short", False),
         )
         if pattern not in used_patterns:
             diversified.append(candidate)
@@ -2859,6 +3151,7 @@ def diversify_candidates(candidates, max_alerts=3):
                 candidate["is_new"],
                 candidate.get("early_priority", "none"),
                 candidate.get("is_reverse", False),
+                candidate.get("pullback_short", False),
             )
             if pattern in used_patterns or candidate in diversified:
                 continue
@@ -2881,7 +3174,7 @@ def passes_new_listing_filter(score: float, breakdown: bool, vol_ratio: float, c
 
 
 # ================================================
-# MAIN SCANNER LOOP (with detailed bull guard log)
+# MAIN SCANNER LOOP (ENHANCED)
 # ================================================
 def run_scanner_loop():
     global last_global_send_ts
@@ -2954,10 +3247,9 @@ def run_scanner_loop():
             # 10. determine mode
             mode_result = determine_short_market_mode(bull_guard, current_mode, market_state, btc_mode, alt_snapshot)
 
-            # 11. handle transition (saves to Redis + sends message if changed)
+            # 11. handle transition
             current_mode = handle_market_mode_transition(mode_result)
 
-            # Detailed bull guard log
             logger.info(
                 f"MARKET MODE: {current_mode} | block={bull_guard.get('block_shorts')} | "
                 f"level={bull_guard.get('level')} | green_ratio={bull_guard.get('green_ratio_15m')} | "
@@ -2966,13 +3258,13 @@ def run_scanner_loop():
                 f"mode_reason={mode_result.get('reason')}"
             )
 
-            # 12. BLOCK SHORTS entirely if active (no signals, but commands still work)
+            # 12. BLOCK SHORTS
             if current_mode == MODE_BLOCK_SHORTS:
                 logger.warning("BLOCK SHORTS active – no signals, sleeping 60s")
                 time.sleep(60)
                 continue
 
-            # 13. global cooldown check AFTER market mode is decided
+            # 13. global cooldown check AFTER market mode
             if is_global_cooldown_active() and current_mode in (MODE_NORMAL_SHORT, MODE_STRONG_SHORT_ONLY):
                 logger.info("Global cooldown active – skipping signal sending")
                 time.sleep(60)
@@ -2996,6 +3288,10 @@ def run_scanner_loop():
                 if not is_valid_candle_timing(df):
                     continue
 
+                signal_row = get_signal_row(df)
+                if signal_row is None:
+                    continue
+
                 early_signal = early_bearish_signal(df)
                 pre_breakdown = is_pre_breakdown(df)
                 breakdown = is_breakdown(df)
@@ -3007,24 +3303,38 @@ def run_scanner_loop():
                 candle_strength = get_candle_strength_ratio(df)
                 losing_strength = is_losing_intraday_strength(df)
                 vwap_distance = get_vwap_distance_percent(df)
-                signal_row = get_signal_row(df)
                 rsi_now = float(signal_row.get("rsi", 50))
                 rsi_slope = get_rsi_slope(df)
                 macd_hist = float(signal_row.get("macd_hist", 0))
                 macd_hist_slope = get_macd_hist_slope(df)
                 breakdown_quality = get_breakdown_quality(df, vol_ratio)
 
+                # New indicators
+                candle_anatomy = get_candle_anatomy(df)
+                body_ratio = candle_anatomy["body_ratio"]
+                upper_wick_ratio = candle_anatomy["upper_wick_ratio"]
+                lower_wick_ratio = candle_anatomy["lower_wick_ratio"]
+                close_position = candle_anatomy["close_position"]
+                bb_position = get_bb_position(df)
+                adx = float(signal_row.get("adx", 0))
+                plus_di = float(signal_row.get("plus_di", 0))
+                minus_di = float(signal_row.get("minus_di", 0))
+                stoch_rsi_k = float(signal_row.get("stoch_rsi_k", 50))
+                stoch_rsi_d = float(signal_row.get("stoch_rsi_d", 50))
+
                 is_reverse = is_overextended_reversal_short(
                     symbol=symbol, df=df, change_24h=change_24h, vol_ratio=vol_ratio,
                     early_signal=early_signal, breakdown=breakdown, pre_breakdown=pre_breakdown,
                 )
 
+                pullback_short = is_pullback_short(df, vol_ratio, mtf_confirmed)
+
                 opportunity_type = classify_opportunity_type_short(
                     breakdown=breakdown, pre_breakdown=pre_breakdown,
-                    dist_ma=dist_ma, mtf_confirmed=mtf_confirmed, is_reverse=is_reverse,
+                    dist_ma=dist_ma, mtf_confirmed=mtf_confirmed,
+                    is_reverse=is_reverse, pullback_short=pullback_short,
                 )
 
-                # Calculate early_priority BEFORE any STRONG_SHORT_ONLY filter
                 early_priority = classify_early_priority_short(
                     early_signal=early_signal,
                     breakdown=breakdown,
@@ -3037,18 +3347,44 @@ def run_scanner_loop():
                     market_state=market_state,
                 )
 
-                # STRONG_SHORT_ONLY filtering (now early_priority defined)
+                # NORMAL_SHORT gate: only allow strong setups
+                if current_mode == MODE_NORMAL_SHORT:
+                    if not (breakdown or pre_breakdown or pullback_short or early_priority == "strong" or is_reverse):
+                        logger.info(f"{symbol} → normal mode filtered: no strong setup")
+                        continue
+
+                # STRONG_SHORT_ONLY gate (updated with pullback exception)
                 if current_mode == MODE_STRONG_SHORT_ONLY:
-                    if not (breakdown or pre_breakdown or early_priority == "strong" or is_reverse):
+                    if not (is_reverse or breakdown_quality == "strong" or pre_breakdown or pullback_short):
                         continue
-                    if not mtf_confirmed and not is_reverse:
+                    if adx < 20 and not is_reverse:
+                        logger.info(f"{symbol} → strong mode: weak ADX")
                         continue
-                    if vol_ratio < 1.25:
+                    if minus_di <= plus_di and not is_reverse:
+                        logger.info(f"{symbol} → strong mode: minus_di <= plus_di")
                         continue
                     if breakdown_quality == "weak" and not is_reverse:
                         continue
+                    if not mtf_confirmed and not is_reverse:
+                        # Only allow pullback_short with very strong conditions if MTF not confirmed
+                        if not (pullback_short and adx >= 24 and minus_di > plus_di and vol_ratio >= 1.35):
+                            continue
+                    if vol_ratio < 1.25 and not pullback_short:
+                        continue
 
-                # Exhaustion trap
+                # Late short after drop filter
+                late_filter = is_late_short_after_drop(
+                    dist_ma=dist_ma, rsi_now=rsi_now, rsi_slope=rsi_slope,
+                    vol_ratio=vol_ratio, candle_strength=candle_strength,
+                    lower_wick_ratio=lower_wick_ratio, bb_position=bb_position,
+                    is_reverse=is_reverse, breakdown_quality=breakdown_quality,
+                    pre_breakdown=pre_breakdown,
+                )
+                if late_filter["reject"]:
+                    logger.info(f"{symbol} → late short after drop rejected")
+                    continue
+
+                # Exhaustion trap (remains)
                 trap = is_short_exhaustion_trap(
                     market_state=market_state, opportunity_type=opportunity_type,
                     dist_ma=dist_ma, vwap_distance=vwap_distance, rsi_now=rsi_now,
@@ -3061,7 +3397,7 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → short exhaustion trap rejected")
                     continue
 
-                # VWAP/MACD/RSI slope extra filters
+                # VWAP/MACD/RSI slope extra filters (remains)
                 if not is_reverse and vwap_distance <= -3.0 and not pre_breakdown:
                     if breakdown_quality != "strong":
                         continue
@@ -3094,6 +3430,31 @@ def run_scanner_loop():
 
                 raw_score = float(score_result.get("score", 0))
                 effective_score = raw_score
+
+                # New score adjustments
+                if adx >= 22 and minus_di > plus_di:
+                    effective_score += 0.30
+                    score_result.setdefault("reasons", []).append("ADX strong")
+                if adx < 18 and breakdown:
+                    effective_score -= 0.40
+                    score_result.setdefault("warning_reasons", []).append("weak_adx_breakdown")
+                if stoch_rsi_k <= 15 and rsi_now <= 35 and dist_ma >= 3.2:
+                    effective_score -= 0.50
+                    score_result.setdefault("warning_reasons", []).append("oversold_rsi")
+                if lower_wick_ratio >= 0.32:
+                    effective_score -= 0.50
+                    score_result.setdefault("warning_reasons", []).append("long_lower_wick")
+                if pullback_short:
+                    effective_score += 0.35
+                    score_result.setdefault("reasons", []).append("pullback_short")
+                if close_position is not None and close_position <= 0.35:
+                    effective_score -= 0.15
+                if bb_position == "below_lower" and rsi_now <= 35:
+                    effective_score -= 0.40
+                    score_result.setdefault("warning_reasons", []).append("below_lower_band")
+                if bb_position == "below_mid" and adx >= 20:
+                    effective_score += 0.20
+
                 if score_result.get("fake_signal"):
                     effective_score -= 0.30
                 if trap["soft_trap"]:
@@ -3140,7 +3501,6 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → rejected by effective min score {score_result['score']} < {effective_required_min_score}")
                     continue
 
-                # new listing filter
                 if is_new and not passes_new_listing_filter(
                     score=float(score_result["score"]),
                     breakdown=breakdown,
@@ -3150,11 +3510,11 @@ def run_scanner_loop():
                     logger.info(f"{symbol} → rejected by new listing filter")
                     continue
 
-                # Setup type and stats
                 setup_type = build_setup_type({
                     "is_reverse": is_reverse,
                     "breakdown": breakdown,
                     "pre_breakdown": pre_breakdown,
+                    "pullback_short": pullback_short,
                     "mtf_confirmed": mtf_confirmed,
                     "vol_ratio": vol_ratio,
                     "market_state": market_state,
@@ -3167,7 +3527,6 @@ def run_scanner_loop():
                     since_ts=stats_reset_ts,
                 )
 
-                # Weak Historical Setup Penalty
                 if setup_type in WEAK_SETUP_TYPES and not is_reverse and breakdown_quality != "strong":
                     effective_score -= 0.60
                     score_result["score"] = round(effective_score, 2)
@@ -3176,13 +3535,31 @@ def run_scanner_loop():
                         logger.info(f"{symbol} → rejected by weak historical setup score")
                         continue
 
-                signal_row = get_signal_row(df)
-                price = float(signal_row["close"])
-                sl_type = "reverse" if is_reverse else ("breakdown" if breakdown else ("pre_breakdown" if pre_breakdown else ("new_listing" if is_new else "standard")))
+                signal_row_final = get_signal_row(df)
+                if signal_row_final is None:
+                    continue
+                price = float(signal_row_final["close"])
+                sl_type = "reverse" if is_reverse else (
+                    "breakdown" if breakdown else (
+                        "pre_breakdown" if pre_breakdown else (
+                            "new_listing" if is_new else (
+                                "pullback_short" if pullback_short else "standard"
+                            )
+                        )
+                    )
+                )
                 stop_loss = calculate_stop_loss_short(df, price, signal_type=sl_type)
                 rr1, rr2 = get_rr_targets(signal_type=sl_type)
                 tp1 = calc_tp_short(price, stop_loss, rr=rr1)
                 tp2 = calc_tp_short(price, stop_loss, rr=rr2)
+
+                # Validate levels before building candidate
+                if not (stop_loss > price and tp1 < price and tp2 < tp1):
+                    logger.warning(
+                        f"{symbol} → invalid short levels entry={price} sl={stop_loss} tp1={tp1} tp2={tp2}"
+                    )
+                    continue
+
                 tv_link = build_tradingview_link(symbol)
 
                 display_risk = adjust_risk_with_entry_timing_short(
@@ -3202,8 +3579,10 @@ def run_scanner_loop():
                     early_priority=early_priority,
                     is_reverse=is_reverse,
                     soft_trap=trap["soft_trap"],
+                    pullback_short=pullback_short,
                 )
 
+                # Build candidate data, do not build message yet
                 candidate = {
                     "symbol": symbol,
                     "score": float(score_result["score"]),
@@ -3216,6 +3595,7 @@ def run_scanner_loop():
                     "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
                     "early_priority": early_priority,
                     "is_reverse": is_reverse,
+                    "pullback_short": pullback_short,
                     "setup_type": setup_type,
                     "raw_score": raw_score,
                     "dynamic_threshold": dynamic_threshold,
@@ -3235,25 +3615,37 @@ def run_scanner_loop():
                     "warning_reasons": score_result.get("warning_reasons", []),
                     "rr1": rr1,
                     "rr2": rr2,
-                    "message": build_message_new(
-                        symbol=symbol, price=price, score_result=score_result,
-                        stop_loss=stop_loss, tp1=tp1, tp2=tp2, rr1=rr1, rr2=rr2,
-                        btc_mode=btc_mode, btc_short_bias=btc_short_bias,
-                        tv_link=tv_link, is_new=is_new, change_24h=change_24h,
-                        market_state_label=market_state_label,
-                        market_bias_label=market_bias_label, alt_mode=alt_mode,
-                        news_warning=news_warning_text,
-                        opportunity_type=opportunity_type,
-                        entry_timing=entry_timing,
-                        display_risk=display_risk,
-                        setup_stats=setup_stats,
-                        is_reverse=is_reverse,
-                        breakdown_quality=breakdown_quality,
-                        bull_guard_active=False,  # ALERT does not need guard, already blocked if active
-                        bull_guard_level="",
-                    ),
-                    "reply_markup": build_track_reply_markup(alert_id),
+                    "price": price,
+                    "stop_loss": stop_loss,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tv_link": tv_link,
+                    "display_risk": display_risk,
+                    "setup_stats": setup_stats,
+                    "bb_position": bb_position,
+                    "lower_wick_ratio": lower_wick_ratio,
+                    "upper_wick_ratio": upper_wick_ratio,
+                    "close_position": close_position,
+                    "body_ratio": body_ratio,
+                    "stoch_rsi_k": stoch_rsi_k,
+                    "stoch_rsi_d": stoch_rsi_d,
+                    "adx": adx,
+                    "plus_di": plus_di,
+                    "minus_di": minus_di,
+                    "rsi_now": rsi_now,
+                    "funding_label": score_result.get("funding_label", "🟡 محايد"),
+                    "reasons": score_result.get("reasons", []),
+                    "score_result": score_result,
+                    "mtf_confirmed": mtf_confirmed,
+                    "btc_short_bias": btc_short_bias,
+                    "change_24h": change_24h,
                     "alert_id": alert_id,
+                    "candle_time": get_signal_candle_time(df),
+                    "entry": price,
+                    "sl": stop_loss,
+                    "signal_rating": score_result.get("signal_rating", "⚡ عادي"),
+                    "late_short_trap": late_filter.get("reject", False),
+                    "late_short_reasons": late_filter.get("reasons", []),
                     "alert_snapshot": {
                         "alert_id": alert_id,
                         "symbol": symbol,
@@ -3276,6 +3668,7 @@ def run_scanner_loop():
                         "opportunity_type": opportunity_type,
                         "early_priority": early_priority,
                         "is_reverse": is_reverse,
+                        "pullback_short": pullback_short,
                         "setup_type": setup_type,
                         "breakdown_quality": breakdown_quality,
                         "rsi_now": rsi_now,
@@ -3290,17 +3683,17 @@ def run_scanner_loop():
                         "rsi_slope": rsi_slope,
                         "macd_hist": macd_hist,
                         "macd_hist_slope": macd_hist_slope,
+                        "adx": adx,
+                        "plus_di": plus_di,
+                        "minus_di": minus_di,
+                        "stoch_rsi_k": stoch_rsi_k,
+                        "stoch_rsi_d": stoch_rsi_d,
+                        "bb_position": bb_position,
+                        "lower_wick_ratio": lower_wick_ratio,
+                        "upper_wick_ratio": upper_wick_ratio,
+                        "close_position": close_position,
+                        "body_ratio": body_ratio,
                     },
-                    "candle_time": get_signal_candle_time(df),
-                    "entry": price,
-                    "sl": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "funding_label": score_result.get("funding_label", "🟡 محايد"),
-                    "reasons": score_result.get("reasons", []),
-                    "mtf_confirmed": mtf_confirmed,
-                    "btc_short_bias": btc_short_bias,
-                    "change_24h": change_24h,
                 }
                 candidate["bucket"] = get_candidate_bucket(candidate)
                 candidates.append(candidate)
@@ -3321,9 +3714,43 @@ def run_scanner_loop():
                 if not locked:
                     continue
 
+                # Build message now
+                message = build_message_new(
+                    symbol=symbol,
+                    price=candidate["price"],
+                    score_result=candidate["score_result"],
+                    stop_loss=candidate["stop_loss"],
+                    tp1=candidate["tp1"],
+                    tp2=candidate["tp2"],
+                    rr1=candidate["rr1"],
+                    rr2=candidate["rr2"],
+                    btc_mode=btc_mode,
+                    btc_short_bias=candidate["btc_short_bias"],
+                    tv_link=candidate["tv_link"],
+                    is_new=candidate["is_new"],
+                    change_24h=candidate["change_24h"],
+                    market_state_label=candidate["market_state_label"],
+                    market_bias_label=candidate["market_bias_label"],
+                    alt_mode=candidate["alt_mode"],
+                    news_warning=news_warning_text,
+                    opportunity_type=candidate["opportunity_type"],
+                    entry_timing=candidate["entry_timing"],
+                    display_risk=candidate["display_risk"],
+                    setup_stats=candidate["setup_stats"],
+                    is_reverse=candidate["is_reverse"],
+                    breakdown_quality=candidate["breakdown_quality"],
+                    bull_guard_active=False,
+                    bull_guard_level="",
+                    pullback_short=candidate["pullback_short"],
+                    bb_position=candidate["bb_position"],
+                    lower_wick_ratio=candidate["lower_wick_ratio"],
+                    stoch_rsi_k=candidate["stoch_rsi_k"],
+                    rsi_now=candidate["rsi_now"],
+                )
+
                 sent_data = send_telegram_message(
-                    candidate["message"],
-                    reply_markup=candidate.get("reply_markup"),
+                    message,
+                    reply_markup=build_track_reply_markup(candidate["alert_id"]),
                 )
                 if sent_data.get("ok"):
                     sent_count += 1
@@ -3338,6 +3765,9 @@ def run_scanner_loop():
                         tag = "OVEREXTENDED_REVERSAL_4H_1H_15M"
                         if tag not in trade_reasons:
                             trade_reasons.append(tag)
+                    if candidate.get("pullback_short"):
+                        if "PULLBACK_SHORT" not in trade_reasons:
+                            trade_reasons.append("PULLBACK_SHORT")
 
                     safe_register_trade(
                         redis_client=r,
@@ -3386,6 +3816,19 @@ def run_scanner_loop():
                         warning_reasons=candidate.get("warning_reasons", []),
                         rr1=candidate.get("rr1", 1.4),
                         rr2=candidate.get("rr2", 2.4),
+                        adx=candidate.get("adx", 0),
+                        plus_di=candidate.get("plus_di", 0),
+                        minus_di=candidate.get("minus_di", 0),
+                        stoch_rsi_k=candidate.get("stoch_rsi_k", 50),
+                        stoch_rsi_d=candidate.get("stoch_rsi_d", 50),
+                        bb_position=candidate.get("bb_position", "inside"),
+                        lower_wick_ratio=candidate.get("lower_wick_ratio", 0),
+                        upper_wick_ratio=candidate.get("upper_wick_ratio", 0),
+                        close_position=candidate.get("close_position", 0),
+                        body_ratio=candidate.get("body_ratio", 0),
+                        pullback_short=candidate.get("pullback_short", False),
+                        late_short_trap=candidate.get("late_short_trap", False),
+                        late_short_reasons=candidate.get("late_short_reasons", []),
                     )
                     logger.info(f"SENT SHORT → {symbol} score={candidate['score']:.1f}")
                 else:
