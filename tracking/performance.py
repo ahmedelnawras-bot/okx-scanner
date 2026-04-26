@@ -15,6 +15,8 @@
 - تم استبدال التقريب الثابت round(..., 6) بدالة round_price()
   حتى لا تتحول أسعار العملات الصغيرة جداً إلى 0.000000.
 - إضافة دوال تحليل الخروج والأداء اليومي وتقارير فورية.
+- تم إصلاح دالة normalize_market_type لتدعم "swap" كمرادف لـ "futures".
+- estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب (وليس per_trade_usd القديم).
 """
 
 import json
@@ -75,9 +77,11 @@ SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0
 # ------------------------------------------------------------
 def normalize_market_type(market_type: str) -> str:
     market_type = (market_type or "futures").strip().lower()
-    if market_type not in ("futures", "spot"):
+    if market_type in ("futures", "swap"):
         return "futures"
-    return market_type
+    if market_type == "spot":
+        return "spot"
+    return "futures"
 
 
 def normalize_bool(value) -> bool:
@@ -1302,7 +1306,7 @@ def format_exit_summary(title: str, summary: dict) -> str:
     tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
     sl_before_tp1 = safe_int(summary.get("sl_before_tp1", 0))
     sl_before_tp1_rate = safe_float(summary.get("sl_before_tp1_rate", 0))
-    tp1_only = safe_int(summary.get("tp1_only", 0))
+    tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     expired = safe_int(summary.get("expired", 0))
     exit_quality = summary.get("exit_quality", "unknown")
 
@@ -1752,7 +1756,8 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     tp1_hits = safe_int(summary.get("tp1_hits", 0))
     tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
-    tp1_only = safe_int(summary.get("tp1_only", summary.get("tp1_wins", 0)))
+    # تم التعديل: قراءة tp1_then_entry أولاً (من summary_helpers الجديد) ثم tp1_only ثم tp1_wins
+    tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     full_wins = safe_int(summary.get("tp2_wins", tp2_hits))
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
     tp2_rate = safe_float(summary.get("tp2_rate", 0))
