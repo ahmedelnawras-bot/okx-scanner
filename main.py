@@ -174,9 +174,9 @@ MODE_RECOVERY_LONG = "RECOVERY_LONG"
 
 MODE_TRANSITION_MIN_INTERVAL = 240
 RECOVERY_CHECK_INTERVAL = 120
-NORMAL_CANDIDATE_DURATION = 240
+NORMAL_CANDIDATE_DURATION = 180
 BLOCK_EXIT_CONFIRM_DURATION = 240
-STRONG_TO_NORMAL_CONFIRM_DURATION = 240
+STRONG_TO_NORMAL_CONFIRM_DURATION = 180
 
 # Market Crash Guard
 MARKET_GUARD_ENABLED = True
@@ -3684,12 +3684,29 @@ def is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode) -> boo
 
 def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> bool:
  try:
-    return (
-        float(red_ratio or 0.0) < 0.54
-        and float(avg_change or 0.0) > -0.45
-        and float(btc_change or 0.0) > -0.25
-        and market_state in ("bull_market", "alt_season", "mixed")
-    )
+    red_ratio = float(red_ratio or 0.0)
+    avg_change = float(avg_change or 0.0)
+    btc_change = float(btc_change or 0.0)
+
+    # في Bull Market / Alt Season نسمح برجوع أسرع للوضع الطبيعي
+    # لأن وجود بعض الشموع الحمراء طبيعي طالما متوسط السوق و BTC ليسوا في ضغط واضح
+    if market_state in ("bull_market", "alt_season"):
+        return (
+            red_ratio < 0.58
+            and avg_change > -0.35
+            and btc_change > -0.20
+        )
+
+    # في Mixed نبقى أكثر تحفظًا
+    if market_state == "mixed":
+        return (
+            red_ratio < 0.52
+            and avg_change > -0.25
+            and btc_change > -0.15
+        )
+
+    # لا نرجع NORMAL من btc_leading أو risk_off
+    return False
  except Exception:
     return False
 
@@ -3799,7 +3816,7 @@ def determine_long_market_mode(
                     pass
             if time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
                 return {"mode": MODE_STRONG_LONG_ONLY, "reason": "تأكيد طبيعي لكن أقل مدة انتقال لم تمر"}
-            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 4 دقائق، رجوع للوضع الطبيعي"}
+            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 3 دقائق، رجوع للوضع الطبيعي"}
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{STRONG_TO_NORMAL_CONFIRM_DURATION}s)"}
     if allow_state_writes and r:
         try:
