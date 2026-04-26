@@ -736,6 +736,48 @@ COMMAND_HANDLERS = {
 
 
 # ================================================
+# SMART PRICE FORMATTERS
+# ================================================
+def fmt_price(value: float) -> str:
+    """Format a price dynamically based on its magnitude, avoiding excessive zeros."""
+    try:
+        value = float(value)
+        if value == 0:
+            return "0"
+        if value < 0.000001:
+            return f"{value:.10f}".rstrip("0").rstrip(".")
+        if value < 0.001:
+            return f"{value:.8f}".rstrip("0").rstrip(".")
+        if value < 1:
+            return f"{value:.6f}".rstrip("0").rstrip(".")
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def round_price(value: float) -> float:
+    """
+    Smart numeric rounding for small-price coins.
+    Prevents SATS/PEPE/SHIB-like prices from becoming 0.000000.
+    """
+    try:
+        value = float(value)
+        if value <= 0:
+            return 0.0
+        if value >= 100:
+            return round(value, 4)
+        if value >= 1:
+            return round(value, 6)
+        if value >= 0.01:
+            return round(value, 8)
+        if value >= 0.0001:
+            return round(value, 10)
+        return round(value, 12)
+    except Exception:
+        return 0.0
+
+
+# ================================================
 # ALERT TRACKING (Enhanced with anti-spam, trade status, leverage, TV link)
 # ================================================
 def build_alert_id(symbol: str, candle_time: int) -> str:
@@ -881,13 +923,28 @@ def build_track_tradingview_link(symbol: str) -> str:
 def build_track_message(alert: dict) -> str:
     try:
         symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
-        entry = float(alert.get("entry", 0))
-        sl = float(alert.get("sl", 0))
-        tp1 = float(alert.get("tp1", 0))
-        tp2 = float(alert.get("tp2", 0))
+        official_trade = load_registered_trade_for_alert(alert)
+
+        entry = float(alert.get("entry", 0) or 0)
+        sl = float(alert.get("sl", 0) or 0)
+        tp1 = float(alert.get("tp1", 0) or 0)
+        tp2 = float(alert.get("tp2", 0) or 0)
+
+        # fallback if alert snapshot is old or stored with zeros
+        if official_trade and isinstance(official_trade, dict):
+            if entry <= 0:
+                entry = float(official_trade.get("entry", 0) or 0)
+            if sl <= 0:
+                sl = float(official_trade.get("sl", 0) or 0)
+            if tp1 <= 0:
+                tp1 = float(official_trade.get("tp1", 0) or 0)
+            if tp2 <= 0:
+                tp2 = float(official_trade.get("tp2", 0) or 0)
+
         candle_time = int(float(alert.get("candle_time", 0)))
         created_ts = int(float(alert.get("created_ts", candle_time)))
         current_price = get_last_price(alert.get("symbol", ""))
+
         favorable_pct, adverse_pct = get_max_move_since_alert(
             symbol=alert.get("symbol", ""),
             since_ts=candle_time,
@@ -897,28 +954,47 @@ def build_track_message(alert: dict) -> str:
         duration_seconds = max(0, int(time.time()) - created_ts)
         duration_h = duration_seconds // 3600
         duration_m = (duration_seconds % 3600) // 60
+
+        # Current move (short benefits from price drop)
         current_move = 0.0
         if entry > 0 and current_price > 0:
             current_move = round(((entry - current_price) / entry) * 100, 2)
+
         leveraged_move = round(current_move * TRACK_LEVERAGE, 2)
         leveraged_fav = round(favorable_pct * TRACK_LEVERAGE, 2)
         leveraged_adv = round(adverse_pct * TRACK_LEVERAGE, 2)
-        official_trade = load_registered_trade_for_alert(alert)
+
         official_status = format_official_trade_status(official_trade)
+
+        # Effective entry from diagnostics if exists
+        effective_entry = entry
+        if official_trade and isinstance(official_trade, dict):
+            diag = official_trade.get("diagnostics", {})
+            if isinstance(diag, dict) and "effective_entry" in diag:
+                effective_entry = float(diag["effective_entry"])
+
         tv_link = build_track_tradingview_link(alert.get("symbol", ""))
         reverse_note = ""
         if alert.get("is_reverse"):
             reverse_note = "\n♻️ Overextended Reversal Type"
+
         msg = (
             f"📌 <b>Alert Track (Short)</b>\n\n"
             f"العملة: {html.escape(symbol)}\n"
-            f"Entry: {entry:.6f}\n"
-            f"SL: {sl:.6f}\n"
-            f"TP1: {tp1:.6f}\n"
-            f"TP2: {tp2:.6f}{reverse_note}\n\n"
+            f"النوع: Short\n"
+            f"الفريم: {TIMEFRAME}\n"
+            f"Signal Entry: {fmt_price(entry)}\n"
+        )
+        if effective_entry != entry:
+            msg += f"Effective Entry: {fmt_price(effective_entry)}\n"
+        msg += (
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp1)}\n"
+            f"TP2: {fmt_price(tp2)}{reverse_note}\n\n"
             f"<b>الحالة الرسمية:</b> {html.escape(official_status)}\n"
-            f"السعر الحالي: {current_price:.6f}\n"
-            f"الحركة الحالية: {current_move:+.2f}% ({leveraged_move:+.2f}% مع الرافعة {TRACK_LEVERAGE:.0f}x)\n"
+            f"السعر الحالي: {fmt_price(current_price)}\n"
+            f"الرافعة التقديرية: {TRACK_LEVERAGE:.0f}x\n"
+            f"الحركة الحالية: {current_move:+.2f}% ({leveraged_move:+.2f}%)\n"
             f"أقصى هبوط لصالح الصفقة: +{favorable_pct:.2f}% (+{leveraged_fav:.2f}%)\n"
             f"أقصى صعود ضد الصفقة: +{adverse_pct:.2f}% (+{leveraged_adv:.2f}%)\n"
             f"المدة: {duration_h}h {duration_m}m\n\n"
@@ -1900,6 +1976,7 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
         idx = signal_row.name
         atr_value = float(signal_row.get("atr", 0))
         recent_high = float(df["high"].iloc[max(0, idx - 4):idx + 1].max())
+
         if signal_type == "breakdown":
             atr_mult = 1.35
         elif signal_type == "pre_breakdown":
@@ -1910,21 +1987,33 @@ def calculate_stop_loss_short(df, entry, signal_type="standard"):
             atr_mult = 1.90
         else:
             atr_mult = 1.55
+
         atr_stop = float(entry) + (atr_value * atr_mult)
         structure_buffer = atr_value * 0.20
         structure_stop = recent_high + structure_buffer
         stop_loss = max(atr_stop, structure_stop)
-        min_pct = {"breakdown": 1.1, "standard": 1.3, "pre_breakdown": 1.6, "new_listing": 2.0, "reverse": 1.6}.get(signal_type, 1.3)
-        current_pct = ((stop_loss - entry) / entry) * 100
+
+        min_pct = {
+            "breakdown": 1.1,
+            "standard": 1.3,
+            "pre_breakdown": 1.6,
+            "new_listing": 2.0,
+            "reverse": 1.6,
+        }.get(signal_type, 1.3)
+
+        current_pct = ((stop_loss - float(entry)) / float(entry)) * 100
         if current_pct < min_pct:
-            stop_loss = entry * (1 + (min_pct / 100))
-        return round(stop_loss, 6)
+            stop_loss = float(entry) * (1 + (min_pct / 100))
+
+        return round_price(stop_loss)
     except Exception:
-        return round(float(entry), 6)
+        return round_price(entry)
+
 
 def calc_tp_short(entry: float, sl: float, rr: float) -> float:
     risk = float(sl) - float(entry)
-    return round(float(entry) - (risk * rr), 6)
+    return round_price(float(entry) - (risk * rr))
+
 
 def get_rr_targets(signal_type="standard", entry_timing=""):
     if signal_type == "breakdown":
@@ -2608,13 +2697,13 @@ def build_message_new(
         header_block += reverse_banner + "\n\n"
     return f"""{header_block}🔴 <b>شورت فيوتشر | {html.escape(symbol_clean)}</b>
 
-💰 السعر: {price:.6f} | ⏱ الفريم: 15m
+💰 السعر: {fmt_price(price)} | ⏱ الفريم: 15m
 ⭐ السكور: {score_result.get("score", 0):.1f} / 10
 🏷 التصنيف: {html.escape(signal_rating)}
 
-🎯 TP1: {tp1:.6f} (-{tp1_pct:.2f}% | {rr1}R)
-🏁 TP2: {tp2:.6f} (-{tp2_pct:.2f}% | {rr2}R)
-🛑 SL: {stop_loss:.6f} (+{sl_pct:.2f}%)
+🎯 TP1: {fmt_price(tp1)} (-{tp1_pct:.2f}% | {rr1}R)
+🏁 TP2: {fmt_price(tp2)} (-{tp2_pct:.2f}% | {rr2}R)
+🛑 SL: {fmt_price(stop_loss)} (+{sl_pct:.2f}%)
 
 🧠 نوع الفرصة: {html.escape(opportunity_type)}{reverse_note}
 🧩 جودة الكسر: {bq_label}
