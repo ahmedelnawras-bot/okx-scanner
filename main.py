@@ -30,6 +30,12 @@ from tracking.performance import (
     get_setup_type_stats,
 )
 
+# محاولة استيراد دالة تقدير تأثير المحفظة بالتوقيع الجديد
+try:
+    from tracking.performance import estimate_wallet_pnl
+except Exception:
+    estimate_wallet_pnl = None
+
 # =========================
 # LOGGING
 # =========================
@@ -594,6 +600,10 @@ TELEGRAM_COMMANDS = {
     "/report_diagnostics": "تقرير تشخيصي شامل",
     "/reset_stats": "تصفير نتائج البوت",
     "/stats_since_reset": "الأداء من بعد آخر تصفير",
+    "/report_daily": "ملخص أداء اليوم للتحسينات",
+    "/report_7d": "أداء آخر 7 أيام",
+    "/report_30d": "أداء آخر 30 يوم",
+    "/report_exits": "تحليل طريقة خروج الصفقات",
 }
 
 
@@ -834,6 +844,282 @@ def stats_since_reset(chat_id: str):
         send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء جلب التقرير\n{html.escape(str(e))}")
 
 
+# =========================
+# دوال مساعدة للتقارير الجديدة
+# =========================
+def _safe_summary_field(summary: dict, field: str, default=0) -> float:
+    """استخراج حقل من ملخص الأداء بأمان."""
+    try:
+        val = summary.get(field, default)
+        return float(val) if val is not None else default
+    except Exception:
+        return default
+
+
+def _format_pct(value: float, digits: int = 2) -> str:
+    """تنسيق نسبة مئوية بعلامة وإظهار علامة زائد."""
+    try:
+        return f"{float(value):+.{digits}f}%"
+    except Exception:
+        return f"{0.0:+.{digits}f}%"
+
+
+def _format_wallet_impact(summary: dict, side: str = "long") -> str:
+    """
+    يحسب تأثير الصفقات على المحفظة باستخدام estimate_wallet_pnl لو متاحة.
+    متوافق مع performance.py الحالي: estimate_wallet_pnl(summary, side="long") -> (wallet_pnl_pct, wallet_pnl_usd)
+    """
+    if estimate_wallet_pnl is None:
+        return "Wallet impact: غير متاح"
+
+    try:
+        result = estimate_wallet_pnl(summary, side=side)
+        if isinstance(result, tuple) and len(result) >= 2:
+            wallet_pct, wallet_usd = result[0], result[1]
+            return f"Wallet impact: {_format_pct(float(wallet_pct))} = {float(wallet_usd):+.2f}$"
+        if isinstance(result, dict):
+            wallet_pct = float(result.get("impact_pct", result.get("wallet_pnl_pct", 0.0)) or 0.0)
+            wallet_usd = float(result.get("impact_usd", result.get("wallet_pnl_usd", 0.0)) or 0.0)
+            return f"Wallet impact: {_format_pct(wallet_pct)} = {wallet_usd:+.2f}$"
+        return "Wallet impact: غير متاح"
+    except Exception as e:
+        logger.warning(f"_format_wallet_impact error: {e}")
+        return "Wallet impact: غير متاح"
+
+
+# =========================
+# دوال التقارير الجديدة
+# =========================
+def build_exits_report_message() -> str:
+    try:
+        summary = get_period_summary(
+            redis_client=r,
+            period="all",
+            market_type="futures",
+            side="long",
+        )
+    except Exception as e:
+        logger.error(f"build_exits_report_message error: {e}")
+        return "❌ حصل خطأ أثناء بناء تقرير تحليل الخروج"
+
+    if not summary:
+        return "ℹ️ لا توجد بيانات كافية لتقرير الخروج."
+
+    signals = int(_safe_summary_field(summary, "signals", 0))
+    closed = int(_safe_summary_field(summary, "closed", 0))
+    open_ = int(_safe_summary_field(summary, "open", 0))
+    wins = int(_safe_summary_field(summary, "wins", 0))
+    tp1_wins = int(_safe_summary_field(summary, "tp1_wins", 0))
+    tp2_wins = int(_safe_summary_field(summary, "tp2_wins", 0))
+    losses = int(_safe_summary_field(summary, "losses", 0))
+    expired = int(_safe_summary_field(summary, "expired", 0))
+    tp1_hits = int(_safe_summary_field(summary, "tp1_hits", tp1_wins + tp2_wins))
+    tp2_hits = int(_safe_summary_field(summary, "tp2_hits", tp2_wins))
+    winrate = float(_safe_summary_field(summary, "winrate", 0.0))
+    tp1_rate = float(_safe_summary_field(summary, "tp1_rate", 0.0))
+    tp2_rate = float(_safe_summary_field(summary, "tp2_rate", 0.0))
+    tp1_to_tp2_rate = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+    loss_rate_closed = round((losses / closed) * 100, 2) if closed > 0 else 0.0
+    pnl_pct = float(_safe_summary_field(
+        summary,
+        "realized_leveraged_pnl_pct",
+        summary.get("realized_pnl_pct", 0.0)
+    ))
+    avg_win = float(_safe_summary_field(summary, "avg_win_pct", 0.0))
+    avg_loss = float(_safe_summary_field(summary, "avg_loss_pct", 0.0))
+    best = float(_safe_summary_field(summary, "best_trade_pct", 0.0))
+    worst = float(_safe_summary_field(summary, "worst_trade_pct", 0.0))
+
+    wallet_line = _format_wallet_impact(summary, side="long")
+
+    lines = [
+        "🚪 <b>Exit Quality Report - LONG</b>",
+        "",
+        f"Signals: {signals}",
+        f"Closed: {closed}",
+        f"Open: {open_}",
+        "",
+        "🎯 <b>أداء الأهداف:</b>",
+        f"• TP1 Hits: {tp1_hits}",
+        f"• TP2 Hits: {tp2_hits}",
+        f"• TP1 Only: {tp1_wins}",
+        f"• Full Wins TP2: {tp2_wins}",
+        f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%",
+        "",
+        "❌ <b>الخروج الخاسر:</b>",
+        f"• Losses: {losses}",
+        f"• Loss Rate من المغلق: {loss_rate_closed:.1f}%",
+        f"• Expired: {expired}",
+        "",
+        "📊 <b>النسب العامة:</b>",
+        f"• Win rate: {winrate:.1f}%",
+        f"• TP1 Rate: {tp1_rate:.1f}%",
+        f"• TP2 Rate: {tp2_rate:.1f}%",
+        "",
+        "💰 <b>الأثر المالي:</b>",
+        f"• Net after leverage: {_format_pct(pnl_pct)}",
+        f"• {wallet_line}",
+        f"• Avg win: {_format_pct(avg_win)}",
+        f"• Avg loss: {_format_pct(avg_loss)}",
+        f"• Best: {_format_pct(best)}",
+        f"• Worst: {_format_pct(worst)}",
+        "",
+        "🧠 <b>قراءة التقرير:</b>",
+        "• TP1 Only = الصفقة وصلت TP1 ثم رجعت Entry للنصف الثاني.",
+        "• TP1 → TP2 Rate مهم جدًا لمعرفة هل TP2 بعيد أو السوق بيرتد بسرعة.",
+        "• لو TP1 Rate جيد و TP2 Rate ضعيف، المشكلة غالبًا في إدارة الخروج وليس الدخول فقط.",
+    ]
+    return "\n".join(lines)
+
+
+def build_daily_report_message() -> str:
+    try:
+        summary = get_trade_summary(
+            redis_client=r,
+            market_type="futures",
+            side="long",
+            since_ts=get_local_day_start_ts(),
+        )
+    except Exception as e:
+        logger.error(f"build_daily_report_message error: {e}")
+        return "❌ حصل خطأ أثناء بناء التقرير اليومي"
+
+    if not summary:
+        return "ℹ️ لا توجد بيانات لليوم الحالي."
+
+    signals = int(_safe_summary_field(summary, "signals", 0))
+    closed = int(_safe_summary_field(summary, "closed", 0))
+    wins = int(_safe_summary_field(summary, "wins", 0))
+    tp1_wins = int(_safe_summary_field(summary, "tp1_wins", 0))
+    tp2_wins = int(_safe_summary_field(summary, "tp2_wins", 0))
+    losses = int(_safe_summary_field(summary, "losses", 0))
+    expired = int(_safe_summary_field(summary, "expired", 0))
+    open_ = int(_safe_summary_field(summary, "open", 0))
+    tp1_hits = int(_safe_summary_field(summary, "tp1_hits", tp1_wins + tp2_wins))
+    tp2_hits = int(_safe_summary_field(summary, "tp2_hits", tp2_wins))
+    winrate = float(_safe_summary_field(summary, "winrate", 0.0))
+    tp1_rate = float(_safe_summary_field(summary, "tp1_rate", 0.0))
+    tp2_rate = float(_safe_summary_field(summary, "tp2_rate", 0.0))
+    tp1_to_tp2_rate = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+    pnl_pct = float(_safe_summary_field(
+        summary,
+        "realized_leveraged_pnl_pct",
+        summary.get("realized_pnl_pct", 0.0)
+    ))
+    raw_pnl = float(_safe_summary_field(summary, "realized_raw_pnl_pct", 0.0))
+    risk_status = str(summary.get("risk_status", "normal")).strip()
+
+    wallet_line = _format_wallet_impact(summary, side="long")
+
+    risk_emoji = "🟢" if risk_status == "normal" else ("🟡" if risk_status == "warning" else "🔴")
+    risk_label = {
+        "normal": "آمن",
+        "warning": "تحذير",
+        "danger": "خطر",
+    }.get(risk_status, risk_status)
+
+    lines = [
+        "📆 <b>Daily Performance - LONG</b>",
+        "",
+        f"Signals: {signals}",
+        f"Closed: {closed}",
+        f"Wins: {wins}",
+        f"• TP2: {tp2_wins}",
+        f"• TP1 Only: {tp1_wins}",
+        f"Losses: {losses}",
+        f"Expired: {expired}",
+        f"Open: {open_}",
+        f"Win rate: {winrate:.1f}%",
+        "",
+        "🎯 <b>جودة الخروج:</b>",
+        f"• TP1 Hits: {tp1_hits}",
+        f"• TP2 Hits: {tp2_hits}",
+        f"• TP1 Rate: {tp1_rate:.1f}%",
+        f"• TP2 Rate: {tp2_rate:.1f}%",
+        f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%",
+        "",
+        "💰 <b>النتيجة المالية:</b>",
+        f"• Net after leverage: {_format_pct(pnl_pct)}",
+        f"• Raw price move: {_format_pct(raw_pnl)}",
+        f"• {wallet_line}",
+        "",
+        f"🧯 <b>المخاطرة:</b> {risk_emoji} {risk_label}",
+    ]
+    return "\n".join(lines)
+
+
+def build_7d_report_message() -> str:
+    try:
+        since_ts = int(time.time()) - 7 * 86400
+        summary = get_trade_summary(
+            redis_client=r,
+            market_type="futures",
+            side="long",
+            since_ts=since_ts,
+        )
+    except Exception as e:
+        logger.error(f"build_7d_report_message error: {e}")
+        return "❌ حصل خطأ أثناء بناء تقرير آخر 7 أيام"
+
+    if not summary:
+        return "ℹ️ لا توجد بيانات لآخر 7 أيام."
+
+    signals = int(_safe_summary_field(summary, "signals", 0))
+    closed = int(_safe_summary_field(summary, "closed", 0))
+    wins = int(_safe_summary_field(summary, "wins", 0))
+    losses = int(_safe_summary_field(summary, "losses", 0))
+    open_ = int(_safe_summary_field(summary, "open", 0))
+    tp1_wins = int(_safe_summary_field(summary, "tp1_wins", 0))
+    tp2_wins = int(_safe_summary_field(summary, "tp2_wins", 0))
+    tp1_hits = int(_safe_summary_field(summary, "tp1_hits", tp1_wins + tp2_wins))
+    tp2_hits = int(_safe_summary_field(summary, "tp2_hits", tp2_wins))
+    winrate = float(_safe_summary_field(summary, "winrate", 0.0))
+    tp1_rate = float(_safe_summary_field(summary, "tp1_rate", 0.0))
+    tp2_rate = float(_safe_summary_field(summary, "tp2_rate", 0.0))
+    tp1_to_tp2_rate = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+    pnl_pct = float(_safe_summary_field(
+        summary,
+        "realized_leveraged_pnl_pct",
+        summary.get("realized_pnl_pct", 0.0)
+    ))
+    avg_win = float(_safe_summary_field(summary, "avg_win_pct", 0.0))
+    avg_loss = float(_safe_summary_field(summary, "avg_loss_pct", 0.0))
+    best = float(_safe_summary_field(summary, "best_trade_pct", 0.0))
+    worst = float(_safe_summary_field(summary, "worst_trade_pct", 0.0))
+
+    wallet_line = _format_wallet_impact(summary, side="long")
+
+    lines = [
+        "📅 <b>7-Day Performance - LONG</b>",
+        "",
+        f"Signals: {signals}",
+        f"Closed: {closed}",
+        f"Open: {open_}",
+        f"Wins: {wins}",
+        f"Losses: {losses}",
+        f"Win rate: {winrate:.1f}%",
+        "",
+        "🎯 <b>أداء الأهداف:</b>",
+        f"• TP1 Hits: {tp1_hits}",
+        f"• TP2 Hits: {tp2_hits}",
+        f"• TP1 Rate: {tp1_rate:.1f}%",
+        f"• TP2 Rate: {tp2_rate:.1f}%",
+        f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%",
+        "",
+        "💰 <b>النتيجة المالية:</b>",
+        f"• Net after leverage: {_format_pct(pnl_pct)}",
+        f"• {wallet_line}",
+        f"• Avg win: {_format_pct(avg_win)}",
+        f"• Avg loss: {_format_pct(avg_loss)}",
+        f"• Best trade: {_format_pct(best)}",
+        f"• Worst trade: {_format_pct(worst)}",
+    ]
+    return "\n".join(lines)
+
+
+# =========================
+# COMMAND HANDLERS
+# =========================
 COMMAND_HANDLERS = {
     "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
     "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
@@ -864,6 +1150,10 @@ COMMAND_HANDLERS = {
     ),
     "/reset_stats": lambda chat_id: reset_stats(chat_id),
     "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
+    "/report_exits": lambda chat_id: send_telegram_reply(chat_id, build_exits_report_message()),
+    "/report_daily": lambda chat_id: send_telegram_reply(chat_id, build_daily_report_message()),
+    "/report_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+    "/report_30d": lambda chat_id: send_telegram_reply(chat_id, build_report_message("month")),
 }
 
 
