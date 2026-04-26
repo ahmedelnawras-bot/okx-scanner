@@ -17,6 +17,8 @@
 - إضافة دوال تحليل الخروج والأداء اليومي وتقارير فورية.
 - تم إصلاح دالة normalize_market_type لتدعم "swap" كمرادف لـ "futures".
 - estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب (وليس per_trade_usd القديم).
+- إضافة دالة diagnose_performance_problem لتشخيص مشاكل الأداء.
+- إصلاح تشخيص exit_summary وعرض المشكلة الأساسية في جميع التقارير.
 """
 
 import json
@@ -1078,7 +1080,6 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             side=side,
         )
 
-        # financial_summary أدق لأنه مبني على الصفقات نفسها، وليس العدادات فقط.
         wins = safe_int(financial_summary.get("wins", wins))
         losses = safe_int(financial_summary.get("losses", losses))
         expired = safe_int(financial_summary.get("expired", expired))
@@ -1208,10 +1209,6 @@ def get_trade_summary(
 # PERIOD HELPER
 # ------------------------------------------------------------
 def get_period_since_ts(period: str) -> Optional[int]:
-    """
-    ترجع طابع زمني لبداية الفترة المطلوبة أو None لـ all.
-    تدعم: 1h, today, 1d, 7d, 30d, all
-    """
     period = str(period or "all").strip().lower()
     now_ts = int(time.time())
 
@@ -1340,6 +1337,14 @@ def format_exit_summary(title: str, summary: dict) -> str:
     elif exit_quality == "good":
         lines.append("ℹ️ الخروج متوازن نسبيًا.")
 
+    # تشخيص الأداء للـ exit summary: نمرر summary كـ exit_summary
+    diagnosis = diagnose_performance_problem(summary, is_exit_summary=True)
+    lines.append("")
+    lines.append(f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>")
+    lines.append(f"• المشكلة الأساسية: {diagnosis['problem_label']}")
+    lines.append(f"• السبب: {diagnosis['explanation']}")
+    lines.append(f"• الإجراء المقترح: {diagnosis['action']}")
+
     return "\n".join(lines)
 
 
@@ -1448,12 +1453,17 @@ def format_daily_performance_report(title: str, rows: list, side: str = "long") 
             "unknown": "—",
         }.get(quality, "—")
 
+        # تشخيص مختصر لكل يوم
+        diagnosis = diagnose_performance_problem(summary, exits)
+        diag_short = f" | مشكلة:{diagnosis['emoji']} {diagnosis['problem_label']}"
+
         lines.append(
             f"📅 {day} | 🎯{signals}/{closed}/{open_t} | "
             f"✅{wins} ❌{losses} ⏳{expired} | WR:{winrate:.0f}% | "
             f"TP1:{tp1_rate:.0f}% TP2:{tp2_rate:.0f}% | "
             f"Net:{net_pnl:+.1f}% | محفظة:{wallet_pct:+.1f}% {wallet_usd:+.1f}$ | "
             f"خروج:{quality_short}"
+            + diag_short
         )
 
     return "\n".join(lines)
@@ -1523,6 +1533,14 @@ def format_today_performance_report(title: str, data: dict, side: str = "long") 
     net_pnl = safe_float(summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0)))
     lines.append(f"صافي بعد الرافعة: {net_pnl:+.2f}%")
     lines.append(f"تأثير المحفظة: {wallet_pct:+.2f}% = {wallet_usd:+.2f}$")
+
+    # تشخيص الأداء
+    diagnosis = diagnose_performance_problem(summary, exit_summary)
+    lines.append("")
+    lines.append(f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>")
+    lines.append(f"• المشكلة الأساسية: {diagnosis['problem_label']}")
+    lines.append(f"• السبب: {diagnosis['explanation']}")
+    lines.append(f"• الإجراء المقترح: {diagnosis['action']}")
 
     if exit_summary:
         lines.append("")
@@ -1756,7 +1774,6 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     tp1_hits = safe_int(summary.get("tp1_hits", 0))
     tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
-    # تم التعديل: قراءة tp1_then_entry أولاً (من summary_helpers الجديد) ثم tp1_only ثم tp1_wins
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     full_wins = safe_int(summary.get("tp2_wins", tp2_hits))
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
@@ -1817,6 +1834,15 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%"
     )
 
+    # تشخيص الأداء
+    diagnosis = diagnose_performance_problem(summary)
+    diagnosis_block = (
+        f"\n🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>\n"
+        f"• المشكلة الأساسية: {diagnosis['problem_label']}\n"
+        f"• السبب: {diagnosis['explanation']}\n"
+        f"• الإجراء المقترح: {diagnosis['action']}"
+    )
+
     financial_block = (
         f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
         f"━━━━━━━━━━━━━━\n"
@@ -1848,8 +1874,143 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"Open: {summary.get('open', 0)}\n"
         f"Win rate: {summary.get('winrate', 0)}%"
         + performance_block
+        + diagnosis_block
         + financial_block
     )
+
+
+# ------------------------------------------------------------
+# PERFORMANCE DIAGNOSIS
+# ------------------------------------------------------------
+def diagnose_performance_problem(
+    summary: dict,
+    exit_summary: dict = None,
+    is_exit_summary: bool = False,
+) -> dict:
+    """
+    تشخيص المشكلة الأساسية في الأداء.
+
+    إذا كان is_exit_summary=True، يُعتمد على الحقول الخاصة بالخروج (تجاهل winrate).
+    وإلا يُستخدم summary العادي (من summarize_trades) مع إمكانية تمرير exit_summary لتحسين التشخيص.
+
+    Returns dict: problem_type, problem_label, severity, emoji, explanation, action
+    """
+    # القيم الأساسية
+    signals = safe_int(summary.get("signals", summary.get("trades_count", 0)))
+    closed = safe_int(summary.get("closed", 0))
+    losses = safe_int(summary.get("losses", 0))
+
+    # بيانات الخروج قد تكون في كائن منفصل (exit_summary) أو داخل summary نفسه إذا is_exit_summary=True
+    if is_exit_summary:
+        tp1_hits = safe_int(summary.get("tp1_hits", 0))
+        tp2_hits = safe_int(summary.get("tp2_hits", 0))
+        tp1_rate = safe_float(summary.get("tp1_rate", 0))
+        tp2_rate = safe_float(summary.get("tp2_rate", 0))
+        tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
+        sl_before_tp1_rate = safe_float(summary.get("sl_before_tp1_rate", 0))
+        winrate = None  # نتجاهل winrate في exit_summary
+    else:
+        tp1_hits = safe_int(summary.get("tp1_hits", 0))
+        tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
+        tp1_rate = safe_float(summary.get("tp1_rate", 0))
+        tp2_rate = safe_float(summary.get("tp2_rate", 0))
+        tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
+        winrate = safe_float(summary.get("winrate", 0))
+        sl_before_tp1_rate = safe_float(
+            (exit_summary or {}).get("sl_before_tp1_rate", 0)
+            if exit_summary else 0.0
+        )
+
+    # حساب loss_rate من الصفقات المغلقة
+    loss_rate_closed = (losses / closed * 100) if closed > 0 else 0.0
+
+    # إعادة حساب tp1_to_tp2_rate إذا لم يكن موجودًا
+    if tp1_to_tp2_rate == 0 and tp1_hits > 0:
+        tp1_to_tp2_rate = (tp2_hits / tp1_hits) * 100
+
+    # 1. لا توجد بيانات كافية
+    if signals == 0 or closed == 0:
+        return {
+            "problem_type": "no_data",
+            "problem_label": "بيانات غير كافية",
+            "severity": "unknown",
+            "emoji": "⚪",
+            "explanation": "لا توجد صفقات مغلقة كافية للحكم.",
+            "action": "انتظر بيانات أكثر قبل تعديل الاستراتيجية."
+        }
+
+    # 2. مشكلة SL / وقف قبل الحركة (تحقق أولاً)
+    sl_condition = sl_before_tp1_rate >= 45
+    if not sl_condition and not is_exit_summary and loss_rate_closed >= 60 and 35 <= tp1_rate <= 50:
+        sl_condition = True
+    if is_exit_summary and not sl_condition and loss_rate_closed >= 60 and tp1_rate < 35:
+        # في exit_summary، لو loss rate عالي و tp1 rate ضعيف جدًا، الأقرب أنها مشكلة دخول وليس SL
+        pass
+    if sl_condition:
+        return {
+            "problem_type": "sl_problem",
+            "problem_label": "مشكلة SL / وقف قبل الحركة",
+            "severity": "danger",
+            "emoji": "🛑",
+            "explanation": "نسبة كبيرة من الصفقات تضرب SL قبل الوصول إلى TP1.",
+            "action": "راجع مكان SL، ATR multiplier، وتجنب الدخول في شموع ممتدة أو بعد Pump."
+        }
+
+    # 3. مشكلة دخول
+    entry_problem_condition = False
+    if is_exit_summary:
+        if tp1_rate < 35 and loss_rate_closed > 55:
+            entry_problem_condition = True
+    else:
+        if (tp1_rate < 35 or safe_float(winrate, 0) < 40) and loss_rate_closed > 55:
+            entry_problem_condition = True
+
+    if entry_problem_condition:
+        return {
+            "problem_type": "entry_problem",
+            "problem_label": "مشكلة دخول",
+            "severity": "danger",
+            "emoji": "🔴",
+            "explanation": "نسبة الوصول إلى TP1 ضعيفة، وهذا غالبًا يعني أن جودة الدخول أو فلترة الإشارات تحتاج تحسين.",
+            "action": "راجع شروط الدخول، الفوليوم، التوقيت، وبعد السعر عن MA/VWAP، وفلتر الإشارات المتأخرة."
+        }
+
+    # 4. مشكلة خروج بعد TP1
+    if tp1_rate >= 50 and tp1_to_tp2_rate < 30:
+        return {
+            "problem_type": "exit_problem",
+            "problem_label": "مشكلة خروج بعد TP1",
+            "severity": "warning",
+            "emoji": "🟡",
+            "explanation": "الإشارات تصل إلى TP1 بنسبة مقبولة، لكن نسبة التحول من TP1 إلى TP2 ضعيفة.",
+            "action": "راجع قرب TP2، أو استخدم خروج تدريجي، أو Trailing Stop بعد TP1."
+        }
+
+    # 5. أداء جيد
+    if is_exit_summary:
+        good_condition = tp1_rate >= 55 and tp1_to_tp2_rate >= 35
+    else:
+        good_condition = tp1_rate >= 55 and tp1_to_tp2_rate >= 35 and safe_float(winrate, 0) >= 50
+
+    if good_condition:
+        return {
+            "problem_type": "good",
+            "problem_label": "الأداء جيد نسبيًا",
+            "severity": "normal",
+            "emoji": "🟢",
+            "explanation": "نسبة الوصول إلى TP1 والتحول إلى TP2 مقبولة.",
+            "action": "استمر في جمع البيانات ولا تعدل بعنف."
+        }
+
+    # 6. مشكلة مختلطة
+    return {
+        "problem_type": "mixed_problem",
+        "problem_label": "مشكلة مختلطة",
+        "severity": "warning",
+        "emoji": "🟡",
+        "explanation": "الأرقام لا تشير إلى سبب واحد واضح، وقد تكون المشكلة خليط بين الدخول والخروج والـ SL.",
+        "action": "افحص الأداء حسب setup_type و entry_timing و market_state."
+    }
 
 
 # ------------------------------------------------------------
