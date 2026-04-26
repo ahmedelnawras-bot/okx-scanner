@@ -1,15 +1,30 @@
 from collections import Counter, defaultdict
 
 
+# =========================
+# SAFE HELPERS
+# =========================
 def _safe_float(value, default=0.0):
     try:
+        if value is None:
+            return default
         return float(value)
     except Exception:
         return default
 
 
 def _safe_bool(value):
-    return bool(value)
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        value = str(value).strip().lower()
+        return value in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
 
 
 def _normalize_reason(reason: str) -> str:
@@ -19,41 +34,69 @@ def _normalize_reason(reason: str) -> str:
         "RSI صاعد بقوة": "RSI صاعد بقوة",
         "RSI مرتفع لكن بزخم": "RSI مرتفع بزخم",
         "RSI عالي": "RSI عالي (تشبع شراء)",
+
         "فوليوم داعم": "فوليوم داعم",
         "فوليوم قوي": "فوليوم قوي",
         "فوليوم انفجار": "فوليوم انفجاري",
+
         "فوق MA": "فوق المتوسط",
+        "فوق المتوسط": "فوق المتوسط",
+
         "شمعة جيدة": "شمعة جيدة",
         "شمعة قوية": "شمعة قوية",
+
         "اختراق": "اختراق",
         "اختراق مبكر جداً": "اختراق مبكر",
+        "اختراق مبكر": "اختراق مبكر",
         "اختراق متأخر": "اختراق متأخر",
         "اختراق قوي مؤكد": "اختراق قوي مؤكد",
+
         "تأكيد فريم الساعة": "تأكيد فريم الساعة",
+
         "BTC داعم": "BTC داعم",
         "BTC غير داعم": "BTC غير داعم",
+
         "هيمنة داعمة": "هيمنة داعمة للألت",
         "هيمنة ضد الألت": "هيمنة ضد الألت (ضغط على العملات)",
+
         "تمويل سلبي": "تمويل سلبي (داعم للشراء)",
         "تمويل إيجابي": "تمويل إيجابي (ضغط محتمل)",
+
         "عملة جديدة": "عملة جديدة",
         "بداية ترند مبكرة": "بداية ترند مبكرة",
         "زخم مبكر تحت المقاومة 🎯": "زخم مبكر تحت المقاومة 🎯",
+
         "بعيد عن MA (متأخر)": "بعيد عن المتوسط (دخول متأخر)",
         "ممتد زيادة": "ممتد زيادة",
         "أسفل المتوسط": "أسفل المتوسط",
         "رفض سعري علوي": "رفض سعري علوي",
+
         "أخبار اقتصادية مهمة قريبة": "أخبار اقتصادية مهمة قريبة",
+
         "Late Pump Risk": "خطر مطاردة Pump متأخر",
         "Bull Market Continuation Risk": "استمرار في Bull Market بعد امتداد خطر",
         "خطر مطاردة Pump متأخر": "خطر مطاردة Pump متأخر",
         "استمرار في Bull Market بعد امتداد خطر": "استمرار في Bull Market بعد امتداد خطر",
         "شمعة قوية لكن احتمال مطاردة": "شمعة قوية لكن احتمال مطاردة",
         "صعود سريع خلال 4 ساعات": "صعود سريع خلال 4 ساعات",
+
+        "Momentum Exhaustion Trap": "خطر نهاية الزخم بعد Pump",
+        "far_from_vwap": "بعيد عن VWAP",
+        "rsi_slope_weak": "RSI بدأ يضعف",
+        "macd_hist_falling": "زخم MACD يتراجع",
+        "macd_hist_negative": "MACD سلبي",
+        "Weak Historical Setup": "نوع إشارة ضعيف تاريخيًا",
+
+        "OVERSOLD_REVERSAL": "Oversold Reversal",
+        "RECOVERY_LONG": "Recovery Long",
+        "POST_CRASH_REBOUND": "Post Crash Rebound",
     }
-    return mapping.get(reason, reason)
+    return mapping.get(str(reason), str(reason))
 
 
+# =========================
+# REDIS LOAD
+# =========================
 def _load_trade(redis_client, trade_key: str):
     if redis_client is None:
         return None
@@ -79,32 +122,74 @@ def _get_all_trades(redis_client):
     if redis_client is None:
         return []
 
+    trades = []
+
+    # الأفضل: الاعتماد على trades:all
     try:
         keys = list(redis_client.smembers("trades:all"))
     except Exception:
-        return []
+        keys = []
 
-    trades = []
     for key in keys:
         trade = _load_trade(redis_client, key)
         if trade:
             trades.append(trade)
 
+    # fallback لو trades:all فاضي
+    if not trades:
+        try:
+            for key in redis_client.scan_iter("trade:*"):
+                trade = _load_trade(redis_client, key)
+                if trade:
+                    trades.append(trade)
+        except Exception:
+            pass
+
     return trades
+
+
+# =========================
+# RESULT DETECTION FIXED
+# =========================
+def _trade_result_text(trade: dict) -> str:
+    try:
+        return str(trade.get("result", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _trade_status_text(trade: dict) -> str:
+    try:
+        return str(trade.get("status", "") or "").strip().lower()
+    except Exception:
+        return ""
 
 
 def _trade_is_tp2_win(trade: dict) -> bool:
     """
-    Full win = TP2 أو result/status win.
+    Full Win = الصفقة وصلت TP2.
+    يدعم الصيغ القديمة والجديدة.
     """
     try:
-        result = str(trade.get("result", "") or "").lower()
-        status = str(trade.get("status", "") or "").lower()
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
 
         return (
-            result in ("win", "tp2", "full_win")
-            or status in ("win", "tp2", "full_win")
-            or bool(trade.get("tp2_hit"))
+            result in (
+                "tp2_win",
+                "tp2",
+                "full_win",
+                "win_tp2",
+                "win",
+            )
+            or status in (
+                "tp2_win",
+                "tp2",
+                "full_win",
+                "win_tp2",
+                "win",
+            )
+            or _safe_bool(trade.get("tp2_hit"))
         )
     except Exception:
         return False
@@ -112,16 +197,33 @@ def _trade_is_tp2_win(trade: dict) -> bool:
 
 def _trade_is_tp1_hit(trade: dict) -> bool:
     """
-    TP1 hit بأي صيغة محفوظة.
+    TP1 Hit بأي صيغة محفوظة.
+    ملاحظة مهمة:
+    TP2 يعتبر TP1+ أيضًا لأن السعر لازم يعدي TP1 قبل TP2.
     """
     try:
-        result = str(trade.get("result", "") or "").lower()
-        status = str(trade.get("status", "") or "").lower()
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
 
         return (
-            bool(trade.get("tp1_hit"))
-            or result in ("tp1", "tp1_only", "partial")
-            or status in ("tp1", "tp1_only", "partial")
+            _safe_bool(trade.get("tp1_hit"))
+            or _trade_is_tp2_win(trade)
+            or result in (
+                "tp1_win",
+                "tp1",
+                "tp1_only",
+                "partial",
+                "partial_win",
+                "win_tp1",
+            )
+            or status in (
+                "tp1_win",
+                "tp1",
+                "tp1_only",
+                "partial",
+                "partial_win",
+                "win_tp1",
+            )
         )
     except Exception:
         return False
@@ -129,30 +231,41 @@ def _trade_is_tp1_hit(trade: dict) -> bool:
 
 def _trade_is_win(trade: dict) -> bool:
     """
-    تعريف الفوز الموحد:
-    أي صفقة ضربت TP1 أو TP2 تعتبر Win.
+    Win = TP1 أو TP2.
     """
     return _trade_is_tp1_hit(trade) or _trade_is_tp2_win(trade)
 
 
 def _trade_is_loss(trade: dict) -> bool:
     try:
-        return str(trade.get("result", "") or "").lower() == "loss"
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
+
+        return result == "loss" or status == "loss"
     except Exception:
         return False
 
 
 def _trade_is_expired(trade: dict) -> bool:
     try:
-        return str(trade.get("result", "") or "").lower() == "expired"
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
+
+        return result == "expired" or status == "expired"
     except Exception:
         return False
 
 
 def _trade_is_open(trade: dict) -> bool:
+    """
+    الصفقة Open فقط لو ليست Win / Loss / Expired.
+    """
     try:
-        status = str(trade.get("status", "") or "").lower()
-        result = str(trade.get("result", "") or "").lower()
+        if _trade_is_win(trade) or _trade_is_loss(trade) or _trade_is_expired(trade):
+            return False
+
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
 
         if status in ("open", "partial"):
             return True
@@ -165,10 +278,12 @@ def _trade_is_open(trade: dict) -> bool:
         return False
 
 
+# =========================
+# SUMMARY
+# =========================
 def _summarize_group(trades):
     total = len(trades)
 
-    tp1_hits = sum(1 for t in trades if _trade_is_tp1_hit(t))
     full_wins = sum(1 for t in trades if _trade_is_tp2_win(t))
 
     tp1_only = sum(
@@ -177,6 +292,9 @@ def _summarize_group(trades):
     )
 
     wins = full_wins + tp1_only
+
+    # لأن Wins هنا معناها TP1+
+    tp1_hits = wins
 
     losses = sum(1 for t in trades if _trade_is_loss(t))
     expired = sum(1 for t in trades if _trade_is_expired(t))
@@ -232,7 +350,7 @@ def _top_reasons(trades, result_filter: str, limit=5):
             if not _trade_is_expired(trade):
                 continue
         else:
-            if trade.get("result") != result_filter:
+            if _trade_result_text(trade) != result_filter:
                 continue
 
         reasons = trade.get("reasons") or []
@@ -254,6 +372,9 @@ def _format_group_line(name: str, trades: list) -> str:
     )
 
 
+# =========================
+# DEEP REPORT
+# =========================
 def build_deep_report(redis_client, market_type: str = None, side: str = None) -> str:
     trades = _get_all_trades(redis_client)
 
