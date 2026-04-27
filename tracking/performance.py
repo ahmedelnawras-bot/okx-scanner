@@ -347,7 +347,30 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "rr2": safe_float(extra_fields.get("rr2"), 3.0),
 
         # الحقول الجديدة
+        "setup_type_base": normalize_text(extra_fields.get("setup_type_base"), ""),
         "final_threshold": safe_float(extra_fields.get("final_threshold"), 0.0),
+        "adjustments_log": normalize_list(extra_fields.get("adjustments_log")),
+        "warning_penalty": safe_float(extra_fields.get("warning_penalty"), 0.0),
+        "warning_penalty_details": normalize_list(extra_fields.get("warning_penalty_details")),
+        "warning_high_count": safe_int(extra_fields.get("warning_high_count"), 0),
+        "warning_medium_count": safe_int(extra_fields.get("warning_medium_count"), 0),
+        "tp1_close_pct": safe_float(extra_fields.get("tp1_close_pct"), 50.0),
+        "tp2_close_pct": safe_float(extra_fields.get("tp2_close_pct"), 50.0),
+        "move_sl_to_entry_after_tp1": normalize_bool(extra_fields.get("move_sl_to_entry_after_tp1", True)),
+        "fib_position": normalize_text(extra_fields.get("fib_position"), "unknown"),
+        "fib_position_ratio": safe_float(extra_fields.get("fib_position_ratio")),
+        "fib_label": normalize_text(extra_fields.get("fib_label"), ""),
+        "had_pullback": normalize_bool(extra_fields.get("had_pullback", False)),
+        "pullback_pct": safe_float(extra_fields.get("pullback_pct")),
+        "pullback_label": normalize_text(extra_fields.get("pullback_label"), ""),
+        "wave_estimate": safe_int(extra_fields.get("wave_estimate"), 0),
+        "wave_peaks": safe_int(extra_fields.get("wave_peaks"), 0),
+        "wave_label": normalize_text(extra_fields.get("wave_label"), ""),
+        "entry_maturity": normalize_text(extra_fields.get("entry_maturity"), "unknown"),
+        "maturity_penalty": safe_float(extra_fields.get("maturity_penalty"), 0.0),
+        "maturity_bonus": safe_float(extra_fields.get("maturity_bonus"), 0.0),
+        "falling_knife_risk": normalize_bool(extra_fields.get("falling_knife_risk", False)),
+        "falling_knife_reasons": normalize_list(extra_fields.get("falling_knife_reasons")),
         "target_method": normalize_text(extra_fields.get("target_method"), "unknown"),
         "nearest_resistance": round_price(extra_fields.get("nearest_resistance")) if extra_fields.get("nearest_resistance") is not None else None,
         "nearest_support": round_price(extra_fields.get("nearest_support")) if extra_fields.get("nearest_support") is not None else None,
@@ -356,16 +379,12 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "target_notes": normalize_list(extra_fields.get("target_notes")),
         "sl_method": normalize_text(extra_fields.get("sl_method"), "unknown"),
         "sl_notes": normalize_text(extra_fields.get("sl_notes"), ""),
-        "falling_knife_risk": normalize_bool(extra_fields.get("falling_knife_risk", False)),
-        "reversal_quality": normalize_text(extra_fields.get("reversal_quality"), ""),
         "wave_context": normalize_text(extra_fields.get("wave_context"), ""),
         "setup_context": normalize_text(extra_fields.get("setup_context"), ""),
+        "reversal_quality": normalize_text(extra_fields.get("reversal_quality"), ""),
         "reversal_structure_confirmed": normalize_bool(extra_fields.get("reversal_structure_confirmed", False)),
-        "warning_penalty": safe_float(extra_fields.get("warning_penalty"), 0.0),
-        "warning_high_count": safe_int(extra_fields.get("warning_high_count"), 0),
-        "warning_medium_count": safe_int(extra_fields.get("warning_medium_count"), 0),
-        "warning_penalty_details": normalize_list(extra_fields.get("warning_penalty_details")),
-        "adjustments_log": normalize_list(extra_fields.get("adjustments_log")),
+        "strong_bull_pullback": normalize_bool(extra_fields.get("strong_bull_pullback", False)),
+        "strong_breakout_exception": normalize_bool(extra_fields.get("strong_breakout_exception", False)),
         "protected_breakeven": normalize_bool(extra_fields.get("protected_breakeven", False)),
         "breakeven_protection_reason": normalize_text(extra_fields.get("breakeven_protection_reason"), ""),
         "breakeven_protected_ts": (
@@ -442,7 +461,8 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "rr2": safe_float(diagnostics.get("rr2"), 3.0),
         "diagnostics": diagnostics,
 
-        # الحقول الجديدة من trade_data أو diagnostics
+        # الحقول الجديدة المهمة للتاريخ
+        "setup_type_base": get_field("setup_type_base", ""),
         "final_threshold": safe_float(get_field("final_threshold", 0.0)),
         "target_method": get_field("target_method", "unknown"),
         "nearest_resistance": get_field("nearest_resistance"),
@@ -453,13 +473,29 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "sl_method": get_field("sl_method", "unknown"),
         "sl_notes": get_field("sl_notes", ""),
         "falling_knife_risk": normalize_bool(get_field("falling_knife_risk", False)),
-        "reversal_quality": get_field("reversal_quality", ""),
+        "falling_knife_reasons": normalize_list(get_field("falling_knife_reasons", [])),
         "wave_context": get_field("wave_context", ""),
         "setup_context": get_field("setup_context", ""),
+        "reversal_quality": get_field("reversal_quality", ""),
         "reversal_structure_confirmed": normalize_bool(get_field("reversal_structure_confirmed", False)),
+        "strong_bull_pullback": normalize_bool(get_field("strong_bull_pullback", False)),
+        "strong_breakout_exception": normalize_bool(get_field("strong_breakout_exception", False)),
+        "tp1_close_pct": safe_float(get_field("tp1_close_pct", 50.0)),
+        "tp2_close_pct": safe_float(get_field("tp2_close_pct", 50.0)),
+        "move_sl_to_entry_after_tp1": normalize_bool(get_field("move_sl_to_entry_after_tp1", True)),
+        "fib_position": get_field("fib_position", "unknown"),
+        "fib_position_ratio": safe_float(get_field("fib_position_ratio")),
+        "fib_label": get_field("fib_label", ""),
+        "had_pullback": normalize_bool(get_field("had_pullback", False)),
+        "pullback_pct": safe_float(get_field("pullback_pct")),
+        "pullback_label": get_field("pullback_label", ""),
+        "wave_estimate": safe_int(get_field("wave_estimate", 0)),
+        "wave_peaks": safe_int(get_field("wave_peaks", 0)),
+        "wave_label": get_field("wave_label", ""),
+        "entry_maturity": get_field("entry_maturity", "unknown"),
+        "maturity_penalty": safe_float(get_field("maturity_penalty", 0.0)),
+        "maturity_bonus": safe_float(get_field("maturity_bonus", 0.0)),
         "warning_penalty": safe_float(get_field("warning_penalty", 0.0)),
-        "warning_high_count": safe_int(get_field("warning_high_count", 0)),
-        "warning_medium_count": safe_int(get_field("warning_medium_count", 0)),
         "warning_penalty_details": normalize_list(get_field("warning_penalty_details", [])),
         "adjustments_log": normalize_list(get_field("adjustments_log", [])),
         "protected_breakeven": normalize_bool(get_field("protected_breakeven", False)),
@@ -529,7 +565,7 @@ def register_trade(
     pullback_high: float = None,
     rr1: float = 1.5,
     rr2: float = 3.0,
-    # New fields
+    # New fields (optional)
     final_threshold: float = None,
     target_method: str = None,
     nearest_resistance: float = None,
@@ -540,6 +576,7 @@ def register_trade(
     sl_method: str = None,
     sl_notes: str = None,
     falling_knife_risk: bool = False,
+    falling_knife_reasons: list = None,
     reversal_quality: str = None,
     wave_context: str = None,
     setup_context: str = None,
@@ -554,6 +591,25 @@ def register_trade(
     breakeven_protected_ts: int = None,
     original_sl_before_breakeven: float = None,
     protected_breakeven_exit: bool = False,
+    # More optional fields
+    tp1_close_pct: float = None,
+    tp2_close_pct: float = None,
+    move_sl_to_entry_after_tp1: bool = None,
+    setup_type_base: str = None,
+    fib_position: str = None,
+    fib_position_ratio: float = None,
+    fib_label: str = None,
+    had_pullback: bool = None,
+    pullback_pct: float = None,
+    pullback_label: str = None,
+    wave_estimate: float = None,
+    wave_peaks: float = None,
+    wave_label: str = None,
+    entry_maturity: str = None,
+    maturity_penalty: float = None,
+    maturity_bonus: float = None,
+    strong_bull_pullback: bool = None,
+    strong_breakout_exception: bool = None,
     **kwargs,
 ):
     if redis_client is None:
@@ -594,6 +650,31 @@ def register_trade(
     if not has_high_impact_news and "news_nearby" in kwargs:
         has_high_impact_news = normalize_bool(kwargs.get("news_nearby"))
 
+    # الحصول على الحقول الإضافية من kwargs إذا لم تُمرر في الـ signature
+    def _get_kwarg(name, default=None):
+        return kwargs.get(name, default)
+
+    _tp1_close_pct = safe_float(tp1_close_pct) if tp1_close_pct is not None else safe_float(_get_kwarg("tp1_close_pct", 50.0))
+    _tp2_close_pct = safe_float(tp2_close_pct) if tp2_close_pct is not None else safe_float(_get_kwarg("tp2_close_pct", 50.0))
+    _move_sl_to_entry_after_tp1 = normalize_bool(move_sl_to_entry_after_tp1) if move_sl_to_entry_after_tp1 is not None else normalize_bool(_get_kwarg("move_sl_to_entry_after_tp1", True))
+    _setup_type_base = setup_type_base or _get_kwarg("setup_type_base", "")
+    _fib_position = fib_position or _get_kwarg("fib_position", "unknown")
+    _fib_position_ratio = safe_float(fib_position_ratio) if fib_position_ratio is not None else safe_float(_get_kwarg("fib_position_ratio"))
+    _fib_label = fib_label or _get_kwarg("fib_label", "")
+    _had_pullback = normalize_bool(had_pullback) if had_pullback is not None else normalize_bool(_get_kwarg("had_pullback", False))
+    _pullback_pct = safe_float(pullback_pct) if pullback_pct is not None else safe_float(_get_kwarg("pullback_pct"))
+    _pullback_label = pullback_label or _get_kwarg("pullback_label", "")
+    _wave_estimate = safe_int(wave_estimate) if wave_estimate is not None else safe_int(_get_kwarg("wave_estimate", 0))
+    _wave_peaks = safe_int(wave_peaks) if wave_peaks is not None else safe_int(_get_kwarg("wave_peaks", 0))
+    _wave_label = wave_label or _get_kwarg("wave_label", "")
+    _entry_maturity = entry_maturity if entry_maturity is not None else _get_kwarg("entry_maturity", "unknown")
+    _entry_maturity = normalize_text(_entry_maturity, "unknown")
+    _maturity_penalty = safe_float(maturity_penalty) if maturity_penalty is not None else safe_float(_get_kwarg("maturity_penalty", 0.0))
+    _maturity_bonus = safe_float(maturity_bonus) if maturity_bonus is not None else safe_float(_get_kwarg("maturity_bonus", 0.0))
+    _strong_bull_pullback = normalize_bool(strong_bull_pullback) if strong_bull_pullback is not None else normalize_bool(_get_kwarg("strong_bull_pullback", False))
+    _strong_breakout_exception = normalize_bool(strong_breakout_exception) if strong_breakout_exception is not None else normalize_bool(_get_kwarg("strong_breakout_exception", False))
+    _falling_knife_reasons = normalize_list(falling_knife_reasons) if falling_knife_reasons is not None else normalize_list(_get_kwarg("falling_knife_reasons"))
+
     pre_signal = bool(pre_breakout)
     break_signal = bool(breakout)
     signal_event = "breakdown" if side == "short" else "breakout"
@@ -629,7 +710,30 @@ def register_trade(
         "rr1": rr1,
         "rr2": rr2,
         # إضافة الحقول الجديدة
+        "setup_type_base": _setup_type_base,
         "final_threshold": final_threshold,
+        "adjustments_log": adjustments_log,
+        "warning_penalty": warning_penalty,
+        "warning_high_count": warning_high_count,
+        "warning_medium_count": warning_medium_count,
+        "warning_penalty_details": warning_penalty_details,
+        "tp1_close_pct": _tp1_close_pct,
+        "tp2_close_pct": _tp2_close_pct,
+        "move_sl_to_entry_after_tp1": _move_sl_to_entry_after_tp1,
+        "fib_position": _fib_position,
+        "fib_position_ratio": _fib_position_ratio,
+        "fib_label": _fib_label,
+        "had_pullback": _had_pullback,
+        "pullback_pct": _pullback_pct,
+        "pullback_label": _pullback_label,
+        "wave_estimate": _wave_estimate,
+        "wave_peaks": _wave_peaks,
+        "wave_label": _wave_label,
+        "entry_maturity": _entry_maturity,
+        "maturity_penalty": _maturity_penalty,
+        "maturity_bonus": _maturity_bonus,
+        "falling_knife_risk": falling_knife_risk,
+        "falling_knife_reasons": _falling_knife_reasons,
         "target_method": target_method,
         "nearest_resistance": nearest_resistance,
         "nearest_support": nearest_support,
@@ -638,16 +742,12 @@ def register_trade(
         "target_notes": target_notes,
         "sl_method": sl_method,
         "sl_notes": sl_notes,
-        "falling_knife_risk": falling_knife_risk,
-        "reversal_quality": reversal_quality,
         "wave_context": wave_context,
         "setup_context": setup_context,
+        "reversal_quality": reversal_quality,
         "reversal_structure_confirmed": reversal_structure_confirmed,
-        "warning_penalty": warning_penalty,
-        "warning_high_count": warning_high_count,
-        "warning_medium_count": warning_medium_count,
-        "warning_penalty_details": warning_penalty_details,
-        "adjustments_log": adjustments_log,
+        "strong_bull_pullback": _strong_bull_pullback,
+        "strong_breakout_exception": _strong_breakout_exception,
         "protected_breakeven": protected_breakeven,
         "breakeven_protection_reason": breakeven_protection_reason,
         "breakeven_protected_ts": breakeven_protected_ts,
@@ -702,6 +802,7 @@ def register_trade(
         "diagnostics": docs,
 
         # الحقول الجديدة كـ top-level
+        "setup_type_base": _setup_type_base or "",
         "final_threshold": safe_float(final_threshold) if final_threshold is not None else safe_float(score),
         "target_method": target_method or "unknown",
         "nearest_resistance": round_price(nearest_resistance) if nearest_resistance is not None else None,
@@ -712,15 +813,16 @@ def register_trade(
         "sl_method": sl_method or "unknown",
         "sl_notes": sl_notes or "",
         "falling_knife_risk": normalize_bool(falling_knife_risk),
-        "reversal_quality": reversal_quality or "",
+        "falling_knife_reasons": _falling_knife_reasons,
         "wave_context": wave_context or "",
         "setup_context": setup_context or "",
+        "reversal_quality": reversal_quality or "",
         "reversal_structure_confirmed": bool(reversal_structure_confirmed),
-        "warning_penalty": safe_float(warning_penalty) if warning_penalty is not None else 0.0,
-        "warning_high_count": safe_int(warning_high_count, 0) if warning_high_count is not None else 0,
-        "warning_medium_count": safe_int(warning_medium_count, 0) if warning_medium_count is not None else 0,
-        "warning_penalty_details": normalize_list(warning_penalty_details),
-        "adjustments_log": normalize_list(adjustments_log),
+        "strong_bull_pullback": _strong_bull_pullback,
+        "strong_breakout_exception": _strong_breakout_exception,
+        "tp1_close_pct": _tp1_close_pct,
+        "tp2_close_pct": _tp2_close_pct,
+        "move_sl_to_entry_after_tp1": _move_sl_to_entry_after_tp1,
         "protected_breakeven": bool(protected_breakeven),
         "breakeven_protection_reason": breakeven_protection_reason or "",
         "breakeven_protected_ts": breakeven_protected_ts or None,
@@ -728,6 +830,24 @@ def register_trade(
         "protected_breakeven_exit": bool(protected_breakeven_exit),
         "sl_moved_to_entry": False,
         "sl_move_reason": "",
+        # حقول إضافية اختيارية
+        "fib_position": _fib_position,
+        "fib_position_ratio": _fib_position_ratio,
+        "fib_label": _fib_label,
+        "had_pullback": _had_pullback,
+        "pullback_pct": _pullback_pct,
+        "pullback_label": _pullback_label,
+        "wave_estimate": _wave_estimate,
+        "wave_peaks": _wave_peaks,
+        "wave_label": _wave_label,
+        "entry_maturity": _entry_maturity,
+        "maturity_penalty": _maturity_penalty,
+        "maturity_bonus": _maturity_bonus,
+        "adjustments_log": normalize_list(adjustments_log),
+        "warning_penalty": safe_float(warning_penalty) if warning_penalty is not None else 0.0,
+        "warning_high_count": safe_int(warning_high_count, 0) if warning_high_count is not None else 0,
+        "warning_medium_count": safe_int(warning_medium_count, 0) if warning_medium_count is not None else 0,
+        "warning_penalty_details": normalize_list(warning_penalty_details),
     }
 
     try:
@@ -877,20 +997,38 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
             safe_float(trade_data.get("entry"), 0.0)
         )
 
+        # استخدام tp1_close_pct من trade_data أو diagnostics، الافتراضي 50
+        tp1_close_pct = safe_float(
+            trade_data.get("tp1_close_pct", diagnostics.get("tp1_close_pct", 50.0)),
+            50.0
+        )
+        remaining_pct = max(0.0, 100.0 - tp1_close_pct)
+
         trade_data["tp1_hit"] = True
         trade_data["tp1_hit_at"] = int(time.time())
         trade_data["status"] = "partial"
-        trade_data["sl"] = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
+        trade_data["partial_close_pct"] = tp1_close_pct
+        trade_data["remaining_position_pct"] = remaining_pct
         trade_data["updated_at"] = int(time.time())
 
-        trade_data["sl_moved_to_entry"] = True
-        trade_data["sl_move_reason"] = "TP1 hit - protect remaining 50%"
-        trade_data["partial_close_pct"] = 50.0
-        trade_data["remaining_position_pct"] = 50.0
+        # هل ننقل SL لنقطة الدخول؟
+        move_sl = normalize_bool(
+            trade_data.get("move_sl_to_entry_after_tp1",
+                          diagnostics.get("move_sl_to_entry_after_tp1", True))
+        )
+        if move_sl:
+            trade_data["sl"] = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
+            trade_data["sl_moved_to_entry"] = True
+            trade_data["sl_move_reason"] = "TP1 hit - protect remaining position"
+        else:
+            trade_data["sl_moved_to_entry"] = False
+            trade_data["sl_move_reason"] = "TP1 hit - SL unchanged by config"
 
         diagnostics = trade_data.get("diagnostics", {}) or {}
-        diagnostics["sl_moved_to_entry"] = True
-        diagnostics["sl_move_reason"] = "TP1 hit - protect remaining 50%"
+        diagnostics["sl_moved_to_entry"] = trade_data["sl_moved_to_entry"]
+        diagnostics["sl_move_reason"] = trade_data["sl_move_reason"]
+        diagnostics["partial_close_pct"] = tp1_close_pct
+        diagnostics["remaining_position_pct"] = remaining_pct
         trade_data["diagnostics"] = diagnostics
 
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
@@ -970,7 +1108,6 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
                 result = "tp2_win"
             elif low <= sl:
                 result = "tp1_win"
-
     else:
         if not tp1_hit:
             if high >= sl:
@@ -1048,52 +1185,58 @@ def update_open_trades(
         if not candles:
             continue
 
-        # --- Breakeven protection logic ---
-        if protect_breakeven_on_block and market_mode and "BLOCK" in str(market_mode).upper():
-            if (side == "long" and "BLOCK_LONGS" in str(market_mode).upper()) or \
-               (side == "short" and "BLOCK_SHORTS" in str(market_mode).upper()):
-                try:
-                    current_price = candles[-1]["close"]
-                    entry_price = safe_float(trade.get("entry"), 0.0)
-                    if entry_price > 0:
-                        if side == "long":
-                            current_profit_pct = ((current_price - entry_price) / entry_price) * 100
-                        else:
-                            current_profit_pct = ((entry_price - current_price) / entry_price) * 100
-                        if current_profit_pct >= breakeven_min_profit_pct:
-                            if not trade.get("protected_breakeven"):
-                                current_sl = safe_float(trade.get("sl"), 0.0)
-                                need_move = True
-                                if side == "long":
-                                    if current_sl >= entry_price:
-                                        need_move = False
-                                else:
-                                    if current_sl <= entry_price:
-                                        need_move = False
-                                if need_move:
-                                    if trade.get("original_sl_before_breakeven") is None:
-                                        trade["original_sl_before_breakeven"] = current_sl
-                                    trade["sl"] = entry_price
-                                    trade["protected_breakeven"] = True
-                                    trade["breakeven_protection_reason"] = reason or "market_block_protection"
-                                    trade["breakeven_protected_ts"] = now_ts
-                                    trade["sl_moved_to_entry"] = True
-                                    trade["sl_move_reason"] = reason or "market_block_protection"
+        # --- Breakeven protection logic (معدل لتحديد الجهة الصحيحة) ---
+        mode_upper = str(market_mode or "").upper()
+        block_this_side = (
+            "BLOCK_ALL" in mode_upper
+            or mode_upper.strip() == "BLOCK"
+            or (side == "long" and "BLOCK_LONGS" in mode_upper)
+            or (side == "short" and "BLOCK_SHORTS" in mode_upper)
+        )
 
-                                    diagnostics = trade.get("diagnostics", {}) or {}
-                                    diagnostics["protected_breakeven"] = True
-                                    diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
-                                    diagnostics["breakeven_protected_ts"] = now_ts
-                                    diagnostics["original_sl_before_breakeven"] = current_sl
-                                    diagnostics["sl_moved_to_entry"] = True
-                                    diagnostics["sl_move_reason"] = reason or "market_block_protection"
-                                    trade["diagnostics"] = diagnostics
+        if protect_breakeven_on_block and block_this_side:
+            try:
+                current_price = candles[-1]["close"]
+                entry_price = safe_float(trade.get("entry"), 0.0)
+                if entry_price > 0:
+                    if side == "long":
+                        current_profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    else:
+                        current_profit_pct = ((entry_price - current_price) / entry_price) * 100
+                    if current_profit_pct >= breakeven_min_profit_pct:
+                        if not trade.get("protected_breakeven"):
+                            current_sl = safe_float(trade.get("sl"), 0.0)
+                            need_move = True
+                            if side == "long":
+                                if current_sl >= entry_price:
+                                    need_move = False
+                            else:
+                                if current_sl <= entry_price:
+                                    need_move = False
+                            if need_move:
+                                if trade.get("original_sl_before_breakeven") is None:
+                                    trade["original_sl_before_breakeven"] = current_sl
+                                trade["sl"] = entry_price
+                                trade["protected_breakeven"] = True
+                                trade["breakeven_protection_reason"] = reason or "market_block_protection"
+                                trade["breakeven_protected_ts"] = now_ts
+                                trade["sl_moved_to_entry"] = True
+                                trade["sl_move_reason"] = reason or "market_block_protection"
 
-                                    save_trade(redis_client, trade_key, trade)
-                                    update_trade_history_snapshot(redis_client, trade)
-                                    logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
-                except Exception as e:
-                    logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
+                                diagnostics = trade.get("diagnostics", {}) or {}
+                                diagnostics["protected_breakeven"] = True
+                                diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
+                                diagnostics["breakeven_protected_ts"] = now_ts
+                                diagnostics["original_sl_before_breakeven"] = current_sl
+                                diagnostics["sl_moved_to_entry"] = True
+                                diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                trade["diagnostics"] = diagnostics
+
+                                save_trade(redis_client, trade_key, trade)
+                                update_trade_history_snapshot(redis_client, trade)
+                                logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
+            except Exception as e:
+                logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
 
         # --- Normal trade evaluation with evaluation_start_ts ---
         evaluation_start_ts = created_at
@@ -1244,7 +1387,7 @@ def get_setup_type_stats(
                 continue
 
             if since_ts is not None:
-                created_at = safe_int(trade.get("created_at", 0), 0)
+                created_at = safe_int(trade.get("created_at"), 0)
                 if created_at < int(since_ts):
                     continue
 
