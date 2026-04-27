@@ -29,7 +29,11 @@ from tracking.performance import (
  format_period_summary, 
  get_setup_type_stats, 
 ) 
- 
+from analysis.rejection_tracking import (
+    log_rejected_candidate,
+    build_rejections_report_message,
+)
+
 # محاولة استيراد دالة تقدير تأثير المحفظة 
 try: 
  from tracking.performance import estimate_wallet_pnl 
@@ -641,6 +645,7 @@ def build_help_message() -> str:
 <b>📊 تحليل الأداء:</b>
 /report_deep - تحليل متقدم شامل
 /report_exits - جودة الخروج TP1/TP2/SL
+/report_rejections - تحليل أسباب رفض الفرص
 /report_setups - أفضل وأسوأ أنواع الإشارات
 /report_scores - تحليل السكور
 /report_market - الأداء حسب حالة السوق
@@ -1364,6 +1369,10 @@ COMMAND_HANDLERS = {
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
  "/report_diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_full_diagnostics_report(r, market_type="futures", side="long", period="all")),
  "/report_exits": lambda chat_id: send_telegram_reply(chat_id, build_exits_report_message()),
+ "/report_rejections": lambda chat_id: send_telegram_reply(
+    chat_id,
+    build_rejections_report_message(r)
+),
  "/report_daily": lambda chat_id: send_telegram_reply(chat_id, build_daily_report_message()),
  "/report_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
  "/reset_stats": lambda chat_id: reset_stats(chat_id),
@@ -3417,7 +3426,42 @@ def get_candidate_bucket(candidate: dict) -> str:
 def apply_top_momentum_filter(candidates):
  if not candidates:
     return []
+
+ def _log_top_momentum_rejection(c, reason="top_momentum_filter"):
+    try:
+        log_rejected_candidate(
+            redis_client=r,
+            symbol=c.get("symbol", "UNKNOWN"),
+            reason=reason,
+            candle_time=c.get("candle_time"),
+            score=c.get("score"),
+            raw_score=c.get("raw_score"),
+            final_threshold=c.get("final_threshold"),
+            market_state=c.get("market_state", ""),
+            current_mode=c.get("current_mode", ""),
+            setup_type=c.get("setup_type", ""),
+            entry_timing=c.get("entry_timing", ""),
+            opportunity_type=c.get("opportunity_type", ""),
+            dist_ma=c.get("dist_ma"),
+            rsi_now=c.get("rsi_now"),
+            vol_ratio=c.get("vol_ratio"),
+            vwap_distance=c.get("vwap_distance"),
+            mtf_confirmed=c.get("mtf_confirmed"),
+            breakout=c.get("breakout"),
+            pre_breakout=c.get("pre_breakout"),
+            is_reverse=c.get("is_reverse"),
+            extra={
+                "momentum_priority": c.get("momentum_priority"),
+                "bucket": c.get("bucket"),
+                "change_24h": c.get("change_24h"),
+                "rank_volume_24h": c.get("rank_volume_24h"),
+            },
+        )
+    except Exception:
+        pass
+
  strong_candidates = []
+
  # If few candidates, relax thresholds
  if len(candidates) <= 3:
     for c in candidates:
@@ -3425,31 +3469,41 @@ def apply_top_momentum_filter(candidates):
             min_sc = OVERSOLD_REVERSAL_MIN_SCORE
         elif c.get("is_new"):
             min_sc = TOP_MOMENTUM_NEW_MIN_SCORE
-        # For normal candidates we use a lower limit, but ensure quality for continuations
         elif (c.get("breakout") or c.get("pre_breakout") or c.get("early_priority") == "strong"
               or c.get("strong_bull_pullback") or c.get("strong_breakout_exception")):
-            min_sc = max(6.2, TOP_MOMENTUM_MIN_SCORE)  # allow good candidates
+            min_sc = max(6.2, TOP_MOMENTUM_MIN_SCORE)
         else:
-            min_sc = 6.8  # stricter for plain continuations
+            min_sc = 6.8
+
         if c["score"] >= min_sc:
             strong_candidates.append(c)
-    strong_candidates.sort(key=lambda x: (x["momentum_priority"], x["score"], x["change_24h"], x["rank_volume_24h"]), reverse=True)
+        else:
+            _log_top_momentum_rejection(c, reason="top_momentum_min_score")
+
+    strong_candidates.sort(
+        key=lambda x: (x["momentum_priority"], x["score"], x["change_24h"], x["rank_volume_24h"]),
+        reverse=True
+    )
     logger.info(f"Top momentum small-candidate mode: kept {len(strong_candidates)} of {len(candidates)}")
     return strong_candidates
 
- # Normal mode (more than 3 candidates)
+ # Normal mode
  min_score = get_effective_min_score(False, False)
  for c in candidates:
     if c["score"] >= min_score:
-        # additional guard for plain continuations
         if not (c.get("breakout") or c.get("pre_breakout") or c.get("early_priority") == "strong"
                 or c.get("strong_bull_pullback") or c.get("strong_breakout_exception") or c.get("is_reverse")):
             if c["score"] < 6.8:
+                _log_top_momentum_rejection(c, reason="top_momentum_plain_continuation_score")
                 continue
         strong_candidates.append(c)
+    else:
+        _log_top_momentum_rejection(c, reason="top_momentum_min_score")
+
  if not strong_candidates:
     logger.info("Top momentum filter: no candidates above threshold")
     return []
+
  strong_candidates.sort(
     key=lambda x: (
         x["momentum_priority"],
@@ -3459,16 +3513,26 @@ def apply_top_momentum_filter(candidates):
     ),
     reverse=True,
  )
+
  top_n = max(4, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
  filtered = strong_candidates[:top_n]
+ filtered_ids = set(id(x) for x in filtered)
+
+ for c in strong_candidates:
+    if id(c) not in filtered_ids:
+        _log_top_momentum_rejection(c, reason="top_momentum_rank_cut")
+
  final_candidates = []
  new_count = 0
+
  for c in filtered:
     if c["is_new"]:
         if new_count >= NEW_LISTING_MAX_PER_RUN:
+            _log_top_momentum_rejection(c, reason="top_momentum_new_listing_limit")
             continue
         new_count += 1
     final_candidates.append(c)
+
  logger.info(
     f"Top momentum filter: kept {len(final_candidates)} of {len(strong_candidates)} "
     f"(from total {len(candidates)})"
@@ -5428,6 +5492,25 @@ def run_scanner_loop():
             )
             # تفعيل حظر الـ late_guard المباشر
             if late_guard.get("should_block") and not is_reverse:
+                log_rejected_candidate(
+                    redis_client=r,
+                    symbol=symbol,
+                    reason="late_guard_should_block",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing="",
+                    opportunity_type=temp_opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"late_guard_reasons": late_guard.get("reasons", [])},
+                )
                 logger.info(f"{symbol} --> skipped by late_guard should_block: {late_guard.get('reasons', [])}")
                 continue
             entry_maturity_data = {
@@ -5564,11 +5647,30 @@ def run_scanner_loop():
             pre_score_adjustments_log = []
 
             if not is_reverse:
+                entry_maturity_status = str(entry_maturity_data.get("entry_maturity", "unknown") or "unknown")
+                had_pullback = bool(entry_maturity_data.get("had_pullback", False))
+                fib_position = str(entry_maturity_data.get("fib_position", "unknown") or "unknown")
+                wave_estimate = int(entry_maturity_data.get("wave_estimate", 0) or 0)
+
+                healthy_pullback_context = (
+                    entry_maturity_status == "healthy"
+                    and had_pullback
+                    and "صحي" in str(entry_timing_temp)
+                )
+
                 hard_late_entry = (
-                    "متأخر جدًا" in entry_timing_temp
-                    or "موجة خامسة" in entry_timing_temp
-                    or "امتداد سعري" in entry_timing_temp
-                    or "نهاية موجة" in entry_timing_temp
+                    not healthy_pullback_context
+                    and (
+                        "متأخر جدًا" in str(entry_timing_temp)
+                        or "موجة خامسة" in str(entry_timing_temp)
+                        or "امتداد سعري" in str(entry_timing_temp)
+                        or "نهاية موجة" in str(entry_timing_temp)
+                        or (
+                            fib_position == "overextended"
+                            and wave_estimate >= 5
+                            and not had_pullback
+                        )
+                    )
                 )
 
                 if hard_late_entry:
@@ -5580,10 +5682,36 @@ def run_scanner_loop():
                         })
                         logger.info(f"{symbol} --> hard late entry overridden by strong exception")
                     else:
+                        log_rejected_candidate(
+                            redis_client=r,
+                            symbol=symbol,
+                            reason="hard_late_entry",
+                            candle_time=candle_time,
+                            market_state=market_state,
+                            current_mode=current_mode,
+                            entry_timing=entry_timing_temp,
+                            opportunity_type=temp_opportunity_type,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            is_reverse=is_reverse,
+                            extra={
+                                "entry_maturity": entry_maturity_status,
+                                "had_pullback": had_pullback,
+                                "fib_position": fib_position,
+                                "wave_estimate": wave_estimate,
+                                "breakout_quality": breakout_quality,
+                            },
+                        )
                         logger.info(
                             f"{symbol} --> rejected by hard late entry block "
-                            f"(entry_timing={entry_timing_temp}, score_pre=not_calculated, "
-                            f"dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
+                            f"(entry_timing={entry_timing_temp}, entry_maturity={entry_maturity_status}, "
+                            f"had_pullback={had_pullback}, fib={fib_position}, wave={wave_estimate}, "
+                            f"score_pre=not_calculated, dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
                             f"vol={vol_ratio:.2f}, vwap={vwap_distance:.2f})"
                         )
                         continue
@@ -5601,6 +5729,29 @@ def run_scanner_loop():
                     final_threshold_min = 6.0
 
                 if not (breakout or pre_breakout or early_priority == "strong" or strong_bull_pullback or (is_reverse and reversal_4h_result.get("confirmed"))):
+                    log_rejected_candidate(
+                        redis_client=r,
+                        symbol=symbol,
+                        reason="strong_only_no_valid_setup",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "early_priority": early_priority,
+                            "strong_bull_pullback": strong_bull_pullback,
+                            "breakout_quality": breakout_quality,
+                        },
+                    )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: no valid strong setup)")
                     continue
                 if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong"):
@@ -5839,6 +5990,32 @@ def run_scanner_loop():
                 score_after_penalties=score_result["score"],
             )
             if should_reject_near_resistance:
+                log_rejected_candidate(
+                    redis_client=r,
+                    symbol=symbol,
+                    reason="near_resistance",
+                    candle_time=candle_time,
+                    score=score_result.get("score"),
+                    raw_score=raw_score,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing_temp,
+                    opportunity_type=temp_opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={
+                        "nearest_resistance": early_nearest_resistance,
+                        "resistance_warning": early_resistance_warning,
+                        "res_dynamic_penalty": res_dynamic_penalty,
+                        "upper_wick_ratio": upper_wick_ratio,
+                    },
+                )
                 logger.info(f"{symbol} --> rejected by near resistance + weak market guard")
                 continue
             if res_dynamic_penalty != 0.0:
@@ -5971,6 +6148,36 @@ def run_scanner_loop():
                 continue
 
             if score_result["score"] < final_threshold:
+                log_rejected_candidate(
+                    redis_client=r,
+                    symbol=symbol,
+                    reason="final_threshold",
+                    candle_time=candle_time,
+                    score=score_result.get("score"),
+                    raw_score=raw_score,
+                    final_threshold=final_threshold,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    setup_type="",
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={
+                        "dynamic_threshold": dynamic_threshold,
+                        "required_min_score": effective_required_min_score,
+                        "adjustments_log": adjustments_log,
+                        "warning_reasons": score_result.get("warning_reasons", []),
+                        "early_priority": early_priority,
+                        "breakout_quality": breakout_quality,
+                    },
+                )
                 logger.info(
                     f"{symbol} --> rejected by final_threshold {final_threshold:.2f} "
                     f"(score={score_result['score']:.2f}, dynamic={dynamic_threshold:.2f}, "
@@ -6055,6 +6262,32 @@ def run_scanner_loop():
                 if "Weak Historical Setup" not in score_result["warning_reasons"]:
                     score_result["warning_reasons"].append("Weak Historical Setup")
                 if score_result["score"] < final_threshold:
+                    log_rejected_candidate(
+                        redis_client=r,
+                        symbol=symbol,
+                        reason="weak_historical_setup",
+                        candle_time=candle_time,
+                        score=score_result.get("score"),
+                        raw_score=raw_score,
+                        final_threshold=final_threshold,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        setup_type=setup_type,
+                        entry_timing=entry_timing,
+                        opportunity_type=opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "setup_type_base": setup_type_base,
+                            "breakout_quality": breakout_quality,
+                        },
+                    )
                     logger.info(f"{symbol} --> skipped (weak historical setup: score below final_threshold {final_threshold})")
                     continue
                 momentum_priority -= 0.60
@@ -6093,6 +6326,7 @@ def run_scanner_loop():
                 "entry_timing": entry_timing,
                 "opportunity_type": opportunity_type,
                 "market_state": market_state,
+                "current_mode": current_mode,
                 "market_state_label": market_state_label,
                 "market_bias_label": market_bias_label,
                 "breakout_quality": breakout_quality,
