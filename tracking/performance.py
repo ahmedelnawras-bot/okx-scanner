@@ -1,4 +1,3 @@
-```python
 # tracking/performance.py
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -369,9 +368,14 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "adjustments_log": normalize_list(extra_fields.get("adjustments_log")),
         "protected_breakeven": normalize_bool(extra_fields.get("protected_breakeven", False)),
         "breakeven_protection_reason": normalize_text(extra_fields.get("breakeven_protection_reason"), ""),
-        "breakeven_protected_ts": safe_int(extra_fields.get("breakeven_protected_ts"), None),
+        "breakeven_protected_ts": (
+            safe_int(extra_fields.get("breakeven_protected_ts"), 0)
+            if extra_fields.get("breakeven_protected_ts") is not None else None
+        ),
         "original_sl_before_breakeven": round_price(extra_fields.get("original_sl_before_breakeven")) if extra_fields.get("original_sl_before_breakeven") is not None else None,
         "protected_breakeven_exit": normalize_bool(extra_fields.get("protected_breakeven_exit", False)),
+        "sl_moved_to_entry": normalize_bool(extra_fields.get("sl_moved_to_entry", False)),
+        "sl_move_reason": normalize_text(extra_fields.get("sl_move_reason"), ""),
     }
 
     return diagnostics
@@ -379,6 +383,12 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
 
 def build_history_snapshot(trade_data: dict) -> dict:
     diagnostics = trade_data.get("diagnostics", {}) or {}
+
+    def get_field(name, default=None):
+        val = trade_data.get(name)
+        if val is None:
+            val = diagnostics.get(name)
+        return val if val is not None else default
 
     return {
         "symbol": trade_data.get("symbol", ""),
@@ -433,30 +443,35 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "diagnostics": diagnostics,
 
         # الحقول الجديدة من trade_data أو diagnostics
-        "final_threshold": safe_float(trade_data.get("final_threshold", diagnostics.get("final_threshold"))),
-        "target_method": trade_data.get("target_method") or diagnostics.get("target_method") or "unknown",
-        "nearest_resistance": trade_data.get("nearest_resistance") or diagnostics.get("nearest_resistance"),
-        "nearest_support": trade_data.get("nearest_support") or diagnostics.get("nearest_support"),
-        "resistance_warning": trade_data.get("resistance_warning") or diagnostics.get("resistance_warning", ""),
-        "support_warning": trade_data.get("support_warning") or diagnostics.get("support_warning", ""),
-        "target_notes": normalize_list(trade_data.get("target_notes", diagnostics.get("target_notes"))),
-        "sl_method": trade_data.get("sl_method") or diagnostics.get("sl_method") or "unknown",
-        "sl_notes": trade_data.get("sl_notes") or diagnostics.get("sl_notes", ""),
-        "falling_knife_risk": normalize_bool(trade_data.get("falling_knife_risk", diagnostics.get("falling_knife_risk", False))),
-        "reversal_quality": trade_data.get("reversal_quality") or diagnostics.get("reversal_quality", ""),
-        "wave_context": trade_data.get("wave_context") or diagnostics.get("wave_context", ""),
-        "setup_context": trade_data.get("setup_context") or diagnostics.get("setup_context", ""),
-        "reversal_structure_confirmed": normalize_bool(trade_data.get("reversal_structure_confirmed", diagnostics.get("reversal_structure_confirmed", False))),
-        "warning_penalty": safe_float(trade_data.get("warning_penalty", diagnostics.get("warning_penalty"))),
-        "warning_high_count": safe_int(trade_data.get("warning_high_count", diagnostics.get("warning_high_count"))),
-        "warning_medium_count": safe_int(trade_data.get("warning_medium_count", diagnostics.get("warning_medium_count"))),
-        "warning_penalty_details": normalize_list(trade_data.get("warning_penalty_details", diagnostics.get("warning_penalty_details"))),
-        "adjustments_log": normalize_list(trade_data.get("adjustments_log", diagnostics.get("adjustments_log"))),
-        "protected_breakeven": normalize_bool(trade_data.get("protected_breakeven", diagnostics.get("protected_breakeven", False))),
-        "breakeven_protection_reason": trade_data.get("breakeven_protection_reason") or diagnostics.get("breakeven_protection_reason", ""),
-        "breakeven_protected_ts": safe_int(trade_data.get("breakeven_protected_ts", diagnostics.get("breakeven_protected_ts"))),
-        "original_sl_before_breakeven": trade_data.get("original_sl_before_breakeven") or diagnostics.get("original_sl_before_breakeven"),
-        "protected_breakeven_exit": normalize_bool(trade_data.get("protected_breakeven_exit", diagnostics.get("protected_breakeven_exit", False))),
+        "final_threshold": safe_float(get_field("final_threshold", 0.0)),
+        "target_method": get_field("target_method", "unknown"),
+        "nearest_resistance": get_field("nearest_resistance"),
+        "nearest_support": get_field("nearest_support"),
+        "resistance_warning": get_field("resistance_warning", ""),
+        "support_warning": get_field("support_warning", ""),
+        "target_notes": normalize_list(get_field("target_notes", [])),
+        "sl_method": get_field("sl_method", "unknown"),
+        "sl_notes": get_field("sl_notes", ""),
+        "falling_knife_risk": normalize_bool(get_field("falling_knife_risk", False)),
+        "reversal_quality": get_field("reversal_quality", ""),
+        "wave_context": get_field("wave_context", ""),
+        "setup_context": get_field("setup_context", ""),
+        "reversal_structure_confirmed": normalize_bool(get_field("reversal_structure_confirmed", False)),
+        "warning_penalty": safe_float(get_field("warning_penalty", 0.0)),
+        "warning_high_count": safe_int(get_field("warning_high_count", 0)),
+        "warning_medium_count": safe_int(get_field("warning_medium_count", 0)),
+        "warning_penalty_details": normalize_list(get_field("warning_penalty_details", [])),
+        "adjustments_log": normalize_list(get_field("adjustments_log", [])),
+        "protected_breakeven": normalize_bool(get_field("protected_breakeven", False)),
+        "breakeven_protection_reason": get_field("breakeven_protection_reason", ""),
+        "breakeven_protected_ts": (
+            safe_int(get_field("breakeven_protected_ts"), 0)
+            if get_field("breakeven_protected_ts") is not None else None
+        ),
+        "original_sl_before_breakeven": get_field("original_sl_before_breakeven"),
+        "protected_breakeven_exit": normalize_bool(get_field("protected_breakeven_exit", False)),
+        "sl_moved_to_entry": normalize_bool(get_field("sl_moved_to_entry", False)),
+        "sl_move_reason": get_field("sl_move_reason", ""),
     }
 
 
@@ -514,7 +529,7 @@ def register_trade(
     pullback_high: float = None,
     rr1: float = 1.5,
     rr2: float = 3.0,
-    # New fields (optional)
+    # New fields
     final_threshold: float = None,
     target_method: str = None,
     nearest_resistance: float = None,
@@ -583,7 +598,7 @@ def register_trade(
     break_signal = bool(breakout)
     signal_event = "breakdown" if side == "short" else "breakout"
 
-    diagnostics = build_trade_diagnostics({
+    docs = build_trade_diagnostics({
         "raw_score": score if raw_score is None else raw_score,
         "effective_score": score if effective_score is None else effective_score,
         "dynamic_threshold": dynamic_threshold,
@@ -613,7 +628,7 @@ def register_trade(
         "effective_entry": entry,
         "rr1": rr1,
         "rr2": rr2,
-        # الحقول الجديدة
+        # إضافة الحقول الجديدة
         "final_threshold": final_threshold,
         "target_method": target_method,
         "nearest_resistance": nearest_resistance,
@@ -638,6 +653,8 @@ def register_trade(
         "breakeven_protected_ts": breakeven_protected_ts,
         "original_sl_before_breakeven": original_sl_before_breakeven,
         "protected_breakeven_exit": protected_breakeven_exit,
+        "sl_moved_to_entry": False,
+        "sl_move_reason": "",
     })
 
     trade_data = {
@@ -682,9 +699,9 @@ def register_trade(
         "change_24h": round(safe_float(change_24h), 2),
 
         "setup_type": setup_type or "unknown",
-        "diagnostics": diagnostics,
+        "diagnostics": docs,
 
-        # New optional fields
+        # الحقول الجديدة كـ top-level
         "final_threshold": safe_float(final_threshold) if final_threshold is not None else safe_float(score),
         "target_method": target_method or "unknown",
         "nearest_resistance": round_price(nearest_resistance) if nearest_resistance is not None else None,
@@ -700,8 +717,8 @@ def register_trade(
         "setup_context": setup_context or "",
         "reversal_structure_confirmed": bool(reversal_structure_confirmed),
         "warning_penalty": safe_float(warning_penalty) if warning_penalty is not None else 0.0,
-        "warning_high_count": safe_int(warning_high_count) if warning_high_count is not None else 0,
-        "warning_medium_count": safe_int(warning_medium_count) if warning_medium_count is not None else 0,
+        "warning_high_count": safe_int(warning_high_count, 0) if warning_high_count is not None else 0,
+        "warning_medium_count": safe_int(warning_medium_count, 0) if warning_medium_count is not None else 0,
         "warning_penalty_details": normalize_list(warning_penalty_details),
         "adjustments_log": normalize_list(adjustments_log),
         "protected_breakeven": bool(protected_breakeven),
@@ -709,6 +726,8 @@ def register_trade(
         "breakeven_protected_ts": breakeven_protected_ts or None,
         "original_sl_before_breakeven": round_price(original_sl_before_breakeven) if original_sl_before_breakeven is not None else None,
         "protected_breakeven_exit": bool(protected_breakeven_exit),
+        "sl_moved_to_entry": False,
+        "sl_move_reason": "",
     }
 
     try:
@@ -868,6 +887,11 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         trade_data["sl_move_reason"] = "TP1 hit - protect remaining 50%"
         trade_data["partial_close_pct"] = 50.0
         trade_data["remaining_position_pct"] = 50.0
+
+        diagnostics = trade_data.get("diagnostics", {}) or {}
+        diagnostics["sl_moved_to_entry"] = True
+        diagnostics["sl_move_reason"] = "TP1 hit - protect remaining 50%"
+        trade_data["diagnostics"] = diagnostics
 
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
         side = normalize_side(trade_data.get("side", "long"))
@@ -1047,7 +1071,6 @@ def update_open_trades(
                                     if current_sl <= entry_price:
                                         need_move = False
                                 if need_move:
-                                    # حفظ SL القديم قبل التعديل
                                     if trade.get("original_sl_before_breakeven") is None:
                                         trade["original_sl_before_breakeven"] = current_sl
                                     trade["sl"] = entry_price
@@ -1056,6 +1079,16 @@ def update_open_trades(
                                     trade["breakeven_protected_ts"] = now_ts
                                     trade["sl_moved_to_entry"] = True
                                     trade["sl_move_reason"] = reason or "market_block_protection"
+
+                                    diagnostics = trade.get("diagnostics", {}) or {}
+                                    diagnostics["protected_breakeven"] = True
+                                    diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
+                                    diagnostics["breakeven_protected_ts"] = now_ts
+                                    diagnostics["original_sl_before_breakeven"] = current_sl
+                                    diagnostics["sl_moved_to_entry"] = True
+                                    diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                    trade["diagnostics"] = diagnostics
+
                                     save_trade(redis_client, trade_key, trade)
                                     update_trade_history_snapshot(redis_client, trade)
                                     logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
@@ -1064,8 +1097,9 @@ def update_open_trades(
 
         # --- Normal trade evaluation with evaluation_start_ts ---
         evaluation_start_ts = created_at
-        if trade.get("protected_breakeven") and safe_int(trade.get("breakeven_protected_ts"), 0) > 0:
-            evaluation_start_ts = safe_int(trade.get("breakeven_protected_ts"), created_at)
+        protected_ts = trade.get("breakeven_protected_ts")
+        if trade.get("protected_breakeven") and protected_ts is not None:
+            evaluation_start_ts = safe_int(protected_ts, created_at)
 
         result = None
         state_changed = False
@@ -1809,7 +1843,7 @@ def get_all_trades_data(
                 trade_market = normalize_market_type(trade.get("market_type", "futures"))
                 trade_side = normalize_side(trade.get("side", "long"))
                 created_ts = get_trade_created_ts(trade)
-                ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0))
+                ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0), 0)
 
                 if market_type and trade_market != normalize_market_type(market_type):
                     continue
@@ -1832,7 +1866,7 @@ def get_all_trades_data(
             trade_market = normalize_market_type(trade.get("market_type", "futures"))
             trade_side = normalize_side(trade.get("side", "long"))
             created_ts = get_trade_created_ts(trade)
-            ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0))
+            ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0), 0)
 
             if market_type and trade_market != normalize_market_type(market_type):
                 continue
@@ -2279,4 +2313,3 @@ def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct
     )
 
     return wallet_pnl_pct, wallet_pnl_usd
-```
