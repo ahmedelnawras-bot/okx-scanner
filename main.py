@@ -75,7 +75,7 @@ COMMAND_POLL_INTERVAL = 3
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 TOP_MOMENTUM_PERCENT = 0.30
-TOP_MOMENTUM_MIN_SCORE = 7.0
+TOP_MOMENTUM_MIN_SCORE = 6.4   # modified from 7.0
 TOP_MOMENTUM_NEW_MIN_SCORE = 6.0
 NEW_LISTING_MIN_VOL_RATIO = 1.8
 NEW_LISTING_MIN_CANDLE_STRENGTH = 0.45
@@ -773,7 +773,7 @@ def _format_wallet_impact(summary: dict, side="long") -> str:
     return "Wallet impact: غير متاح"
 
 
-# ----------- New helper functions for exits report -----------
+# ----------- Helper functions for exits report -----------
 def _load_long_trades_from_redis(limit: int = 700) -> list:
     trades = []
     if not r:
@@ -845,6 +845,108 @@ def _trade_exit_bucket(trade: dict) -> str:
         return "unknown"
 
 
+def _get_trade_pnl_pct(trade: dict) -> float:
+    # try stored fields
+    for field in ["realized_leveraged_pnl_pct", "leveraged_pnl_pct", "pnl_pct", "result_pct", "realized_pnl_pct", "raw_pnl_pct"]:
+        val = trade.get(field)
+        if val is not None:
+            try:
+                f = float(val)
+                if f != f:
+                    continue
+                return f
+            except Exception:
+                continue
+    # estimate from entry/sl/tp1/tp2
+    entry = _safe_float(trade.get("entry"), None)
+    if entry is None or entry <= 0:
+        return 0.0
+    result = str(trade.get("result", "") or "").lower()
+    if result == "loss":
+        sl = _safe_float(trade.get("sl"), 0)
+        if sl > 0:
+            return round(((sl - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
+        return 0.0
+    if result == "tp2_win":
+        tp2 = _safe_float(trade.get("tp2"), 0)
+        if tp2 > 0:
+            return round(((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
+        return 0.0
+    if result == "tp1_win":
+        tp1 = _safe_float(trade.get("tp1"), 0)
+        if tp1 > 0:
+            return round(((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
+        return 0.0
+    if result == "expired":
+        last_price = _safe_float(trade.get("last_price"), 0)
+        if last_price > 0:
+            return round(((last_price - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
+        return 0.0
+    if bool(trade.get("protected_breakeven_exit", False)):
+        return 0.0
+    # partial or other: use current approximate? skip for now
+    return 0.0
+
+
+def _is_trade_win_bucket(bucket: str) -> bool:
+    return bucket in ("tp2", "tp1_only", "partial", "breakeven_protected", "tp1_hit_open_or_unknown")
+
+
+def _build_group_exit_stats(trades: list, group_field: str, max_items: int = 6) -> dict:
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for t in trades:
+        bucket = _trade_exit_bucket(t)
+        if bucket in ("open", "unknown"):
+            continue
+        key = str(t.get(group_field, "unknown"))[:60]
+        groups[key].append((t, bucket))
+    stats = {}
+    for key, items in groups.items():
+        total = len(items)
+        wins = sum(1 for _, b in items if _is_trade_win_bucket(b))
+        losses = sum(1 for _, b in items if b == "loss")
+        expired = sum(1 for _, b in items if b == "expired")
+        tp1_count = sum(1 for _, b in items if b in ("tp2", "tp1_only", "partial", "tp1_hit_open_or_unknown"))
+        tp2_count = sum(1 for _, b in items if b == "tp2")
+        breakeven_count = sum(1 for _, b in items if b == "breakeven_protected")
+        winrate = (wins / total * 100) if total else 0.0
+        tp1_rate = (tp1_count / total * 100) if total else 0.0
+        tp2_rate = (tp2_count / total * 100) if total else 0.0
+        pnls = [_get_trade_pnl_pct(t) for t, _ in items]
+        avg_pnl = _avg(pnls) if pnls else 0.0
+        stats[key] = {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "expired": expired,
+            "tp1_count": tp1_count,
+            "tp2_count": tp2_count,
+            "breakeven_count": breakeven_count,
+            "winrate": winrate,
+            "tp1_rate": tp1_rate,
+            "tp2_rate": tp2_rate,
+            "avg_pnl": avg_pnl,
+        }
+    # sort by total desc, take top max_items
+    sorted_items = sorted(stats.items(), key=lambda x: x[1]["total"], reverse=True)[:max_items]
+    return dict(sorted_items)
+
+
+def _format_group_exit_stats(title: str, stats: dict) -> str:
+    lines = [f"<b>{title}</b>"]
+    for key, info in stats.items():
+        lines.append(
+            f"• {html.escape(str(key))} | total={info['total']} | "
+            f"winrate={info['winrate']:.1f}% | "
+            f"TP1={info['tp1_count']}/{info['tp1_rate']:.1f}% | "
+            f"TP2={info['tp2_count']}/{info['tp2_rate']:.1f}% | "
+            f"SL={info['losses']} | Exp={info['expired']} | "
+            f"AvgPnL={_pct_safe(info['avg_pnl'])}"
+        )
+    return "\n".join(lines)
+
+
 def _format_last_closed_trades(trades: list, max_items: int = 8) -> str:
     lines = []
     closed = [
@@ -862,13 +964,7 @@ def _format_last_closed_trades(trades: list, max_items: int = 8) -> str:
         setup_type = str(t.get("setup_type", "unknown"))
         entry_timing = str(t.get("entry_timing", ""))
 
-        pnl = (
-            t.get("realized_leveraged_pnl_pct")
-            or t.get("leveraged_pnl_pct")
-            or t.get("pnl_pct")
-            or t.get("result_pct")
-            or 0.0
-        )
+        pnl = _get_trade_pnl_pct(t)
 
         label = {
             "tp2": "🎯 TP2",
@@ -917,34 +1013,15 @@ def build_exits_report_message() -> str:
 
         tp1_to_tp2 = (tp2_effective / tp1_effective * 100) if tp1_effective else 0
 
-        all_pnls = []
-        for t in closed:
-            pnl = _safe_float(
-                t.get("realized_leveraged_pnl_pct")
-                or t.get("leveraged_pnl_pct")
-                or t.get("pnl_pct")
-                or t.get("result_pct")
-                or 0.0
-            )
-            all_pnls.append(pnl)
-
+        all_pnls = [_get_trade_pnl_pct(t) for t in closed]
         avg_pnl = _avg(all_pnls) if all_pnls else 0.0
-        win_pnls = [p for i, p in enumerate(all_pnls) if _trade_exit_bucket(closed[i]) not in ("loss", "expired")]
-        loss_pnls = [p for i, p in enumerate(all_pnls) if _trade_exit_bucket(closed[i]) in ("loss", "expired")]
+        win_pnls = [p for i, p in enumerate(all_pnls) if _is_trade_win_bucket(_trade_exit_bucket(closed[i]))]
+        loss_pnls = [p for i, p in enumerate(all_pnls) if _trade_exit_bucket(closed[i]) == "loss"]
         avg_win = _avg(win_pnls) if win_pnls else 0.0
         avg_loss = _avg(loss_pnls) if loss_pnls else 0.0
 
-        setup_stats = {}
-        for t in closed:
-            st = str(t.get("setup_type", "unknown"))[:50]
-            setup_stats[st] = setup_stats.get(st, 0) + 1
-        worst_setups = sorted(setup_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        timing_stats = {}
-        for t in closed:
-            et = str(t.get("entry_timing", "unknown"))[:30]
-            timing_stats[et] = timing_stats.get(et, 0) + 1
-        worst_timing = sorted(timing_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+        setup_stats = _build_group_exit_stats(closed, "setup_type", max_items=6)
+        timing_stats = _build_group_exit_stats(closed, "entry_timing", max_items=6)
 
         lines = [
             "📊 <b>تقرير جودة الخروج الشامل - LONG</b>",
@@ -970,19 +1047,13 @@ def build_exits_report_message() -> str:
             f"• Avg Win: {_pct_safe(avg_win)}",
             f"• Avg Loss: {_pct_safe(avg_loss)}",
             "",
-            "<b>📌 أكثر setup_types ظهورًا في الصفقات المغلقة:</b>",
+            _format_group_exit_stats("📌 أداء setup_type", setup_stats),
+            "",
+            _format_group_exit_stats("📍 أداء entry_timing", timing_stats),
+            "",
+            "<b>🔹 آخر الصفقات المغلقة:</b>",
+            _format_last_closed_trades(trades),
         ]
-        for st, cnt in worst_setups:
-            lines.append(f"• {html.escape(st)} ({cnt})")
-
-        lines.append("")
-        lines.append("<b>📍 أكثر entry_timing ظهورًا في الصفقات المغلقة:</b>")
-        for et, cnt in worst_timing:
-            lines.append(f"• {html.escape(et)} ({cnt})")
-
-        lines.append("")
-        lines.append("<b>🔹 آخر الصفقات المغلقة:</b>")
-        lines.append(_format_last_closed_trades(trades))
 
         return _limit_telegram_message("\n".join(lines))
 
@@ -3341,9 +3412,34 @@ def apply_top_momentum_filter(candidates):
  if not candidates:
     return []
  strong_candidates = []
+ # If few candidates, relax thresholds
+ if len(candidates) <= 3:
+    for c in candidates:
+        if c.get("is_reverse"):
+            min_sc = OVERSOLD_REVERSAL_MIN_SCORE
+        elif c.get("is_new"):
+            min_sc = TOP_MOMENTUM_NEW_MIN_SCORE
+        # For normal candidates we use a lower limit, but ensure quality for continuations
+        elif (c.get("breakout") or c.get("pre_breakout") or c.get("early_priority") == "strong"
+              or c.get("strong_bull_pullback") or c.get("strong_breakout_exception")):
+            min_sc = max(6.2, TOP_MOMENTUM_MIN_SCORE)  # allow good candidates
+        else:
+            min_sc = 6.8  # stricter for plain continuations
+        if c["score"] >= min_sc:
+            strong_candidates.append(c)
+    strong_candidates.sort(key=lambda x: (x["momentum_priority"], x["score"], x["change_24h"], x["rank_volume_24h"]), reverse=True)
+    logger.info(f"Top momentum small-candidate mode: kept {len(strong_candidates)} of {len(candidates)}")
+    return strong_candidates
+
+ # Normal mode (more than 3 candidates)
+ min_score = get_effective_min_score(False, False)
  for c in candidates:
-    min_score = get_effective_min_score(c["is_new"], c.get("is_reverse", False))
     if c["score"] >= min_score:
+        # additional guard for plain continuations
+        if not (c.get("breakout") or c.get("pre_breakout") or c.get("early_priority") == "strong"
+                or c.get("strong_bull_pullback") or c.get("strong_breakout_exception") or c.get("is_reverse")):
+            if c["score"] < 6.8:
+                continue
         strong_candidates.append(c)
  if not strong_candidates:
     logger.info("Top momentum filter: no candidates above threshold")
@@ -5352,6 +5448,32 @@ def run_scanner_loop():
                 logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
                 continue
 
+            # compute strong_bull_pullback once for later reuse
+            strong_bull_pullback = (
+                market_state in ("bull_market", "alt_season")
+                and mtf_confirmed
+                and vol_ratio >= 1.35
+                and rsi_now <= 66
+                and dist_ma <= 3.2
+                and candle_strength >= 0.45
+                and gaining_strength
+                and (not late_guard["late_pump_risk"])
+                and (not late_guard["extreme_late_pump"])
+                and (not trap_check["is_trap"])
+                and vwap_distance <= 2.2
+                and (macd_hist >= 0 or macd_hist_slope >= 0)
+            )
+
+            strong_breakout_exception = (
+                breakout
+                and breakout_quality == "strong"
+                and mtf_confirmed
+                and vol_ratio >= 1.8
+                and rsi_now <= 66
+                and dist_ma <= 3.8
+                and vwap_distance <= 2.2
+            )
+
             if not is_reverse:
                 hard_late_entry = (
                     "متأخر جدًا" in entry_timing_temp
@@ -5360,36 +5482,36 @@ def run_scanner_loop():
                     or "نهاية موجة" in entry_timing_temp
                 )
 
-                hard_late_exception = (
-                    breakout
-                    and breakout_quality == "strong"
-                    and mtf_confirmed
-                    and vol_ratio >= 1.8
-                    and rsi_now <= 66
-                    and dist_ma <= 3.8
-                    and vwap_distance <= 2.2
-                )
-
-                if hard_late_entry and not hard_late_exception:
-                    logger.info(
-                        f"{symbol} --> rejected by hard late entry block "
-                        f"(entry_timing={entry_timing_temp}, score_pre=not_calculated, "
-                        f"dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
-                        f"vol={vol_ratio:.2f}, vwap={vwap_distance:.2f})"
-                    )
-                    continue
+                if hard_late_entry:
+                    if strong_bull_pullback or strong_breakout_exception:
+                        adjustments_log.append({
+                            "name": "hard_late_exception",
+                            "value": 0.0,
+                            "reason": "strong_bull_pullback_or_strong_breakout"
+                        })
+                        logger.info(f"{symbol} --> hard late entry overridden by strong exception")
+                    else:
+                        logger.info(
+                            f"{symbol} --> rejected by hard late entry block "
+                            f"(entry_timing={entry_timing_temp}, score_pre=not_calculated, "
+                            f"dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
+                            f"vol={vol_ratio:.2f}, vwap={vwap_distance:.2f})"
+                        )
+                        continue
 
             breakout_warning = guard.get("warning", "")
             upper_wick_ratio = guard.get("upper_wick_ratio", 0.0)
             late_breakout_guard_reason = guard.get("reason", "none") or "none"
             if current_mode == MODE_STRONG_LONG_ONLY:
-                if not (breakout or pre_breakout or early_priority == "strong"):
-                    logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: no breakout/pre/early_strong)")
+                if not (breakout or pre_breakout or early_priority == "strong" or strong_bull_pullback):
+                    logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: no breakout/pre/early_strong/strong_bull_pullback)")
                     continue
+                if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong"):
+                    logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY strong_bull_pullback exception")
                 if not mtf_confirmed and not (is_reverse and reversal_4h_result.get("confirmed")):
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: mtf not confirmed)")
                     continue
-                if vol_ratio < 1.25:
+                if vol_ratio < 1.25 and not strong_bull_pullback:
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: vol_ratio too low)")
                     continue
                 if breakout and breakout_quality == "weak":
@@ -5630,16 +5752,6 @@ def run_scanner_loop():
                         "value": bull_continuation_extra,
                         "reason": "extra_required_min_score_for_bull_continuation"
                     })
-
-                strong_bull_pullback = (
-                    market_state in ("bull_market", "alt_season")
-                    and mtf_confirmed
-                    and vol_ratio >= 1.35
-                    and rsi_now <= 66
-                    and dist_ma <= 3.2
-                    and candle_strength >= 0.45
-                    and gaining_strength
-                )
 
                 if not strong_bull_pullback and score_result["score"] < 7.5:
                     logger.info(
@@ -5916,6 +6028,8 @@ def run_scanner_loop():
                 "setup_context": setup_type,
                 "reversal_quality": "",
                 "reversal_structure_confirmed": False,
+                "strong_bull_pullback": strong_bull_pullback,
+                "strong_breakout_exception": strong_breakout_exception,
                 "message": build_message(
                     symbol=symbol,
                     price=price,
@@ -6031,6 +6145,8 @@ def run_scanner_loop():
                     "setup_context": setup_type,
                     "reversal_quality": "",
                     "reversal_structure_confirmed": False,
+                    "strong_bull_pullback": strong_bull_pullback,
+                    "strong_breakout_exception": strong_breakout_exception,
                 },
                 "candle_time": candle_time,
                 "now": now,
@@ -6162,6 +6278,8 @@ def run_scanner_loop():
                     setup_context=candidate.get("setup_context", ""),
                     reversal_quality=candidate.get("reversal_quality", ""),
                     reversal_structure_confirmed=candidate.get("reversal_structure_confirmed", False),
+                    strong_bull_pullback=candidate.get("strong_bull_pullback", False),
+                    strong_breakout_exception=candidate.get("strong_breakout_exception", False),
                 )
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
