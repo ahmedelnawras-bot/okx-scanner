@@ -588,12 +588,38 @@ def build_report_message(period: str) -> str:
     logger.error(f"build_report_message error on period={period}: {e}")
     return "❌ حصل خطأ أثناء بناء التقرير"
 
+
+def _limit_telegram_message(text: str, limit: int = 3900) -> str:
+    try:
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit - 200] + "\n\n⚠️ تم اختصار التقرير لأن حجمه أكبر من حد Telegram."
+    except Exception:
+        return "❌ فشل اختصار الرسالة"
+
+
 def build_deep_report_message() -> str:
- try:
-    return build_deep_report(r, market_type="futures", side="long")
- except Exception as e:
-    logger.error(f"build_deep_report error: {e}")
-    return "❌ حصل خطأ أثناء بناء التقرير"
+    try:
+        try:
+            report = build_deep_report(r, market_type="futures", side="long")
+        except TypeError:
+            logger.warning("build_deep_report does not accept market_type/side, falling back to build_deep_report(r)")
+            report = build_deep_report(r)
+
+        if not report:
+            return "ℹ️ لا توجد بيانات كافية لبناء التقرير العميق"
+
+        return _limit_telegram_message(report)
+
+    except Exception as e:
+        logger.exception(f"build_deep_report error: {e}")
+        return (
+            "❌ حصل خطأ أثناء بناء التقرير العميق\n"
+            f"السبب: {html.escape(str(e))}\n\n"
+            "راجع Logs لمعرفة الحقل أو الدالة التي سببت المشكلة."
+        )
+
 
 def build_help_message() -> str:
  return """<b>📋 OKX Scanner Bot - LONG</b>
@@ -746,46 +772,224 @@ def _format_wallet_impact(summary: dict, side="long") -> str:
  except Exception:
     return "Wallet impact: غير متاح"
 
-def build_exits_report_message() -> str:
- try:
-    summary = get_trade_summary(
-        redis_client=r,
-        market_type="futures",
-        side="long",
-    )
-    if not summary:
-        return "ℹ️ لا توجد بيانات بعد"
-    tp1_rate = float(_safe_summary_field(summary, "tp1_rate", 0.0))
-    tp2_rate = float(_safe_summary_field(summary, "tp2_rate", 0.0))
-    pnl_pct = float(_safe_summary_field(summary, "realized_leveraged_pnl_pct", 0.0))
-    avg_win = float(_safe_summary_field(summary, "avg_win_pct", 0.0))
-    avg_loss = float(_safe_summary_field(summary, "avg_loss_pct", 0.0))
-    best = float(_safe_summary_field(summary, "best_trade_pct", 0.0))
-    worst = float(_safe_summary_field(summary, "worst_trade_pct", 0.0))
-    wallet_line = _format_wallet_impact(summary, side="long")
-    lines = [
-        "<b>📊 تحليل جودة الخروج - LONG</b>",
-        "",
-        f"• TP1 Rate: {tp1_rate:.1f}%",
-        f"• TP2 Rate: {tp2_rate:.1f}%",
-        "",
-        "<b>💰 النتيجة المالية:</b>",
-        f"• Net after leverage: {_format_pct(pnl_pct)}",
-        f"• {wallet_line}",
-        f"• Avg win: {_format_pct(avg_win)}",
-        f"• Avg loss: {_format_pct(avg_loss)}",
-        f"• Best: {_format_pct(best)}",
-        f"• Worst: {_format_pct(worst)}",
-        "",
-        "<b>📝 تفسير التقرير:</b>",
-        "• TP1 Only = الصفقة وصلت TP1 ثم رجعت Entry",
-        "• TP1 → TP2 Rate مهم جدًا لمعرفة هل TP2 يتحقق بعد TP1 أم السوق يرتد بسرعة",
-        "• لو TP1 Rate جيد و TP2 Rate ضعيف، المشكلة غالبًا في إدارة الخروج وليس الدخول فقط",
-    ]
+
+# ----------- New helper functions for exits report -----------
+def _load_long_trades_from_redis(limit: int = 700) -> list:
+    trades = []
+    if not r:
+        return trades
+    try:
+        keys = r.keys("trade:futures:long:*")
+        for key in keys[:limit]:
+            try:
+                raw = r.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    data["_redis_key"] = key
+                    trades.append(data)
+            except Exception:
+                continue
+
+        trades.sort(
+            key=lambda x: int(float(x.get("created_ts") or x.get("candle_time") or 0)),
+            reverse=True
+        )
+        return trades
+    except Exception as e:
+        logger.error(f"_load_long_trades_from_redis error: {e}")
+        return trades
+
+
+def _pct_safe(value, decimals=2):
+    try:
+        return f"{float(value):+.{decimals}f}%"
+    except Exception:
+        return "N/A"
+
+
+def _avg(values):
+    try:
+        values = [float(v) for v in values if v is not None]
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+    except Exception:
+        return 0.0
+
+
+def _trade_exit_bucket(trade: dict) -> str:
+    try:
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+
+        if bool(trade.get("protected_breakeven_exit", False)):
+            return "breakeven_protected"
+        if result == "tp2_win":
+            return "tp2"
+        if result == "tp1_win":
+            return "tp1_only"
+        if result == "loss":
+            return "loss"
+        if result == "expired":
+            return "expired"
+        if status == "partial":
+            return "partial"
+        if status == "open":
+            return "open"
+        if bool(trade.get("tp1_hit", False)):
+            return "tp1_hit_open_or_unknown"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _format_last_closed_trades(trades: list, max_items: int = 8) -> str:
+    lines = []
+    closed = [
+        t for t in trades
+        if _trade_exit_bucket(t) not in ("open", "unknown")
+    ][:max_items]
+
+    if not closed:
+        return "• لا توجد صفقات مغلقة كافية بعد"
+
+    for t in closed:
+        symbol = clean_symbol_for_message(str(t.get("symbol", "UNKNOWN")))
+        bucket = _trade_exit_bucket(t)
+        score = _safe_float(t.get("score"), 0.0)
+        setup_type = str(t.get("setup_type", "unknown"))
+        entry_timing = str(t.get("entry_timing", ""))
+
+        pnl = (
+            t.get("realized_leveraged_pnl_pct")
+            or t.get("leveraged_pnl_pct")
+            or t.get("pnl_pct")
+            or t.get("result_pct")
+            or 0.0
+        )
+
+        label = {
+            "tp2": "🎯 TP2",
+            "tp1_only": "✅ TP1 فقط",
+            "loss": "❌ SL",
+            "expired": "⏳ Expired",
+            "partial": "✅ Partial",
+            "breakeven_protected": "🛡 Breakeven",
+            "tp1_hit_open_or_unknown": "✅ TP1 Hit",
+        }.get(bucket, bucket)
+
+        lines.append(
+            f"• {html.escape(symbol)} | {label} | Score {score:.2f} | "
+            f"{_pct_safe(pnl)} | {html.escape(setup_type[:45])} | {html.escape(entry_timing[:25])}"
+        )
+
     return "\n".join(lines)
- except Exception as e:
-    logger.error(f"build_exits_report_message error: {e}")
-    return "❌ حصل خطأ أثناء بناء تقرير الخروج"
+
+
+def build_exits_report_message() -> str:
+    try:
+        trades = _load_long_trades_from_redis()
+        if not trades:
+            return "ℹ️ لا توجد بيانات بعد"
+
+        total = len(trades)
+        open_trades = [t for t in trades if _trade_exit_bucket(t) == "open"]
+        closed = [t for t in trades if _trade_exit_bucket(t) not in ("open", "unknown")]
+        tp2_wins = [t for t in closed if _trade_exit_bucket(t) == "tp2"]
+        tp1_only = [t for t in closed if _trade_exit_bucket(t) == "tp1_only"]
+        partial = [t for t in closed if _trade_exit_bucket(t) == "partial"]
+        breakeven = [t for t in closed if _trade_exit_bucket(t) == "breakeven_protected"]
+        losses = [t for t in closed if _trade_exit_bucket(t) == "loss"]
+        expired = [t for t in closed if _trade_exit_bucket(t) == "expired"]
+        tp1_hit_other = [t for t in closed if _trade_exit_bucket(t) == "tp1_hit_open_or_unknown"]
+
+        closed_count = len(closed)
+        tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(tp1_hit_other)
+        tp2_effective = len(tp2_wins)
+        sl_count = len(losses)
+        expired_count = len(expired)
+
+        tp1_rate = (tp1_effective / closed_count * 100) if closed_count else 0
+        tp2_rate = (tp2_effective / closed_count * 100) if closed_count else 0
+        sl_rate = (sl_count / closed_count * 100) if closed_count else 0
+
+        tp1_to_tp2 = (tp2_effective / tp1_effective * 100) if tp1_effective else 0
+
+        all_pnls = []
+        for t in closed:
+            pnl = _safe_float(
+                t.get("realized_leveraged_pnl_pct")
+                or t.get("leveraged_pnl_pct")
+                or t.get("pnl_pct")
+                or t.get("result_pct")
+                or 0.0
+            )
+            all_pnls.append(pnl)
+
+        avg_pnl = _avg(all_pnls) if all_pnls else 0.0
+        win_pnls = [p for i, p in enumerate(all_pnls) if _trade_exit_bucket(closed[i]) not in ("loss", "expired")]
+        loss_pnls = [p for i, p in enumerate(all_pnls) if _trade_exit_bucket(closed[i]) in ("loss", "expired")]
+        avg_win = _avg(win_pnls) if win_pnls else 0.0
+        avg_loss = _avg(loss_pnls) if loss_pnls else 0.0
+
+        setup_stats = {}
+        for t in closed:
+            st = str(t.get("setup_type", "unknown"))[:50]
+            setup_stats[st] = setup_stats.get(st, 0) + 1
+        worst_setups = sorted(setup_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        timing_stats = {}
+        for t in closed:
+            et = str(t.get("entry_timing", "unknown"))[:30]
+            timing_stats[et] = timing_stats.get(et, 0) + 1
+        worst_timing = sorted(timing_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        lines = [
+            "📊 <b>تقرير جودة الخروج الشامل - LONG</b>",
+            "",
+            f"• إجمالي الصفقات: {total}",
+            f"• مفتوح: {len(open_trades)}",
+            f"• مغلق: {closed_count}",
+            f"• 🎯 TP2: {tp2_effective}",
+            f"• ✅ TP1 فقط: {len(tp1_only)}",
+            f"• ✅ Partial: {len(partial)}",
+            f"• 🛡 Breakeven: {len(breakeven)}",
+            f"• ❌ SL: {sl_count}",
+            f"• ⏳ Expired: {expired_count}",
+            "",
+            "<b>📈 نسب:</b>",
+            f"• TP1 Rate: {tp1_rate:.1f}%",
+            f"• TP2 Rate: {tp2_rate:.1f}%",
+            f"• TP1 → TP2: {tp1_to_tp2:.1f}%",
+            f"• SL Rate: {sl_rate:.1f}%",
+            "",
+            "<b>💰 مالي:</b>",
+            f"• Avg PnL: {_pct_safe(avg_pnl)}",
+            f"• Avg Win: {_pct_safe(avg_win)}",
+            f"• Avg Loss: {_pct_safe(avg_loss)}",
+            "",
+            "<b>📌 أكثر setup_types ظهورًا في الصفقات المغلقة:</b>",
+        ]
+        for st, cnt in worst_setups:
+            lines.append(f"• {html.escape(st)} ({cnt})")
+
+        lines.append("")
+        lines.append("<b>📍 أكثر entry_timing ظهورًا في الصفقات المغلقة:</b>")
+        for et, cnt in worst_timing:
+            lines.append(f"• {html.escape(et)} ({cnt})")
+
+        lines.append("")
+        lines.append("<b>🔹 آخر الصفقات المغلقة:</b>")
+        lines.append(_format_last_closed_trades(trades))
+
+        return _limit_telegram_message("\n".join(lines))
+
+    except Exception as e:
+        logger.exception(f"build_exits_report_message error: {e}")
+        return "❌ حصل خطأ أثناء بناء تقرير الخروج"
+
 
 def build_daily_report_message() -> str:
  try:
@@ -2113,7 +2317,7 @@ def append_late_pump_warnings(score_result: dict, late_guard: dict) -> dict:
     if late_guard.get("late_pump_risk"):
         score_result["warning_reasons"].append("خطر مطاردة")
     if late_guard.get("bull_continuation_risk"):
-        score_result["warning_reasons"].append("استمرار في Bull Market بعد امتداد خطر")
+        score_result["warning_reasons"].append("خطر مطاردة Pump متأخر")
     for reason in late_guard.get("reasons", []):
         label = warning_map.get(reason)
         if label:
@@ -2122,6 +2326,149 @@ def append_late_pump_warnings(score_result: dict, late_guard: dict) -> dict:
     return score_result
  except Exception:
     return score_result
+
+def calculate_warning_penalty(warning_reasons: list) -> tuple:
+    penalty = 0.0
+    penalty_reasons = []
+
+    high_risk_warnings = {
+        "خطر مطاردة": 0.20,
+        "خطر مطاردة Pump متأخر": 0.20,
+        "خطر نهاية الزخم": 0.20,
+        "موجة خامسة بدون Pullback واضح": 0.20,
+        "RSI بدأ يضعف": 0.20,
+        "اختراق متأخر": 0.20,
+        "اختراق متأخر، يُنصح بالحذر": 0.20,
+        "رفض سعري علوي بعد الاختراق": 0.20,
+    }
+
+    medium_risk_warnings = {
+        "بعيد عن VWAP": 0.08,
+        "زخم MACD يتراجع": 0.08,
+        "MACD سلبي": 0.08,
+        "رفض سعري علوي": 0.08,
+        "شمعة قوية لكن احتمال مطاردة": 0.08,
+        "صعود سريع خلال 4 ساعات": 0.08,
+    }
+
+    high_risk_count = 0
+    medium_risk_count = 0
+
+    for warning in warning_reasons or []:
+        normalized = normalize_reason(str(warning))
+        if normalized in high_risk_warnings:
+            value = high_risk_warnings[normalized]
+            penalty += value
+            high_risk_count += 1
+            penalty_reasons.append({
+                "warning": normalized,
+                "penalty": value,
+                "level": "high"
+            })
+        elif normalized in medium_risk_warnings:
+            value = medium_risk_warnings[normalized]
+            penalty += value
+            medium_risk_count += 1
+            penalty_reasons.append({
+                "warning": normalized,
+                "penalty": value,
+                "level": "medium"
+            })
+
+    if high_risk_count >= 2:
+        penalty += 0.15
+        penalty_reasons.append({
+            "warning": "multiple_high_risk",
+            "penalty": 0.15,
+            "level": "extra"
+        })
+
+    penalty = min(penalty, 0.80)
+    return round(penalty, 2), penalty_reasons, high_risk_count, medium_risk_count
+
+# ==========================================
+# FALLING KNIFE DETECTION
+# ==========================================
+def detect_falling_knife_risk(df, dist_ma, change_24h, vol_ratio) -> dict:
+    result = {
+        "falling_knife_risk": False,
+        "checks": 0,
+        "reasons": [],
+    }
+
+    try:
+        if df is None or df.empty or len(df) < 8:
+            return result
+
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+
+        idx = signal_row.name
+        if idx is None or idx < 4:
+            return result
+
+        last = df.iloc[idx]
+        prev = df.iloc[idx - 1]
+
+        open_ = _safe_float(last.get("open"), 0.0)
+        close_ = _safe_float(last.get("close"), 0.0)
+        high_ = _safe_float(last.get("high"), 0.0)
+        low_ = _safe_float(last.get("low"), 0.0)
+
+        prev_close = _safe_float(prev.get("close"), close_)
+        rsi_now = _safe_float(last.get("rsi"), 50.0)
+        rsi_prev = _safe_float(prev.get("rsi"), rsi_now)
+
+        candle_range = high_ - low_
+        close_position = ((close_ - low_) / candle_range) if candle_range > 0 else 0.5
+
+        recent = df.iloc[max(0, idx - 3):idx + 1]
+        red_candles = 0
+        for _, row in recent.iterrows():
+            if _safe_float(row.get("close"), 0.0) < _safe_float(row.get("open"), 0.0):
+                red_candles += 1
+
+        checks = 0
+        reasons = []
+
+        if close_ < open_:
+            checks += 1
+            reasons.append("current_candle_red")
+
+        if close_ < prev_close:
+            checks += 1
+            reasons.append("lower_close")
+
+        if rsi_now < rsi_prev:
+            checks += 1
+            reasons.append("rsi_not_improving")
+
+        if close_position <= 0.35:
+            checks += 1
+            reasons.append("weak_close_position")
+
+        if red_candles >= 3:
+            checks += 1
+            reasons.append("three_or_more_recent_red_candles")
+
+        if vol_ratio >= 1.4 and close_ < open_:
+            checks += 1
+            reasons.append("high_volume_selling")
+
+        if change_24h <= -18.0 and dist_ma <= -7.0:
+            checks += 1
+            reasons.append("deep_24h_drop_and_far_below_ma")
+
+        result["checks"] = checks
+        result["reasons"] = reasons
+        result["falling_knife_risk"] = checks >= 5
+
+        return result
+
+    except Exception as e:
+        logger.warning(f"detect_falling_knife_risk error: {e}")
+        return result
 
 def is_oversold_reversal_long(
  df,
@@ -2164,6 +2511,10 @@ def is_oversold_reversal_long(
         and upper_wick_ > candle_range_ * 0.4
     )
     if exhaustion_wick_:
+        return False
+    falling = detect_falling_knife_risk(df, dist_ma, change_24h, vol_ratio)
+    if falling.get("falling_knife_risk"):
+        logger.info(f"Oversold reversal blocked by falling knife: {falling.get('reasons', [])}")
         return False
     bullish_close_ = close_ > open_
     gained_momentum_ = close_ >= prev_close_
@@ -2280,6 +2631,45 @@ def is_higher_timeframe_confirmed(symbol):
  except Exception as e:
     logger.error(f"MTF error on {symbol}: {e}")
     return False
+
+def is_higher_timeframe_confirmed_from_candles(candles) -> bool:
+    try:
+        df = to_dataframe(candles)
+        if df is None or df.empty or len(df) < 10:
+            return False
+
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
+
+        idx = signal_row.name
+        if idx is None or idx < 3:
+            return False
+
+        checks = 0
+
+        ma_value = signal_row.get("ma", None)
+        if ma_value is not None and _safe_float(signal_row["close"]) > _safe_float(ma_value):
+            checks += 1
+
+        high_rsi = _safe_float(signal_row.get("rsi"), 50) >= 50
+        if high_rsi:
+            checks += 1
+
+        last_3 = df.iloc[idx - 3:idx]
+        green_candles = sum(
+            1 for _, row in last_3.iterrows()
+            if _safe_float(row["close"]) > _safe_float(row["open"])
+        )
+
+        if green_candles >= 2:
+            checks += 1
+
+        return checks >= 2
+
+    except Exception as e:
+        logger.error(f"MTF from candles error: {e}")
+        return False
 
 def is_4h_oversold_confirmed(symbol: str) -> dict:
  try:
@@ -2831,15 +3221,57 @@ def get_setup_market_regime(market_state: str) -> str:
  value = str(market_state or "").strip()
  return value if value in allowed else "mixed"
 
+def infer_wave_context(entry_maturity_data: dict, is_reverse: bool, dist_ma: float, breakout: bool, pre_breakout: bool) -> str:
+    try:
+        if not entry_maturity_data:
+            return "unknown"
+
+        wave_estimate = int(entry_maturity_data.get("wave_estimate", 0) or 0)
+        fib_position = str(entry_maturity_data.get("fib_position", "unknown") or "unknown")
+        entry_maturity = str(entry_maturity_data.get("entry_maturity", "unknown") or "unknown")
+        had_pullback = bool(entry_maturity_data.get("had_pullback", False))
+
+        if is_reverse:
+            if wave_estimate >= 5 or dist_ma <= -OVERSOLD_REVERSAL_MIN_DIST_MA:
+                return "wave_5_down"
+            return "reverse_unknown"
+
+        if entry_maturity == "healthy" and had_pullback:
+            return "golden_pullback"
+
+        if wave_estimate == 3:
+            return "wave_3"
+
+        if wave_estimate >= 5 and fib_position == "overextended":
+            return "wave_5_late"
+
+        if wave_estimate >= 5 and not had_pullback:
+            return "wave_5_late"
+
+        if breakout or pre_breakout:
+            return "breakout_context"
+
+        return "unknown"
+
+    except Exception:
+        return "unknown"
+
 def build_setup_type(candidate: dict) -> str:
- try:
-    family = get_setup_family(candidate)
-    mtf = "mtf_yes" if candidate.get("mtf_confirmed") else "mtf_no"
-    vol_band = get_setup_volume_band(candidate.get("vol_ratio", 1.0))
-    market_regime = get_setup_market_regime(candidate.get("market_state"))
-    return f"{family}|{mtf}|{vol_band}|{market_regime}"
- except Exception:
-    return "unknown"
+    try:
+        family = get_setup_family(candidate)
+        mtf = "mtf_yes" if candidate.get("mtf_confirmed") else "mtf_no"
+        vol_band = get_setup_volume_band(candidate.get("vol_ratio", 1.0))
+        market_regime = get_setup_market_regime(candidate.get("market_state"))
+        wave_context = str(candidate.get("wave_context", "") or "").strip()
+
+        base = f"{family}|{mtf}|{vol_band}|{market_regime}"
+
+        if wave_context and wave_context != "unknown":
+            return f"{base}|{wave_context}"
+
+        return base
+    except Exception:
+        return "unknown"
 
 def get_hybrid_label_from_stats(setup_stats: dict) -> str:
  try:
@@ -3047,7 +3479,7 @@ def normalize_reason(reason: str) -> str:
     "رفض سعري علوي": "رفض سعري علوي",
     "اخبار اقتصادية مهمة قريبة": "اخبار اقتصادية مهمة قريبة",
     "Late Pump Risk": "خطر مطاردة Pump متأخر",
-    "Bull Market Continuation Risk": "استمرار في Bull Market بعد امتداد خطر",
+    "Bull Market Continuation Risk": "خطر مطاردة Pump متأخر",
     "شمعة قوية لكن احتمال مطاردة": "شمعة قوية لكن احتمال مطاردة",
     "صعود سريع خلال 4 ساعات": "صعود سريع خلال 4 ساعات",
     "Momentum Exhaustion Trap": "خطر نهاية الزخم",
@@ -3304,6 +3736,14 @@ def get_breakout_quality(df, vol_ratio: float) -> str:
 # =========================
 # SL / TP LOGIC
 # =========================
+SMART_TP1_ENABLED = True
+SMART_TP1_MIN_RR = 1.2
+SMART_TP1_DEFAULT_RR_FALLBACK = 2.0
+SMART_TP1_RESISTANCE_BUFFER_ATR = 0.20
+SMART_TP1_NEAR_RESISTANCE_RR = 1.2
+SMART_TP1_LOOKBACK_SWING = 50
+SMART_TP1_ROUND_LEVELS_ENABLED = True
+
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
  if signal_type == "breakout":
     return 2.2, 3.5
@@ -3318,6 +3758,299 @@ def get_rr_targets_long(signal_type="standard", entry_timing=""):
 def calc_tp_long(entry: float, sl: float, rr: float) -> float:
  risk = float(entry) - float(sl)
  return round(float(entry) + (risk * rr), 6)
+
+def _round_price_dynamic(value: float) -> float:
+    try:
+        value = float(value)
+        if value <= 0:
+            return 0.0
+        if value >= 100:
+            return round(value, 2)
+        if value >= 1:
+            return round(value, 4)
+        if value >= 0.01:
+            return round(value, 6)
+        return round(value, 8)
+    except Exception:
+        return 0.0
+
+
+def _collect_resistance_candidates_long(df, entry: float) -> list:
+    candidates = []
+    try:
+        if df is None or df.empty or entry <= 0:
+            return candidates
+
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return candidates
+
+        idx = signal_row.name
+        if idx is None:
+            return candidates
+
+        start = max(0, idx - SMART_TP1_LOOKBACK_SWING)
+        work = df.iloc[start:idx].copy()          # exclude signal candle
+        if work.empty:
+            return candidates
+
+        highs = work["high"].astype(float)
+        closes = work["close"].astype(float)
+
+        # recent swing highs above entry
+        for h in highs.tail(30).tolist():
+            h = _safe_float(h, 0.0)
+            if h > entry:
+                candidates.append({
+                    "price": h,
+                    "source": "swing_high"
+                })
+
+        # recent close highs above entry
+        for c in closes.tail(30).tolist():
+            c = _safe_float(c, 0.0)
+            if c > entry:
+                candidates.append({
+                    "price": c,
+                    "source": "recent_close_high"
+                })
+
+        # Bollinger upper
+        bb_upper = _safe_float(signal_row.get("bb_upper"), 0.0)
+        if bb_upper > entry:
+            candidates.append({
+                "price": bb_upper,
+                "source": "bb_upper"
+            })
+
+        # previous 20 high
+        if len(work) >= 20:
+            prev_high = _safe_float(work["high"].tail(20).max(), 0.0)
+            if prev_high > entry:
+                candidates.append({
+                    "price": prev_high,
+                    "source": "prev_20_high"
+                })
+
+        # simple psychological / round levels
+        if SMART_TP1_ROUND_LEVELS_ENABLED:
+            round_levels = []
+            if entry >= 100:
+                step = 5.0
+            elif entry >= 10:
+                step = 0.5
+            elif entry >= 1:
+                step = 0.05
+            elif entry >= 0.1:
+                step = 0.005
+            elif entry >= 0.01:
+                step = 0.0005
+            else:
+                step = 0.00005
+
+            try:
+                base = int(entry / step) * step
+                for i in range(1, 8):
+                    level = base + step * i
+                    if level > entry:
+                        round_levels.append(level)
+            except Exception:
+                round_levels = []
+
+            for level in round_levels:
+                candidates.append({
+                    "price": level,
+                    "source": "round_level"
+                })
+
+        # remove duplicates and invalid
+        cleaned = []
+        seen = set()
+        for item in candidates:
+            price = _safe_float(item.get("price"), 0.0)
+            if price <= entry:
+                continue
+            key = round(price, 10)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append({
+                "price": price,
+                "source": item.get("source", "unknown")
+            })
+
+        cleaned.sort(key=lambda x: x["price"])
+        return cleaned
+
+    except Exception as e:
+        logger.warning(f"_collect_resistance_candidates_long error: {e}")
+        return candidates
+
+
+def find_nearest_resistance_long(df, entry: float):
+    try:
+        candidates = _collect_resistance_candidates_long(df, entry)
+        if not candidates:
+            return None
+        return candidates[0]
+    except Exception:
+        return None
+
+
+def find_nearest_support_long(df, entry: float):
+    try:
+        if df is None or df.empty or entry <= 0:
+            return None
+
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return None
+
+        idx = signal_row.name
+        if idx is None:
+            return None
+
+        start = max(0, idx - 50)
+        work = df.iloc[start:idx + 1].copy()
+        if work.empty:
+            return None
+
+        lows = work["low"].astype(float)
+        supports = [float(x) for x in lows.tail(40).tolist() if _safe_float(x, 0.0) < entry]
+
+        ma_value = _safe_float(signal_row.get("ma"), 0.0)
+        if 0 < ma_value < entry:
+            supports.append(ma_value)
+
+        vwap_value = _safe_float(signal_row.get("vwap"), 0.0)
+        if 0 < vwap_value < entry:
+            supports.append(vwap_value)
+
+        if not supports:
+            return None
+
+        nearest = max(supports)
+        return {
+            "price": nearest,
+            "source": "nearest_support"
+        }
+
+    except Exception as e:
+        logger.warning(f"find_nearest_support_long error: {e}")
+        return None
+
+
+def build_smart_tp1_long(
+    df,
+    entry: float,
+    sl: float,
+    rr1: float,
+    rr2: float,
+    atr_value: float,
+    market_state: str,
+    breakout: bool,
+    pre_breakout: bool,
+) -> dict:
+    result = {
+        "tp1": calc_tp_long(entry, sl, rr=rr1),
+        "tp2": calc_tp_long(entry, sl, rr=rr2),
+        "nearest_resistance": None,
+        "nearest_support": None,
+        "target_method": "rr",
+        "target_notes": [],
+        "resistance_warning": "",
+        "support_warning": "",
+        "rr1_effective": rr1,
+        "rr2_effective": rr2,
+    }
+
+    try:
+        if not SMART_TP1_ENABLED:
+            return result
+
+        entry = float(entry)
+        sl = float(sl)
+        atr_value = float(atr_value or 0.0)
+
+        risk = entry - sl
+        if entry <= 0 or sl <= 0 or risk <= 0:
+            result["target_notes"].append("invalid_risk_fallback_rr")
+            return result
+
+        min_tp1 = entry + (risk * SMART_TP1_MIN_RR)
+        rr_tp1 = entry + (risk * rr1)
+
+        nearest_resistance_data = find_nearest_resistance_long(df, entry)
+        nearest_support_data = find_nearest_support_long(df, entry)
+
+        if nearest_resistance_data:
+            nearest_resistance = _safe_float(nearest_resistance_data.get("price"), 0.0)
+            result["nearest_resistance"] = _round_price_dynamic(nearest_resistance)
+        else:
+            nearest_resistance = 0.0
+
+        if nearest_support_data:
+            nearest_support = _safe_float(nearest_support_data.get("price"), 0.0)
+            result["nearest_support"] = _round_price_dynamic(nearest_support)
+
+        if nearest_resistance <= 0:
+            result["tp1"] = _round_price_dynamic(rr_tp1)
+            result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=rr2))
+            result["target_method"] = "rr_no_resistance"
+            result["target_notes"].append("no_nearest_resistance_found")
+            return result
+
+        buffer = atr_value * SMART_TP1_RESISTANCE_BUFFER_ATR if atr_value > 0 else risk * 0.10
+        resistance_before_buffer = nearest_resistance - buffer
+
+        resistance_rr = (nearest_resistance - entry) / risk if risk > 0 else 0.0
+        buffered_rr = (resistance_before_buffer - entry) / risk if risk > 0 else 0.0
+
+        # لو المقاومة قبل الحد الأدنى 1.2R، نخلي TP1 على 1.2R لكن نطلع تحذير
+        if resistance_rr < SMART_TP1_MIN_RR:
+            result["tp1"] = _round_price_dynamic(min_tp1)
+            result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=rr2))
+            result["target_method"] = "rr_min_due_close_resistance"
+            result["resistance_warning"] = "مقاومة قريبة جدًا قبل TP1"
+            result["target_notes"].append(
+                f"nearest_resistance_before_min_rr rr={resistance_rr:.2f}"
+            )
+            result["rr1_effective"] = SMART_TP1_MIN_RR
+            return result
+
+        # لو المقاومة بين 1.2R و RR الأصلي، TP1 يكون قبل المقاومة ببوفر
+        if SMART_TP1_MIN_RR <= buffered_rr < rr1:
+            smart_tp1 = max(min_tp1, resistance_before_buffer)
+            result["tp1"] = _round_price_dynamic(smart_tp1)
+            result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=rr2))
+            result["target_method"] = "structure_before_resistance"
+            result["target_notes"].append(
+                f"tp1_before_resistance source={nearest_resistance_data.get('source', 'unknown')} rr={buffered_rr:.2f}"
+            )
+            result["rr1_effective"] = round((smart_tp1 - entry) / risk, 2)
+            return result
+
+        # لو المقاومة بعيدة، استخدم RR الطبيعي
+        result["tp1"] = _round_price_dynamic(rr_tp1)
+
+        # TP2: لو السوق قوي والكسر موجود، نخلي TP2 أعلى قليلًا لو المقاومة بعيدة
+        tp2_rr = rr2
+        if market_state in ("bull_market", "alt_season") and (breakout or pre_breakout):
+            tp2_rr = max(rr2, rr1 + 1.2)
+
+        result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=tp2_rr))
+        result["target_method"] = "rr_with_structure_check"
+        result["target_notes"].append(
+            f"resistance_ok source={nearest_resistance_data.get('source', 'unknown')} rr={resistance_rr:.2f}"
+        )
+        result["rr1_effective"] = rr1
+        result["rr2_effective"] = tp2_rr
+        return result
+
+    except Exception as e:
+        logger.warning(f"build_smart_tp1_long error: {e}")
+        result["target_notes"].append("smart_tp1_error_fallback_rr")
+        return result
 
 # =====================
 # FORMAT ENTRY MATURITY BLOCK
@@ -3370,6 +4103,11 @@ def build_message(
  pullback_low=None,
  pullback_high=None,
  entry_maturity_data=None,
+ warning_penalty=0.0,
+ resistance_warning="",
+ target_method="rr",
+ nearest_resistance=None,
+ wave_context="",
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -3443,6 +4181,25 @@ def build_message(
  header_block = f"{hybrid_label}\n\n" if hybrid_label else ""
  if reverse_banner:
     header_block += f"{reverse_banner}\n\n"
+
+ penalty_text = ""
+ if warning_penalty > 0:
+    penalty_text = f"\n🧮 <b>تأثير التحذيرات على السكور:</b> {fmt_num(-warning_penalty, 2)}"
+
+ resistance_text = ""
+ if resistance_warning:
+    resistance_text = f"\n⚠️ <b>{html.escape(resistance_warning)}</b>"
+
+ target_text = ""
+ if target_method and target_method != "rr":
+    target_text += f"\n🎯 <b>Target Method:</b> {html.escape(str(target_method))}"
+ if nearest_resistance:
+    target_text += f"\n🧱 <b>أقرب مقاومة:</b> {fmt_num(nearest_resistance, 6)}"
+
+ wave_text = ""
+ if wave_context:
+    wave_text = f"\n🌊 <b>Wave:</b> {html.escape(wave_context)}"
+
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
@@ -3456,7 +4213,7 @@ def build_message(
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
 📊 <b>أسباب الدخول:</b>
-{bullish_text}{warnings_block}{news_block}
+{bullish_text}{warnings_block}{news_block}{penalty_text}{resistance_text}{target_text}{wave_text}
 📍 <b>الدخول:</b> {safe_entry_timing}
 {entry_maturity_block}
 ⚖️ <b>المخاطرة:</b> {safe_display_risk}
@@ -4010,82 +4767,11 @@ def handle_telegram_commands():
 # SAFE REGISTER TRADE WRAPPER
 # =======================
 def safe_register_trade(**kwargs):
- try:
-    return register_trade(**kwargs)
- except TypeError as e:
-    allowed_keys = {
-        "redis_client",
-        "symbol",
-        "market_type",
-        "side",
-        "candle_time",
-        "entry",
-        "sl",
-        "tp1",
-        "tp2",
-        "score",
-        "timeframe",
-        "btc_mode",
-        "funding_label",
-        "reasons",
-        "pre_breakout",
-        "breakout",
-        "vol_ratio",
-        "candle_strength",
-        "mtf_confirmed",
-        "is_new",
-        "btc_dominance_proxy",
-        "change_24h",
-        "setup_type",
-        "raw_score",
-        "effective_score",
-        "dynamic_threshold",
-        "required_min_score",
-        "dist_ma",
-        "entry_timing",
-        "opportunity_type",
-        "market_state",
-        "market_state_label",
-        "market_bias_label",
-        "alt_mode",
-        "early_priority",
-        "breakout_quality",
-        "fake_signal",
-        "is_reverse_signal",
-        "reversal_4h_confirmed",
-        "rank_volume_24h",
-        "alert_id",
-        "has_high_impact_news",
-        "news_titles",
-        "warning_reasons",
-        "pullback_low",
-        "pullback_high",
-        "pullback_entry",
-        "rr1",
-        "rr2",
-        "fib_position",
-        "fib_position_ratio",
-        "fib_label",
-        "had_pullback",
-        "pullback_pct",
-        "pullback_label",
-        "wave_estimate",
-        "wave_peaks",
-        "wave_label",
-        "entry_maturity",
-        "maturity_penalty",
-        "maturity_bonus",
-    }
-    filtered = {k: v for k, v in kwargs.items() if k in allowed_keys}
-    logger.warning(f"register_trade TypeError, retrying with filtered kwargs: {e}")
     try:
-        return register_trade(**filtered)
-    except Exception as e2:
-        logger.error(f"register_trade filtered retry failed: {e2}")
+        return register_trade(**kwargs)
+    except Exception as e:
+        logger.error(f"register_trade failed: {e}")
         return None
- except Exception as e:
-    logger.error(f"register_trade failed: {e}")
-    return None
 
 # =========================
 # MAIN LOOP
@@ -4110,9 +4796,7 @@ def run_scanner_loop():
             time.sleep(30)
             continue
         logger.info(f"LONG RUN START | pid={os.getpid()}")
-        update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
-        winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
-        logger.info(format_winrate_summary(winrate_summary))
+
         stats_reset_ts = None
         if r:
             try:
@@ -4163,6 +4847,27 @@ def run_scanner_loop():
             allow_state_writes=True,
         )
         current_mode = handle_market_mode_transition(mode_result)
+
+        try:
+            update_open_trades(
+                r,
+                market_type="futures",
+                side="long",
+                timeframe=TIMEFRAME,
+                market_mode=current_mode,
+                protect_breakeven_on_block=True,
+                breakeven_min_profit_pct=0.15,
+                reason=f"market_mode={current_mode}",
+            )
+        except TypeError:
+            logger.warning("update_open_trades does not support breakeven kwargs yet, falling back to old call")
+            update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
+        except Exception as e:
+            logger.error(f"update_open_trades error: {e}")
+
+        winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
+        logger.info(format_winrate_summary(winrate_summary))
+
         logger.info(
             f"MARKET MODE | mode={current_mode} | "
             f"guard_level={market_guard.get('level')} | "
@@ -4421,6 +5126,13 @@ def run_scanner_loop():
             limit=100,
             max_workers=MAX_CANDLE_FETCH_WORKERS,
         )
+        htf_candles_map = fetch_candles_parallel(
+            filtered_scan_pairs,
+            timeframe=HTF_TIMEFRAME,
+            limit=100,
+            max_workers=MAX_CANDLE_FETCH_WORKERS,
+        )
+        logger.info(f"Parallel HTF candle fetch completed: {len(htf_candles_map)} symbols")
         logger.info(f"Parallel candle fetch completed: {len(candles_map)} symbols")
         tested = 0
         sent_count = 0
@@ -4462,7 +5174,9 @@ def run_scanner_loop():
             early_signal = early_bullish_signal(df)
             pre_breakout = is_pre_breakout(df)
             breakout = is_breakout(df)
-            mtf_confirmed = is_higher_timeframe_confirmed(symbol)
+            mtf_confirmed = is_higher_timeframe_confirmed_from_candles(
+                htf_candles_map.get(symbol, [])
+            )
             is_new = is_new_listing_by_candles(candles)
             funding = get_funding_rate(symbol)
             vol_ratio = get_volume_ratio(df)
@@ -4479,6 +5193,12 @@ def run_scanner_loop():
             above_upper_bb = is_above_upper_bollinger(df)
             change_4h = get_change_4h(df)
             breakout_quality = get_breakout_quality(df, vol_ratio) if breakout else "none"
+            falling_knife_data = detect_falling_knife_risk(
+                df=df,
+                dist_ma=dist_ma,
+                change_24h=change_24h,
+                vol_ratio=vol_ratio,
+            )
             is_reverse = is_oversold_reversal_long(
                 df=df,
                 dist_ma=dist_ma,
@@ -4631,6 +5351,34 @@ def run_scanner_loop():
             if guard["retest_required"]:
                 logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
                 continue
+
+            if not is_reverse:
+                hard_late_entry = (
+                    "متأخر جدًا" in entry_timing_temp
+                    or "موجة خامسة" in entry_timing_temp
+                    or "امتداد سعري" in entry_timing_temp
+                    or "نهاية موجة" in entry_timing_temp
+                )
+
+                hard_late_exception = (
+                    breakout
+                    and breakout_quality == "strong"
+                    and mtf_confirmed
+                    and vol_ratio >= 1.8
+                    and rsi_now <= 66
+                    and dist_ma <= 3.8
+                    and vwap_distance <= 2.2
+                )
+
+                if hard_late_entry and not hard_late_exception:
+                    logger.info(
+                        f"{symbol} --> rejected by hard late entry block "
+                        f"(entry_timing={entry_timing_temp}, score_pre=not_calculated, "
+                        f"dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
+                        f"vol={vol_ratio:.2f}, vwap={vwap_distance:.2f})"
+                    )
+                    continue
+
             breakout_warning = guard.get("warning", "")
             upper_wick_ratio = guard.get("upper_wick_ratio", 0.0)
             late_breakout_guard_reason = guard.get("reason", "none") or "none"
@@ -4694,33 +5442,97 @@ def run_scanner_loop():
                 continue
             raw_score = float(score_result.get("score", 0))
             effective_score = raw_score
+            adjustments_log = []
+
             score_result = append_late_pump_warnings(score_result, late_guard)
             if late_guard.get("extreme_late_pump") and not is_reverse:
                 effective_score -= EXTREME_LATE_PUMP_SCORE_PENALTY
+                adjustments_log.append({
+                    "name": "extreme_late_pump_penalty",
+                    "value": -EXTREME_LATE_PUMP_SCORE_PENALTY,
+                    "reason": "extreme_late_pump"
+                })
             elif late_guard.get("late_pump_risk") and not is_reverse:
                 effective_score -= LATE_PUMP_SCORE_PENALTY
+                adjustments_log.append({
+                    "name": "late_pump_penalty",
+                    "value": -LATE_PUMP_SCORE_PENALTY,
+                    "reason": "late_pump"
+                })
             if late_guard.get("bull_continuation_risk") and not is_reverse:
                 effective_score -= BULL_CONTINUATION_SCORE_PENALTY
+                adjustments_log.append({
+                    "name": "bull_continuation_penalty",
+                    "value": -BULL_CONTINUATION_SCORE_PENALTY,
+                    "reason": "bull_continuation"
+                })
             if score_result.get("fake_signal"):
                 if breakout or pre_breakout:
-                    effective_score -= 0.20
+                    eff = -0.20
                 elif early_signal:
-                    effective_score -= 0.15
+                    eff = -0.15
                 else:
-                    effective_score -= 0.30
+                    eff = -0.30
+                effective_score += eff
+                adjustments_log.append({
+                    "name": "fake_signal_penalty",
+                    "value": eff,
+                    "reason": "fake_signal"
+                })
             if not gaining_strength and not breakout and not pre_breakout:
                 effective_score -= 0.15
-            effective_score += get_early_priority_score_bonus(early_priority)
+                adjustments_log.append({
+                    "name": "not_gaining_strength_penalty",
+                    "value": -0.15,
+                    "reason": "no_intraday_strength"
+                })
+            early_bonus = get_early_priority_score_bonus(early_priority)
+            if early_bonus != 0:
+                effective_score += early_bonus
+                adjustments_log.append({
+                    "name": "early_priority_bonus",
+                    "value": early_bonus,
+                    "reason": early_priority
+                })
             if breakout and not late_guard.get("late_pump_risk") and not late_guard.get("bull_continuation_risk"):
                 if vol_ratio >= 1.5:
                     effective_score += 0.30
+                    adjustments_log.append({
+                        "name": "breakout_volume_bonus",
+                        "value": 0.30,
+                        "reason": "breakout_high_vol"
+                    })
                 elif vol_ratio >= 1.3:
                     effective_score += 0.15
+                    adjustments_log.append({
+                        "name": "breakout_volume_bonus",
+                        "value": 0.15,
+                        "reason": "breakout_medium_vol"
+                    })
             if is_reverse:
                 effective_score += OVERSOLD_REVERSAL_SCORE_BONUS
+                adjustments_log.append({
+                    "name": "oversold_reversal_bonus",
+                    "value": OVERSOLD_REVERSAL_SCORE_BONUS,
+                    "reason": "is_reverse"
+                })
             if not is_reverse:
-                effective_score -= float(entry_maturity_data.get("maturity_penalty", 0.0) or 0.0)
-                effective_score += float(entry_maturity_data.get("maturity_bonus", 0.0) or 0.0)
+                maturity_penalty = float(entry_maturity_data.get("maturity_penalty", 0.0) or 0.0)
+                maturity_bonus = float(entry_maturity_data.get("maturity_bonus", 0.0) or 0.0)
+                if maturity_penalty != 0:
+                    effective_score -= maturity_penalty
+                    adjustments_log.append({
+                        "name": "entry_maturity_penalty",
+                        "value": -maturity_penalty,
+                        "reason": "entry_maturity"
+                    })
+                if maturity_bonus != 0:
+                    effective_score += maturity_bonus
+                    adjustments_log.append({
+                        "name": "entry_maturity_bonus",
+                        "value": maturity_bonus,
+                        "reason": "entry_maturity"
+                    })
             for reason in entry_maturity_data.get("warning_reasons", []):
                 if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
                     score_result["warning_reasons"] = []
@@ -4728,6 +5540,11 @@ def run_scanner_loop():
                     score_result["warning_reasons"].append(reason)
             if trap_check["soft_trap"] and not is_reverse:
                 effective_score -= 0.30
+                adjustments_log.append({
+                    "name": "soft_trap_penalty",
+                    "value": -0.30,
+                    "reason": "momentum_exhaustion_soft_trap"
+                })
                 if "Momentum Exhaustion Trap" not in score_result.get("warning_reasons", []):
                     if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
                         score_result["warning_reasons"] = []
@@ -4737,7 +5554,18 @@ def run_scanner_loop():
                     score_result["warning_reasons"] = []
                 if breakout_warning not in score_result["warning_reasons"]:
                     score_result["warning_reasons"].append(breakout_warning)
+            current_warnings = score_result.get("warning_reasons", [])
+            warning_penalty_value, warning_penalty_details, warning_high_count, warning_medium_count = calculate_warning_penalty(current_warnings)
+            if warning_penalty_value != 0.0 and not is_reverse:
+                effective_score -= warning_penalty_value
+                adjustments_log.append({
+                    "name": "warning_penalty",
+                    "value": -warning_penalty_value,
+                    "reason": warning_penalty_details
+                })
+
             score_result["score"] = round(effective_score, 2)
+
             dynamic_threshold = get_dynamic_entry_threshold(
                 market_state=market_state,
                 score_result=score_result,
@@ -4755,21 +5583,27 @@ def run_scanner_loop():
             if current_mode == MODE_STRONG_LONG_ONLY:
                 effective_score -= 0.35
                 score_result["score"] = round(effective_score, 2)
+                adjustments_log.append({
+                    "name": "strong_mode_penalty",
+                    "value": -0.35,
+                    "reason": "strong_mode"
+                })
                 dynamic_threshold += 0.25
                 dynamic_threshold = round(dynamic_threshold, 2)
             if current_mode == MODE_STRONG_LONG_ONLY and "🔴" in entry_timing_temp:
                 logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: late entry)")
                 continue
-            if score_result["score"] < dynamic_threshold and early_priority != "strong":
-                logger.info(f"{symbol} --> score {score_result['score']:.2f} < dynamic_threshold {dynamic_threshold}")
-                continue
+
             opportunity_type = temp_opportunity_type
             entry_timing = entry_timing_temp
             effective_required_min_score = FINAL_MIN_SCORE
+
             if is_reverse:
                 effective_required_min_score = OVERSOLD_REVERSAL_MIN_SCORE
+
             if pre_breakout:
                 effective_required_min_score = max(effective_required_min_score - PRE_BREAKOUT_EXTRA_SCORE, 5.8)
+
             if (
                 market_state == "bull_market"
                 and opportunity_type in ("استمرار", "continuation")
@@ -4786,25 +5620,61 @@ def run_scanner_loop():
                     bull_continuation_extra += 0.30
                 if vol_ratio >= 1.8 and candle_strength >= 0.60:
                     bull_continuation_extra += 0.30
+
                 effective_required_min_score += bull_continuation_extra
                 effective_required_min_score = round(effective_required_min_score, 2)
-                if score_result["score"] < 7.5:
+
+                if bull_continuation_extra != 0:
+                    adjustments_log.append({
+                        "name": "bull_continuation_threshold_extra",
+                        "value": bull_continuation_extra,
+                        "reason": "extra_required_min_score_for_bull_continuation"
+                    })
+
+                strong_bull_pullback = (
+                    market_state in ("bull_market", "alt_season")
+                    and mtf_confirmed
+                    and vol_ratio >= 1.35
+                    and rsi_now <= 66
+                    and dist_ma <= 3.2
+                    and candle_strength >= 0.45
+                    and gaining_strength
+                )
+
+                if not strong_bull_pullback and score_result["score"] < 7.5:
                     logger.info(
                         f"{symbol} --> skipped "
-                        f"(bull continuation without breakout/pre_breakout needs score >= 7.5 | "
-                        f"score={score_result['score']} | dist_ma={dist_ma:.2f} | "
-                        f"rsi={rsi_now:.1f} | vwap={vwap_distance:.2f})"
+                        f"(bull continuation strict filter | score={score_result['score']} | "
+                        f"dist_ma={dist_ma:.2f} | rsi={rsi_now:.1f} | vwap={vwap_distance:.2f})"
                     )
                     continue
+
+                if strong_bull_pullback:
+                    adjustments_log.append({
+                        "name": "strong_bull_pullback_exception",
+                        "value": 0.0,
+                        "reason": "bypassed_bull_continuation_7_5_filter"
+                    })
+
+            final_threshold = max(dynamic_threshold, effective_required_min_score)
+
+            if early_priority == "strong":
+                final_threshold -= 0.15
+                adjustments_log.append({
+                    "name": "early_priority_final_threshold_discount",
+                    "value": -0.15,
+                    "reason": "early_priority_strong"
+                })
+
+            final_threshold = round(final_threshold, 2)
+
             if (not mtf_confirmed) and "🔴" in entry_timing and not is_reverse:
                 logger.info(f"{symbol} --> skipped (late without MTF confirmation)")
                 continue
             if mtf_confirmed and change_4h > 3 and not breakout and not pre_breakout and not is_reverse:
                 logger.info(f"{symbol} --> skipped (chasing 4h move)")
                 continue
-            if score_result["score"] < effective_required_min_score:
-                logger.info(f"{symbol} --> rejected by effective min score")
-                continue
+
             if not breakout and not pre_breakout and dist_ma > 6.2 and not is_reverse:
                 logger.info(f"{symbol} --> rejected (late move without breakout)")
                 continue
@@ -4821,6 +5691,15 @@ def run_scanner_loop():
             ):
                 logger.info(f"{symbol} → rejected by balanced new listing filter")
                 continue
+
+            if score_result["score"] < final_threshold:
+                logger.info(
+                    f"{symbol} --> rejected by final_threshold {final_threshold:.2f} "
+                    f"(score={score_result['score']:.2f}, dynamic={dynamic_threshold:.2f}, "
+                    f"required={effective_required_min_score:.2f})"
+                )
+                continue
+
             price = _safe_float(signal_row["close"], 0)
             if breakout:
                 sl_type = "breakout"
@@ -4830,10 +5709,50 @@ def run_scanner_loop():
                 sl_type = "new_listing"
             else:
                 sl_type = "standard"
+
             stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
             rr1, rr2 = get_rr_targets_long(signal_type=sl_type, entry_timing=entry_timing)
-            tp1 = calc_tp_long(price, stop_loss, rr=rr1)
-            tp2 = calc_tp_long(price, stop_loss, rr=rr2)
+
+            smart_targets = build_smart_tp1_long(
+                df=df,
+                entry=price,
+                sl=stop_loss,
+                rr1=rr1,
+                rr2=rr2,
+                atr_value=atr_value,
+                market_state=market_state,
+                breakout=breakout,
+                pre_breakout=pre_breakout,
+            )
+
+            tp1 = smart_targets.get("tp1", calc_tp_long(price, stop_loss, rr=rr1))
+            tp2 = smart_targets.get("tp2", calc_tp_long(price, stop_loss, rr=rr2))
+            target_method = smart_targets.get("target_method", "rr")
+            nearest_resistance = smart_targets.get("nearest_resistance")
+            nearest_support = smart_targets.get("nearest_support")
+            resistance_warning = smart_targets.get("resistance_warning", "")
+            support_warning = smart_targets.get("support_warning", "")
+            target_notes = smart_targets.get("target_notes", [])
+            rr1 = smart_targets.get("rr1_effective", rr1)
+            rr2 = smart_targets.get("rr2_effective", rr2)
+
+            if resistance_warning and not is_reverse:
+                effective_score -= 0.25
+                score_result["score"] = round(effective_score, 2)
+                adjustments_log.append({
+                    "name": "near_resistance_penalty",
+                    "value": -0.25,
+                    "reason": resistance_warning
+                })
+
+                if score_result["score"] < final_threshold:
+                    logger.info(
+                        f"{symbol} --> rejected by near resistance warning "
+                        f"(score={score_result['score']:.2f}, final_threshold={final_threshold:.2f}, "
+                        f"nearest_resistance={nearest_resistance})"
+                    )
+                    continue
+
             tv_link = build_tradingview_link(symbol)
             explicit_warnings = score_result.get("warning_reasons") or []
             _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -4864,6 +5783,13 @@ def run_scanner_loop():
                 momentum_priority -= 0.30
             momentum_priority = round(momentum_priority, 2)
             alert_id = build_alert_id(symbol, candle_time)
+            wave_context = infer_wave_context(
+                entry_maturity_data=entry_maturity_data,
+                is_reverse=is_reverse,
+                dist_ma=dist_ma,
+                breakout=breakout,
+                pre_breakout=pre_breakout,
+            )
             setup_type_candidate = {
                 "is_reverse": is_reverse,
                 "breakout": breakout,
@@ -4871,27 +5797,30 @@ def run_scanner_loop():
                 "mtf_confirmed": mtf_confirmed,
                 "vol_ratio": vol_ratio,
                 "market_state": market_state,
+                "wave_context": wave_context,
             }
             setup_type = build_setup_type(setup_type_candidate)
-            if (setup_type in WEAK_SETUP_TYPES
+            setup_type_base = "|".join(str(setup_type).split("|")[:4])
+            if (setup_type_base in WEAK_SETUP_TYPES
                 and not is_reverse
                 and not pre_breakout
                 and breakout_quality != "strong"
                 and current_mode != MODE_RECOVERY_LONG):
                 effective_score -= 0.60
                 score_result["score"] = round(effective_score, 2)
+                adjustments_log.append({
+                    "name": "weak_historical_setup_penalty",
+                    "value": -0.60,
+                    "reason": "weak_historical_setup"
+                })
                 if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
                     score_result["warning_reasons"] = []
                 if "Weak Historical Setup" not in score_result["warning_reasons"]:
                     score_result["warning_reasons"].append("Weak Historical Setup")
                 # إعادة فحص العتبات بعد الخصم
-                if score_result["score"] < dynamic_threshold:
-                    logger.info(f"{symbol} --> skipped (weak historical setup: score below dynamic threshold {dynamic_threshold})")
+                if score_result["score"] < final_threshold:
+                    logger.info(f"{symbol} --> skipped (weak historical setup: score below final_threshold {final_threshold})")
                     continue
-                if score_result["score"] < effective_required_min_score:
-                    logger.info(f"{symbol} --> skipped (weak historical setup: score below effective required min score)")
-                    continue
-                # تحديث momentum_priority ليعكس السكور الجديد
                 momentum_priority -= 0.60
                 momentum_priority = round(momentum_priority, 2)
             setup_stats = get_setup_type_stats(
@@ -4914,9 +5843,16 @@ def run_scanner_loop():
                 "early_priority": early_priority,
                 "is_reverse": is_reverse,
                 "setup_type": setup_type,
+                "setup_type_base": setup_type_base,
                 "raw_score": raw_score,
                 "dynamic_threshold": dynamic_threshold,
                 "required_min_score": effective_required_min_score,
+                "final_threshold": final_threshold,
+                "adjustments_log": adjustments_log,
+                "warning_penalty": warning_penalty_value,
+                "warning_penalty_details": warning_penalty_details,
+                "warning_high_count": warning_high_count,
+                "warning_medium_count": warning_medium_count,
                 "dist_ma": dist_ma,
                 "entry_timing": entry_timing,
                 "opportunity_type": opportunity_type,
@@ -4966,6 +5902,20 @@ def run_scanner_loop():
                 "maturity_penalty": entry_maturity_data.get("maturity_penalty", 0.0),
                 "maturity_bonus": entry_maturity_data.get("maturity_bonus", 0.0),
                 "mtf_confirmed": mtf_confirmed,
+                "falling_knife_risk": bool(falling_knife_data.get("falling_knife_risk", False)),
+                "falling_knife_reasons": falling_knife_data.get("reasons", []),
+                "target_method": target_method,
+                "nearest_resistance": nearest_resistance,
+                "nearest_support": nearest_support,
+                "resistance_warning": resistance_warning,
+                "support_warning": support_warning,
+                "target_notes": target_notes,
+                "sl_method": "atr",
+                "sl_notes": f"sl_type={sl_type}",
+                "wave_context": wave_context,
+                "setup_context": setup_type,
+                "reversal_quality": "",
+                "reversal_structure_confirmed": False,
                 "message": build_message(
                     symbol=symbol,
                     price=price,
@@ -4995,6 +5945,11 @@ def run_scanner_loop():
                     pullback_low=pullback_low,
                     pullback_high=pullback_high,
                     entry_maturity_data=entry_maturity_data,
+                    warning_penalty=warning_penalty_value,
+                    resistance_warning=resistance_warning,
+                    target_method=target_method,
+                    nearest_resistance=nearest_resistance,
+                    wave_context=wave_context,
                 ),
                 "reply_markup": build_track_reply_markup(alert_id),
                 "alert_id": alert_id,
@@ -5058,6 +6013,24 @@ def run_scanner_loop():
                     "entry_maturity": entry_maturity_data.get("entry_maturity", "unknown"),
                     "maturity_penalty": entry_maturity_data.get("maturity_penalty", 0.0),
                     "maturity_bonus": entry_maturity_data.get("maturity_bonus", 0.0),
+                    "final_threshold": final_threshold,
+                    "adjustments_log": adjustments_log,
+                    "warning_penalty": warning_penalty_value,
+                    "warning_penalty_details": warning_penalty_details,
+                    "falling_knife_risk": bool(falling_knife_data.get("falling_knife_risk", False)),
+                    "falling_knife_reasons": falling_knife_data.get("reasons", []),
+                    "target_method": target_method,
+                    "nearest_resistance": nearest_resistance,
+                    "nearest_support": nearest_support,
+                    "resistance_warning": resistance_warning,
+                    "support_warning": support_warning,
+                    "target_notes": target_notes,
+                    "sl_method": "atr",
+                    "sl_notes": f"sl_type={sl_type}",
+                    "wave_context": wave_context,
+                    "setup_context": setup_type,
+                    "reversal_quality": "",
+                    "reversal_structure_confirmed": False,
                 },
                 "candle_time": candle_time,
                 "now": now,
@@ -5130,10 +6103,17 @@ def run_scanner_loop():
                     btc_dominance_proxy=candidate.get("btc_dominance_proxy", "🟡 محايد"),
                     change_24h=candidate["change_24h"],
                     setup_type=candidate["setup_type"],
+                    setup_type_base=candidate.get("setup_type_base", ""),
                     raw_score=candidate.get("raw_score", candidate["score"]),
                     effective_score=candidate["score"],
                     dynamic_threshold=candidate["dynamic_threshold"],
                     required_min_score=candidate["required_min_score"],
+                    final_threshold=candidate.get("final_threshold", 0.0),
+                    adjustments_log=candidate.get("adjustments_log", []),
+                    warning_penalty=candidate.get("warning_penalty", 0.0),
+                    warning_penalty_details=candidate.get("warning_penalty_details", []),
+                    warning_high_count=candidate.get("warning_high_count", 0),
+                    warning_medium_count=candidate.get("warning_medium_count", 0),
                     dist_ma=candidate["dist_ma"],
                     entry_timing=candidate.get("entry_timing", ""),
                     opportunity_type=candidate.get("opportunity_type", ""),
@@ -5168,6 +6148,20 @@ def run_scanner_loop():
                     entry_maturity=candidate.get("entry_maturity", "unknown"),
                     maturity_penalty=candidate.get("maturity_penalty", 0.0),
                     maturity_bonus=candidate.get("maturity_bonus", 0.0),
+                    falling_knife_risk=candidate.get("falling_knife_risk", False),
+                    falling_knife_reasons=candidate.get("falling_knife_reasons", []),
+                    target_method=candidate.get("target_method", "rr"),
+                    nearest_resistance=candidate.get("nearest_resistance"),
+                    nearest_support=candidate.get("nearest_support"),
+                    resistance_warning=candidate.get("resistance_warning", ""),
+                    support_warning=candidate.get("support_warning", ""),
+                    target_notes=candidate.get("target_notes", []),
+                    sl_method=candidate.get("sl_method", "atr"),
+                    sl_notes=candidate.get("sl_notes", ""),
+                    wave_context=candidate.get("wave_context", ""),
+                    setup_context=candidate.get("setup_context", ""),
+                    reversal_quality=candidate.get("reversal_quality", ""),
+                    reversal_structure_confirmed=candidate.get("reversal_structure_confirmed", False),
                 )
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
