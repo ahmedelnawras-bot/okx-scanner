@@ -1,3 +1,4 @@
+```python
 # tracking/performance.py
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -19,6 +20,7 @@
 - estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب (وليس per_trade_usd القديم).
 - إضافة دالة diagnose_performance_problem لتشخيص مشاكل الأداء.
 - إصلاح تشخيص exit_summary وعرض المشكلة الأساسية في جميع التقارير.
+- دعم الحقول الجديدة للتخزين وحماية نقطة التعادل.
 """
 
 import json
@@ -344,6 +346,32 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
 
         "rr1": safe_float(extra_fields.get("rr1"), 1.5),
         "rr2": safe_float(extra_fields.get("rr2"), 3.0),
+
+        # الحقول الجديدة
+        "final_threshold": safe_float(extra_fields.get("final_threshold"), 0.0),
+        "target_method": normalize_text(extra_fields.get("target_method"), "unknown"),
+        "nearest_resistance": round_price(extra_fields.get("nearest_resistance")) if extra_fields.get("nearest_resistance") is not None else None,
+        "nearest_support": round_price(extra_fields.get("nearest_support")) if extra_fields.get("nearest_support") is not None else None,
+        "resistance_warning": normalize_text(extra_fields.get("resistance_warning"), ""),
+        "support_warning": normalize_text(extra_fields.get("support_warning"), ""),
+        "target_notes": normalize_list(extra_fields.get("target_notes")),
+        "sl_method": normalize_text(extra_fields.get("sl_method"), "unknown"),
+        "sl_notes": normalize_text(extra_fields.get("sl_notes"), ""),
+        "falling_knife_risk": normalize_bool(extra_fields.get("falling_knife_risk", False)),
+        "reversal_quality": normalize_text(extra_fields.get("reversal_quality"), ""),
+        "wave_context": normalize_text(extra_fields.get("wave_context"), ""),
+        "setup_context": normalize_text(extra_fields.get("setup_context"), ""),
+        "reversal_structure_confirmed": normalize_bool(extra_fields.get("reversal_structure_confirmed", False)),
+        "warning_penalty": safe_float(extra_fields.get("warning_penalty"), 0.0),
+        "warning_high_count": safe_int(extra_fields.get("warning_high_count"), 0),
+        "warning_medium_count": safe_int(extra_fields.get("warning_medium_count"), 0),
+        "warning_penalty_details": normalize_list(extra_fields.get("warning_penalty_details")),
+        "adjustments_log": normalize_list(extra_fields.get("adjustments_log")),
+        "protected_breakeven": normalize_bool(extra_fields.get("protected_breakeven", False)),
+        "breakeven_protection_reason": normalize_text(extra_fields.get("breakeven_protection_reason"), ""),
+        "breakeven_protected_ts": safe_int(extra_fields.get("breakeven_protected_ts"), None),
+        "original_sl_before_breakeven": round_price(extra_fields.get("original_sl_before_breakeven")) if extra_fields.get("original_sl_before_breakeven") is not None else None,
+        "protected_breakeven_exit": normalize_bool(extra_fields.get("protected_breakeven_exit", False)),
     }
 
     return diagnostics
@@ -403,6 +431,32 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "rr1": safe_float(diagnostics.get("rr1"), 1.5),
         "rr2": safe_float(diagnostics.get("rr2"), 3.0),
         "diagnostics": diagnostics,
+
+        # الحقول الجديدة من trade_data أو diagnostics
+        "final_threshold": safe_float(trade_data.get("final_threshold", diagnostics.get("final_threshold"))),
+        "target_method": trade_data.get("target_method") or diagnostics.get("target_method") or "unknown",
+        "nearest_resistance": trade_data.get("nearest_resistance") or diagnostics.get("nearest_resistance"),
+        "nearest_support": trade_data.get("nearest_support") or diagnostics.get("nearest_support"),
+        "resistance_warning": trade_data.get("resistance_warning") or diagnostics.get("resistance_warning", ""),
+        "support_warning": trade_data.get("support_warning") or diagnostics.get("support_warning", ""),
+        "target_notes": normalize_list(trade_data.get("target_notes", diagnostics.get("target_notes"))),
+        "sl_method": trade_data.get("sl_method") or diagnostics.get("sl_method") or "unknown",
+        "sl_notes": trade_data.get("sl_notes") or diagnostics.get("sl_notes", ""),
+        "falling_knife_risk": normalize_bool(trade_data.get("falling_knife_risk", diagnostics.get("falling_knife_risk", False))),
+        "reversal_quality": trade_data.get("reversal_quality") or diagnostics.get("reversal_quality", ""),
+        "wave_context": trade_data.get("wave_context") or diagnostics.get("wave_context", ""),
+        "setup_context": trade_data.get("setup_context") or diagnostics.get("setup_context", ""),
+        "reversal_structure_confirmed": normalize_bool(trade_data.get("reversal_structure_confirmed", diagnostics.get("reversal_structure_confirmed", False))),
+        "warning_penalty": safe_float(trade_data.get("warning_penalty", diagnostics.get("warning_penalty"))),
+        "warning_high_count": safe_int(trade_data.get("warning_high_count", diagnostics.get("warning_high_count"))),
+        "warning_medium_count": safe_int(trade_data.get("warning_medium_count", diagnostics.get("warning_medium_count"))),
+        "warning_penalty_details": normalize_list(trade_data.get("warning_penalty_details", diagnostics.get("warning_penalty_details"))),
+        "adjustments_log": normalize_list(trade_data.get("adjustments_log", diagnostics.get("adjustments_log"))),
+        "protected_breakeven": normalize_bool(trade_data.get("protected_breakeven", diagnostics.get("protected_breakeven", False))),
+        "breakeven_protection_reason": trade_data.get("breakeven_protection_reason") or diagnostics.get("breakeven_protection_reason", ""),
+        "breakeven_protected_ts": safe_int(trade_data.get("breakeven_protected_ts", diagnostics.get("breakeven_protected_ts"))),
+        "original_sl_before_breakeven": trade_data.get("original_sl_before_breakeven") or diagnostics.get("original_sl_before_breakeven"),
+        "protected_breakeven_exit": normalize_bool(trade_data.get("protected_breakeven_exit", diagnostics.get("protected_breakeven_exit", False))),
     }
 
 
@@ -460,6 +514,31 @@ def register_trade(
     pullback_high: float = None,
     rr1: float = 1.5,
     rr2: float = 3.0,
+    # New fields (optional)
+    final_threshold: float = None,
+    target_method: str = None,
+    nearest_resistance: float = None,
+    nearest_support: float = None,
+    resistance_warning: str = None,
+    support_warning: str = None,
+    target_notes: list = None,
+    sl_method: str = None,
+    sl_notes: str = None,
+    falling_knife_risk: bool = False,
+    reversal_quality: str = None,
+    wave_context: str = None,
+    setup_context: str = None,
+    reversal_structure_confirmed: bool = False,
+    warning_penalty: float = None,
+    warning_high_count: int = None,
+    warning_medium_count: int = None,
+    warning_penalty_details: list = None,
+    adjustments_log: list = None,
+    protected_breakeven: bool = False,
+    breakeven_protection_reason: str = None,
+    breakeven_protected_ts: int = None,
+    original_sl_before_breakeven: float = None,
+    protected_breakeven_exit: bool = False,
     **kwargs,
 ):
     if redis_client is None:
@@ -534,6 +613,31 @@ def register_trade(
         "effective_entry": entry,
         "rr1": rr1,
         "rr2": rr2,
+        # الحقول الجديدة
+        "final_threshold": final_threshold,
+        "target_method": target_method,
+        "nearest_resistance": nearest_resistance,
+        "nearest_support": nearest_support,
+        "resistance_warning": resistance_warning,
+        "support_warning": support_warning,
+        "target_notes": target_notes,
+        "sl_method": sl_method,
+        "sl_notes": sl_notes,
+        "falling_knife_risk": falling_knife_risk,
+        "reversal_quality": reversal_quality,
+        "wave_context": wave_context,
+        "setup_context": setup_context,
+        "reversal_structure_confirmed": reversal_structure_confirmed,
+        "warning_penalty": warning_penalty,
+        "warning_high_count": warning_high_count,
+        "warning_medium_count": warning_medium_count,
+        "warning_penalty_details": warning_penalty_details,
+        "adjustments_log": adjustments_log,
+        "protected_breakeven": protected_breakeven,
+        "breakeven_protection_reason": breakeven_protection_reason,
+        "breakeven_protected_ts": breakeven_protected_ts,
+        "original_sl_before_breakeven": original_sl_before_breakeven,
+        "protected_breakeven_exit": protected_breakeven_exit,
     })
 
     trade_data = {
@@ -579,6 +683,32 @@ def register_trade(
 
         "setup_type": setup_type or "unknown",
         "diagnostics": diagnostics,
+
+        # New optional fields
+        "final_threshold": safe_float(final_threshold) if final_threshold is not None else safe_float(score),
+        "target_method": target_method or "unknown",
+        "nearest_resistance": round_price(nearest_resistance) if nearest_resistance is not None else None,
+        "nearest_support": round_price(nearest_support) if nearest_support is not None else None,
+        "resistance_warning": resistance_warning or "",
+        "support_warning": support_warning or "",
+        "target_notes": normalize_list(target_notes),
+        "sl_method": sl_method or "unknown",
+        "sl_notes": sl_notes or "",
+        "falling_knife_risk": normalize_bool(falling_knife_risk),
+        "reversal_quality": reversal_quality or "",
+        "wave_context": wave_context or "",
+        "setup_context": setup_context or "",
+        "reversal_structure_confirmed": bool(reversal_structure_confirmed),
+        "warning_penalty": safe_float(warning_penalty) if warning_penalty is not None else 0.0,
+        "warning_high_count": safe_int(warning_high_count) if warning_high_count is not None else 0,
+        "warning_medium_count": safe_int(warning_medium_count) if warning_medium_count is not None else 0,
+        "warning_penalty_details": normalize_list(warning_penalty_details),
+        "adjustments_log": normalize_list(adjustments_log),
+        "protected_breakeven": bool(protected_breakeven),
+        "breakeven_protection_reason": breakeven_protection_reason or "",
+        "breakeven_protected_ts": breakeven_protected_ts or None,
+        "original_sl_before_breakeven": round_price(original_sl_before_breakeven) if original_sl_before_breakeven is not None else None,
+        "protected_breakeven_exit": bool(protected_breakeven_exit),
     }
 
     try:
@@ -679,6 +809,11 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         trade_data["closed_at"] = int(time.time())
         trade_data["updated_at"] = int(time.time())
 
+        if result == "breakeven":
+            trade_data["protected_breakeven_exit"] = True
+            if not trade_data.get("exit_reason"):
+                trade_data["exit_reason"] = "breakeven_exit"
+
         redis_client.set(
             trade_key,
             json.dumps(trade_data, ensure_ascii=False),
@@ -698,6 +833,8 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
             redis_client.hincrby(stats_key, "losses", 1)
         elif result == "expired":
             redis_client.hincrby(stats_key, "expired", 1)
+        elif result == "breakeven":
+            redis_client.hincrby(stats_key, "breakeven_exits", 1)
 
         update_trade_history_snapshot(redis_client, trade_data)
         return True
@@ -726,6 +863,11 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         trade_data["status"] = "partial"
         trade_data["sl"] = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
         trade_data["updated_at"] = int(time.time())
+
+        trade_data["sl_moved_to_entry"] = True
+        trade_data["sl_move_reason"] = "TP1 hit - protect remaining 50%"
+        trade_data["partial_close_pct"] = 50.0
+        trade_data["remaining_position_pct"] = 50.0
 
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
         side = normalize_side(trade_data.get("side", "long"))
@@ -828,6 +970,12 @@ def update_open_trades(
     side: str = "long",
     timeframe: str = "15m",
     max_age_hours: int = 24,
+    # --- Breakeven protection params ---
+    market_mode: str = None,
+    protect_breakeven_on_block: bool = False,
+    breakeven_min_profit_pct: float = 0.15,
+    reason: str = "",
+    **kwargs,
 ):
     if redis_client is None:
         return
@@ -876,6 +1024,49 @@ def update_open_trades(
         if not candles:
             continue
 
+        # --- Breakeven protection logic ---
+        if protect_breakeven_on_block and market_mode and "BLOCK" in str(market_mode).upper():
+            if (side == "long" and "BLOCK_LONGS" in str(market_mode).upper()) or \
+               (side == "short" and "BLOCK_SHORTS" in str(market_mode).upper()):
+                try:
+                    current_price = candles[-1]["close"]
+                    entry_price = safe_float(trade.get("entry"), 0.0)
+                    if entry_price > 0:
+                        if side == "long":
+                            current_profit_pct = ((current_price - entry_price) / entry_price) * 100
+                        else:
+                            current_profit_pct = ((entry_price - current_price) / entry_price) * 100
+                        if current_profit_pct >= breakeven_min_profit_pct:
+                            if not trade.get("protected_breakeven"):
+                                current_sl = safe_float(trade.get("sl"), 0.0)
+                                need_move = True
+                                if side == "long":
+                                    if current_sl >= entry_price:
+                                        need_move = False
+                                else:
+                                    if current_sl <= entry_price:
+                                        need_move = False
+                                if need_move:
+                                    # حفظ SL القديم قبل التعديل
+                                    if trade.get("original_sl_before_breakeven") is None:
+                                        trade["original_sl_before_breakeven"] = current_sl
+                                    trade["sl"] = entry_price
+                                    trade["protected_breakeven"] = True
+                                    trade["breakeven_protection_reason"] = reason or "market_block_protection"
+                                    trade["breakeven_protected_ts"] = now_ts
+                                    trade["sl_moved_to_entry"] = True
+                                    trade["sl_move_reason"] = reason or "market_block_protection"
+                                    save_trade(redis_client, trade_key, trade)
+                                    update_trade_history_snapshot(redis_client, trade)
+                                    logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
+                except Exception as e:
+                    logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
+
+        # --- Normal trade evaluation with evaluation_start_ts ---
+        evaluation_start_ts = created_at
+        if trade.get("protected_breakeven") and safe_int(trade.get("breakeven_protected_ts"), 0) > 0:
+            evaluation_start_ts = safe_int(trade.get("breakeven_protected_ts"), created_at)
+
         result = None
         state_changed = False
 
@@ -884,7 +1075,7 @@ def update_open_trades(
             if candle_ts > 10_000_000_000:
                 candle_ts = candle_ts // 1000
 
-            if candle_ts < created_at:
+            if candle_ts < evaluation_start_ts:
                 continue
 
             result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
@@ -915,8 +1106,16 @@ def update_open_trades(
                 break
 
         if result:
-            mark_trade_closed(redis_client, trade_key, trade, result)
-            logger.info(f"{symbol} → trade closed as {result}")
+            if result == "loss" and trade.get("protected_breakeven") and \
+               abs(safe_float(trade.get("sl"), 0.0) - safe_float(trade.get("entry"), 0.0)) < 1e-12:
+                trade["result"] = "breakeven"
+                trade["protected_breakeven_exit"] = True
+                trade["exit_reason"] = "breakeven_protected_sl"
+                mark_trade_closed(redis_client, trade_key, trade, "breakeven")
+                logger.info(f"{symbol} → trade closed as breakeven (protected)")
+            else:
+                mark_trade_closed(redis_client, trade_key, trade, result)
+                logger.info(f"{symbol} → trade closed as {result}")
         elif state_changed:
             logger.info(f"{symbol} → trade updated")
 
@@ -1004,7 +1203,10 @@ def get_setup_type_stats(
             except Exception:
                 continue
 
-            if str(trade.get("setup_type", "unknown")) != str(setup_type):
+            trade_setup = str(trade.get("setup_type", "unknown"))
+            requested_setup = str(setup_type)
+
+            if trade_setup != requested_setup and not trade_setup.startswith(requested_setup + "|"):
                 continue
 
             if since_ts is not None:
@@ -1058,6 +1260,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "tp2_rate": 0.0,
             "tp1_to_tp2_rate": 0.0,
             "net_profit_pct": 0.0,
+            "breakeven_exits": 0,
         }
 
     stats_key = get_stats_key(market_type, side)
@@ -1087,9 +1290,10 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         tp1_wins = safe_int(financial_summary.get("tp1_wins", tp1_wins))
         tp2_wins = safe_int(financial_summary.get("tp2_wins", tp2_wins))
         open_count = safe_int(financial_summary.get("open", open_count))
+        breakeven_exits = safe_int(financial_summary.get("breakeven_exits", 0))
 
-        decided = wins + losses
-        closed = wins + losses + expired
+        decided = wins + losses + breakeven_exits
+        closed = wins + losses + expired + breakeven_exits
         total_signals = closed + open_count
 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
@@ -1129,6 +1333,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
                 "net_profit_pct",
                 financial_summary.get("realized_leveraged_pnl_pct", 0.0)
             )),
+            "breakeven_exits": breakeven_exits,
         }
 
     except Exception as e:
@@ -1161,6 +1366,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "tp2_rate": 0.0,
             "tp1_to_tp2_rate": 0.0,
             "net_profit_pct": 0.0,
+            "breakeven_exits": 0,
         }
 
 
@@ -1306,6 +1512,7 @@ def format_exit_summary(title: str, summary: dict) -> str:
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     expired = safe_int(summary.get("expired", 0))
     exit_quality = summary.get("exit_quality", "unknown")
+    breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
 
     quality_ar = {
         "good": "جيد ✅",
@@ -1325,6 +1532,8 @@ def format_exit_summary(title: str, summary: dict) -> str:
     lines.append(f"🛑 SL Before TP1: {sl_before_tp1} ({sl_before_tp1_rate:.1f}%)")
     lines.append(f"🔄 TP1 Only / رجوع Entry: {tp1_only}")
     lines.append(f"⏳ Expired: {expired}")
+    if breakeven_exits > 0:
+        lines.append(f"🔷 Breakeven Exits: {breakeven_exits}")
     lines.append(f"🔍 Exit Quality: {quality_text}")
     lines.append("")
 
@@ -1337,7 +1546,6 @@ def format_exit_summary(title: str, summary: dict) -> str:
     elif exit_quality == "good":
         lines.append("ℹ️ الخروج متوازن نسبيًا.")
 
-    # تشخيص الأداء للـ exit summary: نمرر summary كـ exit_summary
     diagnosis = diagnose_performance_problem(summary, is_exit_summary=True)
     lines.append("")
     lines.append(f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>")
@@ -1440,6 +1648,7 @@ def format_daily_performance_report(title: str, rows: list, side: str = "long") 
         tp1_rate = safe_float(summary.get("tp1_rate", 0))
         tp2_rate = safe_float(summary.get("tp2_rate", 0))
         net_pnl = safe_float(summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0)))
+        breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
 
         wallet_pct, wallet_usd = estimate_wallet_pnl(summary, side=side)
 
@@ -1453,13 +1662,14 @@ def format_daily_performance_report(title: str, rows: list, side: str = "long") 
             "unknown": "—",
         }.get(quality, "—")
 
-        # تشخيص مختصر لكل يوم
         diagnosis = diagnose_performance_problem(summary, exits)
         diag_short = f" | مشكلة:{diagnosis['emoji']} {diagnosis['problem_label']}"
 
+        be_str = f" 🔷BE:{breakeven_exits}" if breakeven_exits > 0 else ""
+
         lines.append(
             f"📅 {day} | 🎯{signals}/{closed}/{open_t} | "
-            f"✅{wins} ❌{losses} ⏳{expired} | WR:{winrate:.0f}% | "
+            f"✅{wins} ❌{losses} ⏳{expired}{be_str} | WR:{winrate:.0f}% | "
             f"TP1:{tp1_rate:.0f}% TP2:{tp2_rate:.0f}% | "
             f"Net:{net_pnl:+.1f}% | محفظة:{wallet_pct:+.1f}% {wallet_usd:+.1f}$ | "
             f"خروج:{quality_short}"
@@ -1521,9 +1731,12 @@ def format_today_performance_report(title: str, data: dict, side: str = "long") 
     wins = safe_int(summary.get("wins", 0))
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
+    breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
 
     lines.append(f"إشارات: {signals} | مغلقة: {closed} | مفتوحة: {open_t}")
     lines.append(f"فوز: {wins} | خسارة: {losses} | منتهية: {expired}")
+    if breakeven_exits > 0:
+        lines.append(f"تعادل محمي: {breakeven_exits}")
     lines.append(f"نسبة الفوز: {safe_float(summary.get('winrate', 0)):.1f}%")
     lines.append(
         f"TP1 Rate: {safe_float(summary.get('tp1_rate', 0)):.1f}% | "
@@ -1534,7 +1747,6 @@ def format_today_performance_report(title: str, data: dict, side: str = "long") 
     lines.append(f"صافي بعد الرافعة: {net_pnl:+.2f}%")
     lines.append(f"تأثير المحفظة: {wallet_pct:+.2f}% = {wallet_usd:+.2f}$")
 
-    # تشخيص الأداء
     diagnosis = diagnose_performance_problem(summary, exit_summary)
     lines.append("")
     lines.append(f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>")
@@ -1734,6 +1946,10 @@ def format_winrate_summary(summary: dict) -> str:
         0.0,
     )
 
+    breakeven_str = ""
+    if safe_int(summary.get("breakeven_exits", 0)) > 0:
+        breakeven_str = f" | BE Exits: {summary['breakeven_exits']}"
+
     return (
         f"{prefix}Win rate: {summary.get('winrate', 0)}% | "
         f"TP1 Rate: {summary.get('tp1_rate', 0)}% | "
@@ -1747,6 +1963,7 @@ def format_winrate_summary(summary: dict) -> str:
         f"TP1 Hits: {summary.get('tp1_hits', 0)} | "
         f"Expired: {summary.get('expired', 0)} | "
         f"Open: {summary.get('open', 0)}"
+        + breakeven_str
     )
 
 
@@ -1756,7 +1973,9 @@ def format_period_summary(title: str, summary: dict) -> str:
     wins = safe_int(summary.get("wins", 0))
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
-    decided = wins + losses + expired
+    breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
+    decided = wins + losses + expired + breakeven_exits
+    closed = decided
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
     gross_loss = safe_float(summary.get("gross_loss_pct", 0.0))
@@ -1833,8 +2052,9 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
         f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%"
     )
+    if breakeven_exits > 0:
+        performance_block += f"\n• Breakeven Protected Exits: {breakeven_exits}"
 
-    # تشخيص الأداء
     diagnosis = diagnose_performance_problem(summary)
     diagnosis_block = (
         f"\n🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>\n"
@@ -1865,12 +2085,13 @@ def format_period_summary(title: str, summary: dict) -> str:
     return (
         f"📊 {title}\n"
         f"Signals: {summary.get('signals', 0)}\n"
-        f"Closed: {decided}\n"
+        f"Closed: {closed}\n"
         f"Wins (TP1+): {wins}\n"
         f"• Full Wins (TP2): {full_wins}\n"
         f"• TP1 Only: {tp1_only}\n"
         f"Losses: {losses}\n"
         f"Expired: {expired}\n"
+        + (f"Breakeven Exits: {breakeven_exits}\n" if breakeven_exits > 0 else "") +
         f"Open: {summary.get('open', 0)}\n"
         f"Win rate: {summary.get('winrate', 0)}%"
         + performance_block
@@ -1887,20 +2108,10 @@ def diagnose_performance_problem(
     exit_summary: dict = None,
     is_exit_summary: bool = False,
 ) -> dict:
-    """
-    تشخيص المشكلة الأساسية في الأداء.
-
-    إذا كان is_exit_summary=True، يُعتمد على الحقول الخاصة بالخروج (تجاهل winrate).
-    وإلا يُستخدم summary العادي (من summarize_trades) مع إمكانية تمرير exit_summary لتحسين التشخيص.
-
-    Returns dict: problem_type, problem_label, severity, emoji, explanation, action
-    """
-    # القيم الأساسية
     signals = safe_int(summary.get("signals", summary.get("trades_count", 0)))
     closed = safe_int(summary.get("closed", 0))
     losses = safe_int(summary.get("losses", 0))
 
-    # بيانات الخروج قد تكون في كائن منفصل (exit_summary) أو داخل summary نفسه إذا is_exit_summary=True
     if is_exit_summary:
         tp1_hits = safe_int(summary.get("tp1_hits", 0))
         tp2_hits = safe_int(summary.get("tp2_hits", 0))
@@ -1908,7 +2119,7 @@ def diagnose_performance_problem(
         tp2_rate = safe_float(summary.get("tp2_rate", 0))
         tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
         sl_before_tp1_rate = safe_float(summary.get("sl_before_tp1_rate", 0))
-        winrate = None  # نتجاهل winrate في exit_summary
+        winrate = None
     else:
         tp1_hits = safe_int(summary.get("tp1_hits", 0))
         tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
@@ -1921,14 +2132,11 @@ def diagnose_performance_problem(
             if exit_summary else 0.0
         )
 
-    # حساب loss_rate من الصفقات المغلقة
     loss_rate_closed = (losses / closed * 100) if closed > 0 else 0.0
 
-    # إعادة حساب tp1_to_tp2_rate إذا لم يكن موجودًا
     if tp1_to_tp2_rate == 0 and tp1_hits > 0:
         tp1_to_tp2_rate = (tp2_hits / tp1_hits) * 100
 
-    # 1. لا توجد بيانات كافية
     if signals == 0 or closed == 0:
         return {
             "problem_type": "no_data",
@@ -1939,13 +2147,10 @@ def diagnose_performance_problem(
             "action": "انتظر بيانات أكثر قبل تعديل الاستراتيجية."
         }
 
-    # 2. مشكلة SL / وقف قبل الحركة (تحقق أولاً)
     sl_condition = sl_before_tp1_rate >= 45
     if not sl_condition and not is_exit_summary and loss_rate_closed >= 60 and 35 <= tp1_rate <= 50:
         sl_condition = True
-    if is_exit_summary and not sl_condition and loss_rate_closed >= 60 and tp1_rate < 35:
-        # في exit_summary، لو loss rate عالي و tp1 rate ضعيف جدًا، الأقرب أنها مشكلة دخول وليس SL
-        pass
+
     if sl_condition:
         return {
             "problem_type": "sl_problem",
@@ -1956,7 +2161,6 @@ def diagnose_performance_problem(
             "action": "راجع مكان SL، ATR multiplier، وتجنب الدخول في شموع ممتدة أو بعد Pump."
         }
 
-    # 3. مشكلة دخول
     entry_problem_condition = False
     if is_exit_summary:
         if tp1_rate < 35 and loss_rate_closed > 55:
@@ -1975,7 +2179,6 @@ def diagnose_performance_problem(
             "action": "راجع شروط الدخول، الفوليوم، التوقيت، وبعد السعر عن MA/VWAP، وفلتر الإشارات المتأخرة."
         }
 
-    # 4. مشكلة خروج بعد TP1
     if tp1_rate >= 50 and tp1_to_tp2_rate < 30:
         return {
             "problem_type": "exit_problem",
@@ -1986,7 +2189,6 @@ def diagnose_performance_problem(
             "action": "راجع قرب TP2، أو استخدم خروج تدريجي، أو Trailing Stop بعد TP1."
         }
 
-    # 5. أداء جيد
     if is_exit_summary:
         good_condition = tp1_rate >= 55 and tp1_to_tp2_rate >= 35
     else:
@@ -2002,7 +2204,6 @@ def diagnose_performance_problem(
             "action": "استمر في جمع البيانات ولا تعدل بعنف."
         }
 
-    # 6. مشكلة مختلطة
     return {
         "problem_type": "mixed_problem",
         "problem_label": "مشكلة مختلطة",
@@ -2057,10 +2258,6 @@ def estimate_pct_to_usd(pct_value: float, side: str = "long") -> float:
 
 
 def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct: float = None) -> tuple:
-    """
-    حساب تأثير المحفظة باستخدام مارجن الصفقة الواحدة.
-    تُرجع (نسبة المحفظة %, القيمة بالدولار).
-    """
     side = normalize_side(side)
 
     realized_pct_sum = safe_float(
@@ -2082,3 +2279,4 @@ def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct
     )
 
     return wallet_pnl_pct, wallet_pnl_usd
+```
