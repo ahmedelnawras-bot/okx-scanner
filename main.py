@@ -346,6 +346,93 @@ def set_global_cooldown() -> None:
     pass
 
 # =========================
+# NEW HELPER: consolidated rejection logging
+# =========================
+def log_long_rejection(
+    symbol,
+    reason,
+    candle_time=None,
+    score=None,
+    raw_score=None,
+    final_threshold=None,
+    market_state="",
+    current_mode="",
+    setup_type="",
+    entry_timing="",
+    opportunity_type="",
+    dist_ma=None,
+    rsi_now=None,
+    vol_ratio=None,
+    vwap_distance=None,
+    mtf_confirmed=None,
+    breakout=None,
+    pre_breakout=None,
+    is_reverse=None,
+    extra=None,
+):
+    try:
+        log_rejected_candidate(
+            redis_client=r,
+            symbol=symbol,
+            reason=reason,
+            candle_time=candle_time,
+            score=score,
+            raw_score=raw_score,
+            final_threshold=final_threshold,
+            market_state=market_state,
+            current_mode=current_mode,
+            setup_type=setup_type,
+            entry_timing=entry_timing,
+            opportunity_type=opportunity_type,
+            dist_ma=dist_ma,
+            rsi_now=rsi_now,
+            vol_ratio=vol_ratio,
+            vwap_distance=vwap_distance,
+            mtf_confirmed=mtf_confirmed,
+            breakout=breakout,
+            pre_breakout=pre_breakout,
+            is_reverse=is_reverse,
+            extra=extra,
+        )
+    except Exception as e:
+        logger.warning(f"log_long_rejection failed for {symbol} reason={reason}: {e}")
+
+def classify_hard_late_rejection_reason(
+    entry_timing,
+    entry_maturity_status,
+    had_pullback,
+    fib_position,
+    wave_estimate,
+    dist_ma,
+    rsi_now,
+    vol_ratio,
+    vwap_distance,
+    breakout,
+    pre_breakout,
+    mtf_confirmed,
+):
+    """Returns a more specific reason string for hard_late_entry block."""
+    # wave_5_no_pullback
+    if wave_estimate >= 5 and not had_pullback:
+        return "wave_5_no_pullback"
+    # overextended_late_entry
+    if fib_position == "overextended" or "امتداد سعري" in str(entry_timing):
+        return "overextended_late_entry"
+    # post_dump_weak_rebound
+    if dist_ma is not None and dist_ma < -2.0 and rsi_now is not None and rsi_now < 45 and not breakout and not pre_breakout and not mtf_confirmed:
+        return "post_dump_weak_rebound"
+    # weak_recovery_below_ma
+    if dist_ma is not None and dist_ma < 0 and not mtf_confirmed and not breakout and not pre_breakout:
+        return "weak_recovery_below_ma"
+    # no_structure_break
+    if not breakout and not pre_breakout:
+        return "no_structure_break"
+    # low_volume_bounce
+    if vol_ratio is not None and vol_ratio < 1.0:
+        return "low_volume_bounce"
+    return "hard_late_entry"
+
+# =========================
 # ECONOMIC CALENDAR
 # =========================
 def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> list:
@@ -1459,28 +1546,49 @@ def get_last_price(symbol: str) -> float:
     return 0.0
 
 def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str = "long"):
- try:
-    candles = get_candles(symbol, TIMEFRAME, 100)
-    df = to_dataframe(candles)
-    if df is None or df.empty:
-        return 0.0, 0.0
-    work = df[df["ts"] > (since_ts * 1000 if since_ts < 10_000_000_000 else since_ts)].copy()
-    if work.empty:
-        work = df.tail(20).copy()
-    lows = work["low"].astype(float)
-    highs = work["high"].astype(float)
-    if lows.empty or highs.empty or entry <= 0:
-        return 0.0, 0.0
-    if side == "long":
-        favorable_pct = round(((float(highs.max()) - entry) / entry) * 100, 2)
-        adverse_pct = round(((entry - float(lows.min())) / entry) * 100, 2)
-        return favorable_pct, adverse_pct
-    favorable_pct = round(((entry - float(lows.min())) / entry) * 100, 2)
-    adverse_pct = round(((float(highs.max()) - entry) / entry) * 100, 2)
-    return favorable_pct, adverse_pct
- except Exception as e:
-    logger.error(f"get_max_move_since_alert error on {symbol}: {e}")
-    return 0.0, 0.0
+    try:
+        age_seconds = max(0, int(time.time()) - since_ts)
+        if age_seconds <= 24 * 3600:
+            timeframe = TIMEFRAME
+            limit = 120
+        elif age_seconds <= 72 * 3600:
+            timeframe = "1H"
+            limit = 100
+        else:
+            timeframe = "1H"
+            limit = 200
+
+        candles = get_candles(symbol, timeframe, limit)
+        df = to_dataframe(candles)
+        if df is None or df.empty:
+            return 0.0, 0.0, 0.0, 0.0
+
+        ts_col = df["ts"].astype(float)
+        since_ms = since_ts * 1000 if since_ts < 10_000_000_000 else since_ts
+        work = df[ts_col > since_ms].copy()
+        if work.empty:
+            work = df.tail(20).copy()
+
+        lows = work["low"].astype(float)
+        highs = work["high"].astype(float)
+        if lows.empty or highs.empty or entry <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        if side == "long":
+            favorable_price = float(highs.max())
+            favorable_pct = round(((favorable_price - entry) / entry) * 100, 2)
+            adverse_price = float(lows.min())
+            adverse_pct = round(((entry - adverse_price) / entry) * 100, 2)
+            return favorable_price, favorable_pct, adverse_price, adverse_pct
+        else:
+            favorable_price = float(lows.min())
+            favorable_pct = round(((entry - favorable_price) / entry) * 100, 2)
+            adverse_price = float(highs.max())
+            adverse_pct = round(((adverse_price - entry) / entry) * 100, 2)
+            return favorable_price, favorable_pct, adverse_price, adverse_pct
+    except Exception as e:
+        logger.error(f"get_max_move_since_alert error on {symbol}: {e}")
+        return 0.0, 0.0, 0.0, 0.0
 
 def get_alert_status(alert: dict) -> str:
  try:
@@ -1498,7 +1606,7 @@ def get_alert_status(alert: dict) -> str:
     tp1 = _safe_float(alert.get("tp1"), 0)
     tp2 = _safe_float(alert.get("tp2"), 0)
     candle_time = int(_safe_float(alert.get("candle_time"), 0))
-    favorable_pct, adverse_pct = get_max_move_since_alert(
+    favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
         symbol=symbol,
         since_ts=candle_time,
         entry=effective_entry,
@@ -1599,7 +1707,7 @@ def build_track_message(alert: dict) -> str:
         effective_entry = avg_planned
     else:
         effective_entry = recommended_entry if recommended_entry > 0 else pullback_entry if pullback_entry > 0 else entry
-    favorable_pct, adverse_pct = get_max_move_since_alert(
+    favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
         symbol=alert.get("symbol", ""),
         since_ts=candle_time,
         entry=effective_entry,
@@ -1655,8 +1763,8 @@ def build_track_message(alert: dict) -> str:
         f"💵 السعر الحالي: {current_price:.6f}\n"
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
         f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
-        f"🚀 أقصى صعود: +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
-        f"📉 أقصى هبوط ضدك: +{adverse_pct:.2f}% | بعد الرافعة: +{leveraged_adverse:.2f}%\n"
+        f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
+        f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | +{adverse_pct:.2f}% | بعد الرافعة: +{leveraged_adverse:.2f}%\n"
         f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
         f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
     )
@@ -5157,17 +5265,20 @@ def run_scanner_loop():
                 symbol = pair_data["instId"]
                 candles = get_candles(symbol, TIMEFRAME, 100)
                 if not candles:
+                    log_long_rejection(symbol=symbol, reason="no_candles", candle_time=None, market_state=market_state, current_mode=current_mode)
                     continue
                 df = to_dataframe(candles)
                 if df is None or df.empty:
+                    log_long_rejection(symbol=symbol, reason="dataframe_empty", candle_time=None, market_state=market_state, current_mode=current_mode)
                     continue
                 if not is_valid_candle_timing(df):
+                    log_long_rejection(symbol=symbol, reason="invalid_candle_timing", candle_time=get_signal_candle_time(df), market_state=market_state, current_mode=current_mode)
                     continue
                 signal_row = get_signal_row(df)
                 if signal_row is None:
                     continue
                 candle_time = get_signal_candle_time(df)
-                # حماية تكرار محلية
+                # حماية تكرار محلية - لا تسجل رفض
                 now_local = time.time()
                 if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
                     logger.info(f"{symbol} skipped (recovery): local same candle cache")
@@ -5183,16 +5294,20 @@ def run_scanner_loop():
                     continue
                 dist_ma = get_distance_from_ma_percent(df)
                 if dist_ma >= -3.0:
+                    log_long_rejection(symbol=symbol, reason="recovery_dist_ma_not_deep", candle_time=candle_time, market_state=market_state, current_mode=current_mode, dist_ma=dist_ma)
                     continue
                 rsi_now = _safe_float(signal_row.get("rsi"), 50)
                 if rsi_now > 38:
+                    log_long_rejection(symbol=symbol, reason="recovery_rsi_too_high", candle_time=candle_time, market_state=market_state, current_mode=current_mode, rsi_now=rsi_now)
                     continue
                 vol_ratio = get_volume_ratio(df)
                 if vol_ratio < 1.02:
+                    log_long_rejection(symbol=symbol, reason="recovery_low_volume", candle_time=candle_time, market_state=market_state, current_mode=current_mode, vol_ratio=vol_ratio)
                     continue
                 price = _safe_float(signal_row["close"], 0)
                 atr_value = _safe_float(signal_row.get("atr"), 0)
                 if atr_value <= 0:
+                    log_long_rejection(symbol=symbol, reason="recovery_atr_invalid", candle_time=candle_time, market_state=market_state, current_mode=current_mode)
                     continue
                 entry1 = price
                 entry2 = round(price - (atr_value * RECOVERY_ENTRY2_ATR_MULT), 6)
@@ -5391,11 +5506,14 @@ def run_scanner_loop():
             change_24h = extract_24h_change_percent(pair_data)
             candles = candles_map.get(symbol, [])
             if not candles:
+                log_long_rejection(symbol=symbol, reason="no_candles", candle_time=None, market_state=market_state, current_mode=current_mode)
                 continue
             df = to_dataframe(candles)
             if df is None or df.empty:
+                log_long_rejection(symbol=symbol, reason="dataframe_empty", candle_time=None, market_state=market_state, current_mode=current_mode)
                 continue
             if not is_valid_candle_timing(df):
+                log_long_rejection(symbol=symbol, reason="invalid_candle_timing", candle_time=get_signal_candle_time(df), market_state=market_state, current_mode=current_mode)
                 logger.info(f"{symbol} --> skipped (candle timing invalid)")
                 continue
             candle_time = get_signal_candle_time(df)
@@ -5492,8 +5610,7 @@ def run_scanner_loop():
             )
             # تفعيل حظر الـ late_guard المباشر
             if late_guard.get("should_block") and not is_reverse:
-                log_rejected_candidate(
-                    redis_client=r,
+                log_long_rejection(
                     symbol=symbol,
                     reason="late_guard_should_block",
                     candle_time=candle_time,
@@ -5540,12 +5657,64 @@ def run_scanner_loop():
                     and mtf_confirmed
                     and vol_ratio >= 1.8
                 ):
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="entry_maturity_block",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_maturity_data.get("entry_maturity", ""),
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "entry_maturity": entry_maturity_data.get("entry_maturity"),
+                            "fib_position": entry_maturity_data.get("fib_position"),
+                            "wave_estimate": entry_maturity_data.get("wave_estimate"),
+                        },
+                    )
                     logger.info(f"{symbol} → skipped by entry maturity guard: {entry_maturity_data}")
                     continue
             if market_state == "bull_market" and not is_reverse:
                 if vwap_distance >= 2.4 and not breakout and not pre_breakout:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="vwap_overextended_bull_market",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                    )
                     continue
                 if vwap_distance >= 2.8 and breakout_quality != "strong" and not pre_breakout:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="vwap_overextended_bull_market",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"breakout_quality": breakout_quality},
+                    )
                     continue
             if not is_reverse:
                 if (
@@ -5555,11 +5724,59 @@ def run_scanner_loop():
                     and not pre_breakout
                     and breakout_quality != "strong"
                 ):
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="rsi_momentum_weak",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"rsi_slope": rsi_slope, "breakout_quality": breakout_quality},
+                    )
                     continue
                 if rsi_slope < -2.5 and not breakout and not pre_breakout:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="rsi_momentum_weak",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"rsi_slope": rsi_slope},
+                    )
                     continue
             if not is_reverse:
                 if macd_hist < 0 and not breakout and not pre_breakout:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="macd_negative",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"macd_hist": macd_hist},
+                    )
                     continue
                 if (
                     macd_hist_slope < 0
@@ -5568,6 +5785,22 @@ def run_scanner_loop():
                     and not pre_breakout
                     and breakout_quality != "strong"
                 ):
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="macd_momentum_falling",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"macd_hist_slope": macd_hist_slope, "macd_hist": macd_hist},
+                    )
                     continue
             trap_check = is_momentum_exhaustion_trap(
                 market_state=market_state,
@@ -5586,6 +5819,22 @@ def run_scanner_loop():
                 is_reverse=is_reverse,
             )
             if trap_check["is_trap"] and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="momentum_exhaustion_trap",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"trap_reasons": trap_check["reasons"], "checks": trap_check["checks"]},
+                )
                 continue
             entry_timing_temp = classify_entry_timing_long(
                 dist_ma=dist_ma,
@@ -5611,9 +5860,43 @@ def run_scanner_loop():
                 is_reverse=is_reverse,
             )
             if guard["blocked"]:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="late_breakout_guard_blocked",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing_temp,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"]},
+                )
                 logger.info(f"{symbol} --> late breakout guard BLOCKED: {guard['reason']}")
                 continue
             if guard["retest_required"]:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="retest_required",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing_temp,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"]},
+                )
                 logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
                 continue
 
@@ -5682,10 +5965,23 @@ def run_scanner_loop():
                         })
                         logger.info(f"{symbol} --> hard late entry overridden by strong exception")
                     else:
-                        log_rejected_candidate(
-                            redis_client=r,
+                        reason_specific = classify_hard_late_rejection_reason(
+                            entry_timing=entry_timing_temp,
+                            entry_maturity_status=entry_maturity_status,
+                            had_pullback=had_pullback,
+                            fib_position=fib_position,
+                            wave_estimate=wave_estimate,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            mtf_confirmed=mtf_confirmed,
+                        )
+                        log_long_rejection(
                             symbol=symbol,
-                            reason="hard_late_entry",
+                            reason=reason_specific,
                             candle_time=candle_time,
                             market_state=market_state,
                             current_mode=current_mode,
@@ -5708,7 +6004,7 @@ def run_scanner_loop():
                             },
                         )
                         logger.info(
-                            f"{symbol} --> rejected by hard late entry block "
+                            f"{symbol} --> rejected by {reason_specific} "
                             f"(entry_timing={entry_timing_temp}, entry_maturity={entry_maturity_status}, "
                             f"had_pullback={had_pullback}, fib={fib_position}, wave={wave_estimate}, "
                             f"score_pre=not_calculated, dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
@@ -5729,8 +6025,7 @@ def run_scanner_loop():
                     final_threshold_min = 6.0
 
                 if not (breakout or pre_breakout or early_priority == "strong" or strong_bull_pullback or (is_reverse and reversal_4h_result.get("confirmed"))):
-                    log_rejected_candidate(
-                        redis_client=r,
+                    log_long_rejection(
                         symbol=symbol,
                         reason="strong_only_no_valid_setup",
                         candle_time=candle_time,
@@ -5757,12 +6052,65 @@ def run_scanner_loop():
                 if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong"):
                     logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY strong_bull_pullback exception")
                 if not mtf_confirmed and not (is_reverse and reversal_4h_result.get("confirmed")):
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="strong_only_mtf_not_confirmed",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                    )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: mtf not confirmed)")
                     continue
                 if vol_ratio < 1.25 and not strong_bull_pullback:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="strong_only_low_volume",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"strong_bull_pullback": strong_bull_pullback},
+                    )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: vol_ratio too low)")
                     continue
                 if breakout and breakout_quality == "weak":
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="strong_only_weak_breakout",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"breakout_quality": breakout_quality},
+                    )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: weak breakout)")
                     continue
 
@@ -5782,8 +6130,38 @@ def run_scanner_loop():
                 pullback_high = None
                 pullback_entry = None
             if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="low_volume_no_breakout",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
                 continue
             if is_late_long_entry(dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout) and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="late_entry_simple",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
                 continue
             if is_exhausted_long_move(
                 dist_ma=dist_ma,
@@ -5792,6 +6170,22 @@ def run_scanner_loop():
                 breakout=breakout,
                 pre_breakout=pre_breakout,
             ) and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="exhausted_long_move",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"candle_strength": candle_strength},
+                )
                 continue
             try:
                 score_result = calculate_long_score(
@@ -5810,6 +6204,13 @@ def run_scanner_loop():
                 )
             except Exception as score_err:
                 logger.error(f"{symbol} --> calculate_long_score failed: {score_err}")
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="calculate_long_score_failed",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                )
                 continue
             raw_score = float(score_result.get("score", 0))
             effective_score = raw_score
@@ -5990,8 +6391,7 @@ def run_scanner_loop():
                 score_after_penalties=score_result["score"],
             )
             if should_reject_near_resistance:
-                log_rejected_candidate(
-                    redis_client=r,
+                log_long_rejection(
                     symbol=symbol,
                     reason="near_resistance",
                     candle_time=candle_time,
@@ -6052,6 +6452,23 @@ def run_scanner_loop():
                 dynamic_threshold += 0.25
                 dynamic_threshold = round(dynamic_threshold, 2)
             if current_mode == MODE_STRONG_LONG_ONLY and "🔴" in entry_timing_temp:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="strong_only_late_entry",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing_temp,
+                    opportunity_type=temp_opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
                 logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: late entry)")
                 continue
 
@@ -6093,6 +6510,33 @@ def run_scanner_loop():
                     })
 
                 if not strong_bull_pullback and score_result["score"] < 7.5:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="bull_continuation_strict_filter",
+                        candle_time=candle_time,
+                        score=score_result["score"],
+                        raw_score=raw_score,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing,
+                        opportunity_type=opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "required_score": 7.5,
+                            "bull_continuation_extra": bull_continuation_extra,
+                            "candle_strength": candle_strength,
+                            "breakout_quality": breakout_quality,
+                            "late_guard_reasons": late_guard.get("reasons", []),
+                            "strong_bull_pullback": strong_bull_pullback,
+                        },
+                    )
                     logger.info(
                         f"{symbol} --> skipped "
                         f"(bull continuation strict filter | score={score_result['score']} | "
@@ -6124,18 +6568,88 @@ def run_scanner_loop():
             final_threshold = round(final_threshold, 2)
 
             if (not mtf_confirmed) and "🔴" in entry_timing and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="late_without_mtf",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
                 logger.info(f"{symbol} --> skipped (late without MTF confirmation)")
                 continue
             if mtf_confirmed and change_4h > 3 and not breakout and not pre_breakout and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="chasing_4h_move",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"change_4h": change_4h},
+                )
                 logger.info(f"{symbol} --> skipped (chasing 4h move)")
                 continue
 
             if not breakout and not pre_breakout and dist_ma > 6.2 and not is_reverse:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="late_move_without_breakout",
+                    candle_time=candle_time,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
                 logger.info(f"{symbol} --> rejected (late move without breakout)")
                 continue
             if "🟢 مبكر" in entry_timing:
                 if not mtf_confirmed and not breakout and not pre_breakout:
                     if early_priority != "strong" or score_result["score"] < dynamic_threshold:
+                        log_long_rejection(
+                            symbol=symbol,
+                            reason="early_without_confirmation",
+                            candle_time=candle_time,
+                            market_state=market_state,
+                            current_mode=current_mode,
+                            entry_timing=entry_timing,
+                            opportunity_type=opportunity_type,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            is_reverse=is_reverse,
+                            extra={"early_priority": early_priority, "dynamic_threshold": dynamic_threshold},
+                        )
                         logger.info(f"{symbol} --> مبكر بدون تأكيد قوي، تم التخطي")
                         continue
             if is_new and not passes_new_listing_filter(
@@ -6144,12 +6658,31 @@ def run_scanner_loop():
                 vol_ratio=vol_ratio,
                 candle_strength=candle_strength,
             ):
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="new_listing_filter",
+                    candle_time=candle_time,
+                    score=score_result.get("score"),
+                    raw_score=raw_score,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"candle_strength": candle_strength},
+                )
                 logger.info(f"{symbol} → rejected by balanced new listing filter")
                 continue
 
             if score_result["score"] < final_threshold:
-                log_rejected_candidate(
-                    redis_client=r,
+                log_long_rejection(
                     symbol=symbol,
                     reason="final_threshold",
                     candle_time=candle_time,
@@ -6158,7 +6691,6 @@ def run_scanner_loop():
                     final_threshold=final_threshold,
                     market_state=market_state,
                     current_mode=current_mode,
-                    setup_type="",
                     entry_timing=entry_timing,
                     opportunity_type=opportunity_type,
                     dist_ma=dist_ma,
@@ -6204,6 +6736,27 @@ def run_scanner_loop():
             base_risk = get_base_risk_label(score_result, warnings_count)
             display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
             if "🔴" in entry_timing and "🔴" in display_risk and not breakout and vol_ratio < 1.2:
+                log_long_rejection(
+                    symbol=symbol,
+                    reason="late_high_risk_low_volume",
+                    candle_time=candle_time,
+                    score=score_result.get("score"),
+                    raw_score=raw_score,
+                    final_threshold=final_threshold,
+                    market_state=market_state,
+                    current_mode=current_mode,
+                    entry_timing=entry_timing,
+                    opportunity_type=opportunity_type,
+                    dist_ma=dist_ma,
+                    rsi_now=rsi_now,
+                    vol_ratio=vol_ratio,
+                    vwap_distance=vwap_distance,
+                    mtf_confirmed=mtf_confirmed,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                    extra={"display_risk": display_risk},
+                )
                 logger.info(f"{symbol} → rejected (late + high risk + no breakout + low vol)")
                 continue
             momentum_priority = get_momentum_priority(
@@ -6262,8 +6815,7 @@ def run_scanner_loop():
                 if "Weak Historical Setup" not in score_result["warning_reasons"]:
                     score_result["warning_reasons"].append("Weak Historical Setup")
                 if score_result["score"] < final_threshold:
-                    log_rejected_candidate(
-                        redis_client=r,
+                    log_long_rejection(
                         symbol=symbol,
                         reason="weak_historical_setup",
                         candle_time=candle_time,
