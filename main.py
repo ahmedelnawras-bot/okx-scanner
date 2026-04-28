@@ -433,6 +433,455 @@ def classify_hard_late_rejection_reason(
     return "hard_late_entry"
 
 # =========================
+# NEW HELPER: HTF context extraction
+# =========================
+def get_htf_context_from_candles(candles) -> dict:
+    """
+    Analyze higher timeframe candles (1H or 4H) and return a structured context.
+    Returns a dict with keys: valid, close, ma, rsi, dist_ma, above_ma, rsi_healthy, rsi_hot, overextended, trend_healthy.
+    """
+    ctx = {
+        "valid": False,
+        "close": 0.0,
+        "ma": 0.0,
+        "rsi": 50.0,
+        "dist_ma": 0.0,
+        "above_ma": False,
+        "rsi_healthy": False,
+        "rsi_hot": False,
+        "overextended": False,
+        "trend_healthy": False,
+    }
+    if not candles:
+        return ctx
+    df = to_dataframe(candles)
+    if df is None or df.empty:
+        return ctx
+    signal_row = get_signal_row(df)
+    if signal_row is None:
+        return ctx
+    close = _safe_float(signal_row.get("close"), 0.0)
+    ma = _safe_float(signal_row.get("ma"), 0.0)
+    rsi = _safe_float(signal_row.get("rsi"), 50.0)
+    if close <= 0 or ma <= 0:
+        return ctx
+    dist_ma = round(((close - ma) / ma) * 100, 4)
+    ctx["valid"] = True
+    ctx["close"] = close
+    ctx["ma"] = ma
+    ctx["rsi"] = rsi
+    ctx["dist_ma"] = dist_ma
+    ctx["above_ma"] = close > ma
+    ctx["rsi_healthy"] = 50.0 <= rsi <= 65.0
+    ctx["rsi_hot"] = rsi >= 70.0
+    ctx["overextended"] = dist_ma >= 5.0 or rsi >= 70.0
+    ctx["trend_healthy"] = ctx["above_ma"] and ctx["rsi_healthy"] and dist_ma <= 4.0
+    return ctx
+
+def evaluate_wave5_htf_override(
+    entry_timing,
+    entry_maturity_data,
+    dist_ma,
+    htf_1h_context,
+    htf_4h_context,
+    breakout,
+    pre_breakout,
+    breakout_quality,
+    mtf_confirmed,
+    vol_ratio,
+) -> dict:
+    """
+    Decide whether a wave-5 / late signal from 15m can be overridden based on higher timeframes.
+    Returns a dict with: is_wave5_late, can_override, should_reject, reason, penalty, label.
+    """
+    result = {
+        "is_wave5_late": False,
+        "can_override": False,
+        "should_reject": False,
+        "reason": "",
+        "penalty": 0.0,
+        "label": "",
+    }
+
+    # Determine if signal is considered wave-5 / late based on 15m + entry_maturity
+    entry_maturity_status = str(entry_maturity_data.get("entry_maturity", "unknown") or "unknown")
+    had_pullback = bool(entry_maturity_data.get("had_pullback", False))
+    fib_position = str(entry_maturity_data.get("fib_position", "unknown") or "unknown")
+    wave_estimate = int(entry_maturity_data.get("wave_estimate", 0) or 0)
+
+    is_wave5_late = (
+        ("موجة خامسة" in str(entry_timing))
+        or ("متأخر جدًا" in str(entry_timing))
+        or ("نهاية موجة" in str(entry_timing))
+        or (wave_estimate >= 5 and not had_pullback)
+        or (fib_position == "overextended" and wave_estimate >= 5)
+    )
+    result["is_wave5_late"] = is_wave5_late
+    if not is_wave5_late:
+        return result
+
+    # Check HTF conditions
+    htf_healthy = (
+        htf_1h_context.get("trend_healthy", False)
+        and not htf_4h_context.get("overextended", True)
+    )
+    breakout_exception = (
+        (breakout or pre_breakout)
+        and breakout_quality in ("strong", "ok")
+        and mtf_confirmed
+        and (vol_ratio or 0.0) >= 1.25
+    )
+
+    can_override = htf_healthy or breakout_exception
+    result["can_override"] = can_override
+
+    if can_override:
+        result["should_reject"] = False
+        if htf_healthy:
+            result["penalty"] = 0.25
+            result["label"] = "wave_5_15m_but_htf_healthy"
+        else:
+            result["penalty"] = 0.15
+            result["label"] = "wave_5_15m_but_breakout_confirmed"
+        result["reason"] = "wave5_override_by_htf"
+    else:
+        # Check if HTFs confirm extended/late
+        htf_confirm_late = (
+            htf_1h_context.get("overextended", False)
+            or htf_4h_context.get("overextended", False)
+            or not htf_1h_context.get("trend_healthy", False)
+        )
+        if htf_confirm_late:
+            result["should_reject"] = True
+            result["reason"] = "wave5_confirmed_by_htf"
+            result["label"] = "wave_5_confirmed_by_htf"
+        else:
+            # Inconclusive, fallback to simple late entry logic
+            result["should_reject"] = True
+            result["reason"] = "wave5_default_reject"
+            result["label"] = "wave_5_no_pullback"
+
+    return result
+
+# =========================
+# NEW: Extra Strong Long Setup Detectors
+# =========================
+def detect_failed_breakdown_trap(df, vol_ratio: float, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "failed_breakdown_trap", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 30:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 20:
+            return result
+        close = _safe_float(signal_row.get("close"), 0.0)
+        low = _safe_float(signal_row.get("low"), 0.0)
+        open_ = _safe_float(signal_row.get("open"), 0.0)
+        if close <= 0 or low <= 0:
+            return result
+        # swing low from previous 20 bars (exclude signal)
+        lookback_start = max(0, idx - 20)
+        prev_lows = df["low"].iloc[lookback_start:idx].astype(float)
+        if prev_lows.empty:
+            return result
+        swing_low = float(prev_lows.min())
+        if swing_low <= 0:
+            return result
+        # breakdown check: low slightly below swing_low
+        breakdown_pct = round(((swing_low - low) / swing_low) * 100, 4)
+        if not (0.2 <= breakdown_pct <= 1.5):
+            return result
+        # recovery: close back above swing_low
+        if close <= swing_low:
+            return result
+        close_position = (close - low) / (_safe_float(signal_row.get("high"), close) - low) if (_safe_float(signal_row.get("high"), close) - low) > 0 else 0.5
+        checks = 0
+        if close > open_:
+            checks += 1
+        if close_position >= 0.55:
+            checks += 1
+        if vol_ratio >= 1.15:
+            checks += 1
+        if mtf_confirmed:
+            checks += 1
+        if checks >= 3:
+            result["detected"] = True
+            result["score_bonus"] = 0.35 if mtf_confirmed else 0.25
+            result["details"] = {"swing_low": swing_low, "breakdown_pct": breakdown_pct, "close_position": close_position}
+        return result
+    except Exception:
+        return result
+
+def detect_retest_breakout_confirmed(df, vol_ratio: float, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "retest_breakout_confirmed", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 35:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 25:
+            return result
+        close = _safe_float(signal_row.get("close"), 0.0)
+        if close <= 0:
+            return result
+        # resistance from last 20 bars before last 3 bars
+        resistance_start = max(0, idx - 23)
+        resistance_end = max(0, idx - 3)
+        if resistance_end <= resistance_start:
+            return result
+        resist_highs = df["high"].iloc[resistance_start:resistance_end].astype(float)
+        if resist_highs.empty:
+            return result
+        resistance = float(resist_highs.max())
+        # breakout: a close above resistance in last 5 bars
+        last5 = df.iloc[max(0, idx - 4):idx + 1]
+        broke_above = any(_safe_float(r.get("close"), 0.0) > resistance for _, r in last5.iterrows())
+        if not broke_above:
+            return result
+        # retest: a low near resistance
+        retest_bars = df.iloc[max(0, idx - 5):idx + 1]
+        near_resistance = any(abs(_safe_float(r.get("low"), 0.0) - resistance) / resistance <= 0.003 for _, r in retest_bars.iterrows())
+        if not near_resistance:
+            return result
+        if close <= resistance:
+            return result
+        close_position = (close - _safe_float(signal_row.get("low"), close)) / (_safe_float(signal_row.get("high"), close) - _safe_float(signal_row.get("low"), close)) if (_safe_float(signal_row.get("high"), close) - _safe_float(signal_row.get("low"), close)) > 0 else 0.5
+        if close <= _safe_float(signal_row.get("open"), close) and close_position < 0.55:
+            return result
+        if vol_ratio < 1.05:
+            return result
+        result["detected"] = True
+        result["score_bonus"] = 0.40 if (mtf_confirmed and vol_ratio >= 1.2) else 0.25
+        result["details"] = {"resistance": resistance}
+        return result
+    except Exception:
+        return result
+
+def detect_vwap_reclaim(df, vol_ratio: float, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "vwap_reclaim", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 25:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 2:
+            return result
+        vwap = _safe_float(signal_row.get("vwap"), 0.0)
+        if vwap <= 0:
+            return result
+        close = _safe_float(signal_row.get("close"), 0.0)
+        open_ = _safe_float(signal_row.get("open"), 0.0)
+        rsi = _safe_float(signal_row.get("rsi"), 50.0)
+        # previous bars below VWAP
+        prev_close = _safe_float(df.iloc[idx - 1].get("close"), 0.0) if idx >= 1 else 0.0
+        prev2_close = _safe_float(df.iloc[idx - 2].get("close"), 0.0) if idx >= 2 else 0.0
+        below_before = (prev_close < vwap) or (prev2_close < vwap)
+        if not below_before:
+            return result
+        if close <= vwap:
+            return result
+        if close <= open_:
+            return result
+        if rsi < 48:
+            return result
+        if vol_ratio < 1.10:
+            return result
+        result["detected"] = True
+        result["score_bonus"] = 0.30 if mtf_confirmed else 0.20
+        result["details"] = {"vwap": vwap, "rsi": rsi, "vol_ratio": vol_ratio}
+        return result
+    except Exception:
+        return result
+
+def detect_relative_strength_vs_btc(symbol: str, df, btc_df, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "relative_strength_vs_btc", "details": {}}
+    try:
+        if df is None or df.empty or btc_df is None or btc_df.empty:
+            return result
+        if len(df) < 8 or len(btc_df) < 8:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        close_now = _safe_float(signal_row.get("close"), 0.0)
+        if close_now <= 0:
+            return result
+        coin_change_8 = get_change_8(df)
+        btc_change_8 = get_change_8(btc_df)
+        if abs(coin_change_8) < 1e-6 and abs(btc_change_8) < 1e-6:
+            return result
+        relative_strength = round(coin_change_8 - btc_change_8, 4)
+        if relative_strength <= 1.0:
+            return result
+        dist_ma = get_distance_from_ma_percent(df)
+        rsi_now = _safe_float(signal_row.get("rsi"), 50.0)
+        if dist_ma <= -1.5:
+            return result
+        if rsi_now < 50 and not mtf_confirmed:
+            return result
+        result["detected"] = True
+        result["score_bonus"] = 0.35 if relative_strength > 2.0 else 0.25
+        result["details"] = {"coin_change_8": coin_change_8, "btc_change_8": btc_change_8, "relative_strength": relative_strength}
+        return result
+    except Exception:
+        return result
+
+def detect_higher_low_continuation(df, dist_ma: float, rsi_now: float, vol_ratio: float, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "higher_low_continuation", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 35:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 20:
+            return result
+        # find two swing lows
+        lows = df["low"].iloc[max(0, idx - 30):idx].astype(float)
+        if len(lows) < 10:
+            return result
+        # simplistic swing detection
+        swing_lows = []
+        for i in range(2, len(lows) - 2):
+            if lows.iloc[i] < lows.iloc[i-1] and lows.iloc[i] < lows.iloc[i-2] and lows.iloc[i] < lows.iloc[i+1] and lows.iloc[i] < lows.iloc[i+2]:
+                swing_lows.append((i, float(lows.iloc[i])))
+        if len(swing_lows) < 2:
+            return result
+        last_swing = swing_lows[-1]
+        prev_swing = swing_lows[-2]
+        if last_swing[1] <= prev_swing[1]:
+            return result
+        if dist_ma < -0.5 or dist_ma > 3.2:
+            return result
+        if rsi_now < 48 or rsi_now > 66:
+            return result
+        if vol_ratio < 1.0:
+            return result
+        result["detected"] = True
+        result["score_bonus"] = 0.30 if mtf_confirmed else 0.20
+        result["details"] = {"swing_low1": prev_swing[1], "swing_low2": last_swing[1], "rsi": rsi_now}
+        return result
+    except Exception:
+        return result
+
+def detect_support_bounce_confirmed(df, vol_ratio: float, mtf_confirmed: bool = False) -> dict:
+    result = {"detected": False, "score_bonus": 0.0, "reason": "support_bounce_confirmed", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 30:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 25:
+            return result
+        close = _safe_float(signal_row.get("close"), 0.0)
+        low = _safe_float(signal_row.get("low"), 0.0)
+        open_ = _safe_float(signal_row.get("open"), 0.0)
+        rsi = _safe_float(signal_row.get("rsi"), 50.0)
+        if close <= 0 or low <= 0:
+            return result
+        support_start = max(0, idx - 30)
+        support_lows = df["low"].iloc[support_start:idx].astype(float)
+        if support_lows.empty:
+            return result
+        support = float(support_lows.min())
+        # proximity
+        proximity = abs(low - support) / support if support > 0 else 999
+        if not (0.003 <= proximity <= 0.006):
+            return result
+        close_position = (close - low) / (_safe_float(signal_row.get("high"), close) - low) if (_safe_float(signal_row.get("high"), close) - low) > 0 else 0.5
+        if close_position < 0.60:
+            return result
+        if close <= open_:
+            return result
+        if vol_ratio < 1.05:
+            return result
+        if rsi < 45:
+            return result
+        result["detected"] = True
+        result["score_bonus"] = 0.35 if mtf_confirmed else 0.25
+        result["details"] = {"support": support, "proximity": proximity, "close_position": close_position}
+        return result
+    except Exception:
+        return result
+
+def get_change_8(df) -> float:
+    try:
+        if df is None or df.empty or len(df) < 8:
+            return 0.0
+        close_now = _safe_float(df.iloc[-1].get("close"), 0.0)
+        close_8 = _safe_float(df.iloc[-8].get("close"), 0.0)
+        if close_8 <= 0:
+            return 0.0
+        return round(((close_now - close_8) / close_8) * 100, 2)
+    except Exception:
+        return 0.0
+
+def detect_extra_strong_long_setups(
+    symbol: str,
+    df,
+    btc_df,
+    dist_ma: float,
+    rsi_now: float,
+    vol_ratio: float,
+    mtf_confirmed: bool,
+) -> dict:
+    setups = []
+    total_bonus = 0.0
+    primary_setup = ""
+    details = {}
+
+    detectors = [
+        detect_failed_breakdown_trap,
+        detect_retest_breakout_confirmed,
+        detect_vwap_reclaim,
+        detect_higher_low_continuation,
+        detect_support_bounce_confirmed,
+    ]
+
+    for detector in detectors:
+        if detector == detect_higher_low_continuation:
+            res = detector(df, dist_ma, rsi_now, vol_ratio, mtf_confirmed)
+        elif detector == detect_support_bounce_confirmed:
+            res = detector(df, vol_ratio, mtf_confirmed)
+        else:
+            res = detector(df, vol_ratio, mtf_confirmed)
+        if res.get("detected"):
+            setups.append(res["reason"])
+            total_bonus += res.get("score_bonus", 0.0)
+            details[res["reason"]] = res.get("details", {})
+            if not primary_setup:
+                primary_setup = res["reason"]
+
+    # relative strength separately because it needs btc_df
+    rel_res = detect_relative_strength_vs_btc(symbol, df, btc_df, mtf_confirmed)
+    if rel_res.get("detected"):
+        setups.append(rel_res["reason"])
+        total_bonus += rel_res.get("score_bonus", 0.0)
+        details[rel_res["reason"]] = rel_res.get("details", {})
+        if not primary_setup:
+            primary_setup = rel_res["reason"]
+
+    total_bonus = min(total_bonus, 0.60)
+
+    return {
+        "has_extra_setup": len(setups) > 0,
+        "setups": setups,
+        "score_bonus": round(total_bonus, 2),
+        "primary_setup": primary_setup,
+        "details": details,
+    }
+
+# =========================
 # ECONOMIC CALENDAR
 # =========================
 def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> list:
@@ -711,14 +1160,14 @@ def build_deep_report_message() -> str:
     except Exception as e:
         logger.exception(f"build_deep_report error: {e}")
         return (
-            "❌ حصل خطأ أثناء بناء التقرير العميق\n"
+            "❌ حصل��خطأ أثناء بناء التقرير العميق\n"
             f"السبب: {html.escape(str(e))}\n\n"
             "راجع Logs لمعرفة الحقل أو الدالة التي سببت المشكلة."
         )
 
 
 def build_help_message() -> str:
- return """<b>📋 OKX Scanner Bot - LONG</b>
+ return """<b>😋 OKX Scanner Bot - LONG</b>
 
 <b>⚡ أوامر سريعة:</b>
 /mood - حالة السوق والمود الحالي
@@ -943,8 +1392,26 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    # try stored fields
-    for field in ["realized_leveraged_pnl_pct", "leveraged_pnl_pct", "pnl_pct", "result_pct", "realized_pnl_pct", "raw_pnl_pct"]:
+    """
+    يحسب ربح/خسارة الصفقة بعد الرافعة.
+
+    مهم:
+    لو الصفقة ضربت TP1 ثم رجعت Breakeven، لا تُحسب صفر.
+    يتم احتساب ربح الجزء المغلق عند TP1 فقط.
+    مثال:
+    TP1 ربحه +30% بعد الرافعة، و TP1_CLOSE_PCT = 50
+    إذن الربح الحقيقي للصفقة = +15%
+    """
+
+    # 1) لو فيه ربح محفوظ فعليًا استخدمه مباشرة
+    for field in [
+        "realized_leveraged_pnl_pct",
+        "leveraged_pnl_pct",
+        "pnl_pct",
+        "result_pct",
+        "realized_pnl_pct",
+        "raw_pnl_pct",
+    ]:
         val = trade.get(field)
         if val is not None:
             try:
@@ -954,34 +1421,78 @@ def _get_trade_pnl_pct(trade: dict) -> float:
                 return f
             except Exception:
                 continue
-    # estimate from entry/sl/tp1/tp2
+
     entry = _safe_float(trade.get("entry"), None)
     if entry is None or entry <= 0:
         return 0.0
+
     result = str(trade.get("result", "") or "").lower()
+    status = str(trade.get("status", "") or "").lower()
+
+    tp1 = _safe_float(trade.get("tp1"), 0.0)
+    tp2 = _safe_float(trade.get("tp2"), 0.0)
+    sl = _safe_float(trade.get("sl"), 0.0)
+
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    protected_breakeven_exit = bool(trade.get("protected_breakeven_exit", False))
+
+    tp1_close_pct = _safe_float(trade.get("tp1_close_pct"), TP1_CLOSE_PCT)
+    tp2_close_pct = _safe_float(trade.get("tp2_close_pct"), TP2_CLOSE_PCT)
+
+    tp1_weight = max(0.0, min(100.0, tp1_close_pct)) / 100.0
+    tp2_weight = max(0.0, min(100.0, tp2_close_pct)) / 100.0
+
+    # 2) خسارة كاملة عند SL
     if result == "loss":
-        sl = _safe_float(trade.get("sl"), 0)
         if sl > 0:
             return round(((sl - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
         return 0.0
+
+    # 3) TP2: نحسب TP1 الجزئي + TP2 الجزئي
     if result == "tp2_win":
-        tp2 = _safe_float(trade.get("tp2"), 0)
-        if tp2 > 0:
-            return round(((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
-        return 0.0
-    if result == "tp1_win":
-        tp1 = _safe_float(trade.get("tp1"), 0)
+        pnl = 0.0
+
         if tp1 > 0:
-            return round(((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
+            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
+            pnl += tp1_pnl * tp1_weight
+
+        if tp2 > 0:
+            tp2_pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
+            pnl += tp2_pnl * tp2_weight
+
+        if pnl == 0.0 and tp2 > 0:
+            pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
+
+        return round(pnl, 4)
+
+    # 4) TP1 فقط: نحسب الجزء المقفول عند TP1 فقط
+    if result == "tp1_win":
+        if tp1 > 0:
+            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
+            return round(tp1_pnl * tp1_weight, 4)
         return 0.0
+
+    # 5) Breakeven بعد TP1: النصف الأول ربح TP1، والنصف الثاني خرج Entry = صفر
+    if protected_breakeven_exit or "breakeven" in result:
+        if tp1_hit and tp1 > 0:
+            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
+            return round(tp1_pnl * tp1_weight, 4)
+        return 0.0
+
+    # 6) Partial مفتوحة أو غير محسومة: لو TP1 اتضرب نحسب الربح المحقق فقط
+    if status == "partial" or tp1_hit:
+        if tp1 > 0:
+            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
+            return round(tp1_pnl * tp1_weight, 4)
+        return 0.0
+
+    # 7) Expired: نحسبها من آخر سعر لو متاح
     if result == "expired":
-        last_price = _safe_float(trade.get("last_price"), 0)
+        last_price = _safe_float(trade.get("last_price"), 0.0)
         if last_price > 0:
             return round(((last_price - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
         return 0.0
-    if bool(trade.get("protected_breakeven_exit", False)):
-        return 0.0
-    # partial or other: use current approximate? skip for now
+
     return 0.0
 
 
@@ -1004,7 +1515,7 @@ def _build_group_exit_stats(trades: list, group_field: str, max_items: int = 6) 
         wins = sum(1 for _, b in items if _is_trade_win_bucket(b))
         losses = sum(1 for _, b in items if b == "loss")
         expired = sum(1 for _, b in items if b == "expired")
-        tp1_count = sum(1 for _, b in items if b in ("tp2", "tp1_only", "partial", "tp1_hit_open_or_unknown"))
+        tp1_count = sum(1 for _, b in items if b in ("tp2", "tp1_only", "partial", "breakeven_protected", "tp1_hit_open_or_unknown"))
         tp2_count = sum(1 for _, b in items if b == "tp2")
         breakeven_count = sum(1 for _, b in items if b == "breakeven_protected")
         winrate = (wins / total * 100) if total else 0.0
@@ -1099,7 +1610,8 @@ def build_exits_report_message() -> str:
         tp1_hit_other = [t for t in closed if _trade_exit_bucket(t) == "tp1_hit_open_or_unknown"]
 
         closed_count = len(closed)
-        tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(tp1_hit_other)
+        # modified: include breakeven trades in tp1_effective
+        tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(breakeven) + len(tp1_hit_other)
         tp2_effective = len(tp2_wins)
         sl_count = len(losses)
         expired_count = len(expired)
@@ -4452,6 +4964,8 @@ def build_message(
  target_method="rr",
  nearest_resistance=None,
  wave_context="",
+ extra_setup_names=None,
+ primary_extra_setup="",
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -4544,6 +5058,10 @@ def build_message(
  if wave_context:
     wave_text = f"\n🌊 <b>Wave:</b> {html.escape(wave_context)}"
 
+ extra_setup_text = ""
+ if primary_extra_setup:
+    extra_setup_text = f"\n🧩 <b>Setup إضافي:</b> {html.escape(primary_extra_setup)}"
+
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
@@ -4553,7 +5071,7 @@ def build_message(
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 50%)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
@@ -5491,8 +6009,18 @@ def run_scanner_loop():
             limit=100,
             max_workers=MAX_CANDLE_FETCH_WORKERS,
         )
+        # --- Fetch 4H candles for wave-5 override ---
+        htf_4h_candles_map = fetch_candles_parallel(
+            filtered_scan_pairs,
+            timeframe="4H",
+            limit=80,
+            max_workers=MAX_CANDLE_FETCH_WORKERS,
+        )
         logger.info(f"Parallel HTF candle fetch completed: {len(htf_candles_map)} symbols")
         logger.info(f"Parallel candle fetch completed: {len(candles_map)} symbols")
+        # --- Fetch BTC 15m once ---
+        btc_15m_candles = get_candles("BTC-USDT-SWAP", TIMEFRAME, 100)
+        btc_15m_df = to_dataframe(btc_15m_candles)
         tested = 0
         sent_count = 0
         sent_symbols_this_run = set()
@@ -5541,6 +6069,9 @@ def run_scanner_loop():
             mtf_confirmed = is_higher_timeframe_confirmed_from_candles(
                 htf_candles_map.get(symbol, [])
             )
+            # --- Get higher timeframe contexts ---
+            htf_1h_context = get_htf_context_from_candles(htf_candles_map.get(symbol, []))
+            htf_4h_context = get_htf_context_from_candles(htf_4h_candles_map.get(symbol, []))
             is_new = is_new_listing_by_candles(candles)
             funding = get_funding_rate(symbol)
             vol_ratio = get_volume_ratio(df)
@@ -5593,6 +6124,20 @@ def run_scanner_loop():
                 dist_ma=dist_ma,
                 mtf_confirmed=mtf_confirmed,
             )
+            # --- Extra strong setups ---
+            extra_setups = detect_extra_strong_long_setups(
+                symbol=symbol,
+                df=df,
+                btc_df=btc_15m_df,
+                dist_ma=dist_ma,
+                rsi_now=rsi_now,
+                vol_ratio=vol_ratio,
+                mtf_confirmed=mtf_confirmed,
+            )
+            has_extra_strong_setup = bool(extra_setups.get("has_extra_setup"))
+            extra_setup_names = extra_setups.get("setups", [])
+            extra_setup_bonus = float(extra_setups.get("score_bonus", 0.0) or 0.0)
+            primary_extra_setup = extra_setups.get("primary_setup", "")
             late_guard = get_late_pump_risk(
                 market_state=market_state,
                 opportunity_type=temp_opportunity_type,
@@ -5626,7 +6171,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"late_guard_reasons": late_guard.get("reasons", [])},
+                    extra={"late_guard_reasons": late_guard.get("reasons", []),
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} --> skipped by late_guard should_block: {late_guard.get('reasons', [])}")
                 continue
@@ -5676,6 +6225,10 @@ def run_scanner_loop():
                             "entry_maturity": entry_maturity_data.get("entry_maturity"),
                             "fib_position": entry_maturity_data.get("fib_position"),
                             "wave_estimate": entry_maturity_data.get("wave_estimate"),
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
                         },
                     )
                     logger.info(f"{symbol} → skipped by entry maturity guard: {entry_maturity_data}")
@@ -5696,6 +6249,12 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
+                        extra={
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
+                        },
                     )
                     continue
                 if vwap_distance >= 2.8 and breakout_quality != "strong" and not pre_breakout:
@@ -5713,7 +6272,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"breakout_quality": breakout_quality},
+                        extra={"breakout_quality": breakout_quality,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     continue
             if not is_reverse:
@@ -5738,7 +6301,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"rsi_slope": rsi_slope, "breakout_quality": breakout_quality},
+                        extra={"rsi_slope": rsi_slope, "breakout_quality": breakout_quality,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     continue
                 if rsi_slope < -2.5 and not breakout and not pre_breakout:
@@ -5756,7 +6323,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"rsi_slope": rsi_slope},
+                        extra={"rsi_slope": rsi_slope,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     continue
             if not is_reverse:
@@ -5775,7 +6346,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"macd_hist": macd_hist},
+                        extra={"macd_hist": macd_hist,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     continue
                 if (
@@ -5799,7 +6374,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"macd_hist_slope": macd_hist_slope, "macd_hist": macd_hist},
+                        extra={"macd_hist_slope": macd_hist_slope, "macd_hist": macd_hist,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     continue
             trap_check = is_momentum_exhaustion_trap(
@@ -5833,7 +6412,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"trap_reasons": trap_check["reasons"], "checks": trap_check["checks"]},
+                    extra={"trap_reasons": trap_check["reasons"], "checks": trap_check["checks"],
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 continue
             entry_timing_temp = classify_entry_timing_long(
@@ -5875,7 +6458,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"]},
+                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} --> late breakout guard BLOCKED: {guard['reason']}")
                 continue
@@ -5895,7 +6482,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"]},
+                    extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
                 continue
@@ -5929,6 +6520,9 @@ def run_scanner_loop():
             # Pre-score adjustments log collector
             pre_score_adjustments_log = []
 
+            # --- Initialize wave5_eval to prevent UnboundLocalError ---
+            wave5_eval = {}
+
             if not is_reverse:
                 entry_maturity_status = str(entry_maturity_data.get("entry_maturity", "unknown") or "unknown")
                 had_pullback = bool(entry_maturity_data.get("had_pullback", False))
@@ -5957,15 +6551,34 @@ def run_scanner_loop():
                 )
 
                 if hard_late_entry:
-                    if strong_bull_pullback or strong_breakout_exception:
+                    # --- Apply wave-5 HTF override ---
+                    wave5_eval = evaluate_wave5_htf_override(
+                        entry_timing=entry_timing_temp,
+                        entry_maturity_data=entry_maturity_data,
+                        dist_ma=dist_ma,
+                        htf_1h_context=htf_1h_context,
+                        htf_4h_context=htf_4h_context,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        breakout_quality=breakout_quality,
+                        mtf_confirmed=mtf_confirmed,
+                        vol_ratio=vol_ratio,
+                    )
+                    if wave5_eval["can_override"]:
+                        # Override: accept but apply penalty
                         pre_score_adjustments_log.append({
-                            "name": "hard_late_exception",
-                            "value": 0.0,
-                            "reason": "strong_bull_pullback_or_strong_breakout"
+                            "name": "wave5_htf_override_penalty",
+                            "value": -wave5_eval["penalty"],
+                            "reason": wave5_eval["label"]
                         })
-                        logger.info(f"{symbol} --> hard late entry overridden by strong exception")
+                        warning_msg = "15m wave late but HTF healthy" if "htf_healthy" in wave5_eval["label"] else "15m wave late but breakout confirmed"
+                        if "warning_reasons" not in entry_maturity_data:
+                            entry_maturity_data["warning_reasons"] = []
+                        entry_maturity_data["warning_reasons"].append(warning_msg)
+                        logger.info(f"{symbol} --> wave5 overridden: {wave5_eval['label']}, penalty={wave5_eval['penalty']}")
                     else:
-                        reason_specific = classify_hard_late_rejection_reason(
+                        # Rejection confirmed by HTF
+                        reason_specific = wave5_eval["label"] or classify_hard_late_rejection_reason(
                             entry_timing=entry_timing_temp,
                             entry_maturity_status=entry_maturity_status,
                             had_pullback=had_pullback,
@@ -6001,6 +6614,12 @@ def run_scanner_loop():
                                 "fib_position": fib_position,
                                 "wave_estimate": wave_estimate,
                                 "breakout_quality": breakout_quality,
+                                "htf_1h_context": htf_1h_context,
+                                "htf_4h_context": htf_4h_context,
+                                "has_extra_strong_setup": has_extra_strong_setup,
+                                "extra_setup_names": extra_setup_names,
+                                "primary_extra_setup": primary_extra_setup,
+                                "extra_setup_bonus": extra_setup_bonus,
                             },
                         )
                         logger.info(
@@ -6024,7 +6643,12 @@ def run_scanner_loop():
                 else:
                     final_threshold_min = 6.0
 
-                if not (breakout or pre_breakout or early_priority == "strong" or strong_bull_pullback or (is_reverse and reversal_4h_result.get("confirmed"))):
+                if not (
+                    breakout or pre_breakout or early_priority == "strong"
+                    or strong_bull_pullback or strong_breakout_exception
+                    or has_extra_strong_setup
+                    or (is_reverse and reversal_4h_result.get("confirmed"))
+                ):
                     log_long_rejection(
                         symbol=symbol,
                         reason="strong_only_no_valid_setup",
@@ -6045,13 +6669,31 @@ def run_scanner_loop():
                             "early_priority": early_priority,
                             "strong_bull_pullback": strong_bull_pullback,
                             "breakout_quality": breakout_quality,
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
                         },
                     )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: no valid strong setup)")
                     continue
-                if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong"):
+                if has_extra_strong_setup:
+                    logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY extra setup: {extra_setup_names}")
+                if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong" or has_extra_strong_setup):
                     logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY strong_bull_pullback exception")
-                if not mtf_confirmed and not (is_reverse and reversal_4h_result.get("confirmed")):
+                # MTF exception
+                extra_setup_can_bypass_mtf = (
+                    primary_extra_setup in (
+                        "failed_breakdown_trap",
+                        "retest_breakout_confirmed",
+                        "vwap_reclaim",
+                        "support_bounce_confirmed",
+                    )
+                    and vol_ratio >= 1.20
+                    and rsi_now >= 48
+                    and dist_ma <= 3.2
+                )
+                if not mtf_confirmed and not extra_setup_can_bypass_mtf and not (is_reverse and reversal_4h_result.get("confirmed")):
                     log_long_rejection(
                         symbol=symbol,
                         reason="strong_only_mtf_not_confirmed",
@@ -6068,10 +6710,17 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
+                        extra={
+                            "extra_setup_can_bypass_mtf": extra_setup_can_bypass_mtf,
+                            "extra_setup_names": extra_setup_names,
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
+                        },
                     )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: mtf not confirmed)")
                     continue
-                if vol_ratio < 1.25 and not strong_bull_pullback:
+                if vol_ratio < 1.25 and not strong_bull_pullback and not has_extra_strong_setup:
                     log_long_rejection(
                         symbol=symbol,
                         reason="strong_only_low_volume",
@@ -6088,11 +6737,15 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"strong_bull_pullback": strong_bull_pullback},
+                        extra={"strong_bull_pullback": strong_bull_pullback,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: vol_ratio too low)")
                     continue
-                if breakout and breakout_quality == "weak":
+                if breakout and breakout_quality == "weak" and not has_extra_strong_setup:
                     log_long_rejection(
                         symbol=symbol,
                         reason="strong_only_weak_breakout",
@@ -6109,7 +6762,11 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
-                        extra={"breakout_quality": breakout_quality},
+                        extra={"breakout_quality": breakout_quality,
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: weak breakout)")
                     continue
@@ -6129,7 +6786,7 @@ def run_scanner_loop():
                 pullback_low = None
                 pullback_high = None
                 pullback_entry = None
-            if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal:
+            if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal and not has_extra_strong_setup:
                 log_long_rejection(
                     symbol=symbol,
                     reason="low_volume_no_breakout",
@@ -6144,6 +6801,12 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    extra={
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
+                    },
                 )
                 continue
             if is_late_long_entry(dist_ma=dist_ma, breakout=breakout, pre_breakout=pre_breakout) and not is_reverse:
@@ -6161,6 +6824,12 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    extra={
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
+                    },
                 )
                 continue
             if is_exhausted_long_move(
@@ -6184,7 +6853,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"candle_strength": candle_strength},
+                    extra={"candle_strength": candle_strength,
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 continue
             try:
@@ -6215,8 +6888,10 @@ def run_scanner_loop():
             raw_score = float(score_result.get("score", 0))
             effective_score = raw_score
             adjustments_log = []
-            # Merge pre-score adjustments
+            # Merge pre-score adjustments and apply any numeric penalties
             if pre_score_adjustments_log:
+                for adj in pre_score_adjustments_log:
+                    effective_score += float(adj.get("value", 0.0) or 0.0)
                 adjustments_log.extend(pre_score_adjustments_log)
 
             score_result = append_late_pump_warnings(score_result, late_guard)
@@ -6291,6 +6966,18 @@ def run_scanner_loop():
                     "value": OVERSOLD_REVERSAL_SCORE_BONUS,
                     "reason": "is_reverse"
                 })
+
+            # --- Extra setup bonus ---
+            if has_extra_strong_setup and not is_reverse:
+                effective_score += extra_setup_bonus
+                adjustments_log.append({
+                    "name": "extra_strong_setup_bonus",
+                    "value": extra_setup_bonus,
+                    "reason": extra_setup_names,
+                })
+                score_result.setdefault("reasons", [])
+                score_result["reasons"].append(f"Extra Setup: {primary_extra_setup}")
+
             if not is_reverse:
                 maturity_penalty = float(entry_maturity_data.get("maturity_penalty", 0.0) or 0.0)
                 maturity_bonus = float(entry_maturity_data.get("maturity_bonus", 0.0) or 0.0)
@@ -6414,6 +7101,10 @@ def run_scanner_loop():
                         "resistance_warning": early_resistance_warning,
                         "res_dynamic_penalty": res_dynamic_penalty,
                         "upper_wick_ratio": upper_wick_ratio,
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
                     },
                 )
                 logger.info(f"{symbol} --> rejected by near resistance + weak market guard")
@@ -6468,6 +7159,12 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    extra={
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
+                    },
                 )
                 logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: late entry)")
                 continue
@@ -6535,6 +7232,10 @@ def run_scanner_loop():
                             "breakout_quality": breakout_quality,
                             "late_guard_reasons": late_guard.get("reasons", []),
                             "strong_bull_pullback": strong_bull_pullback,
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
                         },
                     )
                     logger.info(
@@ -6584,6 +7285,12 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    extra={
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
+                    },
                 )
                 logger.info(f"{symbol} --> skipped (late without MTF confirmation)")
                 continue
@@ -6604,7 +7311,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"change_4h": change_4h},
+                    extra={"change_4h": change_4h,
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} --> skipped (chasing 4h move)")
                 continue
@@ -6626,6 +7337,12 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    extra={
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
+                    },
                 )
                 logger.info(f"{symbol} --> rejected (late move without breakout)")
                 continue
@@ -6648,7 +7365,11 @@ def run_scanner_loop():
                             breakout=breakout,
                             pre_breakout=pre_breakout,
                             is_reverse=is_reverse,
-                            extra={"early_priority": early_priority, "dynamic_threshold": dynamic_threshold},
+                            extra={"early_priority": early_priority, "dynamic_threshold": dynamic_threshold,
+                                   "has_extra_strong_setup": has_extra_strong_setup,
+                                   "extra_setup_names": extra_setup_names,
+                                   "primary_extra_setup": primary_extra_setup,
+                                   "extra_setup_bonus": extra_setup_bonus},
                         )
                         logger.info(f"{symbol} --> مبكر بدون تأكيد قوي، تم التخطي")
                         continue
@@ -6676,7 +7397,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"candle_strength": candle_strength},
+                    extra={"candle_strength": candle_strength,
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} → rejected by balanced new listing filter")
                 continue
@@ -6708,6 +7433,10 @@ def run_scanner_loop():
                         "warning_reasons": score_result.get("warning_reasons", []),
                         "early_priority": early_priority,
                         "breakout_quality": breakout_quality,
+                        "has_extra_strong_setup": has_extra_strong_setup,
+                        "extra_setup_names": extra_setup_names,
+                        "primary_extra_setup": primary_extra_setup,
+                        "extra_setup_bonus": extra_setup_bonus,
                     },
                 )
                 logger.info(
@@ -6755,7 +7484,11 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
-                    extra={"display_risk": display_risk},
+                    extra={"display_risk": display_risk,
+                           "has_extra_strong_setup": has_extra_strong_setup,
+                           "extra_setup_names": extra_setup_names,
+                           "primary_extra_setup": primary_extra_setup,
+                           "extra_setup_bonus": extra_setup_bonus},
                 )
                 logger.info(f"{symbol} → rejected (late + high risk + no breakout + low vol)")
                 continue
@@ -6787,6 +7520,16 @@ def run_scanner_loop():
                 breakout=breakout,
                 pre_breakout=pre_breakout,
             )
+            # --- Modify wave_context if overridden or extra setup ---
+            if wave5_eval.get("can_override"):
+                if "htf_healthy" in wave5_eval.get("label", ""):
+                    wave_context = "wave_5_15m_htf_healthy"
+                elif "breakout" in wave5_eval.get("label", ""):
+                    wave_context = "wave_5_15m_breakout_confirmed"
+                else:
+                    wave_context = "wave_5_override"
+            if primary_extra_setup:
+                wave_context = primary_extra_setup
             setup_type_candidate = {
                 "is_reverse": is_reverse,
                 "breakout": breakout,
@@ -6838,6 +7581,10 @@ def run_scanner_loop():
                         extra={
                             "setup_type_base": setup_type_base,
                             "breakout_quality": breakout_quality,
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
                         },
                     )
                     logger.info(f"{symbol} --> skipped (weak historical setup: score below final_threshold {final_threshold})")
@@ -6940,6 +7687,13 @@ def run_scanner_loop():
                 "reversal_structure_confirmed": False,
                 "strong_bull_pullback": strong_bull_pullback,
                 "strong_breakout_exception": strong_breakout_exception,
+                "htf_1h_context": htf_1h_context,
+                "htf_4h_context": htf_4h_context,
+                "has_extra_strong_setup": has_extra_strong_setup,
+                "extra_setup_names": extra_setup_names,
+                "extra_setup_bonus": extra_setup_bonus,
+                "primary_extra_setup": primary_extra_setup,
+                "extra_setups_details": extra_setups.get("details", {}),
                 "tp1_close_pct": TP1_CLOSE_PCT,
                 "tp2_close_pct": TP2_CLOSE_PCT,
                 "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
@@ -6977,6 +7731,8 @@ def run_scanner_loop():
                     target_method=target_method,
                     nearest_resistance=nearest_resistance,
                     wave_context=wave_context,
+                    extra_setup_names=extra_setup_names,
+                    primary_extra_setup=primary_extra_setup,
                 ),
                 "reply_markup": build_track_reply_markup(alert_id),
                 "alert_id": alert_id,
@@ -7060,6 +7816,13 @@ def run_scanner_loop():
                     "reversal_structure_confirmed": False,
                     "strong_bull_pullback": strong_bull_pullback,
                     "strong_breakout_exception": strong_breakout_exception,
+                    "htf_1h_context": htf_1h_context,
+                    "htf_4h_context": htf_4h_context,
+                    "has_extra_strong_setup": has_extra_strong_setup,
+                    "extra_setup_names": extra_setup_names,
+                    "extra_setup_bonus": extra_setup_bonus,
+                    "primary_extra_setup": primary_extra_setup,
+                    "extra_setups_details": extra_setups.get("details", {}),
                     "tp1_close_pct": TP1_CLOSE_PCT,
                     "tp2_close_pct": TP2_CLOSE_PCT,
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
@@ -7199,6 +7962,13 @@ def run_scanner_loop():
                     reversal_structure_confirmed=candidate.get("reversal_structure_confirmed", False),
                     strong_bull_pullback=candidate.get("strong_bull_pullback", False),
                     strong_breakout_exception=candidate.get("strong_breakout_exception", False),
+                    htf_1h_context=candidate.get("htf_1h_context", {}),
+                    htf_4h_context=candidate.get("htf_4h_context", {}),
+                    has_extra_strong_setup=candidate.get("has_extra_strong_setup", False),
+                    extra_setup_names=candidate.get("extra_setup_names", []),
+                    extra_setup_bonus=candidate.get("extra_setup_bonus", 0.0),
+                    primary_extra_setup=candidate.get("primary_extra_setup", ""),
+                    extra_setups_details=candidate.get("extra_setups_details", {}),
                 )
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
