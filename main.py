@@ -412,22 +412,16 @@ def classify_hard_late_rejection_reason(
     mtf_confirmed,
 ):
     """Returns a more specific reason string for hard_late_entry block."""
-    # wave_5_no_pullback
     if wave_estimate >= 5 and not had_pullback:
         return "wave_5_no_pullback"
-    # overextended_late_entry
     if fib_position == "overextended" or "امتداد سعري" in str(entry_timing):
         return "overextended_late_entry"
-    # post_dump_weak_rebound
     if dist_ma is not None and dist_ma < -2.0 and rsi_now is not None and rsi_now < 45 and not breakout and not pre_breakout and not mtf_confirmed:
         return "post_dump_weak_rebound"
-    # weak_recovery_below_ma
     if dist_ma is not None and dist_ma < 0 and not mtf_confirmed and not breakout and not pre_breakout:
         return "weak_recovery_below_ma"
-    # no_structure_break
     if not breakout and not pre_breakout:
         return "no_structure_break"
-    # low_volume_bounce
     if vol_ratio is not None and vol_ratio < 1.0:
         return "low_volume_bounce"
     return "hard_late_entry"
@@ -436,10 +430,6 @@ def classify_hard_late_rejection_reason(
 # NEW HELPER: HTF context extraction
 # =========================
 def get_htf_context_from_candles(candles) -> dict:
-    """
-    Analyze higher timeframe candles (1H or 4H) and return a structured context.
-    Returns a dict with keys: valid, close, ma, rsi, dist_ma, above_ma, rsi_healthy, rsi_hot, overextended, trend_healthy.
-    """
     ctx = {
         "valid": False,
         "close": 0.0,
@@ -490,10 +480,6 @@ def evaluate_wave5_htf_override(
     mtf_confirmed,
     vol_ratio,
 ) -> dict:
-    """
-    Decide whether a wave-5 / late signal from 15m can be overridden based on higher timeframes.
-    Returns a dict with: is_wave5_late, can_override, should_reject, reason, penalty, label.
-    """
     result = {
         "is_wave5_late": False,
         "can_override": False,
@@ -502,8 +488,6 @@ def evaluate_wave5_htf_override(
         "penalty": 0.0,
         "label": "",
     }
-
-    # Determine if signal is considered wave-5 / late based on 15m + entry_maturity
     entry_maturity_status = str(entry_maturity_data.get("entry_maturity", "unknown") or "unknown")
     had_pullback = bool(entry_maturity_data.get("had_pullback", False))
     fib_position = str(entry_maturity_data.get("fib_position", "unknown") or "unknown")
@@ -520,7 +504,6 @@ def evaluate_wave5_htf_override(
     if not is_wave5_late:
         return result
 
-    # Check HTF conditions
     htf_healthy = (
         htf_1h_context.get("trend_healthy", False)
         and not htf_4h_context.get("overextended", True)
@@ -531,7 +514,6 @@ def evaluate_wave5_htf_override(
         and mtf_confirmed
         and (vol_ratio or 0.0) >= 1.25
     )
-
     can_override = htf_healthy or breakout_exception
     result["can_override"] = can_override
 
@@ -545,7 +527,6 @@ def evaluate_wave5_htf_override(
             result["label"] = "wave_5_15m_but_breakout_confirmed"
         result["reason"] = "wave5_override_by_htf"
     else:
-        # Check if HTFs confirm extended/late
         htf_confirm_late = (
             htf_1h_context.get("overextended", False)
             or htf_4h_context.get("overextended", False)
@@ -556,11 +537,9 @@ def evaluate_wave5_htf_override(
             result["reason"] = "wave5_confirmed_by_htf"
             result["label"] = "wave_5_confirmed_by_htf"
         else:
-            # Inconclusive, fallback to simple late entry logic
             result["should_reject"] = True
             result["reason"] = "wave5_default_reject"
             result["label"] = "wave_5_no_pullback"
-
     return result
 
 # =========================
@@ -582,7 +561,6 @@ def detect_failed_breakdown_trap(df, vol_ratio: float, mtf_confirmed: bool = Fal
         open_ = _safe_float(signal_row.get("open"), 0.0)
         if close <= 0 or low <= 0:
             return result
-        # swing low from previous 20 bars (exclude signal)
         lookback_start = max(0, idx - 20)
         prev_lows = df["low"].iloc[lookback_start:idx].astype(float)
         if prev_lows.empty:
@@ -590,11 +568,9 @@ def detect_failed_breakdown_trap(df, vol_ratio: float, mtf_confirmed: bool = Fal
         swing_low = float(prev_lows.min())
         if swing_low <= 0:
             return result
-        # breakdown check: low slightly below swing_low
         breakdown_pct = round(((swing_low - low) / swing_low) * 100, 4)
         if not (0.2 <= breakdown_pct <= 1.5):
             return result
-        # recovery: close back above swing_low
         if close <= swing_low:
             return result
         close_position = (close - low) / (_safe_float(signal_row.get("high"), close) - low) if (_safe_float(signal_row.get("high"), close) - low) > 0 else 0.5
@@ -629,7 +605,6 @@ def detect_retest_breakout_confirmed(df, vol_ratio: float, mtf_confirmed: bool =
         close = _safe_float(signal_row.get("close"), 0.0)
         if close <= 0:
             return result
-        # resistance from last 20 bars before last 3 bars
         resistance_start = max(0, idx - 23)
         resistance_end = max(0, idx - 3)
         if resistance_end <= resistance_start:
@@ -638,12 +613,10 @@ def detect_retest_breakout_confirmed(df, vol_ratio: float, mtf_confirmed: bool =
         if resist_highs.empty:
             return result
         resistance = float(resist_highs.max())
-        # breakout: a close above resistance in last 5 bars
         last5 = df.iloc[max(0, idx - 4):idx + 1]
         broke_above = any(_safe_float(r.get("close"), 0.0) > resistance for _, r in last5.iterrows())
         if not broke_above:
             return result
-        # retest: a low near resistance
         retest_bars = df.iloc[max(0, idx - 5):idx + 1]
         near_resistance = any(abs(_safe_float(r.get("low"), 0.0) - resistance) / resistance <= 0.003 for _, r in retest_bars.iterrows())
         if not near_resistance:
@@ -679,7 +652,6 @@ def detect_vwap_reclaim(df, vol_ratio: float, mtf_confirmed: bool = False) -> di
         close = _safe_float(signal_row.get("close"), 0.0)
         open_ = _safe_float(signal_row.get("open"), 0.0)
         rsi = _safe_float(signal_row.get("rsi"), 50.0)
-        # previous bars below VWAP
         prev_close = _safe_float(df.iloc[idx - 1].get("close"), 0.0) if idx >= 1 else 0.0
         prev2_close = _safe_float(df.iloc[idx - 2].get("close"), 0.0) if idx >= 2 else 0.0
         below_before = (prev_close < vwap) or (prev2_close < vwap)
@@ -744,11 +716,9 @@ def detect_higher_low_continuation(df, dist_ma: float, rsi_now: float, vol_ratio
         idx = signal_row.name
         if idx is None or idx < 20:
             return result
-        # find two swing lows
         lows = df["low"].iloc[max(0, idx - 30):idx].astype(float)
         if len(lows) < 10:
             return result
-        # simplistic swing detection
         swing_lows = []
         for i in range(2, len(lows) - 2):
             if lows.iloc[i] < lows.iloc[i-1] and lows.iloc[i] < lows.iloc[i-2] and lows.iloc[i] < lows.iloc[i+1] and lows.iloc[i] < lows.iloc[i+2]:
@@ -794,7 +764,6 @@ def detect_support_bounce_confirmed(df, vol_ratio: float, mtf_confirmed: bool = 
         if support_lows.empty:
             return result
         support = float(support_lows.min())
-        # proximity
         proximity = abs(low - support) / support if support > 0 else 999
         if not (0.003 <= proximity <= 0.006):
             return result
@@ -862,7 +831,6 @@ def detect_extra_strong_long_setups(
             if not primary_setup:
                 primary_setup = res["reason"]
 
-    # relative strength separately because it needs btc_df
     rel_res = detect_relative_strength_vs_btc(symbol, df, btc_df, mtf_confirmed)
     if rel_res.get("detected"):
         setups.append(rel_res["reason"])
@@ -1160,7 +1128,7 @@ def build_deep_report_message() -> str:
     except Exception as e:
         logger.exception(f"build_deep_report error: {e}")
         return (
-            "❌ حصل��خطأ أثناء بناء التقرير العميق\n"
+            "❌ حصل خطأ أثناء بناء التقرير العميق\n"
             f"السبب: {html.escape(str(e))}\n\n"
             "راجع Logs لمعرفة الحقل أو الدالة التي سببت المشكلة."
         )
@@ -1392,18 +1360,6 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    """
-    يحسب ربح/خسارة الصفقة بعد الرافعة.
-
-    مهم:
-    لو الصفقة ضربت TP1 ثم رجعت Breakeven، لا تُحسب صفر.
-    يتم احتساب ربح الجزء المغلق عند TP1 فقط.
-    مثال:
-    TP1 ربحه +30% بعد الرافعة، و TP1_CLOSE_PCT = 50
-    إذن الربح الحقيقي للصفقة = +15%
-    """
-
-    # 1) لو فيه ربح محفوظ فعليًا استخدمه مباشرة
     for field in [
         "realized_leveraged_pnl_pct",
         "leveraged_pnl_pct",
@@ -1442,51 +1398,41 @@ def _get_trade_pnl_pct(trade: dict) -> float:
     tp1_weight = max(0.0, min(100.0, tp1_close_pct)) / 100.0
     tp2_weight = max(0.0, min(100.0, tp2_close_pct)) / 100.0
 
-    # 2) خسارة كاملة عند SL
     if result == "loss":
         if sl > 0:
             return round(((sl - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
         return 0.0
 
-    # 3) TP2: نحسب TP1 الجزئي + TP2 الجزئي
     if result == "tp2_win":
         pnl = 0.0
-
         if tp1 > 0:
             tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
             pnl += tp1_pnl * tp1_weight
-
         if tp2 > 0:
             tp2_pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
             pnl += tp2_pnl * tp2_weight
-
         if pnl == 0.0 and tp2 > 0:
             pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
-
         return round(pnl, 4)
 
-    # 4) TP1 فقط: نحسب الجزء المقفول عند TP1 فقط
     if result == "tp1_win":
         if tp1 > 0:
             tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
             return round(tp1_pnl * tp1_weight, 4)
         return 0.0
 
-    # 5) Breakeven بعد TP1: النصف الأول ربح TP1، والنصف الثاني خرج Entry = صفر
     if protected_breakeven_exit or "breakeven" in result:
         if tp1_hit and tp1 > 0:
             tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
             return round(tp1_pnl * tp1_weight, 4)
         return 0.0
 
-    # 6) Partial مفتوحة أو غير محسومة: لو TP1 اتضرب نحسب الربح المحقق فقط
     if status == "partial" or tp1_hit:
         if tp1 > 0:
             tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
             return round(tp1_pnl * tp1_weight, 4)
         return 0.0
 
-    # 7) Expired: نحسبها من آخر سعر لو متاح
     if result == "expired":
         last_price = _safe_float(trade.get("last_price"), 0.0)
         if last_price > 0:
@@ -1536,7 +1482,6 @@ def _build_group_exit_stats(trades: list, group_field: str, max_items: int = 6) 
             "tp2_rate": tp2_rate,
             "avg_pnl": avg_pnl,
         }
-    # sort by total desc, take top max_items
     sorted_items = sorted(stats.items(), key=lambda x: x[1]["total"], reverse=True)[:max_items]
     return dict(sorted_items)
 
@@ -1610,7 +1555,6 @@ def build_exits_report_message() -> str:
         tp1_hit_other = [t for t in closed if _trade_exit_bucket(t) == "tp1_hit_open_or_unknown"]
 
         closed_count = len(closed)
-        # modified: include breakeven trades in tp1_effective
         tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(breakeven) + len(tp1_hit_other)
         tp2_effective = len(tp2_wins)
         sl_count = len(losses)
@@ -1794,7 +1738,6 @@ def build_7d_report_message() -> str:
 # MARKET STATUS SNAPSHOT FUNCTIONS
 # =========================
 def save_market_status_snapshot(snapshot: dict) -> None:
- """حفظ Snapshot لحالة السوق في Redis مع TTL."""
  if not r or not snapshot:
     return
  try:
@@ -1803,7 +1746,6 @@ def save_market_status_snapshot(snapshot: dict) -> None:
     logger.warning(f"Failed to save market status snapshot: {e}")
 
 def load_market_status_snapshot(max_age_seconds: int = 240):
- """تحميل Snapshot من Redis مع التحقق من العمر."""
  if not r:
     return None
  try:
@@ -1828,10 +1770,6 @@ def load_market_status_snapshot(max_age_seconds: int = 240):
 # MARKET STATUS MESSAGE
 # =========================
 def build_market_status_message() -> str:
- """
- يعرض حالة السوق الحالية والمود الحالي للبوت LONG.
- يحاول استخدام Snapshot محفوظ أولاً، وإلا يقوم بعمل Live calculation.
- """
  try:
     snapshot = load_market_status_snapshot(max_age_seconds=300)
     if snapshot:
@@ -2073,7 +2011,7 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
         candles = get_candles(symbol, timeframe, limit)
         df = to_dataframe(candles)
         if df is None or df.empty:
-            return 0.0, 0.0, 0.0, 0.0
+            return entry, 0.0, entry, 0.0
 
         ts_col = df["ts"].astype(float)
         since_ms = since_ts * 1000 if since_ts < 10_000_000_000 else since_ts
@@ -2084,7 +2022,7 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
         lows = work["low"].astype(float)
         highs = work["high"].astype(float)
         if lows.empty or highs.empty or entry <= 0:
-            return 0.0, 0.0, 0.0, 0.0
+            return entry, 0.0, entry, 0.0
 
         if side == "long":
             favorable_price = float(highs.max())
@@ -2100,7 +2038,7 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
             return favorable_price, favorable_pct, adverse_price, adverse_pct
     except Exception as e:
         logger.error(f"get_max_move_since_alert error on {symbol}: {e}")
-        return 0.0, 0.0, 0.0, 0.0
+        return entry, 0.0, entry, 0.0
 
 def get_alert_status(alert: dict) -> str:
  try:
@@ -4082,7 +4020,6 @@ def apply_top_momentum_filter(candidates):
 
  strong_candidates = []
 
- # If few candidates, relax thresholds
  if len(candidates) <= 3:
     for c in candidates:
         if c.get("is_reverse"):
@@ -4107,7 +4044,6 @@ def apply_top_momentum_filter(candidates):
     logger.info(f"Top momentum small-candidate mode: kept {len(strong_candidates)} of {len(candidates)}")
     return strong_candidates
 
- # Normal mode
  min_score = get_effective_min_score(False, False)
  for c in candidates:
     if c["score"] >= min_score:
@@ -4530,6 +4466,14 @@ SMART_TP1_NEAR_RESISTANCE_RR = 1.2
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
+# Smart SL Settings
+SMART_SL_ENABLED = True
+SMART_SL_SUPPORT_LOOKBACK = 50
+SMART_SL_ATR_BUFFER = 0.35
+SMART_SL_MIN_PCT = 0.80
+SMART_SL_MAX_PCT = 5.00
+SMART_SL_FALLBACK_ATR_MULT = 2.8
+
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
  if signal_type == "breakout":
     return 2.2, 3.5
@@ -4560,6 +4504,60 @@ def _round_price_dynamic(value: float) -> float:
     except Exception:
         return 0.0
 
+# --- Round Level Validators -------------------------------------------------
+def is_major_round_level(price: float) -> bool:
+    """تقبل فقط المستويات السيكولوجية الكبيرة."""
+    if price <= 0:
+        return False
+    # أسعار معروفة مهمة جدًا
+    if price in (100, 500, 1000, 5000, 10000, 50000):
+        return True
+    if price >= 100 and price % 100 == 0:
+        return True
+    if 10 <= price < 100 and price % 10 == 0:
+        return True
+    if 1 <= price < 10 and price % 1 == 0:
+        return True
+    return False
+
+def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50) -> bool:
+    """يتحقق من وجود رفض سعري حقيقي حول المستوى الدائري."""
+    try:
+        if level <= entry:
+            return False
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
+        idx = signal_row.name
+        start = max(0, idx - lookback)
+        work = df.iloc[start:idx].copy()
+        if work.empty:
+            return False
+        tolerance = 0.002  # 0.2% تقريبًا
+        touches_rejected = 0
+        close_above_count = 0
+        for _, row in work.iterrows():
+            high = float(row["high"])
+            close = float(row["close"])
+            low = float(row["low"])
+            open_c = float(row["open"])
+            # الـ high قريب من المستوى مع إغلاق أسفله
+            if abs(high - level) / level <= tolerance:
+                if close < level:
+                    touches_rejected += 1
+                else:
+                    close_above_count += 1
+            # شمعة ذات فتيل علوي واضح حول المستوى
+            if high >= level and max(open_c, close) < level:
+                touches_rejected += 1
+        # إذا أغلق فوقه مرتين أو أكثر نعتبره مكسور
+        if close_above_count >= 2:
+            return False
+        # إذا تم رفضه مرة واحدة على الأقل نعتبره صالح
+        return touches_rejected >= 1
+    except Exception as e:
+        logger.warning(f"is_valid_round_resistance error: {e}")
+        return False
 
 def _collect_resistance_candidates_long(df, entry: float) -> list:
     candidates = []
@@ -4576,7 +4574,7 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
             return candidates
 
         start = max(0, idx - SMART_TP1_LOOKBACK_SWING)
-        work = df.iloc[start:idx].copy()          # exclude signal candle
+        work = df.iloc[start:idx].copy()
         if work.empty:
             return candidates
 
@@ -4618,7 +4616,7 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                     "source": "prev_20_high"
                 })
 
-        # simple psychological / round levels
+        # simple psychological / round levels with filters
         if SMART_TP1_ROUND_LEVELS_ENABLED:
             round_levels = []
             if entry >= 100:
@@ -4644,10 +4642,17 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                 round_levels = []
 
             for level in round_levels:
-                candidates.append({
-                    "price": level,
-                    "source": "round_level"
-                })
+                if is_major_round_level(level):
+                    candidates.append({
+                        "price": level,
+                        "source": "major_round_level"
+                    })
+                elif is_valid_round_resistance(df, level, entry):
+                    candidates.append({
+                        "price": level,
+                        "source": "round_level_confirmed"
+                    })
+                # وإلا نتجاهل المستوى
 
         # remove duplicates and invalid
         cleaned = []
@@ -4678,7 +4683,23 @@ def find_nearest_resistance_long(df, entry: float):
         candidates = _collect_resistance_candidates_long(df, entry)
         if not candidates:
             return None
-        return candidates[0]
+        source_order = {
+            "swing_high": 0,
+            "recent_close_high": 1,
+            "prev_20_high": 2,
+            "bb_upper": 3,
+            "round_level_confirmed": 4,
+            "major_round_level": 5,
+        }
+        valid = []
+        for c in candidates:
+            source = c.get("source", "unknown")
+            order = source_order.get(source, 99)
+            valid.append((order, c["price"], c))
+        if not valid:
+            return None
+        valid.sort(key=lambda x: (x[0], x[1]))
+        return valid[0][2]
     except Exception:
         return None
 
@@ -4792,34 +4813,31 @@ def build_smart_tp1_long(
         resistance_rr = (nearest_resistance - entry) / risk if risk > 0 else 0.0
         buffered_rr = (resistance_before_buffer - entry) / risk if risk > 0 else 0.0
 
-        # لو المقاومة قبل الحد الأدنى 1.2R، نخلي TP1 على 1.2R لكن نطلع تحذير
+        source_label = nearest_resistance_data.get("source", "unknown")
+
         if resistance_rr < SMART_TP1_MIN_RR:
             result["tp1"] = _round_price_dynamic(min_tp1)
             result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=rr2))
             result["target_method"] = "rr_min_due_close_resistance"
             result["resistance_warning"] = "مقاومة قريبة جدًا قبل TP1"
             result["target_notes"].append(
-                f"nearest_resistance_before_min_rr rr={resistance_rr:.2f}"
+                f"nearest_resistance_before_min_rr rr={resistance_rr:.2f} source={source_label}"
             )
             result["rr1_effective"] = SMART_TP1_MIN_RR
             return result
 
-        # لو المقاومة بين 1.2R و RR الأصلي، TP1 يكون قبل المقاومة ببوفر
         if SMART_TP1_MIN_RR <= buffered_rr < rr1:
             smart_tp1 = max(min_tp1, resistance_before_buffer)
             result["tp1"] = _round_price_dynamic(smart_tp1)
             result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=rr2))
             result["target_method"] = "structure_before_resistance"
             result["target_notes"].append(
-                f"tp1_before_resistance source={nearest_resistance_data.get('source', 'unknown')} rr={buffered_rr:.2f}"
+                f"tp1_before_resistance source={source_label} rr={buffered_rr:.2f}"
             )
             result["rr1_effective"] = round((smart_tp1 - entry) / risk, 2)
             return result
 
-        # لو المقاومة بعيدة، استخدم RR الطبيعي
         result["tp1"] = _round_price_dynamic(rr_tp1)
-
-        # TP2: لو السوق قوي والكسر موجود، نخلي TP2 أعلى قليلًا لو المقاومة بعيدة
         tp2_rr = rr2
         if market_state in ("bull_market", "alt_season") and (breakout or pre_breakout):
             tp2_rr = max(rr2, rr1 + 1.2)
@@ -4827,7 +4845,7 @@ def build_smart_tp1_long(
         result["tp2"] = _round_price_dynamic(calc_tp_long(entry, sl, rr=tp2_rr))
         result["target_method"] = "rr_with_structure_check"
         result["target_notes"].append(
-            f"resistance_ok source={nearest_resistance_data.get('source', 'unknown')} rr={resistance_rr:.2f}"
+            f"resistance_ok source={source_label} rr={resistance_rr:.2f}"
         )
         result["rr1_effective"] = rr1
         result["rr2_effective"] = tp2_rr
@@ -4867,14 +4885,13 @@ def near_resistance_guard_long(
     if not resistance_warning or resistance_warning != "مقاومة قريبة جدًا قبل TP1":
         return False, 0.0
 
-    # Determine penalty based on market state
     if market_state in ("risk_off",):
         base_penalty = 0.75
     elif market_state == "btc_leading":
         base_penalty = 0.60
     elif market_state == "mixed":
         base_penalty = 0.45
-    else:  # bull_market, alt_season
+    else:
         base_penalty = 0.25
 
     weak_market_conditions = (
@@ -4889,7 +4906,6 @@ def near_resistance_guard_long(
     )
 
     if weak_market_conditions:
-        # Exception for very strong breakout
         strong_exception = (
             breakout
             and breakout_quality == "strong"
@@ -4903,9 +4919,8 @@ def near_resistance_guard_long(
             and market_state != "risk_off"
         )
         if not strong_exception:
-            return True, 0.0  # reject completely
+            return True, 0.0
 
-    # not weak enough to reject, but still penalize harder
     return False, base_penalty
 
 # =====================
@@ -4966,6 +4981,7 @@ def build_message(
  wave_context="",
  extra_setup_names=None,
  primary_extra_setup="",
+ sl_method="",
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -5062,6 +5078,10 @@ def build_message(
  if primary_extra_setup:
     extra_setup_text = f"\n🧩 <b>Setup إضافي:</b> {html.escape(primary_extra_setup)}"
 
+ sl_method_text = ""
+ if sl_method:
+    sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
+
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
@@ -5070,7 +5090,7 @@ def build_message(
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 50%)
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 50%)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
-🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
+🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
 🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
@@ -5164,7 +5184,7 @@ def get_last_candle_change_pct(df) -> float:
  except Exception:
     return 0.0
 
-def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -> dict:
+def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, candles_map_15m: dict = None) -> dict:
  if not MARKET_GUARD_ENABLED:
     return {
         "active": False,
@@ -5200,9 +5220,11 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -
         symbol = item.get("instId", "")
         if not symbol:
             continue
-        candles = get_candles(
-            symbol, MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT
-        )
+        # استخدام الخريطة الممررة إن وجدت، وإلا fetch
+        if candles_map_15m and symbol in candles_map_15m:
+            candles = candles_map_15m[symbol]
+        else:
+            candles = get_candles(symbol, MARKET_GUARD_TIMEFRAME, MARKET_GUARD_CANDLE_LIMIT)
         df = to_dataframe(candles)
         if df is None or df.empty:
             continue
@@ -5224,7 +5246,11 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict) -
         }
     red_ratio = round(red_count / valid, 4)
     avg_change = round(sum(changes) / len(changes), 4) if changes else 0.0
-    btc_candles = get_candles("BTC-USDT-SWAP", MARKET_GUARD_TIMEFRAME, 5)
+    # BTC
+    if candles_map_15m and "BTC-USDT-SWAP" in candles_map_15m:
+        btc_candles = candles_map_15m["BTC-USDT-SWAP"]
+    else:
+        btc_candles = get_candles("BTC-USDT-SWAP", MARKET_GUARD_TIMEFRAME, 5)
     btc_df = to_dataframe(btc_candles)
     btc_change = 0.0
     if btc_df is not None and not btc_df.empty:
@@ -5309,8 +5335,6 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
     avg_change = float(avg_change or 0.0)
     btc_change = float(btc_change or 0.0)
 
-    # في Bull Market / Alt Season نسمح برجوع أسرع للوضع الطبيعي
-    # لأن وجود بعض الشموع الحمراء طبيعي طالما متوسط السوق و BTC ليسوا في ضغط واضح
     if market_state in ("bull_market", "alt_season"):
         return (
             red_ratio < 0.58
@@ -5318,7 +5342,6 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
             and btc_change > -0.20
         )
 
-    # في Mixed نبقى أكثر تحفظًا
     if market_state == "mixed":
         return (
             red_ratio < 0.52
@@ -5326,7 +5349,6 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
             and btc_change > -0.15
         )
 
-    # لا نرجع NORMAL من btc_leading أو risk_off
     return False
  except Exception:
     return False
@@ -5637,6 +5659,104 @@ def safe_register_trade(**kwargs):
         logger.error(f"register_trade failed: {e}")
         return None
 
+# =======================
+# SMART SL
+# =======================
+def build_smart_sl_long(
+    df,
+    entry: float,
+    atr_value: float,
+    signal_type: str = "standard",
+    market_state: str = "mixed",
+    breakout: bool = False,
+    pre_breakout: bool = False,
+    is_reverse: bool = False,
+) -> dict:
+    result = {
+        "sl": calculate_stop_loss(entry, atr_value, signal_type=signal_type),
+        "nearest_support": None,
+        "sl_method": "atr_fallback",
+        "sl_notes": ["fallback_to_standard_sl"],
+    }
+    try:
+        if not SMART_SL_ENABLED or entry <= 0 or atr_value <= 0:
+            return result
+        # جمع كل الدعوم الممكنة
+        support_candidates = []
+        # support from find_nearest_support_long
+        supp_data = find_nearest_support_long(df, entry)
+        if supp_data:
+            support_candidates.append({
+                "price": supp_data["price"],
+                "source": supp_data.get("source", "nearest_support")
+            })
+
+        # swing low
+        signal_row = get_signal_row(df)
+        if signal_row is not None:
+            idx = signal_row.name
+            if idx is not None and idx >= 10:
+                lookback = min(SMART_SL_SUPPORT_LOOKBACK, idx)
+                recent_lows = df["low"].iloc[idx - lookback:idx].astype(float)
+                swing_low = float(recent_lows.min())
+                if swing_low < entry:
+                    support_candidates.append({
+                        "price": swing_low,
+                        "source": "swing_low_atr"
+                    })
+
+        # MA and VWAP
+        ma_val = _safe_float(signal_row.get("ma"), 0.0) if signal_row is not None else 0.0
+        vwap_val = _safe_float(signal_row.get("vwap"), 0.0) if signal_row is not None else 0.0
+        if 0 < ma_val < entry:
+            support_candidates.append({"price": ma_val, "source": "ma_support"})
+        if 0 < vwap_val < entry:
+            support_candidates.append({"price": vwap_val, "source": "vwap_support"})
+
+        if not support_candidates:
+            return result
+
+        # اختيار الأقرب (الأعلى) تحت entry
+        support_candidates.sort(key=lambda x: x["price"], reverse=True)
+        chosen = support_candidates[0]
+
+        # وضع SL أسفل الدعم ببوفر
+        raw_sl = chosen["price"] - atr_value * SMART_SL_ATR_BUFFER
+        # تطبيق الحدود
+        min_sl = entry * (1 - SMART_SL_MAX_PCT / 100.0)
+        max_sl = entry * (1 - SMART_SL_MIN_PCT / 100.0)
+        sl = max(min_sl, min(max_sl, raw_sl))
+        sl = round(sl, 6)
+
+        result["sl"] = sl
+        result["nearest_support"] = chosen["price"]
+        result["sl_method"] = f"{chosen['source']}_atr"
+        result["sl_notes"] = [f"support={chosen['price']}", f"source={chosen['source']}", f"buffer={SMART_SL_ATR_BUFFER}"]
+        if sl == max_sl:
+            result["sl_method"] = "bounded_max_sl"
+        elif sl == min_sl:
+            result["sl_method"] = "bounded_min_sl"
+        return result
+    except Exception as e:
+        logger.warning(f"build_smart_sl_long error: {e}")
+        return result
+
+# =======================
+# FUNDING PARALLEL FETCH
+# =======================
+def fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS) -> dict:
+    if not symbols:
+        return {}
+    result = {}
+    def _fetch(sym):
+        return sym, get_funding_rate(sym)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch, s): s for s in symbols}
+        for future in as_completed(futures):
+            sym, rate = future.result()
+            result[sym] = rate
+    return result
+
 # =========================
 # MAIN LOOP
 # =========================
@@ -5688,6 +5808,19 @@ def run_scanner_loop():
                     r.set(ALT_SNAPSHOT_CACHE_KEY, json.dumps(alt_snapshot), ex=ALT_SNAPSHOT_CACHE_TTL)
                 except Exception as e:
                     logger.warning(f"Alt snapshot cache write error: {e}")
+
+        # استخراج عينة Market Guard وجلب شموعها مسبقًا
+        sample_pairs = sorted(
+            ranked_pairs,
+            key=lambda x: x.get("_rank_volume_24h", 0),
+            reverse=True
+        )[:MARKET_GUARD_SAMPLE_SIZE]
+        guard_candles_map = fetch_candles_parallel(sample_pairs, timeframe="15m", limit=MARKET_GUARD_CANDLE_LIMIT, max_workers=MAX_CANDLE_FETCH_WORKERS)
+        # تأكد من وجود BTC
+        if "BTC-USDT-SWAP" not in guard_candles_map:
+            btc_candles_15m = get_candles("BTC-USDT-SWAP", "15m", 5)
+            guard_candles_map["BTC-USDT-SWAP"] = btc_candles_15m
+
         market_info = get_market_state(btc_mode, alt_snapshot)
         market_state = market_info["market_state"]
         market_state_label = market_info["market_state_label"]
@@ -5698,6 +5831,7 @@ def run_scanner_loop():
             ranked_pairs=ranked_pairs,
             btc_mode=btc_mode,
             alt_snapshot=alt_snapshot,
+            candles_map_15m=guard_candles_map,
         )
         current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
         if not current_mode:
@@ -5769,6 +5903,7 @@ def run_scanner_loop():
             f"LONG MARKET STATE | mode={current_mode} | btc={btc_mode} | alt={alt_mode} | "
             f"state={market_state_label} | flow={market_bias_label}"
         )
+
         # ---------- RECOVERY LONG ----------
         if current_mode == MODE_RECOVERY_LONG:
             scan_pairs = sorted(
@@ -5796,7 +5931,6 @@ def run_scanner_loop():
                 if signal_row is None:
                     continue
                 candle_time = get_signal_candle_time(df)
-                # حماية تكرار محلية - لا تسجل رفض
                 now_local = time.time()
                 if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
                     logger.info(f"{symbol} skipped (recovery): local same candle cache")
@@ -5997,6 +6131,9 @@ def run_scanner_loop():
             if prefilter_pair_before_candles(p, current_mode)
         ]
         logger.info(f"Pre-filter kept {len(filtered_scan_pairs)} of {len(scan_pairs)} pairs before candle fetch")
+        # Funding parallel fetch
+        symbols = [p["instId"] for p in filtered_scan_pairs]
+        funding_map = fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS)
         candles_map = fetch_candles_parallel(
             filtered_scan_pairs,
             timeframe=TIMEFRAME,
@@ -6009,7 +6146,6 @@ def run_scanner_loop():
             limit=100,
             max_workers=MAX_CANDLE_FETCH_WORKERS,
         )
-        # --- Fetch 4H candles for wave-5 override ---
         htf_4h_candles_map = fetch_candles_parallel(
             filtered_scan_pairs,
             timeframe="4H",
@@ -6018,7 +6154,6 @@ def run_scanner_loop():
         )
         logger.info(f"Parallel HTF candle fetch completed: {len(htf_candles_map)} symbols")
         logger.info(f"Parallel candle fetch completed: {len(candles_map)} symbols")
-        # --- Fetch BTC 15m once ---
         btc_15m_candles = get_candles("BTC-USDT-SWAP", TIMEFRAME, 100)
         btc_15m_df = to_dataframe(btc_15m_candles)
         tested = 0
@@ -6027,7 +6162,6 @@ def run_scanner_loop():
         candidates = []
         candidates_symbols = set()
         for pair_data in filtered_scan_pairs:
-            # Reset final_threshold_min per symbol
             final_threshold_min = None
             tested += 1
             symbol = pair_data["instId"]
@@ -6045,7 +6179,6 @@ def run_scanner_loop():
                 logger.info(f"{symbol} --> skipped (candle timing invalid)")
                 continue
             candle_time = get_signal_candle_time(df)
-            # حماية تكرار محلية
             now = time.time()
             if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
                 logger.info(f"{symbol} skipped: local same candle cache")
@@ -6069,11 +6202,10 @@ def run_scanner_loop():
             mtf_confirmed = is_higher_timeframe_confirmed_from_candles(
                 htf_candles_map.get(symbol, [])
             )
-            # --- Get higher timeframe contexts ---
             htf_1h_context = get_htf_context_from_candles(htf_candles_map.get(symbol, []))
             htf_4h_context = get_htf_context_from_candles(htf_4h_candles_map.get(symbol, []))
             is_new = is_new_listing_by_candles(candles)
-            funding = get_funding_rate(symbol)
+            funding = funding_map.get(symbol, 0.0)
             vol_ratio = get_volume_ratio(df)
             dist_ma = get_distance_from_ma_percent(df)
             candle_strength = get_candle_strength_ratio(df)
@@ -6124,7 +6256,6 @@ def run_scanner_loop():
                 dist_ma=dist_ma,
                 mtf_confirmed=mtf_confirmed,
             )
-            # --- Extra strong setups ---
             extra_setups = detect_extra_strong_long_setups(
                 symbol=symbol,
                 df=df,
@@ -6153,7 +6284,6 @@ def run_scanner_loop():
                 rsi_slope=rsi_slope,
                 macd_hist_slope=macd_hist_slope,
             )
-            # تفعيل حظر الـ late_guard المباشر
             if late_guard.get("should_block") and not is_reverse:
                 log_long_rejection(
                     symbol=symbol,
@@ -6491,7 +6621,6 @@ def run_scanner_loop():
                 logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
                 continue
 
-            # compute strong_bull_pullback once for later reuse
             strong_bull_pullback = (
                 market_state in ("bull_market", "alt_season")
                 and mtf_confirmed
@@ -6517,10 +6646,7 @@ def run_scanner_loop():
                 and vwap_distance <= 2.2
             )
 
-            # Pre-score adjustments log collector
             pre_score_adjustments_log = []
-
-            # --- Initialize wave5_eval to prevent UnboundLocalError ---
             wave5_eval = {}
 
             if not is_reverse:
@@ -6551,7 +6677,6 @@ def run_scanner_loop():
                 )
 
                 if hard_late_entry:
-                    # --- Apply wave-5 HTF override ---
                     wave5_eval = evaluate_wave5_htf_override(
                         entry_timing=entry_timing_temp,
                         entry_maturity_data=entry_maturity_data,
@@ -6565,7 +6690,6 @@ def run_scanner_loop():
                         vol_ratio=vol_ratio,
                     )
                     if wave5_eval["can_override"]:
-                        # Override: accept but apply penalty
                         pre_score_adjustments_log.append({
                             "name": "wave5_htf_override_penalty",
                             "value": -wave5_eval["penalty"],
@@ -6577,7 +6701,6 @@ def run_scanner_loop():
                         entry_maturity_data["warning_reasons"].append(warning_msg)
                         logger.info(f"{symbol} --> wave5 overridden: {wave5_eval['label']}, penalty={wave5_eval['penalty']}")
                     else:
-                        # Rejection confirmed by HTF
                         reason_specific = wave5_eval["label"] or classify_hard_late_rejection_reason(
                             entry_timing=entry_timing_temp,
                             entry_maturity_status=entry_maturity_status,
@@ -6635,10 +6758,8 @@ def run_scanner_loop():
             upper_wick_ratio = guard.get("upper_wick_ratio", 0.0)
             late_breakout_guard_reason = guard.get("reason", "none") or "none"
 
-            # STRONG_LONG_ONLY filter
             if current_mode == MODE_STRONG_LONG_ONLY:
                 if "هابط" in btc_mode and "ضعيف" in alt_mode:
-                    # Raise final threshold later
                     final_threshold_min = 7.4
                 else:
                     final_threshold_min = 6.0
@@ -6681,7 +6802,6 @@ def run_scanner_loop():
                     logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY extra setup: {extra_setup_names}")
                 if strong_bull_pullback and not (breakout or pre_breakout or early_priority == "strong" or has_extra_strong_setup):
                     logger.info(f"{symbol} --> allowed by STRONG_LONG_ONLY strong_bull_pullback exception")
-                # MTF exception
                 extra_setup_can_bypass_mtf = (
                     primary_extra_setup in (
                         "failed_breakdown_trap",
@@ -6888,7 +7008,6 @@ def run_scanner_loop():
             raw_score = float(score_result.get("score", 0))
             effective_score = raw_score
             adjustments_log = []
-            # Merge pre-score adjustments and apply any numeric penalties
             if pre_score_adjustments_log:
                 for adj in pre_score_adjustments_log:
                     effective_score += float(adj.get("value", 0.0) or 0.0)
@@ -6967,7 +7086,6 @@ def run_scanner_loop():
                     "reason": "is_reverse"
                 })
 
-            # --- Extra setup bonus ---
             if has_extra_strong_setup and not is_reverse:
                 effective_score += extra_setup_bonus
                 adjustments_log.append({
@@ -7028,10 +7146,6 @@ def run_scanner_loop():
 
             score_result["score"] = round(effective_score, 2)
 
-            # Apply near resistance guard - now after score calculation for correct penalty logic
-            resistance_rejected = False
-            resistance_dynamic_penalty = 0.0
-            # Build smart targets early to get resistance_warning
             price = _safe_float(signal_row["close"], 0)
             if breakout:
                 sl_type = "breakout"
@@ -7041,8 +7155,23 @@ def run_scanner_loop():
                 sl_type = "new_listing"
             else:
                 sl_type = "standard"
-            stop_loss = calculate_stop_loss(price, atr_value, signal_type=sl_type)
             rr1, rr2 = get_rr_targets_long(signal_type=sl_type, entry_timing=entry_timing_temp)
+            # Smart SL
+            smart_sl = build_smart_sl_long(
+                df=df,
+                entry=price,
+                atr_value=atr_value,
+                signal_type=sl_type,
+                market_state=market_state,
+                breakout=breakout,
+                pre_breakout=pre_breakout,
+                is_reverse=is_reverse,
+            )
+            stop_loss = smart_sl["sl"]
+            nearest_support = smart_sl.get("nearest_support")
+            sl_method = smart_sl.get("sl_method", "atr")
+            sl_notes = smart_sl.get("sl_notes", [])
+
             smart_targets_early = build_smart_tp1_long(
                 df=df,
                 entry=price,
@@ -7056,7 +7185,9 @@ def run_scanner_loop():
             )
             early_resistance_warning = smart_targets_early.get("resistance_warning", "")
             early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
-            # Apply the new guard
+            # near resistance guard
+            resistance_rejected = False
+            resistance_dynamic_penalty = 0.0
             should_reject_near_resistance, res_dynamic_penalty = near_resistance_guard_long(
                 resistance_warning=early_resistance_warning,
                 nearest_resistance=early_nearest_resistance,
@@ -7064,7 +7195,7 @@ def run_scanner_loop():
                 btc_mode=btc_mode,
                 alt_mode=alt_mode,
                 current_mode=current_mode,
-                display_risk=get_base_risk_label(score_result, 0),  # rough initial
+                display_risk=get_base_risk_label(score_result, 0),
                 late_guard=late_guard,
                 vol_ratio=vol_ratio,
                 candle_strength=candle_strength,
@@ -7262,7 +7393,6 @@ def run_scanner_loop():
                     "reason": "early_priority_strong"
                 })
 
-            # Apply STRONG_LONG_ONLY minimum if set
             if current_mode == MODE_STRONG_LONG_ONLY and final_threshold_min is not None:
                 final_threshold = max(final_threshold, final_threshold_min)
 
@@ -7446,12 +7576,10 @@ def run_scanner_loop():
                 )
                 continue
 
-            # No duplicate penalty; use smart targets already computed
             tp1 = smart_targets_early.get("tp1", calc_tp_long(price, stop_loss, rr=rr1))
             tp2 = smart_targets_early.get("tp2", calc_tp_long(price, stop_loss, rr=rr2))
             target_method = smart_targets_early.get("target_method", "rr")
             nearest_resistance = smart_targets_early.get("nearest_resistance")
-            nearest_support = smart_targets_early.get("nearest_support")
             resistance_warning = early_resistance_warning
             support_warning = smart_targets_early.get("support_warning", "")
             target_notes = smart_targets_early.get("target_notes", [])
@@ -7520,7 +7648,6 @@ def run_scanner_loop():
                 breakout=breakout,
                 pre_breakout=pre_breakout,
             )
-            # --- Modify wave_context if overridden or extra setup ---
             if wave5_eval.get("can_override"):
                 if "htf_healthy" in wave5_eval.get("label", ""):
                     wave_context = "wave_5_15m_htf_healthy"
@@ -7679,8 +7806,8 @@ def run_scanner_loop():
                 "resistance_warning": resistance_warning,
                 "support_warning": support_warning,
                 "target_notes": target_notes,
-                "sl_method": "atr",
-                "sl_notes": f"sl_type={sl_type}",
+                "sl_method": sl_method,
+                "sl_notes": sl_notes,
                 "wave_context": wave_context,
                 "setup_context": setup_type,
                 "reversal_quality": "",
@@ -7733,6 +7860,7 @@ def run_scanner_loop():
                     wave_context=wave_context,
                     extra_setup_names=extra_setup_names,
                     primary_extra_setup=primary_extra_setup,
+                    sl_method=sl_method,
                 ),
                 "reply_markup": build_track_reply_markup(alert_id),
                 "alert_id": alert_id,
@@ -7808,8 +7936,8 @@ def run_scanner_loop():
                     "resistance_warning": resistance_warning,
                     "support_warning": support_warning,
                     "target_notes": target_notes,
-                    "sl_method": "atr",
-                    "sl_notes": f"sl_type={sl_type}",
+                    "sl_method": sl_method,
+                    "sl_notes": sl_notes,
                     "wave_context": wave_context,
                     "setup_context": setup_type,
                     "reversal_quality": "",
@@ -7955,7 +8083,7 @@ def run_scanner_loop():
                     support_warning=candidate.get("support_warning", ""),
                     target_notes=candidate.get("target_notes", []),
                     sl_method=candidate.get("sl_method", "atr"),
-                    sl_notes=candidate.get("sl_notes", ""),
+                    sl_notes=candidate.get("sl_notes", []),
                     wave_context=candidate.get("wave_context", ""),
                     setup_context=candidate.get("setup_context", ""),
                     reversal_quality=candidate.get("reversal_quality", ""),
