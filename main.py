@@ -1287,6 +1287,125 @@ def _format_wallet_impact(summary: dict, side="long") -> str:
     return "Wallet impact: غير متاح"
 
 
+# =======================================================
+# CENTRALIZED REGISTRATION PAYLOAD BUILDER
+# =======================================================
+def build_trade_registration_payload(candidate: dict) -> dict:
+    """
+    Build a comprehensive kwargs dictionary for register_trade from a candidate dict.
+    Uses all available fields with safe defaults.
+    """
+    return {
+        "redis_client": r,
+        "symbol": candidate["symbol"],
+        "market_type": "futures",
+        "side": "long",
+        "candle_time": candidate["candle_time"],
+        "timeframe": TIMEFRAME,
+        "entry": candidate["entry"],
+        "sl": candidate["sl"],
+        "tp1": candidate["tp1"],
+        "tp2": candidate["tp2"],
+        "score": candidate["score"],
+        "setup_type": candidate.get("setup_type", ""),
+        "reasons": candidate.get("reasons", []),
+        "warning_reasons": candidate.get("warning_reasons", []),
+        "btc_mode": candidate.get("btc_mode", ""),
+        "funding_label": candidate.get("funding_label", "🟡 محايد"),
+        "pre_breakout": candidate.get("pre_breakout", False),
+        "breakout": candidate.get("breakout", False),
+        "vol_ratio": candidate.get("vol_ratio", 1.0),
+        "candle_strength": candidate.get("candle_strength", 0.0),
+        "mtf_confirmed": candidate.get("mtf_confirmed", False),
+        "is_new": candidate.get("is_new", False),
+        "btc_dominance_proxy": candidate.get("btc_dominance_proxy", ""),
+        "change_24h": candidate.get("change_24h", 0.0),
+        "raw_score": candidate.get("raw_score", 0.0),
+        "effective_score": candidate.get("score", 0.0),
+        "dynamic_threshold": candidate.get("dynamic_threshold", 0.0),
+        "required_min_score": candidate.get("required_min_score", 0.0),
+        "final_threshold": candidate.get("final_threshold", 0.0),
+        "dist_ma": candidate.get("dist_ma", 0.0),
+        "entry_timing": candidate.get("entry_timing", ""),
+        "opportunity_type": candidate.get("opportunity_type", ""),
+        "market_state": candidate.get("market_state", ""),
+        "market_state_label": candidate.get("market_state_label", ""),
+        "market_bias_label": candidate.get("market_bias_label", ""),
+        "alt_mode": candidate.get("alt_mode", ""),
+        "early_priority": candidate.get("early_priority", "none"),
+        "breakout_quality": candidate.get("breakout_quality", "none"),
+        "risk_level": candidate.get("risk_level", ""),
+        "fake_signal": candidate.get("fake_signal", False),
+        "is_reverse_signal": candidate.get("is_reverse", False),
+        "reversal_4h_confirmed": candidate.get("reversal_4h_confirmed", False),
+        "rank_volume_24h": candidate.get("rank_volume_24h", 0.0),
+        "alert_id": candidate.get("alert_id", ""),
+        "has_high_impact_news": candidate.get("has_high_impact_news", False),
+        "news_titles": candidate.get("news_titles", []),
+        "warning_penalty": candidate.get("warning_penalty", 0.0),
+        "warning_high_count": candidate.get("warning_high_count", 0),
+        "warning_medium_count": candidate.get("warning_medium_count", 0),
+        "warning_penalty_details": candidate.get("warning_penalty_details", []),
+        "adjustments_log": candidate.get("adjustments_log", []),
+        "pullback_entry": candidate.get("pullback_entry"),
+        "pullback_low": candidate.get("pullback_low"),
+        "pullback_high": candidate.get("pullback_high"),
+        "rr1": candidate.get("rr1", 2.0),
+        "rr2": candidate.get("rr2", 3.2),
+        "setup_type_base": candidate.get("setup_type_base", ""),
+        "fib_position": candidate.get("fib_position", "unknown"),
+        "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
+        "fib_label": candidate.get("fib_label", ""),
+        "had_pullback": candidate.get("had_pullback", False),
+        "pullback_pct": candidate.get("pullback_pct", 0.0),
+        "pullback_label": candidate.get("pullback_label", ""),
+        "wave_estimate": candidate.get("wave_estimate", 0),
+        "wave_peaks": candidate.get("wave_peaks", 0),
+        "wave_label": candidate.get("wave_label", ""),
+        "entry_maturity": candidate.get("entry_maturity", "unknown"),
+        "maturity_penalty": candidate.get("maturity_penalty", 0.0),
+        "maturity_bonus": candidate.get("maturity_bonus", 0.0),
+        "falling_knife_risk": candidate.get("falling_knife_risk", False),
+        "falling_knife_reasons": candidate.get("falling_knife_reasons", []),
+        "reversal_quality": candidate.get("reversal_quality", ""),
+        "wave_context": candidate.get("wave_context", ""),
+        "setup_context": candidate.get("setup_context", ""),
+        "reversal_structure_confirmed": candidate.get("reversal_structure_confirmed", False),
+        "strong_bull_pullback": candidate.get("strong_bull_pullback", False),
+        "strong_breakout_exception": candidate.get("strong_breakout_exception", False),
+        "target_method": candidate.get("target_method", "rr"),
+        "nearest_resistance": candidate.get("nearest_resistance"),
+        "nearest_support": candidate.get("nearest_support"),
+        "resistance_warning": candidate.get("resistance_warning", ""),
+        "support_warning": candidate.get("support_warning", ""),
+        "target_notes": candidate.get("target_notes", []),
+        "sl_method": candidate.get("sl_method", "atr"),
+        "sl_notes": candidate.get("sl_notes", []),
+        "tp1_close_pct": candidate.get("tp1_close_pct", TP1_CLOSE_PCT),
+        "tp2_close_pct": candidate.get("tp2_close_pct", TP2_CLOSE_PCT),
+        "move_sl_to_entry_after_tp1": candidate.get("move_sl_to_entry_after_tp1", MOVE_SL_TO_ENTRY_AFTER_TP1),
+        "has_extra_strong_setup": candidate.get("has_extra_strong_setup", False),
+        "extra_setup_names": candidate.get("extra_setup_names", []),
+        "extra_setup_bonus": candidate.get("extra_setup_bonus", 0.0),
+        "primary_extra_setup": candidate.get("primary_extra_setup", ""),
+        "extra_setups_details": candidate.get("extra_setups_details", {}),
+    }
+
+
+def register_trade_from_candidate(candidate: dict) -> None:
+    """Centralized registration with full payload and error logging."""
+    try:
+        payload = build_trade_registration_payload(candidate)
+        register_trade(**payload)
+    except Exception as e:
+        error_msg = (
+            f"register_trade failed | symbol={candidate.get('symbol', '?')} | "
+            f"alert_id={candidate.get('alert_id', '?')} | setup={candidate.get('setup_type', '?')} | "
+            f"error={e}"
+        )
+        logger.error(error_msg)
+
+
 # ----------- Helper functions for exits report -----------
 def _load_long_trades_from_redis(limit: int = 700) -> list:
     trades = []
@@ -4013,6 +4132,8 @@ def apply_top_momentum_filter(candidates):
                 "bucket": c.get("bucket"),
                 "change_24h": c.get("change_24h"),
                 "rank_volume_24h": c.get("rank_volume_24h"),
+                "extra_setup_names": c.get("extra_setup_names"),
+                "setup_type_base": c.get("setup_type_base"),
             },
         )
     except Exception:
@@ -4506,10 +4627,8 @@ def _round_price_dynamic(value: float) -> float:
 
 # --- Round Level Validators -------------------------------------------------
 def is_major_round_level(price: float) -> bool:
-    """تقبل فقط المستويات السيكولوجية الكبيرة."""
     if price <= 0:
         return False
-    # أسعار معروفة مهمة جدًا
     if price in (100, 500, 1000, 5000, 10000, 50000):
         return True
     if price >= 100 and price % 100 == 0:
@@ -4521,7 +4640,6 @@ def is_major_round_level(price: float) -> bool:
     return False
 
 def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50) -> bool:
-    """يتحقق من وجود رفض سعري حقيقي حول المستوى الدائري."""
     try:
         if level <= entry:
             return False
@@ -4533,7 +4651,7 @@ def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50
         work = df.iloc[start:idx].copy()
         if work.empty:
             return False
-        tolerance = 0.002  # 0.2% تقريبًا
+        tolerance = 0.002
         touches_rejected = 0
         close_above_count = 0
         for _, row in work.iterrows():
@@ -4541,19 +4659,15 @@ def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50
             close = float(row["close"])
             low = float(row["low"])
             open_c = float(row["open"])
-            # الـ high قريب من المستوى مع إغلاق أسفله
             if abs(high - level) / level <= tolerance:
                 if close < level:
                     touches_rejected += 1
                 else:
                     close_above_count += 1
-            # شمعة ذات فتيل علوي واضح حول المستوى
             if high >= level and max(open_c, close) < level:
                 touches_rejected += 1
-        # إذا أغلق فوقه مرتين أو أكثر نعتبره مكسور
         if close_above_count >= 2:
             return False
-        # إذا تم رفضه مرة واحدة على الأقل نعتبره صالح
         return touches_rejected >= 1
     except Exception as e:
         logger.warning(f"is_valid_round_resistance error: {e}")
@@ -4581,7 +4695,6 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
         highs = work["high"].astype(float)
         closes = work["close"].astype(float)
 
-        # recent swing highs above entry
         for h in highs.tail(30).tolist():
             h = _safe_float(h, 0.0)
             if h > entry:
@@ -4590,7 +4703,6 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                     "source": "swing_high"
                 })
 
-        # recent close highs above entry
         for c in closes.tail(30).tolist():
             c = _safe_float(c, 0.0)
             if c > entry:
@@ -4599,7 +4711,6 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                     "source": "recent_close_high"
                 })
 
-        # Bollinger upper
         bb_upper = _safe_float(signal_row.get("bb_upper"), 0.0)
         if bb_upper > entry:
             candidates.append({
@@ -4607,7 +4718,6 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                 "source": "bb_upper"
             })
 
-        # previous 20 high
         if len(work) >= 20:
             prev_high = _safe_float(work["high"].tail(20).max(), 0.0)
             if prev_high > entry:
@@ -4616,7 +4726,6 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                     "source": "prev_20_high"
                 })
 
-        # simple psychological / round levels with filters
         if SMART_TP1_ROUND_LEVELS_ENABLED:
             round_levels = []
             if entry >= 100:
@@ -4652,9 +4761,7 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                         "price": level,
                         "source": "round_level_confirmed"
                     })
-                # وإلا نتجاهل المستوى
 
-        # remove duplicates and invalid
         cleaned = []
         seen = set()
         for item in candidates:
@@ -4856,9 +4963,6 @@ def build_smart_tp1_long(
         result["target_notes"].append("smart_tp1_error_fallback_rr")
         return result
 
-# ==========================================
-# NEAR RESISTANCE GUARD (NEW)
-# ==========================================
 def near_resistance_guard_long(
     resistance_warning: str,
     nearest_resistance: float,
@@ -4879,9 +4983,6 @@ def near_resistance_guard_long(
     vwap_distance: float,
     score_after_penalties: float,
 ) -> tuple:
-    """
-    Returns (should_reject: bool, dynamic_penalty: float)
-    """
     if not resistance_warning or resistance_warning != "مقاومة قريبة جدًا قبل TP1":
         return False, 0.0
 
@@ -5220,7 +5321,6 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         symbol = item.get("instId", "")
         if not symbol:
             continue
-        # استخدام الخريطة الممررة إن وجدت، وإلا fetch
         if candles_map_15m and symbol in candles_map_15m:
             candles = candles_map_15m[symbol]
         else:
@@ -5246,7 +5346,6 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         }
     red_ratio = round(red_count / valid, 4)
     avg_change = round(sum(changes) / len(changes), 4) if changes else 0.0
-    # BTC
     if candles_map_15m and "BTC-USDT-SWAP" in candles_map_15m:
         btc_candles = candles_map_15m["BTC-USDT-SWAP"]
     else:
@@ -5650,16 +5749,6 @@ def handle_telegram_commands():
     release_telegram_poll_lock()
 
 # =======================
-# SAFE REGISTER TRADE WRAPPER
-# =======================
-def safe_register_trade(**kwargs):
-    try:
-        return register_trade(**kwargs)
-    except Exception as e:
-        logger.error(f"register_trade failed: {e}")
-        return None
-
-# =======================
 # SMART SL
 # =======================
 def build_smart_sl_long(
@@ -5681,9 +5770,7 @@ def build_smart_sl_long(
     try:
         if not SMART_SL_ENABLED or entry <= 0 or atr_value <= 0:
             return result
-        # جمع كل الدعوم الممكنة
         support_candidates = []
-        # support from find_nearest_support_long
         supp_data = find_nearest_support_long(df, entry)
         if supp_data:
             support_candidates.append({
@@ -5691,7 +5778,6 @@ def build_smart_sl_long(
                 "source": supp_data.get("source", "nearest_support")
             })
 
-        # swing low
         signal_row = get_signal_row(df)
         if signal_row is not None:
             idx = signal_row.name
@@ -5705,7 +5791,6 @@ def build_smart_sl_long(
                         "source": "swing_low_atr"
                     })
 
-        # MA and VWAP
         ma_val = _safe_float(signal_row.get("ma"), 0.0) if signal_row is not None else 0.0
         vwap_val = _safe_float(signal_row.get("vwap"), 0.0) if signal_row is not None else 0.0
         if 0 < ma_val < entry:
@@ -5716,13 +5801,10 @@ def build_smart_sl_long(
         if not support_candidates:
             return result
 
-        # اختيار الأقرب (الأعلى) تحت entry
         support_candidates.sort(key=lambda x: x["price"], reverse=True)
         chosen = support_candidates[0]
 
-        # وضع SL أسفل الدعم ببوفر
         raw_sl = chosen["price"] - atr_value * SMART_SL_ATR_BUFFER
-        # تطبيق الحدود
         min_sl = entry * (1 - SMART_SL_MAX_PCT / 100.0)
         max_sl = entry * (1 - SMART_SL_MIN_PCT / 100.0)
         sl = max(min_sl, min(max_sl, raw_sl))
@@ -5809,14 +5891,12 @@ def run_scanner_loop():
                 except Exception as e:
                     logger.warning(f"Alt snapshot cache write error: {e}")
 
-        # استخراج عينة Market Guard وجلب شموعها مسبقًا
         sample_pairs = sorted(
             ranked_pairs,
             key=lambda x: x.get("_rank_volume_24h", 0),
             reverse=True
         )[:MARKET_GUARD_SAMPLE_SIZE]
         guard_candles_map = fetch_candles_parallel(sample_pairs, timeframe="15m", limit=MARKET_GUARD_CANDLE_LIMIT, max_workers=MAX_CANDLE_FETCH_WORKERS)
-        # تأكد من وجود BTC
         if "BTC-USDT-SWAP" not in guard_candles_map:
             btc_candles_15m = get_candles("BTC-USDT-SWAP", "15m", 5)
             guard_candles_map["BTC-USDT-SWAP"] = btc_candles_15m
@@ -6048,72 +6128,99 @@ def run_scanner_loop():
                         "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
-                    safe_register_trade(
-                        redis_client=r,
-                        symbol=symbol,
-                        market_type="futures",
-                        side="long",
-                        candle_time=candle_time,
-                        entry=avg_entry,
-                        sl=sl,
-                        tp1=tp1,
-                        tp2=tp2,
-                        score=0.0,
-                        timeframe=TIMEFRAME,
-                        btc_mode=btc_mode,
-                        funding_label="🟡 محايد",
-                        reasons=["Recovery Long", "Post Crash", "Oversold Bounce"],
-                        pre_breakout=False,
-                        breakout=False,
-                        vol_ratio=vol_ratio,
-                        candle_strength=0.0,
-                        mtf_confirmed=False,
-                        is_new=False,
-                        btc_dominance_proxy=btc_dominance_proxy,
-                        change_24h=extract_24h_change_percent(pair_data),
-                        setup_type="recovery|mtf_yes|vol_mid|post_crash",
-                        raw_score=0.0,
-                        effective_score=0.0,
-                        dynamic_threshold=0.0,
-                        required_min_score=0.0,
-                        dist_ma=dist_ma,
-                        entry_timing="Recovery Entry",
-                        opportunity_type="Recovery Long",
-                        market_state=market_state,
-                        market_state_label=market_state_label,
-                        market_bias_label=market_bias_label,
-                        alt_mode=alt_mode,
-                        early_priority="none",
-                        breakout_quality="none",
-                        fake_signal=False,
-                        is_reverse_signal=True,
-                        reversal_4h_confirmed=False,
-                        rank_volume_24h=float(pair_data.get("_rank_volume_24h", 0)),
-                        alert_id=alert_id,
-                        has_high_impact_news=has_high_impact_news,
-                        news_titles=[e.get("title", "") for e in upcoming_events[:3]],
-                        warning_reasons=[],
-                        pullback_low=entry2,
-                        pullback_high=entry1,
-                        pullback_entry=entry2,
-                        rr1=rr1,
-                        rr2=rr2,
-                        tp1_close_pct=TP1_CLOSE_PCT,
-                        tp2_close_pct=TP2_CLOSE_PCT,
-                        move_sl_to_entry_after_tp1=MOVE_SL_TO_ENTRY_AFTER_TP1,
-                        fib_position="unknown",
-                        fib_position_ratio=0.0,
-                        fib_label="غير معروف",
-                        had_pullback=False,
-                        pullback_pct=0.0,
-                        pullback_label="غير معروف",
-                        wave_estimate=0,
-                        wave_peaks=0,
-                        wave_label="غير معروف",
-                        entry_maturity="unknown",
-                        maturity_penalty=0.0,
-                        maturity_bonus=0.0,
-                    )
+                    # Build a candidate-like dict for recovery registration
+                    recovery_candidate = {
+                        "symbol": symbol,
+                        "candle_time": candle_time,
+                        "entry": avg_entry,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "score": 0.0,
+                        "setup_type": "recovery|mtf_yes|vol_mid|post_crash",
+                        "reasons": ["Recovery Long", "Post Crash", "Oversold Bounce"],
+                        "warning_reasons": [],
+                        "btc_mode": btc_mode,
+                        "funding_label": "🟡 محايد",
+                        "pre_breakout": False,
+                        "breakout": False,
+                        "vol_ratio": vol_ratio,
+                        "candle_strength": 0.0,
+                        "mtf_confirmed": False,
+                        "is_new": False,
+                        "btc_dominance_proxy": btc_dominance_proxy,
+                        "change_24h": extract_24h_change_percent(pair_data),
+                        "raw_score": 0.0,
+                        "effective_score": 0.0,
+                        "dynamic_threshold": 0.0,
+                        "required_min_score": 0.0,
+                        "final_threshold": 0.0,
+                        "dist_ma": dist_ma,
+                        "entry_timing": "Recovery Entry",
+                        "opportunity_type": "Recovery Long",
+                        "market_state": market_state,
+                        "market_state_label": market_state_label,
+                        "market_bias_label": market_bias_label,
+                        "alt_mode": alt_mode,
+                        "early_priority": "none",
+                        "breakout_quality": "none",
+                        "risk_level": "🔴 مرتفع",
+                        "fake_signal": False,
+                        "is_reverse": True,
+                        "reversal_4h_confirmed": False,
+                        "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
+                        "alert_id": alert_id,
+                        "has_high_impact_news": has_high_impact_news,
+                        "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
+                        "warning_penalty": 0.0,
+                        "warning_high_count": 0,
+                        "warning_medium_count": 0,
+                        "warning_penalty_details": [],
+                        "adjustments_log": [],
+                        "pullback_entry": entry2,
+                        "pullback_low": entry2,
+                        "pullback_high": entry1,
+                        "rr1": rr1,
+                        "rr2": rr2,
+                        "setup_type_base": "recovery",
+                        "fib_position": "unknown",
+                        "fib_position_ratio": 0.0,
+                        "fib_label": "غير معروف",
+                        "had_pullback": False,
+                        "pullback_pct": 0.0,
+                        "pullback_label": "غير معروف",
+                        "wave_estimate": 0,
+                        "wave_peaks": 0,
+                        "wave_label": "غير معروف",
+                        "entry_maturity": "unknown",
+                        "maturity_penalty": 0.0,
+                        "maturity_bonus": 0.0,
+                        "falling_knife_risk": False,
+                        "falling_knife_reasons": [],
+                        "reversal_quality": "",
+                        "wave_context": "post_crash",
+                        "setup_context": "",
+                        "reversal_structure_confirmed": False,
+                        "strong_bull_pullback": False,
+                        "strong_breakout_exception": False,
+                        "target_method": "rr",
+                        "nearest_resistance": None,
+                        "nearest_support": None,
+                        "resistance_warning": "",
+                        "support_warning": "",
+                        "target_notes": [],
+                        "sl_method": "atr",
+                        "sl_notes": [],
+                        "tp1_close_pct": TP1_CLOSE_PCT,
+                        "tp2_close_pct": TP2_CLOSE_PCT,
+                        "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                        "has_extra_strong_setup": False,
+                        "extra_setup_names": [],
+                        "extra_setup_bonus": 0.0,
+                        "primary_extra_setup": "",
+                        "extra_setups_details": {},
+                    }
+                    register_trade_from_candidate(recovery_candidate)
                     logger.info(f"✅ SENT RECOVERY LONG ---> {symbol}")
                 else:
                     release_signal_slot(symbol, candle_time, "long")
@@ -6131,7 +6238,6 @@ def run_scanner_loop():
             if prefilter_pair_before_candles(p, current_mode)
         ]
         logger.info(f"Pre-filter kept {len(filtered_scan_pairs)} of {len(scan_pairs)} pairs before candle fetch")
-        # Funding parallel fetch
         symbols = [p["instId"] for p in filtered_scan_pairs]
         funding_map = fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS)
         candles_map = fetch_candles_parallel(
@@ -7156,7 +7262,6 @@ def run_scanner_loop():
             else:
                 sl_type = "standard"
             rr1, rr2 = get_rr_targets_long(signal_type=sl_type, entry_timing=entry_timing_temp)
-            # Smart SL
             smart_sl = build_smart_sl_long(
                 df=df,
                 entry=price,
@@ -7185,7 +7290,6 @@ def run_scanner_loop():
             )
             early_resistance_warning = smart_targets_early.get("resistance_warning", "")
             early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
-            # near resistance guard
             resistance_rejected = False
             resistance_dynamic_penalty = 0.0
             should_reject_near_resistance, res_dynamic_penalty = near_resistance_guard_long(
@@ -7727,90 +7831,75 @@ def run_scanner_loop():
             )
             candidate = {
                 "symbol": symbol,
+                "candle_time": candle_time,
+                "entry": price,
+                "sl": stop_loss,
+                "tp1": tp1,
+                "tp2": tp2,
                 "score": float(score_result["score"]),
-                "momentum_priority": momentum_priority,
-                "breakout": breakout,
-                "pre_breakout": pre_breakout,
-                "vol_ratio": vol_ratio,
-                "candle_strength": candle_strength,
-                "is_new": is_new,
-                "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
-                "early_priority": early_priority,
-                "is_reverse": is_reverse,
                 "setup_type": setup_type,
                 "setup_type_base": setup_type_base,
+                "reasons": score_result.get("reasons", []),
+                "warning_reasons": score_result.get("warning_reasons", []),
+                "btc_mode": btc_mode,
+                "funding_label": score_result.get("funding_label", "🟡 محايد"),
+                "pre_breakout": pre_breakout,
+                "breakout": breakout,
+                "vol_ratio": vol_ratio,
+                "candle_strength": candle_strength,
+                "mtf_confirmed": mtf_confirmed,
+                "is_new": is_new,
+                "btc_dominance_proxy": btc_dominance_proxy,
+                "change_24h": change_24h,
                 "raw_score": raw_score,
+                "effective_score": float(score_result["score"]),
                 "dynamic_threshold": dynamic_threshold,
                 "required_min_score": effective_required_min_score,
                 "final_threshold": final_threshold,
-                "adjustments_log": adjustments_log,
-                "warning_penalty": warning_penalty_value,
-                "warning_penalty_details": warning_penalty_details,
-                "warning_high_count": warning_high_count,
-                "warning_medium_count": warning_medium_count,
                 "dist_ma": dist_ma,
                 "entry_timing": entry_timing,
                 "opportunity_type": opportunity_type,
                 "market_state": market_state,
-                "current_mode": current_mode,
                 "market_state_label": market_state_label,
                 "market_bias_label": market_bias_label,
+                "alt_mode": alt_mode,
+                "early_priority": early_priority,
                 "breakout_quality": breakout_quality,
+                "risk_level": display_risk,
                 "fake_signal": bool(score_result.get("fake_signal", False)),
+                "is_reverse": is_reverse,
                 "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
+                "rank_volume_24h": float(pair_data.get("_rank_volume_24h", 0)),
+                "alert_id": alert_id,
                 "has_high_impact_news": has_high_impact_news,
-                "warning_reasons": score_result.get("warning_reasons", []),
                 "news_titles": [e.get("title", "") for e in upcoming_events[:3]],
+                "warning_penalty": warning_penalty_value,
+                "warning_high_count": warning_high_count,
+                "warning_medium_count": warning_medium_count,
+                "warning_penalty_details": warning_penalty_details,
+                "adjustments_log": adjustments_log,
+                "pullback_entry": pullback_entry,
                 "pullback_low": pullback_low,
                 "pullback_high": pullback_high,
-                "pullback_entry": pullback_entry,
                 "rr1": rr1,
                 "rr2": rr2,
-                "above_upper_bb": above_upper_bb,
-                "change_4h": change_4h,
-                "late_pump_risk": late_guard.get("late_pump_risk", False),
-                "extreme_late_pump": late_guard.get("extreme_late_pump", False),
-                "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
-                "late_guard_reasons": late_guard.get("reasons", []),
-                "rsi_now": rsi_now,
-                "market_guard_active": bool(market_guard.get("active", False)),
-                "market_guard_level": market_guard.get("level", "normal"),
-                "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
-                "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
-                "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
-                "vwap_distance": vwap_distance,
-                "rsi_slope": rsi_slope,
-                "macd_hist": macd_hist,
-                "macd_hist_slope": macd_hist_slope,
-                "upper_wick_ratio": upper_wick_ratio,
-                "retest_required": False,
-                "late_breakout_guard_reason": late_breakout_guard_reason,
                 "fib_position": entry_maturity_data.get("fib_position", "unknown"),
                 "fib_position_ratio": entry_maturity_data.get("fib_position_ratio", 0.0),
-                "fib_label": entry_maturity_data.get("fib_label", "غير معروف"),
+                "fib_label": entry_maturity_data.get("fib_label", ""),
                 "had_pullback": entry_maturity_data.get("had_pullback", False),
                 "pullback_pct": entry_maturity_data.get("pullback_pct", 0.0),
-                "pullback_label": entry_maturity_data.get("pullback_label", "غير معروف"),
+                "pullback_label": entry_maturity_data.get("pullback_label", ""),
                 "wave_estimate": entry_maturity_data.get("wave_estimate", 0),
                 "wave_peaks": entry_maturity_data.get("wave_peaks", 0),
-                "wave_label": entry_maturity_data.get("wave_label", "غير معروف"),
+                "wave_label": entry_maturity_data.get("wave_label", ""),
                 "entry_maturity": entry_maturity_data.get("entry_maturity", "unknown"),
                 "maturity_penalty": entry_maturity_data.get("maturity_penalty", 0.0),
                 "maturity_bonus": entry_maturity_data.get("maturity_bonus", 0.0),
-                "mtf_confirmed": mtf_confirmed,
                 "falling_knife_risk": bool(falling_knife_data.get("falling_knife_risk", False)),
                 "falling_knife_reasons": falling_knife_data.get("reasons", []),
-                "target_method": target_method,
-                "nearest_resistance": nearest_resistance,
-                "nearest_support": nearest_support,
-                "resistance_warning": resistance_warning,
-                "support_warning": support_warning,
-                "target_notes": target_notes,
-                "sl_method": sl_method,
-                "sl_notes": sl_notes,
-                "wave_context": wave_context,
-                "setup_context": setup_type,
                 "reversal_quality": "",
+                "wave_context": wave_context,
+                "setup_context": "",
                 "reversal_structure_confirmed": False,
                 "strong_bull_pullback": strong_bull_pullback,
                 "strong_breakout_exception": strong_breakout_exception,
@@ -7821,9 +7910,19 @@ def run_scanner_loop():
                 "extra_setup_bonus": extra_setup_bonus,
                 "primary_extra_setup": primary_extra_setup,
                 "extra_setups_details": extra_setups.get("details", {}),
+                "target_method": target_method,
+                "nearest_resistance": nearest_resistance,
+                "nearest_support": nearest_support,
+                "resistance_warning": resistance_warning,
+                "support_warning": support_warning,
+                "target_notes": target_notes,
+                "sl_method": sl_method,
+                "sl_notes": sl_notes,
                 "tp1_close_pct": TP1_CLOSE_PCT,
                 "tp2_close_pct": TP2_CLOSE_PCT,
                 "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                "momentum_priority": momentum_priority,
+                "now": now,
                 "message": build_message(
                     symbol=symbol,
                     price=price,
@@ -7939,7 +8038,7 @@ def run_scanner_loop():
                     "sl_method": sl_method,
                     "sl_notes": sl_notes,
                     "wave_context": wave_context,
-                    "setup_context": setup_type,
+                    "setup_context": "",
                     "reversal_quality": "",
                     "reversal_structure_confirmed": False,
                     "strong_bull_pullback": strong_bull_pullback,
@@ -7955,19 +8054,6 @@ def run_scanner_loop():
                     "tp2_close_pct": TP2_CLOSE_PCT,
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 },
-                "candle_time": candle_time,
-                "now": now,
-                "entry": price,
-                "sl": stop_loss,
-                "tp1": tp1,
-                "tp2": tp2,
-                "funding_label": score_result.get("funding_label", "🟡 محايد"),
-                "reasons": score_result.get("reasons", []),
-                "mtf_confirmed": mtf_confirmed,
-                "btc_dominance_proxy": btc_dominance_proxy,
-                "change_24h": change_24h,
-                "market_state": market_state,
-                "alt_mode": alt_mode,
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -7998,106 +8084,8 @@ def run_scanner_loop():
                 last_global_send_ts = time.time()
                 message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
                 save_alert_snapshot(candidate.get("alert_snapshot", {}), message_id=message_id)
-                trade_reasons = list(candidate["reasons"] or [])
-                if candidate.get("is_reverse"):
-                    if "OVERSOLD_REVERSAL" not in trade_reasons:
-                        trade_reasons.append("OVERSOLD_REVERSAL")
-                safe_register_trade(
-                    redis_client=r,
-                    symbol=symbol,
-                    market_type="futures",
-                    side="long",
-                    candle_time=candidate["candle_time"],
-                    entry=candidate["entry"],
-                    sl=candidate["sl"],
-                    tp1=candidate["tp1"],
-                    tp2=candidate["tp2"],
-                    score=candidate["score"],
-                    timeframe=TIMEFRAME,
-                    btc_mode=btc_mode,
-                    funding_label=candidate.get("funding_label", "🟡 محايد"),
-                    reasons=trade_reasons,
-                    pre_breakout=candidate.get("pre_breakout", False),
-                    breakout=candidate["breakout"],
-                    vol_ratio=candidate["vol_ratio"],
-                    candle_strength=candidate["candle_strength"],
-                    mtf_confirmed=candidate.get("mtf_confirmed", False),
-                    is_new=candidate["is_new"],
-                    btc_dominance_proxy=candidate.get("btc_dominance_proxy", "🟡 محايد"),
-                    change_24h=candidate["change_24h"],
-                    setup_type=candidate["setup_type"],
-                    setup_type_base=candidate.get("setup_type_base", ""),
-                    raw_score=candidate.get("raw_score", candidate["score"]),
-                    effective_score=candidate["score"],
-                    dynamic_threshold=candidate["dynamic_threshold"],
-                    required_min_score=candidate["required_min_score"],
-                    final_threshold=candidate.get("final_threshold", 0.0),
-                    adjustments_log=candidate.get("adjustments_log", []),
-                    warning_penalty=candidate.get("warning_penalty", 0.0),
-                    warning_penalty_details=candidate.get("warning_penalty_details", []),
-                    warning_high_count=candidate.get("warning_high_count", 0),
-                    warning_medium_count=candidate.get("warning_medium_count", 0),
-                    dist_ma=candidate["dist_ma"],
-                    entry_timing=candidate.get("entry_timing", ""),
-                    opportunity_type=candidate.get("opportunity_type", ""),
-                    market_state=candidate.get("market_state", "mixed"),
-                    market_state_label=candidate.get("market_state_label", ""),
-                    market_bias_label=candidate.get("market_bias_label", ""),
-                    alt_mode=candidate.get("alt_mode", ""),
-                    early_priority=candidate.get("early_priority", "none"),
-                    breakout_quality=candidate.get("breakout_quality", "none"),
-                    fake_signal=candidate.get("fake_signal", False),
-                    is_reverse_signal=candidate.get("is_reverse", False),
-                    reversal_4h_confirmed=candidate.get("reversal_4h_confirmed", False),
-                    rank_volume_24h=candidate.get("rank_volume_24h", 0.0),
-                    alert_id=candidate.get("alert_id", ""),
-                    has_high_impact_news=candidate.get("has_high_impact_news", False),
-                    news_titles=candidate.get("news_titles", []),
-                    warning_reasons=candidate.get("warning_reasons", []),
-                    pullback_low=candidate.get("pullback_low"),
-                    pullback_high=candidate.get("pullback_high"),
-                    pullback_entry=candidate.get("pullback_entry"),
-                    rr1=candidate.get("rr1", 2.0),
-                    rr2=candidate.get("rr2", 3.2),
-                    tp1_close_pct=candidate.get("tp1_close_pct", TP1_CLOSE_PCT),
-                    tp2_close_pct=candidate.get("tp2_close_pct", TP2_CLOSE_PCT),
-                    move_sl_to_entry_after_tp1=candidate.get("move_sl_to_entry_after_tp1", MOVE_SL_TO_ENTRY_AFTER_TP1),
-                    fib_position=candidate.get("fib_position", "unknown"),
-                    fib_position_ratio=candidate.get("fib_position_ratio", 0.0),
-                    fib_label=candidate.get("fib_label", "غير معروف"),
-                    had_pullback=candidate.get("had_pullback", False),
-                    pullback_pct=candidate.get("pullback_pct", 0.0),
-                    pullback_label=candidate.get("pullback_label", "غير معروف"),
-                    wave_estimate=candidate.get("wave_estimate", 0),
-                    wave_peaks=candidate.get("wave_peaks", 0),
-                    wave_label=candidate.get("wave_label", "غير معروف"),
-                    entry_maturity=candidate.get("entry_maturity", "unknown"),
-                    maturity_penalty=candidate.get("maturity_penalty", 0.0),
-                    maturity_bonus=candidate.get("maturity_bonus", 0.0),
-                    falling_knife_risk=candidate.get("falling_knife_risk", False),
-                    falling_knife_reasons=candidate.get("falling_knife_reasons", []),
-                    target_method=candidate.get("target_method", "rr"),
-                    nearest_resistance=candidate.get("nearest_resistance"),
-                    nearest_support=candidate.get("nearest_support"),
-                    resistance_warning=candidate.get("resistance_warning", ""),
-                    support_warning=candidate.get("support_warning", ""),
-                    target_notes=candidate.get("target_notes", []),
-                    sl_method=candidate.get("sl_method", "atr"),
-                    sl_notes=candidate.get("sl_notes", []),
-                    wave_context=candidate.get("wave_context", ""),
-                    setup_context=candidate.get("setup_context", ""),
-                    reversal_quality=candidate.get("reversal_quality", ""),
-                    reversal_structure_confirmed=candidate.get("reversal_structure_confirmed", False),
-                    strong_bull_pullback=candidate.get("strong_bull_pullback", False),
-                    strong_breakout_exception=candidate.get("strong_breakout_exception", False),
-                    htf_1h_context=candidate.get("htf_1h_context", {}),
-                    htf_4h_context=candidate.get("htf_4h_context", {}),
-                    has_extra_strong_setup=candidate.get("has_extra_strong_setup", False),
-                    extra_setup_names=candidate.get("extra_setup_names", []),
-                    extra_setup_bonus=candidate.get("extra_setup_bonus", 0.0),
-                    primary_extra_setup=candidate.get("primary_extra_setup", ""),
-                    extra_setups_details=candidate.get("extra_setups_details", {}),
-                )
+                # Register the trade using the centralized helper
+                register_trade_from_candidate(candidate)
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
                 release_signal_slot(symbol, candidate["candle_time"], "long")
