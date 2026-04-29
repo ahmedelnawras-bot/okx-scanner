@@ -1392,18 +1392,23 @@ def build_trade_registration_payload(candidate: dict) -> dict:
     }
 
 
-def register_trade_from_candidate(candidate: dict) -> None:
-    """Centralized registration with full payload and error logging."""
+def register_trade_from_candidate(candidate: dict) -> bool:
+    """Centralized registration with full payload and error logging.
+    Returns True if registration succeeded, False otherwise.
+    """
     try:
         payload = build_trade_registration_payload(candidate)
         register_trade(**payload)
+        logger.info(f"register_trade success | symbol={candidate.get('symbol', '?')} | alert_id={candidate.get('alert_id', '?')} | setup={candidate.get('setup_type', '?')} | current_mode={candidate.get('current_mode', '?')}")
+        return True
     except Exception as e:
         error_msg = (
             f"register_trade failed | symbol={candidate.get('symbol', '?')} | "
             f"alert_id={candidate.get('alert_id', '?')} | setup={candidate.get('setup_type', '?')} | "
-            f"error={e}"
+            f"current_mode={candidate.get('current_mode', '?')} | error={e}"
         )
         logger.error(error_msg)
+        return False
 
 
 # ----------- Helper functions for exits report -----------
@@ -6219,6 +6224,7 @@ def run_scanner_loop():
                         "extra_setup_bonus": 0.0,
                         "primary_extra_setup": "",
                         "extra_setups_details": {},
+                        "current_mode": current_mode,
                     }
                     register_trade_from_candidate(recovery_candidate)
                     logger.info(f"✅ SENT RECOVERY LONG ---> {symbol}")
@@ -7690,7 +7696,8 @@ def run_scanner_loop():
             rr1 = smart_targets_early.get("rr1_effective", rr1)
             rr2 = smart_targets_early.get("rr2_effective", rr2)
 
-            tv_link = build_tradingview_link(symbol)
+            # tv_link not needed here; will be built later
+
             explicit_warnings = score_result.get("warning_reasons") or []
             _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
             warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
@@ -7829,6 +7836,7 @@ def run_scanner_loop():
                 setup_type=setup_type,
                 since_ts=stats_reset_ts,
             )
+            # Build candidate WITHOUT message, alert_snapshot, reply_markup, tv_link
             candidate = {
                 "symbol": symbol,
                 "candle_time": candle_time,
@@ -7923,137 +7931,7 @@ def run_scanner_loop():
                 "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 "momentum_priority": momentum_priority,
                 "now": now,
-                "message": build_message(
-                    symbol=symbol,
-                    price=price,
-                    score_result=score_result,
-                    stop_loss=stop_loss,
-                    tp1=tp1,
-                    tp2=tp2,
-                    rr1=rr1,
-                    rr2=rr2,
-                    btc_mode=btc_mode,
-                    btc_dominance_proxy=btc_dominance_proxy,
-                    tv_link=tv_link,
-                    is_new=is_new,
-                    change_24h=change_24h,
-                    market_state_label=market_state_label,
-                    market_bias_label=market_bias_label,
-                    alt_mode=alt_mode,
-                    news_warning=news_warning_text,
-                    opportunity_type=opportunity_type,
-                    entry_timing=entry_timing,
-                    display_risk=display_risk,
-                    setup_stats=setup_stats,
-                    is_reverse=is_reverse,
-                    reversal_4h_confirmed=reversal_4h_result.get("confirmed", False),
-                    reversal_4h_details=reversal_4h_result.get("details", ""),
-                    breakout_quality=breakout_quality,
-                    pullback_low=pullback_low,
-                    pullback_high=pullback_high,
-                    entry_maturity_data=entry_maturity_data,
-                    warning_penalty=warning_penalty_value + res_dynamic_penalty,
-                    resistance_warning=resistance_warning,
-                    target_method=target_method,
-                    nearest_resistance=nearest_resistance,
-                    wave_context=wave_context,
-                    extra_setup_names=extra_setup_names,
-                    primary_extra_setup=primary_extra_setup,
-                    sl_method=sl_method,
-                ),
-                "reply_markup": build_track_reply_markup(alert_id),
-                "alert_id": alert_id,
-                "alert_snapshot": {
-                    "alert_id": alert_id,
-                    "symbol": symbol,
-                    "mode": current_mode,
-                    "market_mode": current_mode,
-                    "timeframe": TIMEFRAME,
-                    "market_entry": price,
-                    "entry": price,
-                    "recommended_entry": pullback_entry if pullback_entry else price,
-                    "pullback_entry": pullback_entry,
-                    "sl": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "rr1": rr1,
-                    "rr2": rr2,
-                    "score": float(score_result["score"]),
-                    "candle_time": candle_time,
-                    "created_ts": int(time.time()),
-                    "market_state": market_state,
-                    "alt_mode": alt_mode,
-                    "btc_mode": btc_mode,
-                    "entry_timing": entry_timing,
-                    "opportunity_type": opportunity_type,
-                    "early_priority": early_priority,
-                    "is_reverse": is_reverse,
-                    "setup_type": setup_type,
-                    "above_upper_bb": above_upper_bb,
-                    "change_4h": change_4h,
-                    "late_pump_risk": late_guard.get("late_pump_risk", False),
-                    "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
-                    "rsi_now": rsi_now,
-                    "dist_ma": dist_ma,
-                    "vol_ratio": vol_ratio,
-                    "pullback_low": pullback_low,
-                    "pullback_high": pullback_high,
-                    "pullback_entry": pullback_entry,
-                    "market_guard_active": bool(market_guard.get("active", False)),
-                    "market_guard_level": market_guard.get("level", "normal"),
-                    "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
-                    "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
-                    "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
-                    "vwap_distance": vwap_distance,
-                    "rsi_slope": rsi_slope,
-                    "macd_hist": macd_hist,
-                    "macd_hist_slope": macd_hist_slope,
-                    "upper_wick_ratio": upper_wick_ratio,
-                    "retest_required": False,
-                    "late_breakout_guard_reason": late_breakout_guard_reason,
-                    "fib_position": entry_maturity_data.get("fib_position", "unknown"),
-                    "fib_position_ratio": entry_maturity_data.get("fib_position_ratio", 0.0),
-                    "fib_label": entry_maturity_data.get("fib_label", "غير معروف"),
-                    "had_pullback": entry_maturity_data.get("had_pullback", False),
-                    "pullback_pct": entry_maturity_data.get("pullback_pct", 0.0),
-                    "pullback_label": entry_maturity_data.get("pullback_label", "غير معروف"),
-                    "wave_estimate": entry_maturity_data.get("wave_estimate", 0),
-                    "wave_peaks": entry_maturity_data.get("wave_peaks", 0),
-                    "wave_label": entry_maturity_data.get("wave_label", "غير معروف"),
-                    "entry_maturity": entry_maturity_data.get("entry_maturity", "unknown"),
-                    "maturity_penalty": entry_maturity_data.get("maturity_penalty", 0.0),
-                    "maturity_bonus": entry_maturity_data.get("maturity_bonus", 0.0),
-                    "final_threshold": final_threshold,
-                    "adjustments_log": adjustments_log,
-                    "warning_penalty": warning_penalty_value,
-                    "warning_penalty_details": warning_penalty_details,
-                    "falling_knife_risk": bool(falling_knife_data.get("falling_knife_risk", False)),
-                    "falling_knife_reasons": falling_knife_data.get("reasons", []),
-                    "target_method": target_method,
-                    "nearest_resistance": nearest_resistance,
-                    "nearest_support": nearest_support,
-                    "resistance_warning": resistance_warning,
-                    "support_warning": support_warning,
-                    "target_notes": target_notes,
-                    "sl_method": sl_method,
-                    "sl_notes": sl_notes,
-                    "wave_context": wave_context,
-                    "setup_context": "",
-                    "reversal_quality": "",
-                    "reversal_structure_confirmed": False,
-                    "strong_bull_pullback": strong_bull_pullback,
-                    "strong_breakout_exception": strong_breakout_exception,
-                    "htf_1h_context": htf_1h_context,
-                    "htf_4h_context": htf_4h_context,
-                    "has_extra_strong_setup": has_extra_strong_setup,
-                    "extra_setup_names": extra_setup_names,
-                    "extra_setup_bonus": extra_setup_bonus,
-                    "primary_extra_setup": primary_extra_setup,
-                    "extra_setups_details": extra_setups.get("details", {}),
-                    "tp1_close_pct": TP1_CLOSE_PCT,
-                    "tp2_close_pct": TP2_CLOSE_PCT,
-                    "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
-                },
+                "current_mode": current_mode,   # <-- ADDED
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -8072,9 +7950,74 @@ def run_scanner_loop():
             locked = reserve_signal_slot(symbol, candidate["candle_time"], "long")
             if not locked:
                 continue
+
+            # Build final message, tv_link, alert_snapshot, reply_markup NOW
+            tv_link = build_tradingview_link(symbol)
+            # Reconstruct a temporary score_result dict for build_message
+            temp_score_result = {
+                "score": candidate["score"],
+                "reasons": candidate.get("reasons", []),
+                "warning_reasons": candidate.get("warning_reasons", []),
+                "funding_label": candidate.get("funding_label", "🟡 محايد"),
+                "signal_rating": "⚡ عادي",  # default; not stored in candidate
+                "fake_signal": candidate.get("fake_signal", False),
+            }
+            message = build_message(
+                symbol=symbol,
+                price=candidate["entry"],
+                score_result=temp_score_result,
+                stop_loss=candidate["sl"],
+                tp1=candidate["tp1"],
+                tp2=candidate["tp2"],
+                rr1=candidate["rr1"],
+                rr2=candidate["rr2"],
+                btc_mode=btc_mode,
+                btc_dominance_proxy=btc_dominance_proxy,
+                tv_link=tv_link,
+                is_new=candidate["is_new"],
+                change_24h=candidate["change_24h"],
+                market_state_label=market_state_label,
+                market_bias_label=market_bias_label,
+                alt_mode=alt_mode,
+                news_warning=news_warning_text,
+                opportunity_type=candidate["opportunity_type"],
+                entry_timing=candidate["entry_timing"],
+                display_risk=candidate["risk_level"],
+                setup_stats=setup_stats,
+                is_reverse=candidate["is_reverse"],
+                reversal_4h_confirmed=candidate["reversal_4h_confirmed"],
+                reversal_4h_details=reversal_4h_result.get("details", ""),
+                breakout_quality=candidate["breakout_quality"],
+                pullback_low=candidate.get("pullback_low"),
+                pullback_high=candidate.get("pullback_high"),
+                entry_maturity_data={
+                    "fib_position": candidate.get("fib_position", "unknown"),
+                    "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
+                    "fib_label": candidate.get("fib_label", "غير معروف"),
+                    "had_pullback": candidate.get("had_pullback", False),
+                    "pullback_pct": candidate.get("pullback_pct", 0.0),
+                    "pullback_label": candidate.get("pullback_label", "غير معروف"),
+                    "wave_estimate": candidate.get("wave_estimate", 0),
+                    "wave_peaks": candidate.get("wave_peaks", 0),
+                    "wave_label": candidate.get("wave_label", "غير معروف"),
+                    "entry_maturity": candidate.get("entry_maturity", "unknown"),
+                    "maturity_penalty": candidate.get("maturity_penalty", 0.0),
+                    "maturity_bonus": candidate.get("maturity_bonus", 0.0),
+                },
+                warning_penalty=candidate["warning_penalty"] + res_dynamic_penalty,
+                resistance_warning=candidate["resistance_warning"],
+                target_method=candidate["target_method"],
+                nearest_resistance=candidate["nearest_resistance"],
+                wave_context=candidate["wave_context"],
+                extra_setup_names=candidate["extra_setup_names"],
+                primary_extra_setup=candidate["primary_extra_setup"],
+                sl_method=candidate["sl_method"],
+            )
+            reply_markup = build_track_reply_markup(candidate["alert_id"])
+
             sent_data = send_telegram_message(
-                candidate["message"],
-                reply_markup=candidate.get("reply_markup"),
+                message,
+                reply_markup=reply_markup,
             )
             if sent_data.get("ok"):
                 sent_count += 1
@@ -8083,8 +8026,99 @@ def run_scanner_loop():
                 last_candle_cache[symbol] = candidate["candle_time"]
                 last_global_send_ts = time.time()
                 message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
-                save_alert_snapshot(candidate.get("alert_snapshot", {}), message_id=message_id)
-                # Register the trade using the centralized helper
+                # Build alert_snapshot from candidate
+                alert_snapshot = {
+                    "alert_id": candidate["alert_id"],
+                    "symbol": symbol,
+                    "mode": current_mode,
+                    "market_mode": current_mode,
+                    "timeframe": TIMEFRAME,
+                    "market_entry": candidate["entry"],
+                    "entry": candidate["entry"],
+                    "recommended_entry": candidate.get("pullback_entry", candidate["entry"]),
+                    "pullback_entry": candidate.get("pullback_entry"),
+                    "sl": candidate["sl"],
+                    "tp1": candidate["tp1"],
+                    "tp2": candidate["tp2"],
+                    "rr1": candidate["rr1"],
+                    "rr2": candidate["rr2"],
+                    "score": candidate["score"],
+                    "candle_time": candidate["candle_time"],
+                    "created_ts": int(time.time()),
+                    "market_state": market_state,
+                    "alt_mode": alt_mode,
+                    "btc_mode": btc_mode,
+                    "entry_timing": candidate["entry_timing"],
+                    "opportunity_type": candidate["opportunity_type"],
+                    "early_priority": candidate["early_priority"],
+                    "is_reverse": candidate["is_reverse"],
+                    "setup_type": candidate["setup_type"],
+                    "above_upper_bb": above_upper_bb,
+                    "change_4h": change_4h,
+                    "late_pump_risk": late_guard.get("late_pump_risk", False),
+                    "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
+                    "rsi_now": rsi_now,
+                    "dist_ma": candidate["dist_ma"],
+                    "vol_ratio": candidate["vol_ratio"],
+                    "pullback_low": candidate.get("pullback_low"),
+                    "pullback_high": candidate.get("pullback_high"),
+                    "pullback_entry": candidate.get("pullback_entry"),
+                    "market_guard_active": bool(market_guard.get("active", False)),
+                    "market_guard_level": market_guard.get("level", "normal"),
+                    "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
+                    "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
+                    "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
+                    "vwap_distance": vwap_distance,
+                    "rsi_slope": rsi_slope,
+                    "macd_hist": macd_hist,
+                    "macd_hist_slope": macd_hist_slope,
+                    "upper_wick_ratio": upper_wick_ratio,
+                    "retest_required": False,
+                    "late_breakout_guard_reason": late_breakout_guard_reason,
+                    "fib_position": candidate.get("fib_position", "unknown"),
+                    "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
+                    "fib_label": candidate.get("fib_label", "غير معروف"),
+                    "had_pullback": candidate.get("had_pullback", False),
+                    "pullback_pct": candidate.get("pullback_pct", 0.0),
+                    "pullback_label": candidate.get("pullback_label", "غير معروف"),
+                    "wave_estimate": candidate.get("wave_estimate", 0),
+                    "wave_peaks": candidate.get("wave_peaks", 0),
+                    "wave_label": candidate.get("wave_label", "غير معروف"),
+                    "entry_maturity": candidate.get("entry_maturity", "unknown"),
+                    "maturity_penalty": candidate.get("maturity_penalty", 0.0),
+                    "maturity_bonus": candidate.get("maturity_bonus", 0.0),
+                    "final_threshold": candidate["final_threshold"],
+                    "adjustments_log": candidate["adjustments_log"],
+                    "warning_penalty": candidate["warning_penalty"],
+                    "warning_penalty_details": candidate["warning_penalty_details"],
+                    "falling_knife_risk": candidate["falling_knife_risk"],
+                    "falling_knife_reasons": candidate["falling_knife_reasons"],
+                    "target_method": candidate["target_method"],
+                    "nearest_resistance": candidate["nearest_resistance"],
+                    "nearest_support": candidate["nearest_support"],
+                    "resistance_warning": candidate["resistance_warning"],
+                    "support_warning": candidate["support_warning"],
+                    "target_notes": candidate["target_notes"],
+                    "sl_method": candidate["sl_method"],
+                    "sl_notes": candidate["sl_notes"],
+                    "wave_context": candidate["wave_context"],
+                    "setup_context": candidate["setup_context"],
+                    "reversal_quality": candidate["reversal_quality"],
+                    "reversal_structure_confirmed": candidate["reversal_structure_confirmed"],
+                    "strong_bull_pullback": candidate["strong_bull_pullback"],
+                    "strong_breakout_exception": candidate["strong_breakout_exception"],
+                    "htf_1h_context": candidate["htf_1h_context"],
+                    "htf_4h_context": candidate["htf_4h_context"],
+                    "has_extra_strong_setup": candidate["has_extra_strong_setup"],
+                    "extra_setup_names": candidate["extra_setup_names"],
+                    "extra_setup_bonus": candidate["extra_setup_bonus"],
+                    "primary_extra_setup": candidate["primary_extra_setup"],
+                    "extra_setups_details": candidate.get("extra_setups_details", {}),
+                    "tp1_close_pct": TP1_CLOSE_PCT,
+                    "tp2_close_pct": TP2_CLOSE_PCT,
+                    "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                }
+                save_alert_snapshot(alert_snapshot, message_id=message_id)
                 register_trade_from_candidate(candidate)
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
