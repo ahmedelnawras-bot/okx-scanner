@@ -378,13 +378,22 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "support_warning": normalize_text(extra_fields.get("support_warning"), ""),
         "target_notes": normalize_list(extra_fields.get("target_notes")),
         "sl_method": normalize_text(extra_fields.get("sl_method"), "unknown"),
-        "sl_notes": normalize_text(extra_fields.get("sl_notes"), ""),
+        # sl_notes كـ list
+        "sl_notes": normalize_list(extra_fields.get("sl_notes")),
         "wave_context": normalize_text(extra_fields.get("wave_context"), ""),
         "setup_context": normalize_text(extra_fields.get("setup_context"), ""),
         "reversal_quality": normalize_text(extra_fields.get("reversal_quality"), ""),
         "reversal_structure_confirmed": normalize_bool(extra_fields.get("reversal_structure_confirmed", False)),
         "strong_bull_pullback": normalize_bool(extra_fields.get("strong_bull_pullback", False)),
         "strong_breakout_exception": normalize_bool(extra_fields.get("strong_breakout_exception", False)),
+
+        # حقول Extra Strong Setup
+        "has_extra_strong_setup": normalize_bool(extra_fields.get("has_extra_strong_setup", False)),
+        "extra_setup_names": normalize_list(extra_fields.get("extra_setup_names")),
+        "extra_setup_bonus": safe_float(extra_fields.get("extra_setup_bonus"), 0.0),
+        "primary_extra_setup": normalize_text(extra_fields.get("primary_extra_setup"), ""),
+        "extra_setups_details": extra_fields.get("extra_setups_details") or {},
+
         "protected_breakeven": normalize_bool(extra_fields.get("protected_breakeven", False)),
         "breakeven_protection_reason": normalize_text(extra_fields.get("breakeven_protection_reason"), ""),
         "breakeven_protected_ts": (
@@ -414,6 +423,8 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "market_type": trade_data.get("market_type", "futures"),
         "side": trade_data.get("side", "long"),
         "setup_type": trade_data.get("setup_type", "unknown"),
+        "timeframe": trade_data.get("timeframe", "15m"),
+        "candle_time": safe_int(trade_data.get("candle_time"), 0),
 
         "score": safe_float(trade_data.get("score"), 0.0),
         "entry": safe_float(trade_data.get("entry"), 0.0),
@@ -471,7 +482,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "support_warning": get_field("support_warning", ""),
         "target_notes": normalize_list(get_field("target_notes", [])),
         "sl_method": get_field("sl_method", "unknown"),
-        "sl_notes": get_field("sl_notes", ""),
+        "sl_notes": normalize_list(get_field("sl_notes", [])),
         "falling_knife_risk": normalize_bool(get_field("falling_knife_risk", False)),
         "falling_knife_reasons": normalize_list(get_field("falling_knife_reasons", [])),
         "wave_context": get_field("wave_context", ""),
@@ -480,6 +491,14 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "reversal_structure_confirmed": normalize_bool(get_field("reversal_structure_confirmed", False)),
         "strong_bull_pullback": normalize_bool(get_field("strong_bull_pullback", False)),
         "strong_breakout_exception": normalize_bool(get_field("strong_breakout_exception", False)),
+
+        # Extra Strong Setup fields in history
+        "has_extra_strong_setup": normalize_bool(get_field("has_extra_strong_setup", False)),
+        "extra_setup_names": normalize_list(get_field("extra_setup_names", [])),
+        "extra_setup_bonus": safe_float(get_field("extra_setup_bonus", 0.0)),
+        "primary_extra_setup": get_field("primary_extra_setup", ""),
+        "extra_setups_details": get_field("extra_setups_details", {}) or {},
+
         "tp1_close_pct": safe_float(get_field("tp1_close_pct", 50.0)),
         "tp2_close_pct": safe_float(get_field("tp2_close_pct", 50.0)),
         "move_sl_to_entry_after_tp1": normalize_bool(get_field("move_sl_to_entry_after_tp1", True)),
@@ -574,7 +593,7 @@ def register_trade(
     support_warning: str = None,
     target_notes: list = None,
     sl_method: str = None,
-    sl_notes: str = None,
+    sl_notes: list = None,
     falling_knife_risk: bool = False,
     falling_knife_reasons: list = None,
     reversal_quality: str = None,
@@ -675,6 +694,13 @@ def register_trade(
     _strong_breakout_exception = normalize_bool(strong_breakout_exception) if strong_breakout_exception is not None else normalize_bool(_get_kwarg("strong_breakout_exception", False))
     _falling_knife_reasons = normalize_list(falling_knife_reasons) if falling_knife_reasons is not None else normalize_list(_get_kwarg("falling_knife_reasons"))
 
+    # Extra Strong Setup fields
+    _has_extra_strong_setup = normalize_bool(_get_kwarg("has_extra_strong_setup", False))
+    _extra_setup_names = normalize_list(_get_kwarg("extra_setup_names"))
+    _extra_setup_bonus = safe_float(_get_kwarg("extra_setup_bonus"), 0.0)
+    _primary_extra_setup = normalize_text(_get_kwarg("primary_extra_setup"), "")
+    _extra_setups_details = _get_kwarg("extra_setups_details", {}) or {}
+
     pre_signal = bool(pre_breakout)
     break_signal = bool(breakout)
     signal_event = "breakdown" if side == "short" else "breakout"
@@ -748,6 +774,13 @@ def register_trade(
         "reversal_structure_confirmed": reversal_structure_confirmed,
         "strong_bull_pullback": _strong_bull_pullback,
         "strong_breakout_exception": _strong_breakout_exception,
+        # Extra Strong Setup
+        "has_extra_strong_setup": _has_extra_strong_setup,
+        "extra_setup_names": _extra_setup_names,
+        "extra_setup_bonus": _extra_setup_bonus,
+        "primary_extra_setup": _primary_extra_setup,
+        "extra_setups_details": _extra_setups_details,
+
         "protected_breakeven": protected_breakeven,
         "breakeven_protection_reason": breakeven_protection_reason,
         "breakeven_protected_ts": breakeven_protected_ts,
@@ -811,7 +844,7 @@ def register_trade(
         "support_warning": support_warning or "",
         "target_notes": normalize_list(target_notes),
         "sl_method": sl_method or "unknown",
-        "sl_notes": sl_notes or "",
+        "sl_notes": normalize_list(sl_notes),
         "falling_knife_risk": normalize_bool(falling_knife_risk),
         "falling_knife_reasons": _falling_knife_reasons,
         "wave_context": wave_context or "",
@@ -820,6 +853,14 @@ def register_trade(
         "reversal_structure_confirmed": bool(reversal_structure_confirmed),
         "strong_bull_pullback": _strong_bull_pullback,
         "strong_breakout_exception": _strong_breakout_exception,
+
+        # Extra Strong Setup top-level
+        "has_extra_strong_setup": _has_extra_strong_setup,
+        "extra_setup_names": _extra_setup_names,
+        "extra_setup_bonus": _extra_setup_bonus,
+        "primary_extra_setup": _primary_extra_setup,
+        "extra_setups_details": _extra_setups_details,
+
         "tp1_close_pct": _tp1_close_pct,
         "tp2_close_pct": _tp2_close_pct,
         "move_sl_to_entry_after_tp1": _move_sl_to_entry_after_tp1,
@@ -997,7 +1038,6 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
             safe_float(trade_data.get("entry"), 0.0)
         )
 
-        # استخدام tp1_close_pct من trade_data أو diagnostics، الافتراضي 50
         tp1_close_pct = safe_float(
             trade_data.get("tp1_close_pct", diagnostics.get("tp1_close_pct", 50.0)),
             50.0
@@ -1011,7 +1051,6 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         trade_data["remaining_position_pct"] = remaining_pct
         trade_data["updated_at"] = int(time.time())
 
-        # هل ننقل SL لنقطة الدخول؟
         move_sl = normalize_bool(
             trade_data.get("move_sl_to_entry_after_tp1",
                           diagnostics.get("move_sl_to_entry_after_tp1", True))
@@ -1349,6 +1388,94 @@ def load_trades(
     return trades
 
 
+def load_trades_with_history(
+    redis_client,
+    market_type: Optional[str] = None,
+    side: Optional[str] = None,
+    since_ts: Optional[int] = None,
+    include_open: bool = True,
+) -> List[dict]:
+    """
+    تحميل الصفقات من trade:* و trade_history:* مع دمج وإزالة التكرار.
+    - الأولوية للـ trade:* للصفقات التي لا تزال مفتوحة/أحدث.
+    - التكرار: نفس (market_type, side, symbol, candle_time).
+    - الترتيب من الأحدث إلى الأقدم حسب created_at أو candle_time.
+    """
+    if redis_client is None:
+        return []
+
+    mt = normalize_market_type(market_type) if market_type else "*"
+    sd = normalize_side(side) if side else "*"
+    pattern_trade = f"trade:{mt}:{sd}:*"
+    pattern_history = f"trade_history:{mt}:{sd}:*"
+
+    trades_dict = {}  # مفتاح (market_type, side, symbol, candle_time) -> trade dict
+
+    def _dedup_key(trade_dict):
+        m = normalize_market_type(trade_dict.get("market_type", "futures"))
+        s = normalize_side(trade_dict.get("side", "long"))
+        sym = trade_dict.get("symbol", "")
+        ctime = safe_int(trade_dict.get("candle_time"), 0)
+        return (m, s, sym, ctime)
+
+    # قراءة trade:* أولاً
+    try:
+        for key in redis_client.scan_iter(pattern_trade):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                trade = json.loads(raw)
+            except Exception:
+                continue
+            trades_dict[_dedup_key(trade)] = trade
+    except Exception as e:
+        logger.error(f"load_trades_with_history trade scan error: {e}")
+
+    # قراءة trade_history:* وتجاوز التكرارات (الموجودة أصلاً من trade:*)
+    try:
+        for key in redis_client.scan_iter(pattern_history):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                trade = json.loads(raw)
+            except Exception:
+                continue
+            dedup = _dedup_key(trade)
+            if dedup not in trades_dict:
+                trades_dict[dedup] = trade
+    except Exception as e:
+        logger.error(f"load_trades_with_history history scan error: {e}")
+
+    # تحويل القاموس إلى قائمة وتطبيق الفلاتر
+    trades = []
+    for trade in trades_dict.values():
+        if since_ts is not None:
+            ts = get_trade_created_ts(trade)
+            if not ts:
+                ts = safe_int(trade.get("candle_time", 0), 0)
+            if ts < since_ts:
+                continue
+
+        if not include_open:
+            status = str(trade.get("status", "") or "").strip().lower()
+            if status in ("open", "partial"):
+                continue
+
+        trades.append(trade)
+
+    # ترتيب من الأحدث إلى الأقدم
+    trades.sort(
+        key=lambda x: (
+            safe_int(x.get("created_at") or get_trade_created_ts(x) or x.get("candle_time", 0)),
+        ),
+        reverse=True,
+    )
+
+    return trades
+
+
 # ------------------------------------------------------------
 # SETUP TYPE STATS
 # ------------------------------------------------------------
@@ -1561,7 +1688,8 @@ def get_trade_summary(
 
     side_norm = normalize_side(side or "long")
 
-    trades = load_trades(
+    # استخدام الدالة الجديدة لتحميل الصفقات من trade + history دون تكرار
+    trades = load_trades_with_history(
         redis_client,
         market_type=market_type,
         side=side_norm,
@@ -1967,38 +2095,26 @@ def get_all_trades_data(
     if redis_client is None:
         return []
 
+    # تنظيف المفاتيح المنتهية من trades:all قبل أي قراءة
+    try:
+        cleanup_missing_trades_from_index(redis_client)
+    except Exception:
+        pass
+
+    # تحسين: استخدام load_trades_with_history عند use_history=True
+    if use_history:
+        return load_trades_with_history(
+            redis_client=redis_client,
+            market_type=market_type,
+            side=side,
+            since_ts=since_ts,
+            include_open=True,
+        )
+
+    # وضع use_history=False (الوضع الافتراضي)
     trades = []
 
     try:
-        if use_history:
-            pattern = "trade_history:*"
-
-            for key in redis_client.scan_iter(pattern):
-                raw = redis_client.get(key)
-                if not raw:
-                    continue
-
-                try:
-                    trade = json.loads(raw)
-                except Exception:
-                    continue
-
-                trade_market = normalize_market_type(trade.get("market_type", "futures"))
-                trade_side = normalize_side(trade.get("side", "long"))
-                created_ts = get_trade_created_ts(trade)
-                ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0), 0)
-
-                if market_type and trade_market != normalize_market_type(market_type):
-                    continue
-                if side and trade_side != normalize_side(side):
-                    continue
-                if since_ts is not None and ts_for_filter < since_ts:
-                    continue
-
-                trades.append(trade)
-
-            return trades
-
         trade_keys = list(redis_client.smembers(get_all_trades_set_key()))
 
         for trade_key in trade_keys:
@@ -2079,7 +2195,8 @@ def get_common_loss_reasons(
     trades: Optional[List[dict]] = None,
 ):
     if trades is None:
-        trades = load_trades(
+        # استخدام load_trades_with_history ليشمل trade و trade_history
+        trades = load_trades_with_history(
             redis_client,
             market_type=market_type,
             side=side,
