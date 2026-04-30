@@ -237,6 +237,7 @@ else:
 # =========================
 sent_cache = {}
 last_candle_cache = {}
+last_candle_cache_meta = {}
 last_global_send_ts = 0.0
 _local_news_cache = {"created_ts": 0, "events": []}
 
@@ -792,8 +793,15 @@ def get_change_8(df) -> float:
     try:
         if df is None or df.empty or len(df) < 8:
             return 0.0
-        close_now = _safe_float(df.iloc[-1].get("close"), 0.0)
-        close_8 = _safe_float(df.iloc[-8].get("close"), 0.0)
+        # Use signal row instead of raw last row for consistency
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return 0.0
+        idx = signal_row.name
+        if idx < 7:
+            return 0.0
+        close_now = _safe_float(df.iloc[idx]["close"], 0.0)
+        close_8 = _safe_float(df.iloc[idx - 7]["close"], 0.0)
         if close_8 <= 0:
             return 0.0
         return round(((close_now - close_8) / close_8) * 100, 2)
@@ -6018,21 +6026,32 @@ def fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS) 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_fetch, s): s for s in symbols}
         for future in as_completed(futures):
+            sym = futures[future]
             try:
-                sym, rate = future.result()
+                _, rate = future.result()
                 result[sym] = rate
             except Exception as e:
-                # Failed future, log and assign 0.0
-                # Try to find symbol from future context, but simpler: iterate futures items
-                for f, s in futures.items():
-                    if f == future:
-                        sym = s
-                        break
-                else:
-                    sym = "unknown"
                 logger.warning(f"Funding fetch failed for {sym}: {e}")
                 result[sym] = 0.0
     return result
+
+# =========================
+# LOCAL CACHE CLEANUP
+# =========================
+def cleanup_local_caches():
+    """Prevent unlimited growth of local caches."""
+    now = time.time()
+    # sent_cache: remove entries older than LOCAL_RECENT_SEND_SECONDS + 300 seconds margin
+    margin = 300
+    stale_send = [sym for sym, ts in sent_cache.items() if now - ts > LOCAL_RECENT_SEND_SECONDS + margin]
+    for sym in stale_send:
+        del sent_cache[sym]
+    # last_candle_cache: remove entries whose metadata timestamp is older than 1 hour (3600 seconds)
+    horizon = 3600
+    stale_candle = [sym for sym, ts in last_candle_cache_meta.items() if now - ts > horizon]
+    for sym in stale_candle:
+        last_candle_cache.pop(sym, None)
+        last_candle_cache_meta.pop(sym, None)
 
 # =========================
 # MAIN LOOP
@@ -6049,6 +6068,10 @@ def run_command_poller():
 def run_scanner_loop():
  global last_global_send_ts
  while True:
+    try:
+        cleanup_local_caches()
+    except Exception:
+        pass
     scan_locked = False
     try:
         scan_locked = acquire_scan_lock()
@@ -6277,6 +6300,7 @@ def run_scanner_loop():
                     recovery_sent += 1
                     sent_cache[symbol] = time.time()
                     last_candle_cache[symbol] = candle_time
+                    last_candle_cache_meta[symbol] = time.time()
                     message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
                     alert_snapshot = {
                         "alert_id": alert_id,
@@ -7500,12 +7524,12 @@ def run_scanner_loop():
             resistance_rejected = False
             resistance_dynamic_penalty = 0.0
             
-            # Calculate actual warnings_count and display_risk correctly
+            # early display_risk for near_resistance_guard (computed before final warnings)
             explicit_warnings = score_result.get("warning_reasons") or []
             _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
-            warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
-            base_risk = get_base_risk_label(score_result, warnings_count)
-            display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing_temp)
+            warnings_count_early = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
+            base_risk_early = get_base_risk_label(score_result, warnings_count_early)
+            display_risk_early = adjust_risk_with_entry_timing(base_risk_early, entry_timing_temp)
 
             should_reject_near_resistance, res_dynamic_penalty = near_resistance_guard_long(
                 resistance_warning=early_resistance_warning,
@@ -7514,7 +7538,7 @@ def run_scanner_loop():
                 btc_mode=btc_mode,
                 alt_mode=alt_mode,
                 current_mode=current_mode,
-                display_risk=display_risk,
+                display_risk=display_risk_early,
                 late_guard=late_guard,
                 vol_ratio=vol_ratio,
                 candle_strength=candle_strength,
@@ -7551,7 +7575,7 @@ def run_scanner_loop():
                             market_state in ("risk_off", "btc_leading", "mixed"),
                             "هابط" in btc_mode,
                             "ضعيف" in alt_mode,
-                            "مرتفع" in display_risk,
+                            "مرتفع" in display_risk_early,
                             current_mode == MODE_STRONG_LONG_ONLY,
                             late_guard.get("late_pump_risk", False),
                             (vol_ratio >= 1.8 and candle_strength >= 0.60),
@@ -7989,7 +8013,7 @@ def run_scanner_loop():
                     wave_context = "wave_5_override"
             if primary_extra_setup:
                 wave_context = primary_extra_setup
-            setup_type_candidate = {
+            setup_type_candidate_final = {
                 "is_reverse": is_reverse,
                 "breakout": breakout,
                 "pre_breakout": pre_breakout,
@@ -7998,7 +8022,7 @@ def run_scanner_loop():
                 "market_state": market_state,
                 "wave_context": wave_context,
             }
-            setup_type = build_setup_type(setup_type_candidate)
+            setup_type = build_setup_type(setup_type_candidate_final)
             setup_type_base = "|".join(str(setup_type).split("|")[:4])
             if (setup_type_base in WEAK_SETUP_TYPES
                 and not is_reverse
@@ -8050,6 +8074,15 @@ def run_scanner_loop():
                     continue
                 momentum_priority -= 0.60
                 momentum_priority = round(momentum_priority, 2)
+
+            # --- FINAL risk label calculation after all warnings/penalties ---
+            final_explicit_warnings = score_result.get("warning_reasons") or []
+            _, final_inferred_warnings = classify_reasons(score_result.get("reasons", []))
+            final_warnings_count = len(final_explicit_warnings) if final_explicit_warnings else len(final_inferred_warnings)
+            final_base_risk = get_base_risk_label(score_result, final_warnings_count)
+            final_display_risk = adjust_risk_with_entry_timing(final_base_risk, entry_timing)
+            # ----------------------------------------------------------------
+
             setup_stats = get_setup_type_stats(
                 redis_client=r,
                 market_type="futures",
@@ -8094,7 +8127,7 @@ def run_scanner_loop():
                 "alt_mode": alt_mode,
                 "early_priority": early_priority,
                 "breakout_quality": breakout_quality,
-                "risk_level": display_risk,
+                "risk_level": final_display_risk,
                 "fake_signal": bool(score_result.get("fake_signal", False)),
                 "is_reverse": is_reverse,
                 "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
@@ -8259,9 +8292,10 @@ def run_scanner_loop():
                 sent_symbols_this_run.add(symbol)
                 sent_cache[symbol] = time.time()
                 last_candle_cache[symbol] = candidate["candle_time"]
+                last_candle_cache_meta[symbol] = time.time()
                 last_global_send_ts = time.time()
                 message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
-                # Build alert_snapshot from candidate
+                # Build alert_snapshot from candidate (fix recommended_entry)
                 alert_snapshot = {
                     "alert_id": candidate["alert_id"],
                     "symbol": symbol,
@@ -8270,7 +8304,7 @@ def run_scanner_loop():
                     "timeframe": TIMEFRAME,
                     "market_entry": candidate["entry"],
                     "entry": candidate["entry"],
-                    "recommended_entry": candidate.get("pullback_entry", candidate["entry"]),
+                    "recommended_entry": candidate.get("pullback_entry") or candidate["entry"],
                     "pullback_entry": candidate.get("pullback_entry"),
                     "sl": candidate["sl"],
                     "tp1": candidate["tp1"],
