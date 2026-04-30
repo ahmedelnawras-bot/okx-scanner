@@ -238,6 +238,7 @@ else:
 sent_cache = {}
 last_candle_cache = {}
 last_global_send_ts = 0.0
+_local_news_cache = {"created_ts": 0, "events": []}
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -852,9 +853,69 @@ def detect_extra_strong_long_setups(
 # =========================
 # ECONOMIC CALENDAR
 # =========================
+NEWS_CACHE_KEY = "cache:long:high_impact_news"
+NEWS_CACHE_TTL = 300
+
 def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> list:
- try:
+    """Fetch high-impact events with Redis or in-memory caching."""
     now = int(time.time())
+
+    # 1. Try Redis cache
+    if r:
+        try:
+            cached = r.get(NEWS_CACHE_KEY)
+            if cached:
+                data = json.loads(cached)
+                if isinstance(data, dict) and data.get("created_ts", 0) > now - NEWS_CACHE_TTL:
+                    logger.info("News cache hit (Redis)")
+                    return data.get("events", [])
+        except Exception as e:
+            logger.warning(f"News cache read error: {e}")
+
+    # 2. Fallback to local in-memory cache
+    if _local_news_cache.get("created_ts", 0) > now - NEWS_CACHE_TTL:
+        logger.info("News in-memory cache hit")
+        return _local_news_cache.get("events", [])
+
+    # 3. Fetch from HTTP
+    try:
+        events = _fetch_high_impact_events_http(now, window_hours)
+
+        # Store to Redis (if available) and local memory
+        payload = {"created_ts": now, "events": events}
+        if r:
+            try:
+                r.set(NEWS_CACHE_KEY, json.dumps(payload, ensure_ascii=False), ex=NEWS_CACHE_TTL + 60)
+                logger.info("News cache refreshed via HTTP -> Redis")
+            except Exception as e:
+                logger.warning(f"News cache write error: {e}")
+        # Update local in-memory cache
+        _local_news_cache["created_ts"] = now
+        _local_news_cache["events"] = events
+        return events
+
+    except Exception as e:
+        logger.warning(f"News HTTP fetch failed: {e}")
+
+        # Fallback to any existing cache, regardless of TTL
+        if r:
+            try:
+                cached = r.get(NEWS_CACHE_KEY)
+                if cached:
+                    data = json.loads(cached)
+                    if isinstance(data, dict):
+                        logger.info("News cache fallback from Redis after HTTP failure")
+                        return data.get("events", [])
+            except Exception:
+                pass
+
+        if _local_news_cache.get("events"):
+            logger.info("News cache fallback from local memory after HTTP failure")
+            return _local_news_cache["events"]
+
+        return []
+
+def _fetch_high_impact_events_http(now: int, window_hours: int) -> list:
     window_end = now + (window_hours * 3600)
     url = "https://economic-calendar.tradingview.com/events"
     params = {
@@ -892,9 +953,6 @@ def get_upcoming_high_impact_events(window_hours: int = NEWS_WINDOW_HOURS) -> li
             })
     logger.info(f"Economic calendar: {len(high_impact)} high-impact events in next {window_hours}h")
     return high_impact
- except Exception as e:
-    logger.warning(f"Economic calendar error: {e}")
-    return []
 
 
 def format_news_warning(events: list) -> str:
@@ -1198,9 +1256,8 @@ def reset_stats(chat_id: str):
     logger.warning(f"reset_stats blocked for non-admin chat_id={chat_id}")
     return
  try:
-    keys = r.keys("trade:futures:long:*")
     deleted = 0
-    for key in keys:
+    for key in r.scan_iter("trade:futures:long:*"):
         try:
             r.delete(key)
             deleted += 1
@@ -1398,16 +1455,34 @@ def register_trade_from_candidate(candidate: dict) -> bool:
     """
     try:
         payload = build_trade_registration_payload(candidate)
-        register_trade(**payload)
-        logger.info(f"register_trade success | symbol={candidate.get('symbol', '?')} | alert_id={candidate.get('alert_id', '?')} | setup={candidate.get('setup_type', '?')} | current_mode={candidate.get('current_mode', '?')}")
-        return True
+        result = register_trade(**payload)
+        return interpret_register_trade_result(result, candidate)
     except Exception as e:
         error_msg = (
-            f"register_trade failed | symbol={candidate.get('symbol', '?')} | "
+            f"register_trade failed exception | symbol={candidate.get('symbol', '?')} | "
             f"alert_id={candidate.get('alert_id', '?')} | setup={candidate.get('setup_type', '?')} | "
             f"current_mode={candidate.get('current_mode', '?')} | error={e}"
         )
         logger.error(error_msg)
+        return False
+
+def interpret_register_trade_result(result, candidate: dict) -> bool:
+    """Interpret register_trade return value (True/False/None/other)."""
+    symbol = candidate.get('symbol', '?')
+    alert_id = candidate.get('alert_id', '?')
+    setup = candidate.get('setup_type', '?')
+    current_mode = candidate.get('current_mode', '?')
+    if result is True:
+        logger.info(f"register_trade success_true | symbol={symbol} | alert_id={alert_id} | setup={setup} | current_mode={current_mode}")
+        return True
+    elif result is False:
+        logger.error(f"register_trade failed_false | symbol={symbol} | alert_id={alert_id} | setup={setup} | current_mode={current_mode}")
+        return False
+    elif result is None:
+        logger.info(f"register_trade success_none_legacy | symbol={symbol} | alert_id={alert_id} | setup={setup} | current_mode={current_mode}")
+        return True
+    else:
+        logger.error(f"register_trade unexpected_result={result!r} | symbol={symbol} | alert_id={alert_id} | setup={setup} | current_mode={current_mode}")
         return False
 
 
@@ -1417,27 +1492,58 @@ def _load_long_trades_from_redis(limit: int = 700) -> list:
     if not r:
         return trades
     try:
-        keys = r.keys("trade:futures:long:*")
-        for key in keys[:limit]:
+        trade_count = 0
+        history_count = 0
+        seen_ids = set()
+
+        # Load from trade:futures:long:*
+        for key in r.scan_iter("trade:futures:long:*"):
             try:
                 raw = r.get(key)
                 if not raw:
                     continue
                 data = json.loads(raw)
-                if isinstance(data, dict):
-                    data["_redis_key"] = key
-                    trades.append(data)
+                if not isinstance(data, dict):
+                    continue
+                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                data["_redis_key"] = key
+                trades.append(data)
+                trade_count += 1
             except Exception:
                 continue
 
-        trades.sort(
-            key=lambda x: int(float(x.get("created_ts") or x.get("candle_time") or 0)),
-            reverse=True
-        )
-        return trades
+        # Load from trade_history:futures:long:*
+        for key in r.scan_iter("trade_history:futures:long:*"):
+            try:
+                raw = r.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                data["_redis_key"] = key
+                trades.append(data)
+                history_count += 1
+            except Exception:
+                continue
+
+        logger.info(f"Loaded trades: trade={trade_count} history={history_count} after dedupe={len(trades)}")
     except Exception as e:
         logger.error(f"_load_long_trades_from_redis error: {e}")
         return trades
+
+    trades.sort(
+        key=lambda x: int(float(x.get("created_ts") or x.get("candle_time") or 0)),
+        reverse=True
+    )
+    return trades[:limit]
 
 
 def _pct_safe(value, decimals=2):
@@ -2164,6 +2270,33 @@ def get_max_move_since_alert(symbol: str, since_ts: int, entry: float, side: str
         logger.error(f"get_max_move_since_alert error on {symbol}: {e}")
         return entry, 0.0, entry, 0.0
 
+def resolve_alert_official_or_estimated_status(alert: dict) -> dict:
+    """
+    Determine the display status for an alert.
+    If official trade data exists and provides a status, use it without calling get_alert_status.
+    Otherwise fall back to estimated candle movement.
+    """
+    symbol = alert.get("symbol", "Unknown")
+    official_status = ""
+    trade = load_registered_trade_for_alert(alert)
+    if trade:
+        official_status = format_official_trade_status(trade)
+        if official_status:
+            return {
+                "official_status": official_status,
+                "estimated_status": "",
+                "display_status": official_status,
+                "is_official": True
+            }
+    # No official trade / empty status – fallback to estimated
+    estimated_status = get_alert_status(alert)
+    return {
+        "official_status": "",
+        "estimated_status": estimated_status,
+        "display_status": estimated_status,
+        "is_official": False
+    }
+
 def get_alert_status(alert: dict) -> str:
  try:
     symbol = alert["symbol"]
@@ -2228,12 +2361,21 @@ def load_registered_trade_for_alert(alert: dict):
  try:
     symbol = alert.get("symbol", "")
     candle_time = int(_safe_float(alert.get("candle_time"), 0))
+    # primary key
     trade_key = f"trade:futures:long:{symbol}:{candle_time}"
     raw = r.get(trade_key)
-    if not raw:
-        return None
-    data = json.loads(raw)
-    return data if isinstance(data, dict) else None
+    if raw:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    # fallback to trade_history
+    history_key = f"trade_history:futures:long:{symbol}:{candle_time}"
+    raw = r.get(history_key)
+    if raw:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    return None
  except Exception as e:
     logger.warning(f"load_registered_trade_for_alert error: {e}")
     return None
@@ -2287,14 +2429,24 @@ def build_track_message(alert: dict) -> str:
         entry=effective_entry,
         side="long",
     )
-    status = get_alert_status(alert)
+
+    # Resolve official vs estimated status (no extra loading of official trade here)
+    status_info = resolve_alert_official_or_estimated_status(alert)
+    display_status = status_info["display_status"]
+    is_official = status_info["is_official"]
+
+    if is_official:
+        logger.info(f"Track using official status for {alert.get('alert_id')}: {display_status}")
+    else:
+        logger.info(f"Track using estimated status for {alert.get('alert_id')}: {display_status}")
+
     duration_seconds = max(0, int(time.time()) - created_ts)
     duration_h = duration_seconds // 3600
     duration_m = (duration_seconds % 3600) // 60
     current_move = 0.0
     if effective_entry > 0 and current_price > 0:
         current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
-    state_badge = get_track_state_badge(status, current_move)
+    state_badge = get_track_state_badge(display_status, current_move)
     tv_link = build_track_tradingview_link(alert.get("symbol", ""))
     leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
     leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
@@ -2309,8 +2461,6 @@ def build_track_message(alert: dict) -> str:
             f"• Entry 2: {entry2:.6f}\n"
             f"• Avg Planned Entry: {avg_planned:.6f}"
         )
-    official_trade = load_registered_trade_for_alert(alert)
-    official_status = format_official_trade_status(official_trade)
     msg = (
         f"📌 <b>Alert Track</b>\n\n"
         f"🪙 {html.escape(symbol)}\n"
@@ -2329,12 +2479,14 @@ def build_track_message(alert: dict) -> str:
         f"🏁 TP2: {tp2:.6f} | إغلاق 50%\n"
         f"🛡 بعد TP1: نقل SL إلى Entry\n\n"
         f"{state_badge}\n"
-        f"📊 {html.escape(status)}\n"
+        f"📊 {html.escape(display_status)}"
     )
-    if official_status:
-        msg += f"🏛 {html.escape(official_status)}\n"
+    if is_official:
+        msg += "\n🏛️ <b>حالة رسمية</b> (مستندة إلى سجل الصفقة)"
+    else:
+        msg += "\n⚠️ <b>حالة تقديرية</b> لعدم توفر صفقة مسجلة"
     msg += (
-        f"💵 السعر الحالي: {current_price:.6f}\n"
+        f"\n💵 السعر الحالي: {current_price:.6f}\n"
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
         f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
         f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
@@ -4791,6 +4943,11 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
 
 
 def find_nearest_resistance_long(df, entry: float):
+    """
+    Find a prioritized nearest resistance above entry.
+    Priority order: swing_high > recent_close_high > prev_20_high > bb_upper > round_level_confirmed > major_round_level.
+    Within the same source priority, the closest price is selected.
+    """
     try:
         candidates = _collect_resistance_candidates_long(df, entry)
         if not candidates:
@@ -5840,8 +5997,20 @@ def fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS) 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_fetch, s): s for s in symbols}
         for future in as_completed(futures):
-            sym, rate = future.result()
-            result[sym] = rate
+            try:
+                sym, rate = future.result()
+                result[sym] = rate
+            except Exception as e:
+                # Failed future, log and assign 0.0
+                # Try to find symbol from future context, but simpler: iterate futures items
+                for f, s in futures.items():
+                    if f == future:
+                        sym = s
+                        break
+                else:
+                    sym = "unknown"
+                logger.warning(f"Funding fetch failed for {sym}: {e}")
+                result[sym] = 0.0
     return result
 
 # =========================
@@ -7836,7 +8005,7 @@ def run_scanner_loop():
                 setup_type=setup_type,
                 since_ts=stats_reset_ts,
             )
-            # Build candidate WITHOUT message, alert_snapshot, reply_markup, tv_link
+            # Build candidate WITH all needed fields; no message/alert_snapshot/tv_link yet
             candidate = {
                 "symbol": symbol,
                 "candle_time": candle_time,
@@ -7932,6 +8101,20 @@ def run_scanner_loop():
                 "momentum_priority": momentum_priority,
                 "now": now,
                 "current_mode": current_mode,   # <-- ADDED
+                # NEW per-candidate analysis fields
+                "setup_stats": setup_stats,
+                "reversal_4h_result": reversal_4h_result,
+                "above_upper_bb": above_upper_bb,
+                "change_4h": change_4h,
+                "late_guard": late_guard,
+                "rsi_now": rsi_now,
+                "vwap_distance": vwap_distance,
+                "rsi_slope": rsi_slope,
+                "macd_hist": macd_hist,
+                "macd_hist_slope": macd_hist_slope,
+                "upper_wick_ratio": upper_wick_ratio,
+                "res_dynamic_penalty": res_dynamic_penalty,
+                "signal_rating": score_result.get("signal_rating", "⚡ عادي"),
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -7959,7 +8142,7 @@ def run_scanner_loop():
                 "reasons": candidate.get("reasons", []),
                 "warning_reasons": candidate.get("warning_reasons", []),
                 "funding_label": candidate.get("funding_label", "🟡 محايد"),
-                "signal_rating": "⚡ عادي",  # default; not stored in candidate
+                "signal_rating": candidate.get("signal_rating", "⚡ عادي"),
                 "fake_signal": candidate.get("fake_signal", False),
             }
             message = build_message(
@@ -7983,10 +8166,10 @@ def run_scanner_loop():
                 opportunity_type=candidate["opportunity_type"],
                 entry_timing=candidate["entry_timing"],
                 display_risk=candidate["risk_level"],
-                setup_stats=setup_stats,
+                setup_stats=candidate.get("setup_stats"),
                 is_reverse=candidate["is_reverse"],
-                reversal_4h_confirmed=candidate["reversal_4h_confirmed"],
-                reversal_4h_details=reversal_4h_result.get("details", ""),
+                reversal_4h_confirmed=candidate["reversal_4h_result"]["confirmed"],
+                reversal_4h_details=candidate["reversal_4h_result"].get("details", ""),
                 breakout_quality=candidate["breakout_quality"],
                 pullback_low=candidate.get("pullback_low"),
                 pullback_high=candidate.get("pullback_high"),
@@ -8004,7 +8187,7 @@ def run_scanner_loop():
                     "maturity_penalty": candidate.get("maturity_penalty", 0.0),
                     "maturity_bonus": candidate.get("maturity_bonus", 0.0),
                 },
-                warning_penalty=candidate["warning_penalty"] + res_dynamic_penalty,
+                warning_penalty=candidate["warning_penalty"] + candidate.get("res_dynamic_penalty", 0.0),
                 resistance_warning=candidate["resistance_warning"],
                 target_method=candidate["target_method"],
                 nearest_resistance=candidate["nearest_resistance"],
@@ -8053,11 +8236,11 @@ def run_scanner_loop():
                     "early_priority": candidate["early_priority"],
                     "is_reverse": candidate["is_reverse"],
                     "setup_type": candidate["setup_type"],
-                    "above_upper_bb": above_upper_bb,
-                    "change_4h": change_4h,
-                    "late_pump_risk": late_guard.get("late_pump_risk", False),
-                    "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
-                    "rsi_now": rsi_now,
+                    "above_upper_bb": candidate["above_upper_bb"],
+                    "change_4h": candidate["change_4h"],
+                    "late_pump_risk": candidate["late_guard"].get("late_pump_risk", False),
+                    "bull_continuation_risk": candidate["late_guard"].get("bull_continuation_risk", False),
+                    "rsi_now": candidate["rsi_now"],
                     "dist_ma": candidate["dist_ma"],
                     "vol_ratio": candidate["vol_ratio"],
                     "pullback_low": candidate.get("pullback_low"),
@@ -8068,11 +8251,11 @@ def run_scanner_loop():
                     "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
                     "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
                     "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
-                    "vwap_distance": vwap_distance,
-                    "rsi_slope": rsi_slope,
-                    "macd_hist": macd_hist,
-                    "macd_hist_slope": macd_hist_slope,
-                    "upper_wick_ratio": upper_wick_ratio,
+                    "vwap_distance": candidate["vwap_distance"],
+                    "rsi_slope": candidate["rsi_slope"],
+                    "macd_hist": candidate["macd_hist"],
+                    "macd_hist_slope": candidate["macd_hist_slope"],
+                    "upper_wick_ratio": candidate["upper_wick_ratio"],
                     "retest_required": False,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
                     "fib_position": candidate.get("fib_position", "unknown"),
