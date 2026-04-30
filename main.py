@@ -7499,6 +7499,14 @@ def run_scanner_loop():
             early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
             resistance_rejected = False
             resistance_dynamic_penalty = 0.0
+            
+            # Calculate actual warnings_count and display_risk correctly
+            explicit_warnings = score_result.get("warning_reasons") or []
+            _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
+            warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
+            base_risk = get_base_risk_label(score_result, warnings_count)
+            display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing_temp)
+
             should_reject_near_resistance, res_dynamic_penalty = near_resistance_guard_long(
                 resistance_warning=early_resistance_warning,
                 nearest_resistance=early_nearest_resistance,
@@ -7506,7 +7514,7 @@ def run_scanner_loop():
                 btc_mode=btc_mode,
                 alt_mode=alt_mode,
                 current_mode=current_mode,
-                display_risk=get_base_risk_label(score_result, 0),
+                display_risk=display_risk,
                 late_guard=late_guard,
                 vol_ratio=vol_ratio,
                 candle_strength=candle_strength,
@@ -7571,6 +7579,26 @@ def run_scanner_loop():
                     "value": -res_dynamic_penalty,
                     "reason": early_resistance_warning
                 })
+
+            # Compute early setup_type_base for possible use in final_threshold rejection reasons
+            wave_context_early = infer_wave_context(
+                entry_maturity_data=entry_maturity_data,
+                is_reverse=is_reverse,
+                dist_ma=dist_ma,
+                breakout=breakout,
+                pre_breakout=pre_breakout,
+            )
+            setup_type_candidate = {
+                "is_reverse": is_reverse,
+                "breakout": breakout,
+                "pre_breakout": pre_breakout,
+                "mtf_confirmed": mtf_confirmed,
+                "vol_ratio": vol_ratio,
+                "market_state": market_state,
+                "wave_context": wave_context_early,
+            }
+            setup_type = build_setup_type(setup_type_candidate)
+            setup_type_base = "|".join(str(setup_type).split("|")[:4])
 
             dynamic_threshold = get_dynamic_entry_threshold(
                 market_state=market_state,
@@ -7923,41 +7951,6 @@ def run_scanner_loop():
             rr1 = smart_targets_early.get("rr1_effective", rr1)
             rr2 = smart_targets_early.get("rr2_effective", rr2)
 
-            # tv_link not needed here; will be built later
-
-            explicit_warnings = score_result.get("warning_reasons") or []
-            _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
-            warnings_count = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
-            base_risk = get_base_risk_label(score_result, warnings_count)
-            display_risk = adjust_risk_with_entry_timing(base_risk, entry_timing)
-            if "🔴" in entry_timing and "🔴" in display_risk and not breakout and vol_ratio < 1.2:
-                log_long_rejection(
-                    symbol=symbol,
-                    reason="late_high_risk_low_volume",
-                    candle_time=candle_time,
-                    score=score_result.get("score"),
-                    raw_score=raw_score,
-                    final_threshold=final_threshold,
-                    market_state=market_state,
-                    current_mode=current_mode,
-                    entry_timing=entry_timing,
-                    opportunity_type=opportunity_type,
-                    dist_ma=dist_ma,
-                    rsi_now=rsi_now,
-                    vol_ratio=vol_ratio,
-                    vwap_distance=vwap_distance,
-                    mtf_confirmed=mtf_confirmed,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    is_reverse=is_reverse,
-                    extra={"display_risk": display_risk,
-                           "has_extra_strong_setup": has_extra_strong_setup,
-                           "extra_setup_names": extra_setup_names,
-                           "primary_extra_setup": primary_extra_setup,
-                           "extra_setup_bonus": extra_setup_bonus},
-                )
-                logger.info(f"{symbol} → rejected (late + high risk + no breakout + low vol)")
-                continue
             momentum_priority = get_momentum_priority(
                 score=float(score_result["score"]),
                 breakout=breakout,
@@ -7979,6 +7972,7 @@ def run_scanner_loop():
                 momentum_priority -= 0.30
             momentum_priority = round(momentum_priority, 2)
             alert_id = build_alert_id(symbol, candle_time)
+            # Redefine wave_context with possible overrides
             wave_context = infer_wave_context(
                 entry_maturity_data=entry_maturity_data,
                 is_reverse=is_reverse,
@@ -8063,7 +8057,7 @@ def run_scanner_loop():
                 setup_type=setup_type,
                 since_ts=stats_reset_ts,
             )
-            # Build candidate WITH all needed fields; no message/alert_snapshot/tv_link yet
+            # Store late_breakout_guard_reason inside candidate
             candidate = {
                 "symbol": symbol,
                 "candle_time": candle_time,
@@ -8158,8 +8152,8 @@ def run_scanner_loop():
                 "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 "momentum_priority": momentum_priority,
                 "now": now,
-                "current_mode": current_mode,   # <-- ADDED
-                # NEW per-candidate analysis fields
+                "current_mode": current_mode,
+                "late_breakout_guard_reason": late_breakout_guard_reason,
                 "setup_stats": setup_stats,
                 "reversal_4h_result": reversal_4h_result,
                 "above_upper_bb": above_upper_bb,
@@ -8315,7 +8309,7 @@ def run_scanner_loop():
                     "macd_hist_slope": candidate["macd_hist_slope"],
                     "upper_wick_ratio": candidate["upper_wick_ratio"],
                     "retest_required": False,
-                    "late_breakout_guard_reason": late_breakout_guard_reason,
+                    "late_breakout_guard_reason": candidate["late_breakout_guard_reason"],
                     "fib_position": candidate.get("fib_position", "unknown"),
                     "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
                     "fib_label": candidate.get("fib_label", "غير معروف"),
@@ -8360,10 +8354,12 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 }
                 save_alert_snapshot(alert_snapshot, message_id=message_id)
+                # Use alert_id from candidate now
+                candidate_alert_id = candidate["alert_id"]
                 register_ok = register_trade_from_candidate(candidate)
-                set_alert_registration_status(alert_id, register_ok)
+                set_alert_registration_status(candidate_alert_id, register_ok)
                 if not register_ok:
-                    logger.error(f"REGISTRATION FAILED after send: symbol={symbol}, alert_id={alert_id}, setup={candidate['setup_type']}, mode={current_mode}, message_id={message_id}")
+                    logger.error(f"REGISTRATION FAILED after send: symbol={symbol}, alert_id={candidate_alert_id}, setup={candidate['setup_type']}, mode={current_mode}, message_id={message_id}")
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
                 release_signal_slot(symbol, candidate["candle_time"], "long")
