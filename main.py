@@ -370,8 +370,12 @@ def log_long_rejection(
     pre_breakout=None,
     is_reverse=None,
     extra=None,
+    secondary_reasons=None,
 ):
     try:
+        extra_dict = extra if isinstance(extra, dict) else {}
+        if secondary_reasons:
+            extra_dict["secondary_reasons"] = secondary_reasons
         log_rejected_candidate(
             redis_client=r,
             symbol=symbol,
@@ -393,7 +397,7 @@ def log_long_rejection(
             breakout=breakout,
             pre_breakout=pre_breakout,
             is_reverse=is_reverse,
-            extra=extra,
+            extra=extra_dict or None,
         )
     except Exception as e:
         logger.warning(f"log_long_rejection failed for {symbol} reason={reason}: {e}")
@@ -2020,8 +2024,8 @@ def build_market_status_message() -> str:
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
         valid_count = int(market_guard.get("valid_count", 0) or 0)
         guard_level = str(market_guard.get("level", "normal"))
-        suggested_mode = normalize_market_mode(snapshot.get("current_mode", MODE_NORMAL_LONG))
-        suggested_reason = mode_reason
+        suggested_mode = normalize_market_mode(snapshot.get("suggested_mode", snapshot.get("current_mode", MODE_NORMAL_LONG)))
+        suggested_reason = snapshot.get("suggested_reason", mode_reason)
         data_source = f"📦 Snapshot ({age_str})"
     else:
         current_mode = normalize_market_mode(r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG)
@@ -2200,6 +2204,23 @@ def load_alert_snapshot_by_message_id(message_id: str):
  except Exception as e:
     logger.error(f"load_alert_snapshot_by_message_id error: {e}")
     return None
+
+def set_alert_registration_status(alert_id: str, success: bool) -> None:
+    if not r or not alert_id:
+        return
+    try:
+        raw = r.get(get_alert_key(alert_id))
+        if raw:
+            data = json.loads(raw)
+            data["register_trade_failed"] = not success
+            data["register_trade_status"] = "ok" if success else "failed"
+            if not success:
+                data["register_trade_failed_ts"] = int(time.time())
+            else:
+                data.pop("register_trade_failed_ts", None)
+            r.set(get_alert_key(alert_id), json.dumps(data, ensure_ascii=False), ex=ALERT_TTL_SECONDS)
+    except Exception as e:
+        logger.error(f"set_alert_registration_status failed for {alert_id}: {e}")
 
 def should_ignore_track_callback(chat_id: str, message_id: str, alert_id: str) -> bool:
  if not r:
@@ -2490,7 +2511,7 @@ def build_track_message(alert: dict) -> str:
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
         f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
         f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
-        f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | +{adverse_pct:.2f}% | بعد الرافعة: +{leveraged_adverse:.2f}%\n"
+        f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
         f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
         f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
     )
@@ -6137,6 +6158,8 @@ def run_scanner_loop():
             "market_info": market_info,
             "market_guard": market_guard,
             "ranked_pairs_count": len(ranked_pairs),
+            "suggested_mode": mode_result.get("mode", current_mode),
+            "suggested_reason": mode_result.get("reason", ""),
         }
         save_market_status_snapshot(snapshot_data)
         global_cooldown_active = is_global_cooldown_active()
@@ -6395,7 +6418,10 @@ def run_scanner_loop():
                         "extra_setups_details": {},
                         "current_mode": current_mode,
                     }
-                    register_trade_from_candidate(recovery_candidate)
+                    register_ok = register_trade_from_candidate(recovery_candidate)
+                    set_alert_registration_status(alert_id, register_ok)
+                    if not register_ok:
+                        logger.error(f"REGISTRATION FAILED after send: symbol={symbol}, alert_id={alert_id}, setup=recovery, mode={current_mode}, message_id={message_id}")
                     logger.info(f"✅ SENT RECOVERY LONG ---> {symbol}")
                 else:
                     release_signal_slot(symbol, candle_time, "long")
@@ -7067,6 +7093,12 @@ def run_scanner_loop():
                         breakout=breakout,
                         pre_breakout=pre_breakout,
                         is_reverse=is_reverse,
+                        secondary_reasons=[
+                            "early_priority: " + early_priority,
+                            "breakout_quality: " + breakout_quality,
+                            "has_extra_strong_setup: " + str(has_extra_strong_setup),
+                            "strong_bull_pullback: " + str(strong_bull_pullback),
+                        ],
                         extra={
                             "early_priority": early_priority,
                             "strong_bull_pullback": strong_bull_pullback,
@@ -7506,6 +7538,18 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    secondary_reasons=[
+                        "weak_market_conditions" if any(cond for cond in [
+                            market_state in ("risk_off", "btc_leading", "mixed"),
+                            "هابط" in btc_mode,
+                            "ضعيف" in alt_mode,
+                            "مرتفع" in display_risk,
+                            current_mode == MODE_STRONG_LONG_ONLY,
+                            late_guard.get("late_pump_risk", False),
+                            (vol_ratio >= 1.8 and candle_strength >= 0.60),
+                            upper_wick_ratio >= 0.35,
+                        ]) else "strong_exception_missing"
+                    ],
                     extra={
                         "nearest_resistance": early_nearest_resistance,
                         "resistance_warning": early_resistance_warning,
@@ -7816,6 +7860,19 @@ def run_scanner_loop():
                 continue
 
             if score_result["score"] < final_threshold:
+                sec_reasons = []
+                if late_guard.get("late_pump_risk"):
+                    sec_reasons.append("late_pump_risk")
+                if late_guard.get("bull_continuation_risk"):
+                    sec_reasons.append("bull_continuation_risk")
+                if trap_check["soft_trap"]:
+                    sec_reasons.append("soft_trap")
+                if warning_penalty_value > 0:
+                    sec_reasons.append("warning_penalty_applied")
+                if res_dynamic_penalty > 0:
+                    sec_reasons.append("near_resistance_penalty")
+                if setup_type_base in WEAK_SETUP_TYPES and not is_reverse and not pre_breakout and breakout_quality != "strong":
+                    sec_reasons.append("weak_historical_setup_penalty_applied")
                 log_long_rejection(
                     symbol=symbol,
                     reason="final_threshold",
@@ -7835,6 +7892,7 @@ def run_scanner_loop():
                     breakout=breakout,
                     pre_breakout=pre_breakout,
                     is_reverse=is_reverse,
+                    secondary_reasons=sec_reasons,
                     extra={
                         "dynamic_threshold": dynamic_threshold,
                         "required_min_score": effective_required_min_score,
@@ -8302,7 +8360,10 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 }
                 save_alert_snapshot(alert_snapshot, message_id=message_id)
-                register_trade_from_candidate(candidate)
+                register_ok = register_trade_from_candidate(candidate)
+                set_alert_registration_status(alert_id, register_ok)
+                if not register_ok:
+                    logger.error(f"REGISTRATION FAILED after send: symbol={symbol}, alert_id={alert_id}, setup={candidate['setup_type']}, mode={current_mode}, message_id={message_id}")
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
                 release_signal_slot(symbol, candidate["candle_time"], "long")
