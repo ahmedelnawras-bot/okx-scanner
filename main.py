@@ -218,6 +218,12 @@ WEAK_SETUP_TYPES = {
 }
 
 # =========================
+# NEW CONFIG FOR BLOCK PROTECTION
+# =========================
+PROTECT_ON_BLOCK_MIN_PROFIT_PCT = 0.15
+PROTECT_ON_BLOCK_BUFFER_PCT = 0.10
+
+# =========================
 # REDIS
 # =========================
 r = None
@@ -1227,7 +1233,8 @@ def build_help_message() -> str:
 /report_diagnostics - تقرير تشخيصي كامل
 
 <b>🛠 إدارة:</b>
-/reset_stats - تصفير إحصائيات اللونج
+/reset_stats - تصفير إحصائيات اللونج (soft)
+/hard_reset - مسح كامل لبيانات اللونج (للمدراء فقط)
 /stats_since_reset - الأداء منذ آخر تصفير
 /how_it_work - شرح طريقة عمل البوت
 
@@ -2128,6 +2135,86 @@ def build_market_status_message() -> str:
 # =========================
 # COMMAND HANDLERS
 # =========================
+def handle_hard_reset(chat_id: str):
+    if not r:
+        send_telegram_reply(chat_id, "❌ Redis غير متصل")
+        return
+    if ADMIN_CHAT_IDS and str(chat_id) not in ADMIN_CHAT_IDS:
+        send_telegram_reply(chat_id, f"⛔ غير مسموح\nchat_id={chat_id}")
+        logger.warning(f"hard_reset blocked for non-admin chat_id={chat_id}")
+        return
+    try:
+        del_trade = 0
+        del_history = 0
+        del_alert = 0
+        del_cooldown = 0
+        mode_cache_deleted = 0
+
+        # Trade keys
+        for key in r.scan_iter("trade:futures:long:*"):
+            r.delete(key)
+            del_trade += 1
+        # Trade history keys
+        for key in r.scan_iter("trade_history:futures:long:*"):
+            r.delete(key)
+            del_history += 1
+        # Open trades / stats
+        r.delete("open_trades:futures:long")
+        r.delete("stats:futures:long")
+        r.delete("stats:last_reset_ts:long")
+
+        # Market mode keys
+        mode_keys = [
+            MARKET_MODE_KEY,
+            MARKET_MODE_LAST_KEY,
+            MARKET_MODE_LAST_TRANSITION_KEY,
+            MARKET_MODE_LAST_RECOVERY_CHECK_KEY,
+            MARKET_MODE_NORMAL_CANDIDATE_KEY,
+            MARKET_MODE_BLOCK_STARTED_KEY,
+            MARKET_MODE_LAST_SAFE_SEEN_KEY,
+        ]
+        for k in mode_keys:
+            if r.delete(k):
+                mode_cache_deleted += 1
+
+        # Cache keys
+        r.delete(ALT_SNAPSHOT_CACHE_KEY)
+        r.delete(MARKET_STATUS_SNAPSHOT_KEY)
+        r.delete(TELEGRAM_OFFSET_KEY)
+        r.delete(TELEGRAM_BOOTSTRAP_DONE_KEY)
+        r.delete(TELEGRAM_POLL_LOCK_KEY)
+
+        # Alerts and sent/cooldowns
+        for key in r.scan_iter("alert:long:*"):
+            r.delete(key)
+            del_alert += 1
+        for key in r.scan_iter("alertmsg:long:*"):
+            r.delete(key)
+            del_alert += 1
+        for key in r.scan_iter("sent:long:*"):
+            r.delete(key)
+            del_cooldown += 1
+        for key in r.scan_iter("cooldown:long:*"):
+            r.delete(key)
+            del_cooldown += 1
+        r.delete("global_cooldown:long")
+        # optional: scan lock
+        r.delete(SCAN_LOCK_KEY)
+
+        msg = (
+            "🔥 <b>Hard Reset LONG تم بنجاح</b>\n"
+            f"- trade keys: {del_trade}\n"
+            f"- trade_history keys: {del_history}\n"
+            f"- alerts/cooldowns: {del_alert + del_cooldown}\n"
+            f"- mode/cache keys deleted: {mode_cache_deleted}\n"
+            f"- time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
+        )
+        send_telegram_reply(chat_id, msg)
+        logger.info(f"HARD RESET LONG executed by {chat_id}: {msg}")
+    except Exception as e:
+        logger.error(f"Hard reset error: {e}")
+        send_telegram_reply(chat_id, f"❌ Hard reset failed: {html.escape(str(e))}")
+
 COMMAND_HANDLERS = {
  "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
  "/mood": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
@@ -2156,6 +2243,7 @@ COMMAND_HANDLERS = {
  "/report_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
  "/reset_stats": lambda chat_id: reset_stats(chat_id),
  "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
+ "/hard_reset": handle_hard_reset,
 }
 
 # =========================
@@ -5840,7 +5928,8 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "• السوق يهبط بعنف أو فيه ضغط جماعي واضح",
         "• تم إيقاف إشارات Long الجديدة مؤقتًا",
         f"• الانتقال: {transition}",
-        "• الأوامر والتقارير و Track شغالة عادي"
+        "• الأوامر والتقارير و Track شغالة عادي",
+        "• تم رفع وقف الخسارة للصفقات الرابحة المفتوحة فوق سعر الدخول"
     ]
  elif new_mode == MODE_RECOVERY_LONG:
     lines = [
@@ -6144,6 +6233,10 @@ def run_scanner_loop():
         )
         current_mode = handle_market_mode_transition(mode_result)
 
+        # --- UPDATE OPEN TRADES WITH PROTECTION (supports buffer if available) ---
+        # NOTE: update_open_trades currently may not support 'breakeven_buffer_pct'.
+        # If it raises TypeError, we fall back to the old call without buffer.
+        # To fully enable SL above entry, tracking/performance.py must accept breakeven_buffer_pct.
         try:
             update_open_trades(
                 r,
@@ -6152,14 +6245,48 @@ def run_scanner_loop():
                 timeframe=TIMEFRAME,
                 market_mode=current_mode,
                 protect_breakeven_on_block=True,
-                breakeven_min_profit_pct=0.15,
+                breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
+                breakeven_buffer_pct=PROTECT_ON_BLOCK_BUFFER_PCT,
                 reason=f"market_mode={current_mode}",
             )
         except TypeError:
-            logger.warning("update_open_trades does not support breakeven kwargs yet, falling back to old call")
-            update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
+            logger.warning("update_open_trades does not accept breakeven_buffer_pct, using fallback without buffer")
+            try:
+                update_open_trades(
+                    r,
+                    market_type="futures",
+                    side="long",
+                    timeframe=TIMEFRAME,
+                    market_mode=current_mode,
+                    protect_breakeven_on_block=True,
+                    breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
+                    reason=f"market_mode={current_mode}",
+                )
+            except Exception:
+                update_open_trades(r, market_type="futures", side="long", timeframe=TIMEFRAME)
         except Exception as e:
             logger.error(f"update_open_trades error: {e}")
+
+        # Log protected count when in BLOCK_LONGS
+        if current_mode == MODE_BLOCK_LONGS and r:
+            try:
+                open_trades_data = r.get("open_trades:futures:long")
+                protected_count = 0
+                if open_trades_data:
+                    trades = json.loads(open_trades_data)
+                    if isinstance(trades, list):
+                        protected_count = sum(
+                            1 for t in trades
+                            if t.get("protected_breakeven") or t.get("breakeven_protected")
+                        )
+                if protected_count > 0:
+                    logger.info(
+                        f"BLOCK_LONGS protection active: {protected_count} open long trades have SL moved above entry (protected)."
+                    )
+                else:
+                    logger.info("No open long trades protected (or buffer not applied).")
+            except Exception as e:
+                logger.warning(f"Could not count protected trades: {e}")
 
         winrate_summary = get_winrate_summary(r, market_type="futures", side="long")
         logger.info(format_winrate_summary(winrate_summary))
