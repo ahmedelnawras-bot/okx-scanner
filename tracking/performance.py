@@ -27,6 +27,18 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - update_open_trades يمنع إعادة معالجة الشموع القديمة نهائياً.
 - حماية breakeven لا تغيّر نقطة بدء التقييم.
 - توافق تام مع الصفقات القديمة و main.py.
+
+**إصدار 3.2 – توافق كامل مع main-10.py**
+- إضافة entry_mode, market_entry, recommended_entry, has_pullback_plan لـ register_trade.
+- إصلاح effective_entry: يُحسب من pullback_entry لما entry_mode == "pullback_pending".
+- إصلاح pullback_triggered: كان هارد كود False، دلوقتي بييجي من القيمة الفعلية.
+- إضافة الحقول الجديدة لـ build_trade_diagnostics وbuild_history_snapshot وtrade_data top-level.
+
+**إصدار 3.3 – إصلاح منطق pullback_pending**
+- صفقات البولباك المعلّقة لا تُقيَّم (SL / TP) حتى يلمس السعر pullback_entry.
+- status = "pending_pullback" حتى التفعيل، ثم يتحول إلى "open".
+- عند تفعيل البولباك تُحدَّث الأهداف وتُحفظ التغييرات فوراً.
+- إضافة تتبع تحليلي كامل للصفقات المعلّقة.
 """
 
 import json
@@ -161,6 +173,21 @@ def safe_timestamp(ts_value, default=0) -> int:
         return ts
     except (ValueError, TypeError):
         return default
+
+
+def get_trade_effective_entry(trade: dict) -> float:
+    """
+    ترجع سعر الدخول الفعلي للصفقة بغض النظر عن حالتها.
+    الأولوية: trade["effective_entry"] → diagnostics["effective_entry"] → trade["entry"]
+    """
+    diagnostics = trade.get("diagnostics", {}) or {}
+    eff = trade.get("effective_entry")
+    if eff is not None and safe_float(eff, 0.0) > 0:
+        return safe_float(eff, 0.0)
+    eff = diagnostics.get("effective_entry")
+    if eff is not None and safe_float(eff, 0.0) > 0:
+        return safe_float(eff, 0.0)
+    return safe_float(trade.get("entry"), 0.0)
 
 
 # ------------------------------------------------------------
@@ -424,6 +451,18 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "sl_moved_to_entry": normalize_bool(_get("sl_moved_to_entry", False)),
         "sl_move_reason": normalize_text(_get("sl_move_reason"), ""),
         "exit_reason": normalize_text(_get("exit_reason"), ""),
+
+        # حقول الدخول الجديدة (v3.2 - main-10 compatibility) + v3.3 pullback tracking
+        "entry_mode": normalize_text(_get("entry_mode"), "market"),
+        "market_entry": round_price(_get("market_entry")) if _get("market_entry") is not None else None,
+        "recommended_entry": round_price(_get("recommended_entry")) if _get("recommended_entry") is not None else None,
+        "has_pullback_plan": normalize_bool(_get("has_pullback_plan", False)),
+
+        # حقول تتبع تفعيل البولباك
+        "activated_at": safe_int(_get("activated_at")) if _get("activated_at") is not None else None,
+        "activated_candle_ts": safe_int(_get("activated_candle_ts")) if _get("activated_candle_ts") is not None else None,
+        "pending_pullback_expired": normalize_bool(_get("pending_pullback_expired", False)),
+        "pending_pullback_expire_reason": normalize_text(_get("pending_pullback_expire_reason"), ""),
     }
 
     return diagnostics
@@ -497,7 +536,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
 
         # حقول جديدة
         "setup_type_base": _get_field("setup_type_base", ""),
-        "final_threshold": safe_float(_get_field("final_threshold", 0.0)),
+        "final_threshold": safe_float(_get_field("final_threshold"), 0.0),
         "target_method": _get_field("target_method", "unknown"),
         "nearest_resistance": _get_field("nearest_resistance"),
         "nearest_support": _get_field("nearest_support"),
@@ -549,6 +588,19 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "sl_move_reason": _get_field("sl_move_reason", ""),
         "exit_reason": _get_field("exit_reason", ""),
         "last_processed_candle_ts": safe_timestamp(trade_data.get("last_processed_candle_ts"), 0),
+
+        # حقول الدخول الجديدة (v3.2)
+        "entry_mode": _get_field("entry_mode", "market"),
+        "market_entry": _get_field("market_entry"),
+        "recommended_entry": _get_field("recommended_entry"),
+        "has_pullback_plan": normalize_bool(_get_field("has_pullback_plan", False)),
+
+        # حقول تتبع تفعيل البولباك (v3.3)
+        "activated_at": _get_field("activated_at"),
+        "activated_candle_ts": _get_field("activated_candle_ts"),
+        "pending_pullback_expired": normalize_bool(_get_field("pending_pullback_expired", False)),
+        "pending_pullback_expire_reason": _get_field("pending_pullback_expire_reason", ""),
+
         "diagnostics": diagnostics,
     }
 
@@ -658,6 +710,11 @@ def register_trade(
     extra_setup_bonus: float = None,
     primary_extra_setup: str = None,
     extra_setups_details: dict = None,
+    # حقول الدخول الجديدة (v3.2 - main-10 compatibility)
+    entry_mode: str = "market",
+    market_entry: float = None,
+    recommended_entry: float = None,
+    has_pullback_plan: bool = False,
     **kwargs,
 ):
     """
@@ -747,6 +804,11 @@ def register_trade(
         "extra_setup_bonus": extra_setup_bonus,
         "primary_extra_setup": primary_extra_setup,
         "extra_setups_details": extra_setups_details,
+        # حقول الدخول الجديدة
+        "entry_mode": entry_mode,
+        "market_entry": market_entry,
+        "recommended_entry": recommended_entry,
+        "has_pullback_plan": has_pullback_plan,
     }
 
     def _get_val(key, default=None):
@@ -779,6 +841,20 @@ def register_trade(
     if _get_val("warning_reasons") is None and kwargs.get("warnings"):
         warning_reasons = normalize_list(kwargs["warnings"])
 
+    # --- حساب effective_entry بناءً على entry_mode ---
+    _entry_mode = str(_get_val("entry_mode", "market") or "market")
+    _pullback_entry = _get_val("pullback_entry")
+    _has_pullback_plan = normalize_bool(_get_val("has_pullback_plan", False))
+
+    if _entry_mode == "pullback_pending" and _pullback_entry is not None and safe_float(_pullback_entry, 0.0) > 0:
+        _effective_entry = round_price(_pullback_entry)
+        _pullback_triggered = False
+        _status = "pending_pullback"
+    else:
+        _effective_entry = entry
+        _pullback_triggered = False
+        _status = "open"
+
     # --- بناء diagnostics (بدون last_processed_candle_ts) ---
     docs = build_trade_diagnostics({
         "raw_score": _get_val("raw_score", score),
@@ -806,8 +882,8 @@ def register_trade(
         "pullback_entry": _get_val("pullback_entry"),
         "pullback_low": _get_val("pullback_low"),
         "pullback_high": _get_val("pullback_high"),
-        "pullback_triggered": False,
-        "effective_entry": entry,
+        "pullback_triggered": _pullback_triggered,
+        "effective_entry": _effective_entry,
         "rr1": _get_val("rr1", rr1),
         "rr2": _get_val("rr2", rr2),
         # حقول جديدة
@@ -855,6 +931,11 @@ def register_trade(
         "extra_setup_bonus": _get_val("extra_setup_bonus", 0.0),
         "primary_extra_setup": _get_val("primary_extra_setup", ""),
         "extra_setups_details": _get_val("extra_setups_details", {}) or {},
+        # حقول الدخول الجديدة (v3.2)
+        "entry_mode": _entry_mode,
+        "market_entry": _get_val("market_entry"),
+        "recommended_entry": _get_val("recommended_entry"),
+        "has_pullback_plan": _has_pullback_plan,
         # حماية
         "protected_breakeven": _get_val("protected_breakeven", False),
         "breakeven_protection_reason": _get_val("breakeven_protection_reason", ""),
@@ -863,6 +944,11 @@ def register_trade(
         "protected_breakeven_exit": _get_val("protected_breakeven_exit", False),
         "sl_moved_to_entry": False,
         "sl_move_reason": "",
+        # حقول تتبع البولباك (v3.3)
+        "activated_at": None,
+        "activated_candle_ts": None,
+        "pending_pullback_expired": False,
+        "pending_pullback_expire_reason": "",
     })
 
     # بناء trade_data
@@ -871,7 +957,7 @@ def register_trade(
         "market_type": market_type,
         "side": side,
         "timeframe": timeframe,
-        "candle_time": normalized_candle_time,          # موحد بالثواني
+        "candle_time": normalized_candle_time,
 
         "entry": entry,
         "sl": sl,
@@ -883,14 +969,14 @@ def register_trade(
         "btc_mode": btc_mode,
         "funding_label": funding_label,
 
-        "status": "open",
+        "status": _status,
         "tp1_hit": False,
         "tp1_hit_at": None,
         "created_at": now_ts,
         "updated_at": now_ts,
         "closed_at": None,
         "result": None,
-        "last_processed_candle_ts": normalized_candle_time,   # top-level فقط
+        "last_processed_candle_ts": normalized_candle_time,
 
         "reasons": list(reasons) if reasons else [],
         "warning_reasons": list(warning_reasons) if warning_reasons else [],
@@ -965,6 +1051,20 @@ def register_trade(
         "warning_high_count": safe_int(_get_val("warning_high_count", 0)),
         "warning_medium_count": safe_int(_get_val("warning_medium_count", 0)),
         "warning_penalty_details": normalize_list(_get_val("warning_penalty_details")),
+
+        # حقول الدخول الجديدة top-level (v3.2)
+        "entry_mode": _entry_mode,
+        "market_entry": round_price(_get_val("market_entry")) if _get_val("market_entry") is not None else None,
+        "recommended_entry": round_price(_get_val("recommended_entry")) if _get_val("recommended_entry") is not None else None,
+        "has_pullback_plan": _has_pullback_plan,
+
+        # حقول تتبع تفعيل البولباك (v3.3)
+        "pullback_triggered": _pullback_triggered,
+        "effective_entry": _effective_entry,
+        "activated_at": None,
+        "activated_candle_ts": None,
+        "pending_pullback_expired": False,
+        "pending_pullback_expire_reason": "",
     }
 
     trade_key = get_trade_key(market_type, side, symbol, normalized_candle_time)
@@ -1067,6 +1167,12 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
             trade_data["protected_breakeven_exit"] = True
             if not trade_data.get("exit_reason"):
                 trade_data["exit_reason"] = "breakeven_exit"
+        elif result == "pending_expired":
+            trade_data["pending_pullback_expired"] = True
+            trade_data["pending_pullback_expire_reason"] = trade_data.get(
+                "pending_pullback_expire_reason",
+                "not_triggered_within_max_age"
+            )
 
         redis_client.set(
             trade_key,
@@ -1089,6 +1195,8 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
             redis_client.hincrby(stats_key, "expired", 1)
         elif result == "breakeven":
             redis_client.hincrby(stats_key, "breakeven_exits", 1)
+        elif result == "pending_expired":
+            redis_client.hincrby(stats_key, "pending_expired", 1)
 
         update_trade_history_snapshot(redis_client, trade_data)
         return True
@@ -1113,10 +1221,7 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
             )
 
         diagnostics = trade_data.get("diagnostics", {}) or {}
-        effective_entry = safe_float(
-            diagnostics.get("effective_entry"),
-            safe_float(trade_data.get("entry"), 0.0)
-        )
+        effective_entry = get_trade_effective_entry(trade_data)
 
         tp1_close_pct = safe_float(
             trade_data.get("tp1_close_pct", diagnostics.get("tp1_close_pct", 50.0)),
@@ -1172,7 +1277,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     diagnostics = trade.get("diagnostics", {}) or {}
 
     entry = safe_float(trade.get("entry"), 0.0)
-    effective_entry = safe_float(diagnostics.get("effective_entry"), entry)
+    effective_entry = get_trade_effective_entry(trade)
 
     sl = safe_float(trade["sl"])
     tp1 = safe_float(trade["tp1"])
@@ -1188,25 +1293,64 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     pullback_entry = diagnostics.get("pullback_entry")
     pullback_high = diagnostics.get("pullback_high")
     pullback_low = diagnostics.get("pullback_low")
-    pullback_triggered = normalize_bool(diagnostics.get("pullback_triggered", False))
+    pullback_triggered = normalize_bool(trade.get("pullback_triggered", diagnostics.get("pullback_triggered", False)))
 
-    has_pullback_plan = (
-        side == "long"
-        and pullback_entry is not None
-        and pullback_high is not None
+    # حقول الدخول المعلّق (v3.3)
+    entry_mode = str(trade.get("entry_mode", diagnostics.get("entry_mode", "market")) or "market")
+    has_pullback_plan_flag = normalize_bool(
+        trade.get("has_pullback_plan", diagnostics.get("has_pullback_plan", False))
     )
 
-    if has_pullback_plan and not pullback_triggered:
+    # --- منطق pullback_pending: لا تُقيَّم الصفقة حتى يلمس السعر pullback_entry ---
+    if (
+        side == "long"
+        and entry_mode == "pullback_pending"
+        and has_pullback_plan_flag
+        and not pullback_triggered
+    ):
         pb_entry = safe_float(pullback_entry, 0.0)
-        if pb_entry > 0 and low <= pb_entry:
+
+        if pb_entry <= 0:
+            # لا توجد منطقة بولباك صالحة، اعتبرها مفتوحة
+            trade["status"] = "open"
+            trade["entry_mode"] = "market"
+        elif low <= pb_entry:
+            # السعر لمس منطقة الدخول → تفعيل البولباك
+            now_ts = int(time.time())
+            candle_ts = safe_timestamp(candle["ts"])
+
+            # توحيد القيم في top-level و diagnostics
+            trade["pullback_triggered"] = True
+            trade["entry_mode"] = "pullback_triggered"
+            trade["effective_entry"] = round_price(pb_entry)
+            trade["activated_at"] = now_ts
+            trade["activated_candle_ts"] = candle_ts
+
             diagnostics["pullback_triggered"] = True
+            diagnostics["entry_mode"] = "pullback_triggered"
             diagnostics["effective_entry"] = round_price(pb_entry)
+            diagnostics["activated_at"] = now_ts
+            diagnostics["activated_candle_ts"] = candle_ts
+
+            trade["status"] = "open"
             trade["diagnostics"] = diagnostics
+
             trade = recalc_targets_from_effective_entry(trade, pb_entry)
             effective_entry = pb_entry
             tp1 = safe_float(trade["tp1"])
             tp2 = safe_float(trade["tp2"])
+            pullback_triggered = True
 
+            # بعد التفعيل نسمح بتقييم SL/TP على نفس الشمعة
+        else:
+            # لم يلمس السعر منطقة الدخول بعد → لا تقييم
+            trade["status"] = "pending_pullback"
+            diagnostics["entry_mode"] = "pullback_pending"
+            diagnostics["pullback_triggered"] = False
+            trade["diagnostics"] = diagnostics
+            return None, False, trade
+
+    # --- التقييم الطبيعي (بعد التفعيل أو للصفقات العادية) ---
     if side == "long":
         if not tp1_hit:
             if low <= sl:
@@ -1274,6 +1418,7 @@ def update_open_trades(
                 pass
             continue
 
+        # الصفقات المغلقة فقط تُزال من open_set
         if trade.get("status") == "closed":
             try:
                 redis_client.srem(open_set_key, trade_key)
@@ -1281,12 +1426,20 @@ def update_open_trades(
                 pass
             continue
 
+        # صفقة "pending_pullback" تبقى في المجموعة وتُعالَج طبيعيًا
         symbol = trade["symbol"]
         created_at = safe_timestamp(trade.get("created_at", now_ts))
 
         if now_ts - created_at > max_age_seconds:
-            mark_trade_closed(redis_client, trade_key, trade, "expired")
-            logger.info(f"{symbol} → trade expired")
+            # التعامل مع الصفقات المعلقة منتهية الصلاحية
+            if trade.get("status") == "pending_pullback" and not trade.get("pullback_triggered"):
+                trade["pending_pullback_expired"] = True
+                trade["pending_pullback_expire_reason"] = "not_triggered_within_max_age"
+                mark_trade_closed(redis_client, trade_key, trade, "pending_expired")
+                logger.info(f"{symbol} → pending pullback expired without activation")
+            else:
+                mark_trade_closed(redis_client, trade_key, trade, "expired")
+                logger.info(f"{symbol} → trade expired")
             continue
 
         raw_candles = fetch_recent_candles(symbol, timeframe=timeframe, limit=100)
@@ -1322,7 +1475,6 @@ def update_open_trades(
             trade = updated_trade
 
             if tp1_now and not trade.get("tp1_hit"):
-                # تمرير c_ts إلى mark_tp1_hit لتثبيت آخر شمعة داخلياً
                 ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
@@ -1336,7 +1488,8 @@ def update_open_trades(
                     break
             else:
                 diagnostics = trade.get("diagnostics", {}) or {}
-                if diagnostics.get("pullback_triggered") and not state_changed:
+                # حفظ التغييرات إذا تم تفعيل pullback أثناء هذه الدورة
+                if trade.get("pullback_triggered") and not state_changed:
                     save_trade(redis_client, trade_key, trade)
                     update_trade_history_snapshot(redis_client, trade)
                     state_changed = True
@@ -1360,7 +1513,8 @@ def update_open_trades(
 
             if protect_breakeven_on_block and block_this_side:
                 try:
-                    entry_price = safe_float(trade.get("entry"), 0.0)
+                    # استخدام سعر الدخول الفعلي (قد يكون pullback_entry إن تفعّل)
+                    entry_price = get_trade_effective_entry(trade)
                     if entry_price > 0:
                         if side == "long":
                             current_profit_pct = ((current_price - entry_price) / entry_price) * 100
@@ -1458,7 +1612,7 @@ def load_trades(
 
             if not include_open:
                 status = str(trade.get("status", "") or "").strip().lower()
-                if status in ("open", "partial"):
+                if status in ("open", "partial", "pending_pullback"):
                     continue
 
             trades.append(trade)
@@ -1541,7 +1695,7 @@ def load_trades_with_history(
 
         if not include_open:
             status = str(trade.get("status", "") or "").strip().lower()
-            if status in ("open", "partial"):
+            if status in ("open", "partial", "pending_pullback"):
                 continue
 
         trades.append(trade)
@@ -2557,3 +2711,215 @@ def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct
     )
 
     return wallet_pnl_pct, wallet_pnl_usd
+
+
+# ------------------------------------------------------------
+# PULLBACK PENDING TRACKING (NEW v3.3)
+# ------------------------------------------------------------
+def get_pending_pullback_summary(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+    since_ts: Optional[int] = None,
+    use_history: bool = True,
+) -> dict:
+    """
+    تحليل صفقات البولباك المعلّقة (pullback_pending).
+    تجلب الصفقات التي تحتوي على has_pullback_plan أو entry_mode يبدأ بـ "pullback".
+    """
+    market_type = normalize_market_type(market_type)
+    side = normalize_side(side)
+
+    # نجلب جميع الصفقات (بما فيها المعلقة) من history
+    trades = get_all_trades_data(
+        redis_client,
+        market_type=market_type,
+        side=side,
+        since_ts=since_ts,
+        use_history=use_history,
+    )
+
+    # تصفية الصفقات التي تحتوي على خطة بولباك
+    pullback_trades = []
+    for trade in trades:
+        entry_mode = str(trade.get("entry_mode", "") or "").lower()
+        has_plan = normalize_bool(trade.get("has_pullback_plan", False))
+        if has_plan or entry_mode.startswith("pullback"):
+            pullback_trades.append(trade)
+
+    total_plans = len(pullback_trades)
+    pending_now = sum(1 for t in pullback_trades if t.get("status") == "pending_pullback")
+    triggered_count = sum(
+        1 for t in pullback_trades
+        if normalize_bool(t.get("pullback_triggered", False))
+        or str(t.get("entry_mode", "")).lower() == "pullback_triggered"
+    )
+    expired_pending_count = sum(
+        1 for t in pullback_trades
+        if t.get("result") == "pending_expired"
+    )
+
+    # الصفقات التي اتفعلت ثم أغلقت (فقط التي تم تفعيلها فعليًا)
+    triggered_closed_trades = [
+        t for t in pullback_trades
+        if (normalize_bool(t.get("pullback_triggered", False)) or
+            str(t.get("entry_mode", "")).lower() == "pullback_triggered")
+        and t.get("result") in ("tp1_win", "tp2_win", "loss", "breakeven")
+    ]
+
+    triggered_wins = sum(
+        1 for t in triggered_closed_trades
+        if t.get("result") in ("tp1_win", "tp2_win")
+    )
+    triggered_losses = sum(
+        1 for t in triggered_closed_trades
+        if t.get("result") == "loss"
+    )
+    triggered_tp1_hits = sum(
+        1 for t in triggered_closed_trades
+        if normalize_bool(t.get("tp1_hit", False))
+    )
+    triggered_tp2_hits = sum(
+        1 for t in triggered_closed_trades
+        if t.get("result") == "tp2_win"
+    )
+
+    decided_triggered = triggered_wins + triggered_losses
+    triggered_winrate = (triggered_wins / decided_triggered * 100) if decided_triggered > 0 else 0.0
+
+    # حساب متوسط زمن التفعيل
+    delays = []
+    for t in pullback_trades:
+        activated_at = safe_timestamp(t.get("activated_at"))
+        created_at = safe_timestamp(t.get("created_at"))
+        if activated_at > 0 and created_at > 0:
+            delays.append((activated_at - created_at) / 60.0)  # دقائق
+    avg_delay = round(sum(delays) / len(delays), 1) if delays else 0.0
+
+    # أفضل وأسوأ صفقة مفعلة - حساب يدوي باستخدام effective_entry
+    best_pct = 0.0
+    worst_pct = 0.0
+    for t in triggered_closed_trades:
+        result = t.get("result")
+        side_t = normalize_side(t.get("side", "long"))
+        effective_entry = get_trade_effective_entry(t)
+        if effective_entry <= 0:
+            continue
+        exit_price = None
+        if result == "tp2_win":
+            exit_price = safe_float(t.get("tp2"), 0.0)
+        elif result == "tp1_win":
+            exit_price = safe_float(t.get("tp1"), 0.0)
+        elif result == "loss":
+            exit_price = safe_float(t.get("sl"), 0.0)
+        elif result == "breakeven":
+            pnl = 0.0
+        else:
+            continue
+        if result != "breakeven":
+            if exit_price is None or exit_price <= 0:
+                continue
+            if side_t == "long":
+                pnl = ((exit_price - effective_entry) / effective_entry) * 100
+            else:
+                pnl = ((effective_entry - exit_price) / effective_entry) * 100
+        leverage = SHORT_REPORT_LEVERAGE if side_t == "short" else REPORT_LEVERAGE
+        pnl *= leverage
+        if pnl > best_pct:
+            best_pct = pnl
+        if pnl < worst_pct:
+            worst_pct = pnl
+
+    # معدلات
+    triggered_rate = (triggered_count / total_plans * 100) if total_plans > 0 else 0.0
+    expired_rate = (expired_pending_count / total_plans * 100) if total_plans > 0 else 0.0
+
+    return {
+        "market_type": market_type,
+        "side": side,
+        "total_pullback_plans": total_plans,
+        "pending_now": pending_now,
+        "triggered_count": triggered_count,
+        "expired_pending_count": expired_pending_count,
+        "triggered_rate": round(triggered_rate, 2),
+        "expired_rate": round(expired_rate, 2),
+        "triggered_wins": triggered_wins,
+        "triggered_losses": triggered_losses,
+        "triggered_tp1_hits": triggered_tp1_hits,
+        "triggered_tp2_hits": triggered_tp2_hits,
+        "triggered_winrate": round(triggered_winrate, 2),
+        "avg_trigger_delay_minutes": avg_delay,
+        "best_triggered_trade_pct": best_pct,
+        "worst_triggered_trade_pct": worst_pct,
+    }
+
+
+def format_pending_pullback_summary(title: str, summary: dict) -> str:
+    """
+    تنسيق تقرير pullback pending للعرض بتنسيق HTML مناسب لتليجرام.
+    """
+    total = summary["total_pullback_plans"]
+    pending = summary["pending_now"]
+    triggered = summary["triggered_count"]
+    expired = summary["expired_pending_count"]
+
+    triggered_rate = summary["triggered_rate"]
+    expired_rate = summary["expired_rate"]
+
+    wins = summary["triggered_wins"]
+    losses = summary["triggered_losses"]
+    tp1_hits = summary["triggered_tp1_hits"]
+    tp2_hits = summary["triggered_tp2_hits"]
+    winrate = summary["triggered_winrate"]
+    avg_delay = summary["avg_trigger_delay_minutes"]
+
+    best = summary["best_triggered_trade_pct"]
+    worst = summary["worst_triggered_trade_pct"]
+
+    lines = [
+        f"<b>{title}</b>",
+        "",
+        f"📊 <b>إجمالي خطط البولباك:</b> {total}",
+        f"⏳ <b>ما زالت معلّقة:</b> {pending}",
+        f"✅ <b>تم التفعيل:</b> {triggered}",
+        f"⌛ <b>انتهت بدون تفعيل:</b> {expired}",
+        "",
+        f"📈 <b>Trigger Rate:</b> {triggered_rate:.1f}%",
+        f"📉 <b>Expired Rate:</b> {expired_rate:.1f}%",
+        "",
+        "<b>🎯 أداء الصفقات بعد التفعيل:</b>",
+        f"• Wins: {wins}",
+        f"• Losses: {losses}",
+        f"• TP1 Hits: {tp1_hits}",
+        f"• TP2 Hits: {tp2_hits}",
+        f"• Winrate بعد التفعيل: {winrate:.1f}%",
+    ]
+
+    if avg_delay > 0:
+        lines.append(f"⏱ <b>متوسط وقت التفعيل:</b> {avg_delay:.1f} دقيقة")
+    if best != 0.0 or worst != 0.0:
+        lines.append(f"• أفضل صفقة مفعلة: {best:+.2f}% | أسوأ صفقة: {worst:+.2f}%")
+
+    lines.append("")
+    lines.append("<b>🧠 التفسير:</b>")
+
+    if total == 0:
+        lines.append("• لا توجد بيانات كافية.")
+    else:
+        if triggered_rate < 30:
+            lines.append("• ⚠️ Trigger Rate منخفض جدًا، منطقة البولباك بعيدة أو شروط الاختيار محتاجة مراجعة.")
+        elif triggered_rate > 70:
+            lines.append("• ✅ Trigger Rate ممتاز، مناطق الدخول قريبة وفعالة.")
+
+        if expired_rate > 40:
+            lines.append("• 🔴 Expired Rate عالي جدًا، يمكن تقليل صلاحية الصفقة أو تقريب pullback_entry.")
+
+        if winrate < 40 and triggered > 0:
+            lines.append("• 🔴 Winrate بعد التفعيل ضعيف، راجع جودة المنطقة أو SL/TP بعد الدخول.")
+        elif winrate > 60 and triggered >= 5:
+            lines.append("• ✅ Winrate بعد التفعيل جيد، استمر.")
+
+        if avg_delay > 60:
+            lines.append("• ⏳ متوسط وقت التفعيل طويل (> 60 دقيقة)، قد تحتاج صبر أكبر أو تعديل زمن الصلاحية.")
+
+    return "\n".join(lines)
