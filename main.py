@@ -2485,11 +2485,10 @@ def get_alert_status(alert: dict) -> str:
 
     if mode == MODE_RECOVERY_LONG and avg_planned > 0:
         effective_entry = avg_planned
+    elif entry_mode == "pullback_pending" and not pullback_triggered:
+        return "⏳ Pending Pullback"
     elif entry_mode == "pullback_pending":
-        if pullback_triggered:
-            effective_entry = pullback_entry if pullback_entry > 0 else entry
-        else:
-            effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
+        effective_entry = pullback_entry if pullback_entry > 0 else entry
     else:
         effective_entry = market_entry if market_entry > 0 else entry
 
@@ -2520,6 +2519,8 @@ def get_alert_status(alert: dict) -> str:
     return "🔴 خطأ"
 
 def get_track_state_badge(status: str, current_move: float) -> str:
+ if "Pending Pullback" in status:
+    return "⏳ Pending"
  if "TP2" in status:
     return "🎯 TP2 Hit"
  if "TP1" in status:
@@ -2625,6 +2626,10 @@ def build_track_message(alert: dict) -> str:
     status_info = resolve_alert_official_or_estimated_status(alert)
     display_status = status_info["display_status"]
     is_official = status_info["is_official"]
+
+    if entry_mode == "pullback_pending" and not pullback_triggered:
+        display_status = "⏳ Pending Pullback"
+        is_official = False
 
     if is_official:
         logger.info(f"Track using official status for {alert.get('alert_id')}: {display_status}")
@@ -8533,7 +8538,7 @@ def run_scanner_loop():
                 extra_setup_names=candidate["extra_setup_names"],
                 primary_extra_setup=candidate["primary_extra_setup"],
                 has_pullback_plan=candidate["has_pullback_plan"],
-                market_price=candidate["market_price"],
+                market_price=candidate.get("market_entry", candidate["entry"]),
                 sl_method=candidate["sl_method"],
             )
             reply_markup = build_track_reply_markup(candidate["alert_id"])
