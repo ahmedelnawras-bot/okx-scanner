@@ -1465,6 +1465,9 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "extra_setup_bonus": candidate.get("extra_setup_bonus", 0.0),
         "primary_extra_setup": candidate.get("primary_extra_setup", ""),
         "extra_setups_details": candidate.get("extra_setups_details", {}),
+        "has_pullback_plan": candidate.get("has_pullback_plan", False),
+        "entry_mode": candidate.get("entry_mode", "market"),
+        "market_price": candidate.get("market_price", None),
     }
 
 
@@ -5379,6 +5382,8 @@ def build_message(
  wave_context="",
  extra_setup_names=None,
  primary_extra_setup="",
+ has_pullback_plan=False,
+ market_price=None,
  sl_method="",
 ):
  symbol_clean = clean_symbol_for_message(symbol)
@@ -5410,10 +5415,18 @@ def build_message(
  safe_24h = rtl_fix("24H")
  pullback_text = ""
  if pullback_low is not None and pullback_high is not None:
-    pullback_text = (
-        f"📥 <b>منطقة دخول البول باك:</b> "
-        f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
-    )
+    if has_pullback_plan and market_price is not None:
+        pullback_text = (
+            f"⏳ <b>انتظار Pullback</b>\n"
+            f"💰 <b>سعر السوق الحالي:</b> {fmt_num(market_price, 6)}\n"
+            f"📥 <b>منطقة دخول البول باك:</b> "
+            f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
+        )
+    else:
+        pullback_text = (
+            f"📥 <b>منطقة دخول البول باك:</b> "
+            f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
+        )
  if is_reverse:
     if reversal_4h_confirmed:
         reversal_4h_block = (
@@ -5480,8 +5493,13 @@ def build_message(
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
 
+ if has_pullback_plan and market_price is not None:
+    price_line = f"🎯 <b>الدخول المخطط:</b> {fmt_num(price, 6)} | 💰 <b>السوق:</b> {fmt_num(market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+ else:
+    price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
-💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}
+{price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
 {pullback_text}
@@ -6252,9 +6270,6 @@ def run_scanner_loop():
         current_mode = handle_market_mode_transition(mode_result)
 
         # --- UPDATE OPEN TRADES WITH PROTECTION (supports buffer if available) ---
-        # NOTE: update_open_trades currently may not accept 'breakeven_buffer_pct'.
-        # If it raises TypeError, we fall back to the old call without buffer.
-        # To fully enable SL above entry, tracking/performance.py must be updated.
         try:
             update_open_trades(
                 r,
@@ -6285,7 +6300,7 @@ def run_scanner_loop():
         except Exception as e:
             logger.error(f"update_open_trades error: {e}")
 
-        # Count protected trades using smembers - open_trades:futures:long is a Redis Set
+        # Count protected trades
         if current_mode == MODE_BLOCK_LONGS and r:
             try:
                 trade_keys = list(r.smembers("open_trades:futures:long"))
@@ -6306,10 +6321,6 @@ def run_scanner_loop():
                 logger.info(
                     f"BLOCK_LONGS protection: {protected_count}/{open_count} open long trades currently protected."
                 )
-                if protected_count > 0:
-                    # Send a concise Telegram message once per BLOCK entry
-                    # Already handled via transition message, avoid spamming
-                    pass
             except Exception as e:
                 logger.warning(f"Could not count protected trades: {e}")
 
@@ -6501,7 +6512,6 @@ def run_scanner_loop():
                         "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
-                    # Build a candidate-like dict for recovery registration
                     recovery_candidate = {
                         "symbol": symbol,
                         "candle_time": candle_time,
@@ -7395,6 +7405,15 @@ def run_scanner_loop():
                 pullback_low = None
                 pullback_high = None
                 pullback_entry = None
+
+            # --- NEW: pullback plan handling ---
+            has_pullback_plan = (
+                pullback_low is not None
+                and pullback_high is not None
+                and pullback_entry is not None
+            )
+            # --- end new ---
+
             if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal and not has_extra_strong_setup:
                 log_long_rejection(
                     symbol=symbol,
@@ -7636,6 +7655,11 @@ def run_scanner_loop():
             score_result["score"] = round(effective_score, 2)
 
             price = _safe_float(signal_row["close"], 0)
+
+            # --- NEW: determine effective entry for trade ---
+            entry_price_for_trade = pullback_entry if has_pullback_plan else price
+            # --- end new ---
+
             if breakout:
                 sl_type = "breakout"
             elif pre_breakout:
@@ -7647,7 +7671,7 @@ def run_scanner_loop():
             rr1, rr2 = get_rr_targets_long(signal_type=sl_type, entry_timing=entry_timing_temp)
             smart_sl = build_smart_sl_long(
                 df=df,
-                entry=price,
+                entry=entry_price_for_trade,
                 atr_value=atr_value,
                 signal_type=sl_type,
                 market_state=market_state,
@@ -7662,7 +7686,7 @@ def run_scanner_loop():
 
             smart_targets_early = build_smart_tp1_long(
                 df=df,
-                entry=price,
+                entry=entry_price_for_trade,
                 sl=stop_loss,
                 rr1=rr1,
                 rr2=rr2,
@@ -7676,7 +7700,7 @@ def run_scanner_loop():
             resistance_rejected = False
             resistance_dynamic_penalty = 0.0
             
-            # early display_risk for near_resistance_guard (computed before final warnings)
+            # early display_risk for near_resistance_guard
             explicit_warnings = score_result.get("warning_reasons") or []
             _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
             warnings_count_early = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
@@ -7756,7 +7780,7 @@ def run_scanner_loop():
                     "reason": early_resistance_warning
                 })
 
-            # Compute early setup_type_base for possible use in final_threshold rejection reasons
+            # Compute early setup_type_base
             wave_context_early = infer_wave_context(
                 entry_maturity_data=entry_maturity_data,
                 is_reverse=is_reverse,
@@ -8117,8 +8141,8 @@ def run_scanner_loop():
                 )
                 continue
 
-            tp1 = smart_targets_early.get("tp1", calc_tp_long(price, stop_loss, rr=rr1))
-            tp2 = smart_targets_early.get("tp2", calc_tp_long(price, stop_loss, rr=rr2))
+            tp1 = smart_targets_early.get("tp1", calc_tp_long(entry_price_for_trade, stop_loss, rr=rr1))
+            tp2 = smart_targets_early.get("tp2", calc_tp_long(entry_price_for_trade, stop_loss, rr=rr2))
             target_method = smart_targets_early.get("target_method", "rr")
             nearest_resistance = smart_targets_early.get("nearest_resistance")
             resistance_warning = early_resistance_warning
@@ -8227,26 +8251,17 @@ def run_scanner_loop():
                 momentum_priority -= 0.60
                 momentum_priority = round(momentum_priority, 2)
 
-            # --- FINAL risk label calculation after all warnings/penalties ---
+            # --- FINAL risk label calculation ---
             final_explicit_warnings = score_result.get("warning_reasons") or []
             _, final_inferred_warnings = classify_reasons(score_result.get("reasons", []))
             final_warnings_count = len(final_explicit_warnings) if final_explicit_warnings else len(final_inferred_warnings)
             final_base_risk = get_base_risk_label(score_result, final_warnings_count)
             final_display_risk = adjust_risk_with_entry_timing(final_base_risk, entry_timing)
-            # ----------------------------------------------------------------
 
-            setup_stats = get_setup_type_stats(
-                redis_client=r,
-                market_type="futures",
-                side="long",
-                setup_type=setup_type,
-                since_ts=stats_reset_ts,
-            )
-            # Store late_breakout_guard_reason inside candidate
             candidate = {
                 "symbol": symbol,
                 "candle_time": candle_time,
-                "entry": price,
+                "entry": entry_price_for_trade,
                 "sl": stop_loss,
                 "tp1": tp1,
                 "tp2": tp2,
@@ -8339,7 +8354,13 @@ def run_scanner_loop():
                 "now": now,
                 "current_mode": current_mode,
                 "late_breakout_guard_reason": late_breakout_guard_reason,
-                "setup_stats": setup_stats,
+                "setup_stats": get_setup_type_stats(
+                    redis_client=r,
+                    market_type="futures",
+                    side="long",
+                    setup_type=setup_type,
+                    since_ts=stats_reset_ts,
+                ),
                 "reversal_4h_result": reversal_4h_result,
                 "above_upper_bb": above_upper_bb,
                 "change_4h": change_4h,
@@ -8352,6 +8373,10 @@ def run_scanner_loop():
                 "upper_wick_ratio": upper_wick_ratio,
                 "res_dynamic_penalty": res_dynamic_penalty,
                 "signal_rating": score_result.get("signal_rating", "⚡ عادي"),
+                "has_pullback_plan": has_pullback_plan,
+                "market_price": price,
+                "recommended_entry": entry_price_for_trade,
+                "entry_mode": "pullback_pending" if has_pullback_plan else "market",
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -8371,9 +8396,8 @@ def run_scanner_loop():
             if not locked:
                 continue
 
-            # Build final message, tv_link, alert_snapshot, reply_markup NOW
+            # Build final message
             tv_link = build_tradingview_link(symbol)
-            # Reconstruct a temporary score_result dict for build_message
             temp_score_result = {
                 "score": candidate["score"],
                 "reasons": candidate.get("reasons", []),
@@ -8431,6 +8455,8 @@ def run_scanner_loop():
                 wave_context=candidate["wave_context"],
                 extra_setup_names=candidate["extra_setup_names"],
                 primary_extra_setup=candidate["primary_extra_setup"],
+                has_pullback_plan=candidate["has_pullback_plan"],
+                market_price=candidate["market_price"],
                 sl_method=candidate["sl_method"],
             )
             reply_markup = build_track_reply_markup(candidate["alert_id"])
@@ -8447,7 +8473,6 @@ def run_scanner_loop():
                 last_candle_cache_meta[symbol] = time.time()
                 last_global_send_ts = time.time()
                 message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
-                # Build alert_snapshot from candidate (fix recommended_entry)
                 alert_snapshot = {
                     "alert_id": candidate["alert_id"],
                     "symbol": symbol,
@@ -8456,8 +8481,8 @@ def run_scanner_loop():
                     "timeframe": TIMEFRAME,
                     "market_entry": candidate["entry"],
                     "entry": candidate["entry"],
-                    "recommended_entry": candidate.get("pullback_entry") or candidate["entry"],
-                    "pullback_entry": candidate.get("pullback_entry"),
+                    "recommended_entry": candidate["entry"],
+                    "pullback_entry": candidate["pullback_entry"],
                     "sl": candidate["sl"],
                     "tp1": candidate["tp1"],
                     "tp2": candidate["tp2"],
@@ -8481,9 +8506,11 @@ def run_scanner_loop():
                     "rsi_now": candidate["rsi_now"],
                     "dist_ma": candidate["dist_ma"],
                     "vol_ratio": candidate["vol_ratio"],
-                    "pullback_low": candidate.get("pullback_low"),
-                    "pullback_high": candidate.get("pullback_high"),
-                    "pullback_entry": candidate.get("pullback_entry"),
+                    "pullback_low": candidate["pullback_low"],
+                    "pullback_high": candidate["pullback_high"],
+                    "has_pullback_plan": candidate["has_pullback_plan"],
+                    "market_price": candidate["market_price"],
+                    "entry_mode": candidate["entry_mode"],
                     "market_guard_active": bool(market_guard.get("active", False)),
                     "market_guard_level": market_guard.get("level", "normal"),
                     "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
@@ -8540,7 +8567,6 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                 }
                 save_alert_snapshot(alert_snapshot, message_id=message_id)
-                # Use alert_id from candidate now
                 candidate_alert_id = candidate["alert_id"]
                 register_ok = register_trade_from_candidate(candidate)
                 set_alert_registration_status(candidate_alert_id, register_ok)
