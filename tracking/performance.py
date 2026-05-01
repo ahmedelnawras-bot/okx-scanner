@@ -20,10 +20,13 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 إصلاح تشخيص exit_summary وعرض المشكلة الأساسية في جميع التقارير.
 دعم الحقول الجديدة للتخزين وحماية نقطة التعادل.
 
-**إصدار 3.0 – إصلاح منطق تتبع الشموع المفتوحة**
-- إضافة حقل last_processed_candle_ts لمنع إعادة معالجة الشموع القديمة.
-- إزالة تأثير وقت الحماية على نقطة بدء التقييم؛ تُعالج جميع الشموع الجديدة دائمًا.
-- تطبيق حماية breakeven بعد تقييم جميع الشموع وفقط إذا بقيت الصفقة مفتوحة.
+**إصدار 3.1 – توحيد الطوابع الزمنية وإصلاح تتبع الشموع**
+- جميع الطوابع الزمنية تُوحد إلى ثوانٍ عبر safe_timestamp().
+- حقل last_processed_candle_ts أصبح top-level فقط، ولم يعد داخل diagnostics.
+- mark_tp1_hit يقبل processed_candle_ts لتثبيت آخر شمعة معالجة.
+- update_open_trades يمنع إعادة معالجة الشموع القديمة نهائياً.
+- حماية breakeven لا تغيّر نقطة بدء التقييم.
+- توافق تام مع الصفقات القديمة و main.py.
 """
 
 import json
@@ -150,7 +153,7 @@ def round_price(value, default=0.0) -> float:
 
 
 def safe_timestamp(ts_value, default=0) -> int:
-    """يحول timestamp بأمان إلى int مع دعم تقسيم الميلي ثانية."""
+    """يحول timestamp بأمان إلى int (ثوانٍ) مع دعم تقسيم الميلي ثانية."""
     try:
         ts = int(float(ts_value))
         if ts > 10_000_000_000:
@@ -166,7 +169,7 @@ def safe_timestamp(ts_value, default=0) -> int:
 def get_trade_key(market_type: str, side: str, symbol: str, candle_time: int) -> str:
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
-    candle_time = int(candle_time)
+    candle_time = int(candle_time)  # من المهم أن يكون بالثواني بالفعل بعد safe_timestamp
     return f"trade:{market_type}:{side}:{symbol}:{candle_time}"
 
 
@@ -317,6 +320,7 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
     """
     بناء diagnostics dict من الحقول الإضافية مع الحفاظ على القيم الآمنة.
     تدعم جميع الحقول الجديدة والقديمة.
+    *** لا يحتوي على last_processed_candle_ts، بل يُحفظ top-level فقط. ***
     """
     extra = extra_fields or {}
 
@@ -420,7 +424,6 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "sl_moved_to_entry": normalize_bool(_get("sl_moved_to_entry", False)),
         "sl_move_reason": normalize_text(_get("sl_move_reason"), ""),
         "exit_reason": normalize_text(_get("exit_reason"), ""),
-        "last_processed_candle_ts": safe_int(_get("last_processed_candle_ts"), 0),
     }
 
     return diagnostics
@@ -445,7 +448,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "side": trade_data.get("side", "long"),
         "setup_type": trade_data.get("setup_type", "unknown"),
         "timeframe": trade_data.get("timeframe", "15m"),
-        "candle_time": safe_int(trade_data.get("candle_time"), 0),
+        "candle_time": safe_timestamp(trade_data.get("candle_time"), 0),
 
         "score": safe_float(trade_data.get("score"), 0.0),
         "entry": safe_float(trade_data.get("entry"), 0.0),
@@ -454,7 +457,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "tp1": safe_float(trade_data.get("tp1"), 0.0),
         "tp2": safe_float(trade_data.get("tp2"), 0.0),
 
-        "created_at": safe_int(trade_data.get("created_at"), 0),
+        "created_at": safe_timestamp(trade_data.get("created_at"), 0),
         "status": trade_data.get("status", "open"),
         "result": trade_data.get("result"),
         "tp1_hit": normalize_bool(trade_data.get("tp1_hit", False)),
@@ -545,7 +548,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "sl_moved_to_entry": normalize_bool(_get_field("sl_moved_to_entry", False)),
         "sl_move_reason": _get_field("sl_move_reason", ""),
         "exit_reason": _get_field("exit_reason", ""),
-        "last_processed_candle_ts": safe_int(_get_field("last_processed_candle_ts"), 0),
+        "last_processed_candle_ts": safe_timestamp(trade_data.get("last_processed_candle_ts"), 0),
         "diagnostics": diagnostics,
     }
 
@@ -752,6 +755,10 @@ def register_trade(
             return direct_args[key]
         return kwargs.get(key, default)
 
+    # --- توحيد الطوابع الزمنية ---
+    now_ts = int(time.time())
+    normalized_candle_time = safe_timestamp(candle_time, now_ts)
+
     # --- أسعار أساسية ---
     entry = round_price(entry)
     sl = round_price(sl)
@@ -772,13 +779,7 @@ def register_trade(
     if _get_val("warning_reasons") is None and kwargs.get("warnings"):
         warning_reasons = normalize_list(kwargs["warnings"])
 
-    now_ts = int(time.time())
-
-    # --- تهيئة last_processed_candle_ts ---
-    # نستخدم candle_time إن وجد وإلا created_at (now_ts)
-    candle_ts_initial = safe_timestamp(candle_time) if candle_time else now_ts
-
-    # --- بناء diagnostics ---
+    # --- بناء diagnostics (بدون last_processed_candle_ts) ---
     docs = build_trade_diagnostics({
         "raw_score": _get_val("raw_score", score),
         "effective_score": _get_val("effective_score", score),
@@ -862,7 +863,6 @@ def register_trade(
         "protected_breakeven_exit": _get_val("protected_breakeven_exit", False),
         "sl_moved_to_entry": False,
         "sl_move_reason": "",
-        "last_processed_candle_ts": candle_ts_initial,
     })
 
     # بناء trade_data
@@ -871,7 +871,7 @@ def register_trade(
         "market_type": market_type,
         "side": side,
         "timeframe": timeframe,
-        "candle_time": int(candle_time),
+        "candle_time": normalized_candle_time,          # موحد بالثواني
 
         "entry": entry,
         "sl": sl,
@@ -890,7 +890,7 @@ def register_trade(
         "updated_at": now_ts,
         "closed_at": None,
         "result": None,
-        "last_processed_candle_ts": candle_ts_initial,
+        "last_processed_candle_ts": normalized_candle_time,   # top-level فقط
 
         "reasons": list(reasons) if reasons else [],
         "warning_reasons": list(warning_reasons) if warning_reasons else [],
@@ -967,8 +967,8 @@ def register_trade(
         "warning_penalty_details": normalize_list(_get_val("warning_penalty_details")),
     }
 
-    trade_key = get_trade_key(market_type, side, symbol, candle_time)
-    history_key = get_trade_history_key(market_type, side, symbol, candle_time)
+    trade_key = get_trade_key(market_type, side, symbol, normalized_candle_time)
+    history_key = get_trade_history_key(market_type, side, symbol, normalized_candle_time)
     open_set_key = get_open_trades_set_key(market_type, side)
     all_trades_key = get_all_trades_set_key()
 
@@ -1035,7 +1035,7 @@ def update_trade_history_snapshot(redis_client, trade_data: dict):
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
         side = normalize_side(trade_data.get("side", "long"))
         symbol = trade_data.get("symbol", "")
-        candle_time = safe_int(trade_data.get("candle_time"), 0)
+        candle_time = safe_timestamp(trade_data.get("candle_time"), 0)
         history_key = get_trade_history_key(market_type, side, symbol, candle_time)
         history_data = build_history_snapshot(trade_data)
         redis_client.set(
@@ -1098,12 +1098,19 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         return False
 
 
-def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
+def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candle_ts: int = None):
     if redis_client is None:
         return False
     try:
         if trade_data.get("tp1_hit"):
             return True
+
+        # تحديث آخر شمعة معالجة إن وُجدت
+        if processed_candle_ts is not None:
+            trade_data["last_processed_candle_ts"] = safe_timestamp(
+                processed_candle_ts,
+                trade_data.get("last_processed_candle_ts", 0)
+            )
 
         diagnostics = trade_data.get("diagnostics", {}) or {}
         effective_entry = safe_float(
@@ -1289,9 +1296,10 @@ def update_open_trades(
 
         current_price = candles[-1]["close"]
 
-        # --- نقطة بدء التقييم (آخر شمعة عولجت، أو created_at) ---
-        last_proc = trade.get("last_processed_candle_ts")
-        eval_start_ts = safe_timestamp(last_proc) if last_proc is not None else created_at
+        # --- نقطة بدء التقييم (آخر شمعة عولجت، أو candle_time، أو created_at) ---
+        last_proc = safe_timestamp(trade.get("last_processed_candle_ts"), 0)
+        candle_ts_base = safe_timestamp(trade.get("candle_time"), 0)
+        eval_start_ts = last_proc if last_proc > 0 else (candle_ts_base if candle_ts_base > 0 else created_at)
 
         # جمع الشموع الجديدة فقط (أحدث من eval_start_ts)
         new_candles = []
@@ -1304,21 +1312,20 @@ def update_open_trades(
 
         result = None
         state_changed = False
-        initial_last_proc = trade.get("last_processed_candle_ts")
 
         # --- معالجة الشموع الجديدة ---
         for c_ts, candle in new_candles:
+            # تسجيل آخر شمعة معالجة فوراً
             trade["last_processed_candle_ts"] = c_ts
 
             result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
             trade = updated_trade
 
             if tp1_now and not trade.get("tp1_hit"):
-                ok = mark_tp1_hit(redis_client, trade_key, trade)
+                # تمرير c_ts إلى mark_tp1_hit لتثبيت آخر شمعة داخلياً
+                ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
-                    # نضمن الاحتفاظ بقيمة last_processed_candle_ts
-                    trade["last_processed_candle_ts"] = c_ts
                     state_changed = True
                     logger.info(f"{symbol} → TP1 hit, SL moved to entry/effective entry")
                 else:
@@ -1340,7 +1347,7 @@ def update_open_trades(
         # --- بعد انتهاء الشموع: تطبيق حماية breakeven فقط إذا ظلت الصفقة مفتوحة ---
         if not result and trade.get("status") not in ("closed",):
             # تحقق من حدوث تقدم في آخر شمعة معالَجة
-            if trade.get("last_processed_candle_ts") != initial_last_proc:
+            if trade.get("last_processed_candle_ts") != (eval_start_ts if eval_start_ts > 0 else None):
                 state_changed = True
 
             mode_upper = str(market_mode or "").upper()
@@ -1445,7 +1452,7 @@ def load_trades(
             if since_ts is not None:
                 ts = get_trade_created_ts(trade)
                 if not ts:
-                    ts = safe_int(trade.get("candle_time"), 0)
+                    ts = safe_timestamp(trade.get("candle_time"), 0)
                 if ts < since_ts:
                     continue
 
@@ -1489,7 +1496,7 @@ def load_trades_with_history(
         m = normalize_market_type(trade_dict.get("market_type", "futures"))
         s = normalize_side(trade_dict.get("side", "long"))
         sym = trade_dict.get("symbol", "")
-        ctime = safe_int(trade_dict.get("candle_time"), 0)
+        ctime = safe_timestamp(trade_dict.get("candle_time"), 0)
         return (m, s, sym, ctime)
 
     # قراءة trade:* أولاً
@@ -1528,7 +1535,7 @@ def load_trades_with_history(
         if since_ts is not None:
             ts = get_trade_created_ts(trade)
             if not ts:
-                ts = safe_int(trade.get("candle_time"), 0)
+                ts = safe_timestamp(trade.get("candle_time"), 0)
             if ts < since_ts:
                 continue
 
@@ -1542,7 +1549,7 @@ def load_trades_with_history(
     # ترتيب من الأحدث إلى الأقدم
     trades.sort(
         key=lambda x: (
-            get_trade_created_ts(x) or safe_int(x.get("candle_time"), 0)
+            get_trade_created_ts(x) or safe_timestamp(x.get("candle_time"), 0)
         ),
         reverse=True,
     )
