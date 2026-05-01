@@ -2126,7 +2126,7 @@ def build_market_status_message() -> str:
     ])
     if suggested_mode != current_mode:
         lines.append("")
-        lines.append("ℹ️ المود المحسوب مختلف عن المخزن، وسيتحدث مع دورة الفحص القادمة")
+        lines.append("ℹ️ المود المحسوب يختلف عن المود الحالي، وسيتم تطبيقه مع دورة الفحص القادمة")
     return "\n".join(lines)
  except Exception as e:
     logger.error(f"build_market_status_message error: {e}")
@@ -2148,13 +2148,14 @@ def handle_hard_reset(chat_id: str):
         del_history = 0
         del_alert = 0
         del_cooldown = 0
-        mode_cache_deleted = 0
+        del_candle = 0
+        del_mode_cache = 0
 
-        # Trade keys
+        # Trade
         for key in r.scan_iter("trade:futures:long:*"):
             r.delete(key)
             del_trade += 1
-        # Trade history keys
+        # Trade history
         for key in r.scan_iter("trade_history:futures:long:*"):
             r.delete(key)
             del_history += 1
@@ -2162,29 +2163,8 @@ def handle_hard_reset(chat_id: str):
         r.delete("open_trades:futures:long")
         r.delete("stats:futures:long")
         r.delete("stats:last_reset_ts:long")
-
-        # Market mode keys
-        mode_keys = [
-            MARKET_MODE_KEY,
-            MARKET_MODE_LAST_KEY,
-            MARKET_MODE_LAST_TRANSITION_KEY,
-            MARKET_MODE_LAST_RECOVERY_CHECK_KEY,
-            MARKET_MODE_NORMAL_CANDIDATE_KEY,
-            MARKET_MODE_BLOCK_STARTED_KEY,
-            MARKET_MODE_LAST_SAFE_SEEN_KEY,
-        ]
-        for k in mode_keys:
-            if r.delete(k):
-                mode_cache_deleted += 1
-
-        # Cache keys
-        r.delete(ALT_SNAPSHOT_CACHE_KEY)
-        r.delete(MARKET_STATUS_SNAPSHOT_KEY)
-        r.delete(TELEGRAM_OFFSET_KEY)
-        r.delete(TELEGRAM_BOOTSTRAP_DONE_KEY)
-        r.delete(TELEGRAM_POLL_LOCK_KEY)
-
-        # Alerts and sent/cooldowns
+        r.delete("trades:all")  # added as per request
+        # Alerts & sent/cooldowns
         for key in r.scan_iter("alert:long:*"):
             r.delete(key)
             del_alert += 1
@@ -2198,15 +2178,41 @@ def handle_hard_reset(chat_id: str):
             r.delete(key)
             del_cooldown += 1
         r.delete("global_cooldown:long")
-        # optional: scan lock
-        r.delete(SCAN_LOCK_KEY)
+        r.delete("scan:long:running")
+        # Mode keys
+        mode_keys = [
+            MARKET_MODE_KEY,
+            MARKET_MODE_LAST_KEY,
+            MARKET_MODE_LAST_TRANSITION_KEY,
+            MARKET_MODE_LAST_RECOVERY_CHECK_KEY,
+            MARKET_MODE_NORMAL_CANDIDATE_KEY,
+            MARKET_MODE_BLOCK_STARTED_KEY,
+            MARKET_MODE_LAST_SAFE_SEEN_KEY,
+        ]
+        for k in mode_keys:
+            if r.delete(k):
+                del_mode_cache += 1
+        # Caches
+        r.delete(ALT_SNAPSHOT_CACHE_KEY)
+        r.delete(MARKET_STATUS_SNAPSHOT_KEY)
+        r.delete(NEWS_CACHE_KEY)  # long-specific news cache
+        r.delete(TELEGRAM_OFFSET_KEY)
+        r.delete(TELEGRAM_BOOTSTRAP_DONE_KEY)
+        r.delete(TELEGRAM_POLL_LOCK_KEY)
+        del_mode_cache += 3  # roughly count these as cache keys
+        # Candle caches long
+        for key in r.scan_iter("candles:long:*"):
+            r.delete(key)
+            del_candle += 1
 
         msg = (
             "🔥 <b>Hard Reset LONG تم بنجاح</b>\n"
             f"- trade keys: {del_trade}\n"
             f"- trade_history keys: {del_history}\n"
-            f"- alerts/cooldowns: {del_alert + del_cooldown}\n"
-            f"- mode/cache keys deleted: {mode_cache_deleted}\n"
+            f"- alerts: {del_alert}\n"
+            f"- cooldown/sent keys: {del_cooldown}\n"
+            f"- mode/cache keys: {del_mode_cache}\n"
+            f"- candle cache keys: {del_candle}\n"
             f"- time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
         )
         send_telegram_reply(chat_id, msg)
@@ -5929,7 +5935,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "• تم إيقاف إشارات Long الجديدة مؤقتًا",
         f"• الانتقال: {transition}",
         "• الأوامر والتقارير و Track شغالة عادي",
-        "• تم رفع وقف الخسارة للصفقات الرابحة المفتوحة فوق سعر الدخول"
+        "• تم تفعيل حماية الصفقات الرابحة المفتوحة بنقل وقف الخسارة إلى نقطة التعادل أو أفضل إذا كان مدعومًا"
     ]
  elif new_mode == MODE_RECOVERY_LONG:
     lines = [
@@ -6234,9 +6240,9 @@ def run_scanner_loop():
         current_mode = handle_market_mode_transition(mode_result)
 
         # --- UPDATE OPEN TRADES WITH PROTECTION (supports buffer if available) ---
-        # NOTE: update_open_trades currently may not support 'breakeven_buffer_pct'.
+        # NOTE: update_open_trades currently may not accept 'breakeven_buffer_pct'.
         # If it raises TypeError, we fall back to the old call without buffer.
-        # To fully enable SL above entry, tracking/performance.py must accept breakeven_buffer_pct.
+        # To fully enable SL above entry, tracking/performance.py must be updated.
         try:
             update_open_trades(
                 r,
@@ -6250,7 +6256,7 @@ def run_scanner_loop():
                 reason=f"market_mode={current_mode}",
             )
         except TypeError:
-            logger.warning("update_open_trades does not accept breakeven_buffer_pct, using fallback without buffer")
+            logger.warning("update_open_trades does not accept breakeven_buffer_pct, using fallback without buffer (tracking/performance.py needs update)")
             try:
                 update_open_trades(
                     r,
@@ -6267,24 +6273,27 @@ def run_scanner_loop():
         except Exception as e:
             logger.error(f"update_open_trades error: {e}")
 
-        # Log protected count when in BLOCK_LONGS
+        # Count protected trades properly using smembers and per-trade load
         if current_mode == MODE_BLOCK_LONGS and r:
             try:
-                open_trades_data = r.get("open_trades:futures:long")
+                trade_keys = r.smembers("open_trades:futures:long")
                 protected_count = 0
-                if open_trades_data:
-                    trades = json.loads(open_trades_data)
-                    if isinstance(trades, list):
-                        protected_count = sum(
-                            1 for t in trades
-                            if t.get("protected_breakeven") or t.get("breakeven_protected")
-                        )
+                for trade_key in trade_keys:
+                    try:
+                        raw = r.get(trade_key)
+                        if raw:
+                            trade = json.loads(raw)
+                            if isinstance(trade, dict):
+                                if (trade.get("protected_breakeven") or
+                                    trade.get("breakeven_protected") or
+                                    (isinstance(trade.get("diagnostics"), dict) and trade["diagnostics"].get("protected_breakeven"))):
+                                    protected_count += 1
+                    except Exception:
+                        continue
                 if protected_count > 0:
-                    logger.info(
-                        f"BLOCK_LONGS protection active: {protected_count} open long trades have SL moved above entry (protected)."
-                    )
+                    logger.info(f"BLOCK_LONGS protection: {protected_count} open long trades currently protected.")
                 else:
-                    logger.info("No open long trades protected (or buffer not applied).")
+                    logger.info("No open long trades currently protected (or buffer not applied).")
             except Exception as e:
                 logger.warning(f"Could not count protected trades: {e}")
 
