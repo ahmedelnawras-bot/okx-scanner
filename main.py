@@ -1234,7 +1234,7 @@ def build_help_message() -> str:
 
 <b>🛠 إدارة:</b>
 /reset_stats - تصفير إحصائيات اللونج (soft)
-/hard_reset - مسح كامل لبيانات اللونج (للمدراء فقط)
+/hard_reset - مسح كامل لبيانات اللونج فقط (للمدراء فقط)
 /stats_since_reset - الأداء منذ آخر تصفير
 /how_it_work - شرح طريقة عمل البوت
 
@@ -2151,19 +2151,31 @@ def handle_hard_reset(chat_id: str):
         del_candle = 0
         del_mode_cache = 0
 
+        # Collect keys to remove from trades:all
+        removed_trade_keys = []
+
         # Trade
         for key in r.scan_iter("trade:futures:long:*"):
             r.delete(key)
             del_trade += 1
+            removed_trade_keys.append(key)
         # Trade history
         for key in r.scan_iter("trade_history:futures:long:*"):
             r.delete(key)
             del_history += 1
+            removed_trade_keys.append(key)
+
+        # Remove only long trade keys from trades:all set
+        if removed_trade_keys:
+            try:
+                r.srem("trades:all", *removed_trade_keys)
+            except Exception as e:
+                logger.warning(f"Failed to srem trade keys from trades:all: {e}")
+
         # Open trades / stats
         r.delete("open_trades:futures:long")
         r.delete("stats:futures:long")
         r.delete("stats:last_reset_ts:long")
-        r.delete("trades:all")  # added as per request
         # Alerts & sent/cooldowns
         for key in r.scan_iter("alert:long:*"):
             r.delete(key)
@@ -5935,7 +5947,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "• تم إيقاف إشارات Long الجديدة مؤقتًا",
         f"• الانتقال: {transition}",
         "• الأوامر والتقارير و Track شغالة عادي",
-        "• تم تفعيل حماية الصفقات الرابحة المفتوحة بنقل وقف الخسارة إلى نقطة التعادل أو أفضل إذا كان مدعومًا"
+        "• تمت محاولة حماية الصفقات الرابحة المفتوحة برفع SL إلى التعادل أو أفضل حسب دعم tracking/performance.py"
     ]
  elif new_mode == MODE_RECOVERY_LONG:
     lines = [
@@ -6273,10 +6285,11 @@ def run_scanner_loop():
         except Exception as e:
             logger.error(f"update_open_trades error: {e}")
 
-        # Count protected trades properly using smembers and per-trade load
+        # Count protected trades using smembers - open_trades:futures:long is a Redis Set
         if current_mode == MODE_BLOCK_LONGS and r:
             try:
-                trade_keys = r.smembers("open_trades:futures:long")
+                trade_keys = list(r.smembers("open_trades:futures:long"))
+                open_count = len(trade_keys)
                 protected_count = 0
                 for trade_key in trade_keys:
                     try:
@@ -6285,15 +6298,18 @@ def run_scanner_loop():
                             trade = json.loads(raw)
                             if isinstance(trade, dict):
                                 if (trade.get("protected_breakeven") or
-                                    trade.get("breakeven_protected") or
-                                    (isinstance(trade.get("diagnostics"), dict) and trade["diagnostics"].get("protected_breakeven"))):
+                                    trade.get("sl_moved_to_entry") or
+                                    trade.get("breakeven_protection_reason")):
                                     protected_count += 1
                     except Exception:
                         continue
+                logger.info(
+                    f"BLOCK_LONGS protection: {protected_count}/{open_count} open long trades currently protected."
+                )
                 if protected_count > 0:
-                    logger.info(f"BLOCK_LONGS protection: {protected_count} open long trades currently protected.")
-                else:
-                    logger.info("No open long trades currently protected (or buffer not applied).")
+                    # Send a concise Telegram message once per BLOCK entry
+                    # Already handled via transition message, avoid spamming
+                    pass
             except Exception as e:
                 logger.warning(f"Could not count protected trades: {e}")
 
