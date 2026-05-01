@@ -7,19 +7,23 @@
 
 جميع الدوال العامة محفوظة للتوافق مع main.py دون أي تغيير في أسمائها.
 
-تم التعديل لدعم تقارير الشورت بخطة إدارة رأس مال مستقلة:
+دعم كامل لتقارير الشورت بخطة إدارة رأس مال مستقلة:
 - الشورت: 10 صفقات، مارجن 20$ لكل صفقة، رافعة 15x، إجمالي مارجن 200$، تعرض اسمي 3000$.
 - اللونج: يبقى على الإعدادات القديمة (35% من رصيد 1000$).
 
-تعديل مهم:
-- تم استبدال التقريب الثابت round(..., 6) بدالة round_price()
-  حتى لا تتحول أسعار العملات الصغيرة جداً إلى 0.000000.
-- إضافة دوال تحليل الخروج والأداء اليومي وتقارير فورية.
-- تم إصلاح دالة normalize_market_type لتدعم "swap" كمرادف لـ "futures".
-- estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب (وليس per_trade_usd القديم).
-- إضافة دالة diagnose_performance_problem لتشخيص مشاكل الأداء.
-- إصلاح تشخيص exit_summary وعرض المشكلة الأساسية في جميع التقارير.
-- دعم الحقول الجديدة للتخزين وحماية نقطة التعادل.
+تم استبدال التقريب الثابت round(..., 6) بدالة round_price()
+حتى لا تتحول أسعار العملات الصغيرة جداً إلى 0.000000.
+إضافة دوال تحليل الخروج والأداء اليومي وتقارير فورية.
+إصلاح دالة normalize_market_type لتدعم "swap" كمرادف لـ "futures".
+estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
+إضافة دالة diagnose_performance_problem لتشخيص مشاكل الأداء.
+إصلاح تشخيص exit_summary وعرض المشكلة الأساسية في جميع التقارير.
+دعم الحقول الجديدة للتخزين وحماية نقطة التعادل.
+
+**إصدار 3.0 – إصلاح منطق تتبع الشموع المفتوحة**
+- إضافة حقل last_processed_candle_ts لمنع إعادة معالجة الشموع القديمة.
+- إزالة تأثير وقت الحماية على نقطة بدء التقييم؛ تُعالج جميع الشموع الجديدة دائمًا.
+- تطبيق حماية breakeven بعد تقييم جميع الشموع وفقط إذا بقيت الصفقة مفتوحة.
 """
 
 import json
@@ -27,7 +31,7 @@ import time
 import logging
 import requests
 from collections import Counter, defaultdict
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 
 from tracking.summary_helpers import (
     safe_float,
@@ -57,8 +61,8 @@ logger = logging.getLogger("okx-scanner")
 # ثوابت
 # ------------------------------------------------------------
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
-TRADE_TTL_SECONDS = 60 * 60 * 24 * 30
-TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90
+TRADE_TTL_SECONDS = 60 * 60 * 24 * 30        # 30 يومًا للمفاتيح النشطة
+TRADE_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 90  # 90 يومًا للتاريخ
 
 # إعدادات اللونج
 REPORT_ACCOUNT_BALANCE_USD = 1000.0
@@ -76,7 +80,7 @@ SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0
 
 
 # ------------------------------------------------------------
-# دوال مساعدة عامة
+# دوال مساعدة عامة (safe & normalization)
 # ------------------------------------------------------------
 def normalize_market_type(market_type: str) -> str:
     market_type = (market_type or "futures").strip().lower()
@@ -95,7 +99,7 @@ def normalize_bool(value) -> bool:
     return bool(value)
 
 
-def normalize_list(value):
+def normalize_list(value) -> list:
     if value is None:
         return []
     if isinstance(value, list):
@@ -122,13 +126,8 @@ def redis_hash_get(stats: dict, key: str, default=0):
 def round_price(value, default=0.0) -> float:
     """
     تقريب ذكي للأسعار.
-
-    السبب:
-    round(price, 6) يقتل العملات الصغيرة جداً ويحولها إلى 0.000000.
-    لذلك نستخدم عدد منازل أكبر حسب حجم السعر.
-
     أمثلة:
-    - BTC / ETH: 2-6 منازل كفاية
+    - BTC / ETH: 4-6 منازل
     - MASK / SOL: 6 منازل
     - SATS / PEPE / SHIB: 10-12 منزلة
     """
@@ -150,12 +149,24 @@ def round_price(value, default=0.0) -> float:
     return round(price, 12)
 
 
+def safe_timestamp(ts_value, default=0) -> int:
+    """يحول timestamp بأمان إلى int مع دعم تقسيم الميلي ثانية."""
+    try:
+        ts = int(float(ts_value))
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+        return ts
+    except (ValueError, TypeError):
+        return default
+
+
 # ------------------------------------------------------------
 # مفاتيح Redis
 # ------------------------------------------------------------
 def get_trade_key(market_type: str, side: str, symbol: str, candle_time: int) -> str:
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
+    candle_time = int(candle_time)
     return f"trade:{market_type}:{side}:{symbol}:{candle_time}"
 
 
@@ -300,125 +311,135 @@ def cleanup_missing_trades_from_index(redis_client) -> int:
 
 
 # ------------------------------------------------------------
-# SERIALIZATION HELPERS
+# SERIALIZATION HELPERS (build diagnostics & history snapshot)
 # ------------------------------------------------------------
 def build_trade_diagnostics(extra_fields: dict = None) -> dict:
-    extra_fields = extra_fields or {}
+    """
+    بناء diagnostics dict من الحقول الإضافية مع الحفاظ على القيم الآمنة.
+    تدعم جميع الحقول الجديدة والقديمة.
+    """
+    extra = extra_fields or {}
 
-    pullback_entry = extra_fields.get("pullback_entry")
-    pullback_low = extra_fields.get("pullback_low")
-    pullback_high = extra_fields.get("pullback_high")
-    effective_entry = extra_fields.get("effective_entry")
+    def _get(key, default=None):
+        val = extra.get(key)
+        return val if val is not None else default
+
+    pullback_entry = _get("pullback_entry")
+    pullback_low = _get("pullback_low")
+    pullback_high = _get("pullback_high")
+    effective_entry = _get("effective_entry")
 
     diagnostics = {
-        "raw_score": safe_float(extra_fields.get("raw_score"), 0.0),
-        "effective_score": safe_float(extra_fields.get("effective_score"), 0.0),
-        "dynamic_threshold": safe_float(extra_fields.get("dynamic_threshold"), 0.0),
-        "required_min_score": safe_float(extra_fields.get("required_min_score"), 0.0),
-        "dist_ma": safe_float(extra_fields.get("dist_ma"), 0.0),
-        "rank_volume_24h": safe_float(extra_fields.get("rank_volume_24h"), 0.0),
+        "raw_score": safe_float(_get("raw_score"), 0.0),
+        "effective_score": safe_float(_get("effective_score"), 0.0),
+        "dynamic_threshold": safe_float(_get("dynamic_threshold"), 0.0),
+        "required_min_score": safe_float(_get("required_min_score"), 0.0),
+        "dist_ma": safe_float(_get("dist_ma"), 0.0),
+        "rank_volume_24h": safe_float(_get("rank_volume_24h"), 0.0),
 
-        "market_state": normalize_text(extra_fields.get("market_state"), "unknown"),
-        "market_state_label": normalize_text(extra_fields.get("market_state_label"), "unknown"),
-        "market_bias_label": normalize_text(extra_fields.get("market_bias_label"), "unknown"),
-        "alt_mode": normalize_text(extra_fields.get("alt_mode"), "unknown"),
-        "entry_timing": normalize_text(extra_fields.get("entry_timing"), "unknown"),
-        "opportunity_type": normalize_text(extra_fields.get("opportunity_type"), "unknown"),
-        "early_priority": normalize_text(extra_fields.get("early_priority"), "unknown"),
-        "breakout_quality": normalize_text(extra_fields.get("breakout_quality"), "unknown"),
-        "risk_level": normalize_text(extra_fields.get("risk_level"), "unknown"),
-        "alert_id": normalize_text(extra_fields.get("alert_id"), ""),
+        "market_state": normalize_text(_get("market_state"), "unknown"),
+        "market_state_label": normalize_text(_get("market_state_label"), "unknown"),
+        "market_bias_label": normalize_text(_get("market_bias_label"), "unknown"),
+        "alt_mode": normalize_text(_get("alt_mode"), "unknown"),
+        "entry_timing": normalize_text(_get("entry_timing"), "unknown"),
+        "opportunity_type": normalize_text(_get("opportunity_type"), "unknown"),
+        "early_priority": normalize_text(_get("early_priority"), "unknown"),
+        "breakout_quality": normalize_text(_get("breakout_quality"), "unknown"),
+        "risk_level": normalize_text(_get("risk_level"), "unknown"),
+        "alert_id": normalize_text(_get("alert_id"), ""),
 
-        "fake_signal": normalize_bool(extra_fields.get("fake_signal", False)),
-        "is_reverse": normalize_bool(extra_fields.get("is_reverse", False)),
-        "reversal_4h_confirmed": normalize_bool(extra_fields.get("reversal_4h_confirmed", False)),
-        "has_high_impact_news": normalize_bool(extra_fields.get("has_high_impact_news", False)),
+        "fake_signal": normalize_bool(_get("fake_signal", False)),
+        "is_reverse": normalize_bool(_get("is_reverse", False)),
+        "reversal_4h_confirmed": normalize_bool(_get("reversal_4h_confirmed", False)),
+        "has_high_impact_news": normalize_bool(_get("has_high_impact_news", False)),
 
-        "news_titles": normalize_list(extra_fields.get("news_titles", [])),
-        "warning_reasons": normalize_list(extra_fields.get("warning_reasons", [])),
+        "news_titles": normalize_list(_get("news_titles")),
+        "warning_reasons": normalize_list(_get("warning_reasons")),
 
         "pullback_entry": round_price(pullback_entry) if pullback_entry is not None else None,
         "pullback_low": round_price(pullback_low) if pullback_low is not None else None,
         "pullback_high": round_price(pullback_high) if pullback_high is not None else None,
-        "pullback_triggered": normalize_bool(extra_fields.get("pullback_triggered", False)),
+        "pullback_triggered": normalize_bool(_get("pullback_triggered", False)),
         "effective_entry": round_price(effective_entry) if effective_entry is not None else None,
 
-        "rr1": safe_float(extra_fields.get("rr1"), 1.5),
-        "rr2": safe_float(extra_fields.get("rr2"), 3.0),
+        "rr1": safe_float(_get("rr1"), 1.5),
+        "rr2": safe_float(_get("rr2"), 3.0),
 
-        # الحقول الجديدة
-        "setup_type_base": normalize_text(extra_fields.get("setup_type_base"), ""),
-        "final_threshold": safe_float(extra_fields.get("final_threshold"), 0.0),
-        "adjustments_log": normalize_list(extra_fields.get("adjustments_log")),
-        "warning_penalty": safe_float(extra_fields.get("warning_penalty"), 0.0),
-        "warning_penalty_details": normalize_list(extra_fields.get("warning_penalty_details")),
-        "warning_high_count": safe_int(extra_fields.get("warning_high_count"), 0),
-        "warning_medium_count": safe_int(extra_fields.get("warning_medium_count"), 0),
-        "tp1_close_pct": safe_float(extra_fields.get("tp1_close_pct"), 50.0),
-        "tp2_close_pct": safe_float(extra_fields.get("tp2_close_pct"), 50.0),
-        "move_sl_to_entry_after_tp1": normalize_bool(extra_fields.get("move_sl_to_entry_after_tp1", True)),
-        "fib_position": normalize_text(extra_fields.get("fib_position"), "unknown"),
-        "fib_position_ratio": safe_float(extra_fields.get("fib_position_ratio")),
-        "fib_label": normalize_text(extra_fields.get("fib_label"), ""),
-        "had_pullback": normalize_bool(extra_fields.get("had_pullback", False)),
-        "pullback_pct": safe_float(extra_fields.get("pullback_pct")),
-        "pullback_label": normalize_text(extra_fields.get("pullback_label"), ""),
-        "wave_estimate": safe_int(extra_fields.get("wave_estimate"), 0),
-        "wave_peaks": safe_int(extra_fields.get("wave_peaks"), 0),
-        "wave_label": normalize_text(extra_fields.get("wave_label"), ""),
-        "entry_maturity": normalize_text(extra_fields.get("entry_maturity"), "unknown"),
-        "maturity_penalty": safe_float(extra_fields.get("maturity_penalty"), 0.0),
-        "maturity_bonus": safe_float(extra_fields.get("maturity_bonus"), 0.0),
-        "falling_knife_risk": normalize_bool(extra_fields.get("falling_knife_risk", False)),
-        "falling_knife_reasons": normalize_list(extra_fields.get("falling_knife_reasons")),
-        "target_method": normalize_text(extra_fields.get("target_method"), "unknown"),
-        "nearest_resistance": round_price(extra_fields.get("nearest_resistance")) if extra_fields.get("nearest_resistance") is not None else None,
-        "nearest_support": round_price(extra_fields.get("nearest_support")) if extra_fields.get("nearest_support") is not None else None,
-        "resistance_warning": normalize_text(extra_fields.get("resistance_warning"), ""),
-        "support_warning": normalize_text(extra_fields.get("support_warning"), ""),
-        "target_notes": normalize_list(extra_fields.get("target_notes")),
-        "sl_method": normalize_text(extra_fields.get("sl_method"), "unknown"),
-        # sl_notes كـ list
-        "sl_notes": normalize_list(extra_fields.get("sl_notes")),
-        "wave_context": normalize_text(extra_fields.get("wave_context"), ""),
-        "setup_context": normalize_text(extra_fields.get("setup_context"), ""),
-        "reversal_quality": normalize_text(extra_fields.get("reversal_quality"), ""),
-        "reversal_structure_confirmed": normalize_bool(extra_fields.get("reversal_structure_confirmed", False)),
-        "strong_bull_pullback": normalize_bool(extra_fields.get("strong_bull_pullback", False)),
-        "strong_breakout_exception": normalize_bool(extra_fields.get("strong_breakout_exception", False)),
+        # الحقول الجديدة (v2)
+        "setup_type_base": normalize_text(_get("setup_type_base"), ""),
+        "final_threshold": safe_float(_get("final_threshold"), 0.0),
+        "adjustments_log": normalize_list(_get("adjustments_log")),
+        "warning_penalty": safe_float(_get("warning_penalty"), 0.0),
+        "warning_penalty_details": normalize_list(_get("warning_penalty_details")),
+        "warning_high_count": safe_int(_get("warning_high_count"), 0),
+        "warning_medium_count": safe_int(_get("warning_medium_count"), 0),
+        "tp1_close_pct": safe_float(_get("tp1_close_pct"), 50.0),
+        "tp2_close_pct": safe_float(_get("tp2_close_pct"), 50.0),
+        "move_sl_to_entry_after_tp1": normalize_bool(_get("move_sl_to_entry_after_tp1", True)),
+        "fib_position": normalize_text(_get("fib_position"), "unknown"),
+        "fib_position_ratio": safe_float(_get("fib_position_ratio")),
+        "fib_label": normalize_text(_get("fib_label"), ""),
+        "had_pullback": normalize_bool(_get("had_pullback", False)),
+        "pullback_pct": safe_float(_get("pullback_pct")),
+        "pullback_label": normalize_text(_get("pullback_label"), ""),
+        "wave_estimate": safe_int(_get("wave_estimate"), 0),
+        "wave_peaks": safe_int(_get("wave_peaks"), 0),
+        "wave_label": normalize_text(_get("wave_label"), ""),
+        "entry_maturity": normalize_text(_get("entry_maturity"), "unknown"),
+        "maturity_penalty": safe_float(_get("maturity_penalty"), 0.0),
+        "maturity_bonus": safe_float(_get("maturity_bonus"), 0.0),
+        "falling_knife_risk": normalize_bool(_get("falling_knife_risk", False)),
+        "falling_knife_reasons": normalize_list(_get("falling_knife_reasons")),
+        "target_method": normalize_text(_get("target_method"), "unknown"),
+        "nearest_resistance": round_price(_get("nearest_resistance")) if _get("nearest_resistance") is not None else None,
+        "nearest_support": round_price(_get("nearest_support")) if _get("nearest_support") is not None else None,
+        "resistance_warning": normalize_text(_get("resistance_warning"), ""),
+        "support_warning": normalize_text(_get("support_warning"), ""),
+        "target_notes": normalize_list(_get("target_notes")),
+        "sl_method": normalize_text(_get("sl_method"), "unknown"),
+        "sl_notes": normalize_list(_get("sl_notes")),
+        "wave_context": normalize_text(_get("wave_context"), ""),
+        "setup_context": normalize_text(_get("setup_context"), ""),
+        "reversal_quality": normalize_text(_get("reversal_quality"), ""),
+        "reversal_structure_confirmed": normalize_bool(_get("reversal_structure_confirmed", False)),
+        "strong_bull_pullback": normalize_bool(_get("strong_bull_pullback", False)),
+        "strong_breakout_exception": normalize_bool(_get("strong_breakout_exception", False)),
 
-        # حقول Extra Strong Setup
-        "has_extra_strong_setup": normalize_bool(extra_fields.get("has_extra_strong_setup", False)),
-        "extra_setup_names": normalize_list(extra_fields.get("extra_setup_names")),
-        "extra_setup_bonus": safe_float(extra_fields.get("extra_setup_bonus"), 0.0),
-        "primary_extra_setup": normalize_text(extra_fields.get("primary_extra_setup"), ""),
-        "extra_setups_details": extra_fields.get("extra_setups_details") or {},
+        # Extra Strong Setup
+        "has_extra_strong_setup": normalize_bool(_get("has_extra_strong_setup", False)),
+        "extra_setup_names": normalize_list(_get("extra_setup_names")),
+        "extra_setup_bonus": safe_float(_get("extra_setup_bonus"), 0.0),
+        "primary_extra_setup": normalize_text(_get("primary_extra_setup"), ""),
+        "extra_setups_details": _get("extra_setups_details") or {},
 
-        "protected_breakeven": normalize_bool(extra_fields.get("protected_breakeven", False)),
-        "breakeven_protection_reason": normalize_text(extra_fields.get("breakeven_protection_reason"), ""),
-        "breakeven_protected_ts": (
-            safe_int(extra_fields.get("breakeven_protected_ts"), 0)
-            if extra_fields.get("breakeven_protected_ts") is not None else None
-        ),
-        "original_sl_before_breakeven": round_price(extra_fields.get("original_sl_before_breakeven")) if extra_fields.get("original_sl_before_breakeven") is not None else None,
-        "protected_breakeven_exit": normalize_bool(extra_fields.get("protected_breakeven_exit", False)),
-        "sl_moved_to_entry": normalize_bool(extra_fields.get("sl_moved_to_entry", False)),
-        "sl_move_reason": normalize_text(extra_fields.get("sl_move_reason"), ""),
+        "protected_breakeven": normalize_bool(_get("protected_breakeven", False)),
+        "breakeven_protection_reason": normalize_text(_get("breakeven_protection_reason"), ""),
+        "breakeven_protected_ts": safe_int(_get("breakeven_protected_ts"), 0) if _get("breakeven_protected_ts") is not None else None,
+        "original_sl_before_breakeven": round_price(_get("original_sl_before_breakeven")) if _get("original_sl_before_breakeven") is not None else None,
+        "protected_breakeven_exit": normalize_bool(_get("protected_breakeven_exit", False)),
+        "sl_moved_to_entry": normalize_bool(_get("sl_moved_to_entry", False)),
+        "sl_move_reason": normalize_text(_get("sl_move_reason"), ""),
+        "exit_reason": normalize_text(_get("exit_reason"), ""),
+        "last_processed_candle_ts": safe_int(_get("last_processed_candle_ts"), 0),
     }
 
     return diagnostics
 
 
 def build_history_snapshot(trade_data: dict) -> dict:
+    """
+    يبني snapshot تاريخي من trade_data مع الأولوية للمفاتيح top-level ثم diagnostics.
+    """
     diagnostics = trade_data.get("diagnostics", {}) or {}
 
-    def get_field(name, default=None):
+    def _get_field(name, default=None):
+        # نبحث أولاً في top-level ثم diagnostics
         val = trade_data.get(name)
         if val is None:
             val = diagnostics.get(name)
         return val if val is not None else default
 
-    return {
+    snapshot = {
         "symbol": trade_data.get("symbol", ""),
         "market_type": trade_data.get("market_type", "futures"),
         "side": trade_data.get("side", "long"),
@@ -438,100 +459,101 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "result": trade_data.get("result"),
         "tp1_hit": normalize_bool(trade_data.get("tp1_hit", False)),
 
-        "market_state": diagnostics.get("market_state", "unknown"),
-        "market_state_label": diagnostics.get("market_state_label", "unknown"),
-        "market_bias_label": diagnostics.get("market_bias_label", "unknown"),
-        "alt_mode": diagnostics.get("alt_mode", "unknown"),
-        "entry_timing": diagnostics.get("entry_timing", "unknown"),
-        "opportunity_type": diagnostics.get("opportunity_type", "unknown"),
-        "early_priority": diagnostics.get("early_priority", "unknown"),
-        "breakout_quality": diagnostics.get("breakout_quality", "unknown"),
-        "risk_level": diagnostics.get("risk_level", "unknown"),
+        "market_state": _get_field("market_state", "unknown"),
+        "market_state_label": _get_field("market_state_label", "unknown"),
+        "market_bias_label": _get_field("market_bias_label", "unknown"),
+        "alt_mode": _get_field("alt_mode", "unknown"),
+        "entry_timing": _get_field("entry_timing", "unknown"),
+        "opportunity_type": _get_field("opportunity_type", "unknown"),
+        "early_priority": _get_field("early_priority", "unknown"),
+        "breakout_quality": _get_field("breakout_quality", "unknown"),
+        "risk_level": _get_field("risk_level", "unknown"),
 
-        "dist_ma": safe_float(diagnostics.get("dist_ma"), 0.0),
-        "raw_score": safe_float(diagnostics.get("raw_score"), 0.0),
-        "effective_score": safe_float(diagnostics.get("effective_score"), 0.0),
-        "dynamic_threshold": safe_float(diagnostics.get("dynamic_threshold"), 0.0),
-        "required_min_score": safe_float(diagnostics.get("required_min_score"), 0.0),
+        "dist_ma": safe_float(_get_field("dist_ma"), 0.0),
+        "raw_score": safe_float(_get_field("raw_score"), 0.0),
+        "effective_score": safe_float(_get_field("effective_score"), 0.0),
+        "dynamic_threshold": safe_float(_get_field("dynamic_threshold"), 0.0),
+        "required_min_score": safe_float(_get_field("required_min_score"), 0.0),
 
-        "fake_signal": diagnostics.get("fake_signal", False),
-        "is_reverse": diagnostics.get("is_reverse", False),
-        "reversal_4h_confirmed": diagnostics.get("reversal_4h_confirmed", False),
-        "has_high_impact_news": diagnostics.get("has_high_impact_news", False),
+        "fake_signal": _get_field("fake_signal", False),
+        "is_reverse": _get_field("is_reverse", False),
+        "reversal_4h_confirmed": _get_field("reversal_4h_confirmed", False),
+        "has_high_impact_news": _get_field("has_high_impact_news", False),
 
         "warning_reasons": normalize_list(trade_data.get("warning_reasons", [])),
-        "news_titles": normalize_list(diagnostics.get("news_titles", [])),
+        "news_titles": normalize_list(_get_field("news_titles", [])),
 
-        "pullback_entry": diagnostics.get("pullback_entry"),
-        "pullback_low": diagnostics.get("pullback_low"),
-        "pullback_high": diagnostics.get("pullback_high"),
-        "pullback_triggered": diagnostics.get("pullback_triggered", False),
-        "effective_entry": diagnostics.get("effective_entry"),
+        "pullback_entry": _get_field("pullback_entry"),
+        "pullback_low": _get_field("pullback_low"),
+        "pullback_high": _get_field("pullback_high"),
+        "pullback_triggered": _get_field("pullback_triggered", False),
+        "effective_entry": _get_field("effective_entry"),
 
-        "rr1": safe_float(diagnostics.get("rr1"), 1.5),
-        "rr2": safe_float(diagnostics.get("rr2"), 3.0),
+        "rr1": safe_float(_get_field("rr1"), 1.5),
+        "rr2": safe_float(_get_field("rr2"), 3.0),
+
+        # حقول جديدة
+        "setup_type_base": _get_field("setup_type_base", ""),
+        "final_threshold": safe_float(_get_field("final_threshold", 0.0)),
+        "target_method": _get_field("target_method", "unknown"),
+        "nearest_resistance": _get_field("nearest_resistance"),
+        "nearest_support": _get_field("nearest_support"),
+        "resistance_warning": _get_field("resistance_warning", ""),
+        "support_warning": _get_field("support_warning", ""),
+        "target_notes": normalize_list(_get_field("target_notes", [])),
+        "sl_method": _get_field("sl_method", "unknown"),
+        "sl_notes": normalize_list(_get_field("sl_notes", [])),
+        "falling_knife_risk": normalize_bool(_get_field("falling_knife_risk", False)),
+        "falling_knife_reasons": normalize_list(_get_field("falling_knife_reasons", [])),
+        "wave_context": _get_field("wave_context", ""),
+        "setup_context": _get_field("setup_context", ""),
+        "reversal_quality": _get_field("reversal_quality", ""),
+        "reversal_structure_confirmed": normalize_bool(_get_field("reversal_structure_confirmed", False)),
+        "strong_bull_pullback": normalize_bool(_get_field("strong_bull_pullback", False)),
+        "strong_breakout_exception": normalize_bool(_get_field("strong_breakout_exception", False)),
+
+        # Extra Strong Setup
+        "has_extra_strong_setup": normalize_bool(_get_field("has_extra_strong_setup", False)),
+        "extra_setup_names": normalize_list(_get_field("extra_setup_names", [])),
+        "extra_setup_bonus": safe_float(_get_field("extra_setup_bonus"), 0.0),
+        "primary_extra_setup": _get_field("primary_extra_setup", ""),
+        "extra_setups_details": _get_field("extra_setups_details", {}) or {},
+
+        "tp1_close_pct": safe_float(_get_field("tp1_close_pct"), 50.0),
+        "tp2_close_pct": safe_float(_get_field("tp2_close_pct"), 50.0),
+        "move_sl_to_entry_after_tp1": normalize_bool(_get_field("move_sl_to_entry_after_tp1", True)),
+        "fib_position": _get_field("fib_position", "unknown"),
+        "fib_position_ratio": safe_float(_get_field("fib_position_ratio")),
+        "fib_label": _get_field("fib_label", ""),
+        "had_pullback": normalize_bool(_get_field("had_pullback", False)),
+        "pullback_pct": safe_float(_get_field("pullback_pct")),
+        "pullback_label": _get_field("pullback_label", ""),
+        "wave_estimate": safe_int(_get_field("wave_estimate"), 0),
+        "wave_peaks": safe_int(_get_field("wave_peaks"), 0),
+        "wave_label": _get_field("wave_label", ""),
+        "entry_maturity": _get_field("entry_maturity", "unknown"),
+        "maturity_penalty": safe_float(_get_field("maturity_penalty"), 0.0),
+        "maturity_bonus": safe_float(_get_field("maturity_bonus"), 0.0),
+        "warning_penalty": safe_float(_get_field("warning_penalty"), 0.0),
+        "warning_penalty_details": normalize_list(_get_field("warning_penalty_details", [])),
+        "adjustments_log": normalize_list(_get_field("adjustments_log", [])),
+        "protected_breakeven": normalize_bool(_get_field("protected_breakeven", False)),
+        "breakeven_protection_reason": _get_field("breakeven_protection_reason", ""),
+        "breakeven_protected_ts": safe_int(_get_field("breakeven_protected_ts")) if _get_field("breakeven_protected_ts") is not None else None,
+        "original_sl_before_breakeven": _get_field("original_sl_before_breakeven"),
+        "protected_breakeven_exit": normalize_bool(_get_field("protected_breakeven_exit", False)),
+        "sl_moved_to_entry": normalize_bool(_get_field("sl_moved_to_entry", False)),
+        "sl_move_reason": _get_field("sl_move_reason", ""),
+        "exit_reason": _get_field("exit_reason", ""),
+        "last_processed_candle_ts": safe_int(_get_field("last_processed_candle_ts"), 0),
         "diagnostics": diagnostics,
-
-        # الحقول الجديدة المهمة للتاريخ
-        "setup_type_base": get_field("setup_type_base", ""),
-        "final_threshold": safe_float(get_field("final_threshold", 0.0)),
-        "target_method": get_field("target_method", "unknown"),
-        "nearest_resistance": get_field("nearest_resistance"),
-        "nearest_support": get_field("nearest_support"),
-        "resistance_warning": get_field("resistance_warning", ""),
-        "support_warning": get_field("support_warning", ""),
-        "target_notes": normalize_list(get_field("target_notes", [])),
-        "sl_method": get_field("sl_method", "unknown"),
-        "sl_notes": normalize_list(get_field("sl_notes", [])),
-        "falling_knife_risk": normalize_bool(get_field("falling_knife_risk", False)),
-        "falling_knife_reasons": normalize_list(get_field("falling_knife_reasons", [])),
-        "wave_context": get_field("wave_context", ""),
-        "setup_context": get_field("setup_context", ""),
-        "reversal_quality": get_field("reversal_quality", ""),
-        "reversal_structure_confirmed": normalize_bool(get_field("reversal_structure_confirmed", False)),
-        "strong_bull_pullback": normalize_bool(get_field("strong_bull_pullback", False)),
-        "strong_breakout_exception": normalize_bool(get_field("strong_breakout_exception", False)),
-
-        # Extra Strong Setup fields in history
-        "has_extra_strong_setup": normalize_bool(get_field("has_extra_strong_setup", False)),
-        "extra_setup_names": normalize_list(get_field("extra_setup_names", [])),
-        "extra_setup_bonus": safe_float(get_field("extra_setup_bonus", 0.0)),
-        "primary_extra_setup": get_field("primary_extra_setup", ""),
-        "extra_setups_details": get_field("extra_setups_details", {}) or {},
-
-        "tp1_close_pct": safe_float(get_field("tp1_close_pct", 50.0)),
-        "tp2_close_pct": safe_float(get_field("tp2_close_pct", 50.0)),
-        "move_sl_to_entry_after_tp1": normalize_bool(get_field("move_sl_to_entry_after_tp1", True)),
-        "fib_position": get_field("fib_position", "unknown"),
-        "fib_position_ratio": safe_float(get_field("fib_position_ratio")),
-        "fib_label": get_field("fib_label", ""),
-        "had_pullback": normalize_bool(get_field("had_pullback", False)),
-        "pullback_pct": safe_float(get_field("pullback_pct")),
-        "pullback_label": get_field("pullback_label", ""),
-        "wave_estimate": safe_int(get_field("wave_estimate", 0)),
-        "wave_peaks": safe_int(get_field("wave_peaks", 0)),
-        "wave_label": get_field("wave_label", ""),
-        "entry_maturity": get_field("entry_maturity", "unknown"),
-        "maturity_penalty": safe_float(get_field("maturity_penalty", 0.0)),
-        "maturity_bonus": safe_float(get_field("maturity_bonus", 0.0)),
-        "warning_penalty": safe_float(get_field("warning_penalty", 0.0)),
-        "warning_penalty_details": normalize_list(get_field("warning_penalty_details", [])),
-        "adjustments_log": normalize_list(get_field("adjustments_log", [])),
-        "protected_breakeven": normalize_bool(get_field("protected_breakeven", False)),
-        "breakeven_protection_reason": get_field("breakeven_protection_reason", ""),
-        "breakeven_protected_ts": (
-            safe_int(get_field("breakeven_protected_ts"), 0)
-            if get_field("breakeven_protected_ts") is not None else None
-        ),
-        "original_sl_before_breakeven": get_field("original_sl_before_breakeven"),
-        "protected_breakeven_exit": normalize_bool(get_field("protected_breakeven_exit", False)),
-        "sl_moved_to_entry": normalize_bool(get_field("sl_moved_to_entry", False)),
-        "sl_move_reason": get_field("sl_move_reason", ""),
     }
+
+    return snapshot
 
 
 # ------------------------------------------------------------
-# TRADE STORAGE
+# TRADE STORAGE (register / load / save / mark)
 # ------------------------------------------------------------
 def register_trade(
     redis_client,
@@ -584,7 +606,7 @@ def register_trade(
     pullback_high: float = None,
     rr1: float = 1.5,
     rr2: float = 3.0,
-    # New fields (optional)
+    # الحقول الجديدة (اختيارية)
     final_threshold: float = None,
     target_method: str = None,
     nearest_resistance: float = None,
@@ -610,7 +632,6 @@ def register_trade(
     breakeven_protected_ts: int = None,
     original_sl_before_breakeven: float = None,
     protected_breakeven_exit: bool = False,
-    # More optional fields
     tp1_close_pct: float = None,
     tp2_close_pct: float = None,
     move_sl_to_entry_after_tp1: bool = None,
@@ -629,137 +650,53 @@ def register_trade(
     maturity_bonus: float = None,
     strong_bull_pullback: bool = None,
     strong_breakout_exception: bool = None,
+    has_extra_strong_setup: bool = None,
+    extra_setup_names: list = None,
+    extra_setup_bonus: float = None,
+    primary_extra_setup: str = None,
+    extra_setups_details: dict = None,
     **kwargs,
 ):
+    """
+    تسجيل صفقة جديدة في Redis مع دعم جميع الحقول الجديدة و backward compatibility.
+    الأولوية للـ arguments المباشرة على kwargs.
+    """
     if redis_client is None:
         return False
 
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
 
-    entry = round_price(entry)
-    sl = round_price(sl)
-
-    tp1 = round_price(tp1) if tp1 is not None else calc_tp1(entry, sl, side=side)
-    tp2 = round_price(tp2) if tp2 is not None else calc_tp2(entry, sl, side=side)
-
-    pullback_entry = round_price(pullback_entry) if pullback_entry is not None else None
-    pullback_low = round_price(pullback_low) if pullback_low is not None else None
-    pullback_high = round_price(pullback_high) if pullback_high is not None else None
-
-    trade_key = get_trade_key(market_type, side, symbol, candle_time)
-    history_key = get_trade_history_key(market_type, side, symbol, candle_time)
-    open_set_key = get_open_trades_set_key(market_type, side)
-    all_trades_key = get_all_trades_set_key()
-
-    now_ts = int(time.time())
-    if reasons is None:
-        reasons = []
-
-    # توافق مع أسماء بديلة قد يرسلها main.py
-    if "is_reverse" in kwargs and not is_reverse_signal:
-        is_reverse_signal = normalize_bool(kwargs.get("is_reverse"))
-
-    if "reverse_signal" in kwargs and not is_reverse_signal:
-        is_reverse_signal = normalize_bool(kwargs.get("reverse_signal"))
-
-    if warning_reasons is None and "warnings" in kwargs:
-        warning_reasons = normalize_list(kwargs.get("warnings"))
-
-    if not has_high_impact_news and "news_nearby" in kwargs:
-        has_high_impact_news = normalize_bool(kwargs.get("news_nearby"))
-
-    # الحصول على الحقول الإضافية من kwargs إذا لم تُمرر في الـ signature
-    def _get_kwarg(name, default=None):
-        return kwargs.get(name, default)
-
-    _tp1_close_pct = safe_float(tp1_close_pct) if tp1_close_pct is not None else safe_float(_get_kwarg("tp1_close_pct", 50.0))
-    _tp2_close_pct = safe_float(tp2_close_pct) if tp2_close_pct is not None else safe_float(_get_kwarg("tp2_close_pct", 50.0))
-    _move_sl_to_entry_after_tp1 = normalize_bool(move_sl_to_entry_after_tp1) if move_sl_to_entry_after_tp1 is not None else normalize_bool(_get_kwarg("move_sl_to_entry_after_tp1", True))
-    _setup_type_base = setup_type_base or _get_kwarg("setup_type_base", "")
-    _fib_position = fib_position or _get_kwarg("fib_position", "unknown")
-    _fib_position_ratio = safe_float(fib_position_ratio) if fib_position_ratio is not None else safe_float(_get_kwarg("fib_position_ratio"))
-    _fib_label = fib_label or _get_kwarg("fib_label", "")
-    _had_pullback = normalize_bool(had_pullback) if had_pullback is not None else normalize_bool(_get_kwarg("had_pullback", False))
-    _pullback_pct = safe_float(pullback_pct) if pullback_pct is not None else safe_float(_get_kwarg("pullback_pct"))
-    _pullback_label = pullback_label or _get_kwarg("pullback_label", "")
-    _wave_estimate = safe_int(wave_estimate) if wave_estimate is not None else safe_int(_get_kwarg("wave_estimate", 0))
-    _wave_peaks = safe_int(wave_peaks) if wave_peaks is not None else safe_int(_get_kwarg("wave_peaks", 0))
-    _wave_label = wave_label or _get_kwarg("wave_label", "")
-    _entry_maturity = entry_maturity if entry_maturity is not None else _get_kwarg("entry_maturity", "unknown")
-    _entry_maturity = normalize_text(_entry_maturity, "unknown")
-    _maturity_penalty = safe_float(maturity_penalty) if maturity_penalty is not None else safe_float(_get_kwarg("maturity_penalty", 0.0))
-    _maturity_bonus = safe_float(maturity_bonus) if maturity_bonus is not None else safe_float(_get_kwarg("maturity_bonus", 0.0))
-    _strong_bull_pullback = normalize_bool(strong_bull_pullback) if strong_bull_pullback is not None else normalize_bool(_get_kwarg("strong_bull_pullback", False))
-    _strong_breakout_exception = normalize_bool(strong_breakout_exception) if strong_breakout_exception is not None else normalize_bool(_get_kwarg("strong_breakout_exception", False))
-    _falling_knife_reasons = normalize_list(falling_knife_reasons) if falling_knife_reasons is not None else normalize_list(_get_kwarg("falling_knife_reasons"))
-
-    # Extra Strong Setup fields
-    _has_extra_strong_setup = normalize_bool(_get_kwarg("has_extra_strong_setup", False))
-    _extra_setup_names = normalize_list(_get_kwarg("extra_setup_names"))
-    _extra_setup_bonus = safe_float(_get_kwarg("extra_setup_bonus"), 0.0)
-    _primary_extra_setup = normalize_text(_get_kwarg("primary_extra_setup"), "")
-    _extra_setups_details = _get_kwarg("extra_setups_details", {}) or {}
-
-    pre_signal = bool(pre_breakout)
-    break_signal = bool(breakout)
-    signal_event = "breakdown" if side == "short" else "breakout"
-
-    docs = build_trade_diagnostics({
-        "raw_score": score if raw_score is None else raw_score,
-        "effective_score": score if effective_score is None else effective_score,
+    # تجميع كل الـ arguments المباشرة في قاموس للمقارنة مع kwargs
+    direct_args = {
+        "raw_score": raw_score,
+        "effective_score": effective_score,
         "dynamic_threshold": dynamic_threshold,
         "required_min_score": required_min_score,
         "dist_ma": dist_ma,
-        "rank_volume_24h": rank_volume_24h,
+        "entry_timing": entry_timing,
+        "opportunity_type": opportunity_type,
         "market_state": market_state,
         "market_state_label": market_state_label,
         "market_bias_label": market_bias_label,
         "alt_mode": alt_mode,
-        "entry_timing": entry_timing,
-        "opportunity_type": opportunity_type,
         "early_priority": early_priority,
         "breakout_quality": breakout_quality,
         "risk_level": risk_level,
-        "alert_id": alert_id,
         "fake_signal": fake_signal,
-        "is_reverse": is_reverse_signal,
+        "is_reverse_signal": is_reverse_signal,
         "reversal_4h_confirmed": reversal_4h_confirmed,
+        "rank_volume_24h": rank_volume_24h,
+        "alert_id": alert_id,
         "has_high_impact_news": has_high_impact_news,
-        "news_titles": news_titles or [],
-        "warning_reasons": warning_reasons or [],
+        "news_titles": news_titles,
+        "warning_reasons": warning_reasons,
         "pullback_entry": pullback_entry,
         "pullback_low": pullback_low,
         "pullback_high": pullback_high,
-        "pullback_triggered": False,
-        "effective_entry": entry,
         "rr1": rr1,
         "rr2": rr2,
-        # إضافة الحقول الجديدة
-        "setup_type_base": _setup_type_base,
         "final_threshold": final_threshold,
-        "adjustments_log": adjustments_log,
-        "warning_penalty": warning_penalty,
-        "warning_high_count": warning_high_count,
-        "warning_medium_count": warning_medium_count,
-        "warning_penalty_details": warning_penalty_details,
-        "tp1_close_pct": _tp1_close_pct,
-        "tp2_close_pct": _tp2_close_pct,
-        "move_sl_to_entry_after_tp1": _move_sl_to_entry_after_tp1,
-        "fib_position": _fib_position,
-        "fib_position_ratio": _fib_position_ratio,
-        "fib_label": _fib_label,
-        "had_pullback": _had_pullback,
-        "pullback_pct": _pullback_pct,
-        "pullback_label": _pullback_label,
-        "wave_estimate": _wave_estimate,
-        "wave_peaks": _wave_peaks,
-        "wave_label": _wave_label,
-        "entry_maturity": _entry_maturity,
-        "maturity_penalty": _maturity_penalty,
-        "maturity_bonus": _maturity_bonus,
-        "falling_knife_risk": falling_knife_risk,
-        "falling_knife_reasons": _falling_knife_reasons,
         "target_method": target_method,
         "nearest_resistance": nearest_resistance,
         "nearest_support": nearest_support,
@@ -768,28 +705,167 @@ def register_trade(
         "target_notes": target_notes,
         "sl_method": sl_method,
         "sl_notes": sl_notes,
+        "falling_knife_risk": falling_knife_risk,
+        "falling_knife_reasons": falling_knife_reasons,
+        "reversal_quality": reversal_quality,
         "wave_context": wave_context,
         "setup_context": setup_context,
-        "reversal_quality": reversal_quality,
         "reversal_structure_confirmed": reversal_structure_confirmed,
-        "strong_bull_pullback": _strong_bull_pullback,
-        "strong_breakout_exception": _strong_breakout_exception,
-        # Extra Strong Setup
-        "has_extra_strong_setup": _has_extra_strong_setup,
-        "extra_setup_names": _extra_setup_names,
-        "extra_setup_bonus": _extra_setup_bonus,
-        "primary_extra_setup": _primary_extra_setup,
-        "extra_setups_details": _extra_setups_details,
-
+        "warning_penalty": warning_penalty,
+        "warning_high_count": warning_high_count,
+        "warning_medium_count": warning_medium_count,
+        "warning_penalty_details": warning_penalty_details,
+        "adjustments_log": adjustments_log,
         "protected_breakeven": protected_breakeven,
         "breakeven_protection_reason": breakeven_protection_reason,
         "breakeven_protected_ts": breakeven_protected_ts,
         "original_sl_before_breakeven": original_sl_before_breakeven,
         "protected_breakeven_exit": protected_breakeven_exit,
+        "tp1_close_pct": tp1_close_pct,
+        "tp2_close_pct": tp2_close_pct,
+        "move_sl_to_entry_after_tp1": move_sl_to_entry_after_tp1,
+        "setup_type_base": setup_type_base,
+        "fib_position": fib_position,
+        "fib_position_ratio": fib_position_ratio,
+        "fib_label": fib_label,
+        "had_pullback": had_pullback,
+        "pullback_pct": pullback_pct,
+        "pullback_label": pullback_label,
+        "wave_estimate": wave_estimate,
+        "wave_peaks": wave_peaks,
+        "wave_label": wave_label,
+        "entry_maturity": entry_maturity,
+        "maturity_penalty": maturity_penalty,
+        "maturity_bonus": maturity_bonus,
+        "strong_bull_pullback": strong_bull_pullback,
+        "strong_breakout_exception": strong_breakout_exception,
+        "has_extra_strong_setup": has_extra_strong_setup,
+        "extra_setup_names": extra_setup_names,
+        "extra_setup_bonus": extra_setup_bonus,
+        "primary_extra_setup": primary_extra_setup,
+        "extra_setups_details": extra_setups_details,
+    }
+
+    def _get_val(key, default=None):
+        """الأولوية للـ direct_args ثم kwargs"""
+        if key in direct_args and direct_args[key] is not None:
+            return direct_args[key]
+        return kwargs.get(key, default)
+
+    # --- أسعار أساسية ---
+    entry = round_price(entry)
+    sl = round_price(sl)
+
+    # TP1 / TP2
+    if tp1 is None:
+        tp1 = calc_tp1(entry, sl, side=side)
+    else:
+        tp1 = round_price(tp1)
+    if tp2 is None:
+        tp2 = calc_tp2(entry, sl, side=side)
+    else:
+        tp2 = round_price(tp2)
+
+    # توحيد بعض الحقول المتشابهة
+    if _get_val("is_reverse_signal") is False and kwargs.get("is_reverse"):
+        is_reverse_signal = normalize_bool(kwargs["is_reverse"])
+    if _get_val("warning_reasons") is None and kwargs.get("warnings"):
+        warning_reasons = normalize_list(kwargs["warnings"])
+
+    now_ts = int(time.time())
+
+    # --- تهيئة last_processed_candle_ts ---
+    # نستخدم candle_time إن وجد وإلا created_at (now_ts)
+    candle_ts_initial = safe_timestamp(candle_time) if candle_time else now_ts
+
+    # --- بناء diagnostics ---
+    docs = build_trade_diagnostics({
+        "raw_score": _get_val("raw_score", score),
+        "effective_score": _get_val("effective_score", score),
+        "dynamic_threshold": _get_val("dynamic_threshold"),
+        "required_min_score": _get_val("required_min_score"),
+        "dist_ma": _get_val("dist_ma"),
+        "rank_volume_24h": _get_val("rank_volume_24h"),
+        "market_state": _get_val("market_state"),
+        "market_state_label": _get_val("market_state_label"),
+        "market_bias_label": _get_val("market_bias_label"),
+        "alt_mode": _get_val("alt_mode"),
+        "entry_timing": _get_val("entry_timing"),
+        "opportunity_type": _get_val("opportunity_type"),
+        "early_priority": _get_val("early_priority"),
+        "breakout_quality": _get_val("breakout_quality"),
+        "risk_level": _get_val("risk_level"),
+        "alert_id": _get_val("alert_id"),
+        "fake_signal": _get_val("fake_signal"),
+        "is_reverse": _get_val("is_reverse_signal"),
+        "reversal_4h_confirmed": _get_val("reversal_4h_confirmed"),
+        "has_high_impact_news": _get_val("has_high_impact_news"),
+        "news_titles": _get_val("news_titles", []),
+        "warning_reasons": warning_reasons or [],
+        "pullback_entry": _get_val("pullback_entry"),
+        "pullback_low": _get_val("pullback_low"),
+        "pullback_high": _get_val("pullback_high"),
+        "pullback_triggered": False,
+        "effective_entry": entry,
+        "rr1": _get_val("rr1", rr1),
+        "rr2": _get_val("rr2", rr2),
+        # حقول جديدة
+        "setup_type_base": _get_val("setup_type_base", ""),
+        "final_threshold": _get_val("final_threshold"),
+        "adjustments_log": _get_val("adjustments_log"),
+        "warning_penalty": _get_val("warning_penalty"),
+        "warning_high_count": _get_val("warning_high_count"),
+        "warning_medium_count": _get_val("warning_medium_count"),
+        "warning_penalty_details": _get_val("warning_penalty_details"),
+        "tp1_close_pct": _get_val("tp1_close_pct", 50.0),
+        "tp2_close_pct": _get_val("tp2_close_pct", 50.0),
+        "move_sl_to_entry_after_tp1": _get_val("move_sl_to_entry_after_tp1", True),
+        "fib_position": _get_val("fib_position", "unknown"),
+        "fib_position_ratio": _get_val("fib_position_ratio"),
+        "fib_label": _get_val("fib_label", ""),
+        "had_pullback": _get_val("had_pullback", False),
+        "pullback_pct": _get_val("pullback_pct"),
+        "pullback_label": _get_val("pullback_label", ""),
+        "wave_estimate": _get_val("wave_estimate", 0),
+        "wave_peaks": _get_val("wave_peaks", 0),
+        "wave_label": _get_val("wave_label", ""),
+        "entry_maturity": _get_val("entry_maturity", "unknown"),
+        "maturity_penalty": _get_val("maturity_penalty", 0.0),
+        "maturity_bonus": _get_val("maturity_bonus", 0.0),
+        "falling_knife_risk": _get_val("falling_knife_risk", False),
+        "falling_knife_reasons": _get_val("falling_knife_reasons", []),
+        "target_method": _get_val("target_method", "unknown"),
+        "nearest_resistance": _get_val("nearest_resistance"),
+        "nearest_support": _get_val("nearest_support"),
+        "resistance_warning": _get_val("resistance_warning", ""),
+        "support_warning": _get_val("support_warning", ""),
+        "target_notes": _get_val("target_notes", []),
+        "sl_method": _get_val("sl_method", "unknown"),
+        "sl_notes": _get_val("sl_notes", []),
+        "wave_context": _get_val("wave_context", ""),
+        "setup_context": _get_val("setup_context", ""),
+        "reversal_quality": _get_val("reversal_quality", ""),
+        "reversal_structure_confirmed": _get_val("reversal_structure_confirmed", False),
+        "strong_bull_pullback": _get_val("strong_bull_pullback", False),
+        "strong_breakout_exception": _get_val("strong_breakout_exception", False),
+        # Extra Strong
+        "has_extra_strong_setup": _get_val("has_extra_strong_setup", False),
+        "extra_setup_names": _get_val("extra_setup_names", []),
+        "extra_setup_bonus": _get_val("extra_setup_bonus", 0.0),
+        "primary_extra_setup": _get_val("primary_extra_setup", ""),
+        "extra_setups_details": _get_val("extra_setups_details", {}) or {},
+        # حماية
+        "protected_breakeven": _get_val("protected_breakeven", False),
+        "breakeven_protection_reason": _get_val("breakeven_protection_reason", ""),
+        "breakeven_protected_ts": _get_val("breakeven_protected_ts"),
+        "original_sl_before_breakeven": _get_val("original_sl_before_breakeven"),
+        "protected_breakeven_exit": _get_val("protected_breakeven_exit", False),
         "sl_moved_to_entry": False,
         "sl_move_reason": "",
+        "last_processed_candle_ts": candle_ts_initial,
     })
 
+    # بناء trade_data
     trade_data = {
         "symbol": symbol,
         "market_type": market_type,
@@ -814,15 +890,16 @@ def register_trade(
         "updated_at": now_ts,
         "closed_at": None,
         "result": None,
+        "last_processed_candle_ts": candle_ts_initial,
 
-        "reasons": list(reasons),
-        "warning_reasons": list(warning_reasons or []),
+        "reasons": list(reasons) if reasons else [],
+        "warning_reasons": list(warning_reasons) if warning_reasons else [],
 
-        "pre_breakout": pre_signal,
-        "breakout": break_signal,
-        "signal_event": signal_event,
-        "pre_signal": pre_signal,
-        "break_signal": break_signal,
+        "pre_breakout": bool(pre_breakout),
+        "breakout": bool(breakout),
+        "signal_event": "breakdown" if side == "short" else "breakout",
+        "pre_signal": bool(pre_breakout),
+        "break_signal": bool(breakout),
 
         "vol_ratio": round(safe_float(vol_ratio), 4),
         "candle_strength": round(safe_float(candle_strength), 4),
@@ -834,62 +911,66 @@ def register_trade(
         "setup_type": setup_type or "unknown",
         "diagnostics": docs,
 
-        # الحقول الجديدة كـ top-level
-        "setup_type_base": _setup_type_base or "",
-        "final_threshold": safe_float(final_threshold) if final_threshold is not None else safe_float(score),
-        "target_method": target_method or "unknown",
-        "nearest_resistance": round_price(nearest_resistance) if nearest_resistance is not None else None,
-        "nearest_support": round_price(nearest_support) if nearest_support is not None else None,
-        "resistance_warning": resistance_warning or "",
-        "support_warning": support_warning or "",
-        "target_notes": normalize_list(target_notes),
-        "sl_method": sl_method or "unknown",
-        "sl_notes": normalize_list(sl_notes),
-        "falling_knife_risk": normalize_bool(falling_knife_risk),
-        "falling_knife_reasons": _falling_knife_reasons,
-        "wave_context": wave_context or "",
-        "setup_context": setup_context or "",
-        "reversal_quality": reversal_quality or "",
-        "reversal_structure_confirmed": bool(reversal_structure_confirmed),
-        "strong_bull_pullback": _strong_bull_pullback,
-        "strong_breakout_exception": _strong_breakout_exception,
+        # top-level لحقول إضافية هامة للتقارير
+        "setup_type_base": _get_val("setup_type_base", ""),
+        "final_threshold": safe_float(_get_val("final_threshold", score)),
+        "target_method": _get_val("target_method", "unknown"),
+        "nearest_resistance": round_price(_get_val("nearest_resistance")) if _get_val("nearest_resistance") is not None else None,
+        "nearest_support": round_price(_get_val("nearest_support")) if _get_val("nearest_support") is not None else None,
+        "resistance_warning": _get_val("resistance_warning", ""),
+        "support_warning": _get_val("support_warning", ""),
+        "target_notes": normalize_list(_get_val("target_notes")),
+        "sl_method": _get_val("sl_method", "unknown"),
+        "sl_notes": normalize_list(_get_val("sl_notes")),
+        "falling_knife_risk": normalize_bool(_get_val("falling_knife_risk", False)),
+        "falling_knife_reasons": normalize_list(_get_val("falling_knife_reasons")),
+        "wave_context": _get_val("wave_context", ""),
+        "setup_context": _get_val("setup_context", ""),
+        "reversal_quality": _get_val("reversal_quality", ""),
+        "reversal_structure_confirmed": bool(_get_val("reversal_structure_confirmed", False)),
+        "strong_bull_pullback": _get_val("strong_bull_pullback", False),
+        "strong_breakout_exception": _get_val("strong_breakout_exception", False),
 
-        # Extra Strong Setup top-level
-        "has_extra_strong_setup": _has_extra_strong_setup,
-        "extra_setup_names": _extra_setup_names,
-        "extra_setup_bonus": _extra_setup_bonus,
-        "primary_extra_setup": _primary_extra_setup,
-        "extra_setups_details": _extra_setups_details,
+        "has_extra_strong_setup": _get_val("has_extra_strong_setup", False),
+        "extra_setup_names": _get_val("extra_setup_names", []),
+        "extra_setup_bonus": _get_val("extra_setup_bonus", 0.0),
+        "primary_extra_setup": _get_val("primary_extra_setup", ""),
+        "extra_setups_details": _get_val("extra_setups_details", {}) or {},
 
-        "tp1_close_pct": _tp1_close_pct,
-        "tp2_close_pct": _tp2_close_pct,
-        "move_sl_to_entry_after_tp1": _move_sl_to_entry_after_tp1,
-        "protected_breakeven": bool(protected_breakeven),
-        "breakeven_protection_reason": breakeven_protection_reason or "",
-        "breakeven_protected_ts": breakeven_protected_ts or None,
-        "original_sl_before_breakeven": round_price(original_sl_before_breakeven) if original_sl_before_breakeven is not None else None,
-        "protected_breakeven_exit": bool(protected_breakeven_exit),
+        "tp1_close_pct": safe_float(_get_val("tp1_close_pct", 50.0)),
+        "tp2_close_pct": safe_float(_get_val("tp2_close_pct", 50.0)),
+        "move_sl_to_entry_after_tp1": normalize_bool(_get_val("move_sl_to_entry_after_tp1", True)),
+        "protected_breakeven": bool(_get_val("protected_breakeven", False)),
+        "breakeven_protection_reason": _get_val("breakeven_protection_reason", ""),
+        "breakeven_protected_ts": _get_val("breakeven_protected_ts"),
+        "original_sl_before_breakeven": round_price(_get_val("original_sl_before_breakeven")) if _get_val("original_sl_before_breakeven") is not None else None,
+        "protected_breakeven_exit": bool(_get_val("protected_breakeven_exit", False)),
         "sl_moved_to_entry": False,
         "sl_move_reason": "",
-        # حقول إضافية اختيارية
-        "fib_position": _fib_position,
-        "fib_position_ratio": _fib_position_ratio,
-        "fib_label": _fib_label,
-        "had_pullback": _had_pullback,
-        "pullback_pct": _pullback_pct,
-        "pullback_label": _pullback_label,
-        "wave_estimate": _wave_estimate,
-        "wave_peaks": _wave_peaks,
-        "wave_label": _wave_label,
-        "entry_maturity": _entry_maturity,
-        "maturity_penalty": _maturity_penalty,
-        "maturity_bonus": _maturity_bonus,
-        "adjustments_log": normalize_list(adjustments_log),
-        "warning_penalty": safe_float(warning_penalty) if warning_penalty is not None else 0.0,
-        "warning_high_count": safe_int(warning_high_count, 0) if warning_high_count is not None else 0,
-        "warning_medium_count": safe_int(warning_medium_count, 0) if warning_medium_count is not None else 0,
-        "warning_penalty_details": normalize_list(warning_penalty_details),
+        # Fib/pullback/wave etc
+        "fib_position": _get_val("fib_position", "unknown"),
+        "fib_position_ratio": safe_float(_get_val("fib_position_ratio")),
+        "fib_label": _get_val("fib_label", ""),
+        "had_pullback": _get_val("had_pullback", False),
+        "pullback_pct": safe_float(_get_val("pullback_pct")),
+        "pullback_label": _get_val("pullback_label", ""),
+        "wave_estimate": safe_int(_get_val("wave_estimate", 0)),
+        "wave_peaks": safe_int(_get_val("wave_peaks", 0)),
+        "wave_label": _get_val("wave_label", ""),
+        "entry_maturity": _get_val("entry_maturity", "unknown"),
+        "maturity_penalty": safe_float(_get_val("maturity_penalty", 0.0)),
+        "maturity_bonus": safe_float(_get_val("maturity_bonus", 0.0)),
+        "adjustments_log": normalize_list(_get_val("adjustments_log")),
+        "warning_penalty": safe_float(_get_val("warning_penalty", 0.0)),
+        "warning_high_count": safe_int(_get_val("warning_high_count", 0)),
+        "warning_medium_count": safe_int(_get_val("warning_medium_count", 0)),
+        "warning_penalty_details": normalize_list(_get_val("warning_penalty_details")),
     }
+
+    trade_key = get_trade_key(market_type, side, symbol, candle_time)
+    history_key = get_trade_history_key(market_type, side, symbol, candle_time)
+    open_set_key = get_open_trades_set_key(market_type, side)
+    all_trades_key = get_all_trades_set_key()
 
     try:
         created = redis_client.set(
@@ -921,7 +1002,6 @@ def register_trade(
 def load_trade(redis_client, trade_key: str):
     if redis_client is None:
         return None
-
     try:
         raw = redis_client.get(trade_key)
         if not raw:
@@ -935,7 +1015,6 @@ def load_trade(redis_client, trade_key: str):
 def save_trade(redis_client, trade_key: str, trade_data: dict):
     if redis_client is None:
         return False
-
     try:
         trade_data["updated_at"] = int(time.time())
         redis_client.set(
@@ -952,24 +1031,19 @@ def save_trade(redis_client, trade_key: str, trade_data: dict):
 def update_trade_history_snapshot(redis_client, trade_data: dict):
     if redis_client is None or not trade_data:
         return False
-
     try:
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
         side = normalize_side(trade_data.get("side", "long"))
         symbol = trade_data.get("symbol", "")
         candle_time = safe_int(trade_data.get("candle_time"), 0)
-
         history_key = get_trade_history_key(market_type, side, symbol, candle_time)
         history_data = build_history_snapshot(trade_data)
-
         redis_client.set(
             history_key,
             json.dumps(history_data, ensure_ascii=False),
             ex=TRADE_HISTORY_TTL_SECONDS,
         )
-
         return True
-
     except Exception as e:
         logger.warning(f"update_trade_history_snapshot error: {e}")
         return False
@@ -1027,7 +1101,6 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
 def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
     if redis_client is None:
         return False
-
     try:
         if trade_data.get("tp1_hit"):
             return True
@@ -1056,14 +1129,14 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
                           diagnostics.get("move_sl_to_entry_after_tp1", True))
         )
         if move_sl:
-            trade_data["sl"] = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
+            new_sl = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
+            trade_data["sl"] = new_sl
             trade_data["sl_moved_to_entry"] = True
             trade_data["sl_move_reason"] = "TP1 hit - protect remaining position"
         else:
             trade_data["sl_moved_to_entry"] = False
             trade_data["sl_move_reason"] = "TP1 hit - SL unchanged by config"
 
-        diagnostics = trade_data.get("diagnostics", {}) or {}
         diagnostics["sl_moved_to_entry"] = trade_data["sl_moved_to_entry"]
         diagnostics["sl_move_reason"] = trade_data["sl_move_reason"]
         diagnostics["partial_close_pct"] = tp1_close_pct
@@ -1073,12 +1146,10 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
         side = normalize_side(trade_data.get("side", "long"))
         stats_key = get_stats_key(market_type, side)
-
         redis_client.hincrby(stats_key, "tp1_hits", 1)
 
         ok = save_trade(redis_client, trade_key, trade_data)
         update_trade_history_snapshot(redis_client, trade_data)
-
         return ok
 
     except Exception as e:
@@ -1087,7 +1158,7 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict):
 
 
 # ------------------------------------------------------------
-# TRADE EVALUATION
+# TRADE EVALUATION (per candle)
 # ------------------------------------------------------------
 def evaluate_trade_on_candle(trade: dict, candle: dict):
     side = normalize_side(trade.get("side", "long"))
@@ -1120,19 +1191,14 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
 
     if has_pullback_plan and not pullback_triggered:
         pb_entry = safe_float(pullback_entry, 0.0)
-
-        if not (pb_entry > 0 and low <= pb_entry):
-            return None, False, trade
-
-        diagnostics["pullback_triggered"] = True
-        diagnostics["effective_entry"] = round_price(pb_entry)
-        trade["diagnostics"] = diagnostics
-
-        trade = recalc_targets_from_effective_entry(trade, pb_entry)
-
-        effective_entry = pb_entry
-        tp1 = safe_float(trade["tp1"])
-        tp2 = safe_float(trade["tp2"])
+        if pb_entry > 0 and low <= pb_entry:
+            diagnostics["pullback_triggered"] = True
+            diagnostics["effective_entry"] = round_price(pb_entry)
+            trade["diagnostics"] = diagnostics
+            trade = recalc_targets_from_effective_entry(trade, pb_entry)
+            effective_entry = pb_entry
+            tp1 = safe_float(trade["tp1"])
+            tp2 = safe_float(trade["tp2"])
 
     if side == "long":
         if not tp1_hit:
@@ -1147,7 +1213,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
                 result = "tp2_win"
             elif low <= sl:
                 result = "tp1_win"
-    else:
+    else:  # short
         if not tp1_hit:
             if high >= sl:
                 result = "loss"
@@ -1170,7 +1236,6 @@ def update_open_trades(
     side: str = "long",
     timeframe: str = "15m",
     max_age_hours: int = 24,
-    # --- Breakeven protection params ---
     market_mode: str = None,
     protect_breakeven_on_block: bool = False,
     breakeven_min_profit_pct: float = 0.15,
@@ -1195,7 +1260,6 @@ def update_open_trades(
 
     for trade_key in trade_keys:
         trade = load_trade(redis_client, trade_key)
-
         if not trade:
             try:
                 redis_client.srem(open_set_key, trade_key)
@@ -1211,7 +1275,7 @@ def update_open_trades(
             continue
 
         symbol = trade["symbol"]
-        created_at = int(trade.get("created_at", now_ts))
+        created_at = safe_timestamp(trade.get("created_at", now_ts))
 
         if now_ts - created_at > max_age_seconds:
             mark_trade_closed(redis_client, trade_key, trade, "expired")
@@ -1220,88 +1284,41 @@ def update_open_trades(
 
         raw_candles = fetch_recent_candles(symbol, timeframe=timeframe, limit=100)
         candles = normalize_candles(raw_candles)
-
         if not candles:
             continue
 
-        # --- Breakeven protection logic (معدل لتحديد الجهة الصحيحة) ---
-        mode_upper = str(market_mode or "").upper()
-        block_this_side = (
-            "BLOCK_ALL" in mode_upper
-            or mode_upper.strip() == "BLOCK"
-            or (side == "long" and "BLOCK_LONGS" in mode_upper)
-            or (side == "short" and "BLOCK_SHORTS" in mode_upper)
-        )
+        current_price = candles[-1]["close"]
 
-        if protect_breakeven_on_block and block_this_side:
-            try:
-                current_price = candles[-1]["close"]
-                entry_price = safe_float(trade.get("entry"), 0.0)
-                if entry_price > 0:
-                    if side == "long":
-                        current_profit_pct = ((current_price - entry_price) / entry_price) * 100
-                    else:
-                        current_profit_pct = ((entry_price - current_price) / entry_price) * 100
-                    if current_profit_pct >= breakeven_min_profit_pct:
-                        if not trade.get("protected_breakeven"):
-                            current_sl = safe_float(trade.get("sl"), 0.0)
-                            need_move = True
-                            if side == "long":
-                                if current_sl >= entry_price:
-                                    need_move = False
-                            else:
-                                if current_sl <= entry_price:
-                                    need_move = False
-                            if need_move:
-                                if trade.get("original_sl_before_breakeven") is None:
-                                    trade["original_sl_before_breakeven"] = current_sl
-                                trade["sl"] = entry_price
-                                trade["protected_breakeven"] = True
-                                trade["breakeven_protection_reason"] = reason or "market_block_protection"
-                                trade["breakeven_protected_ts"] = now_ts
-                                trade["sl_moved_to_entry"] = True
-                                trade["sl_move_reason"] = reason or "market_block_protection"
+        # --- نقطة بدء التقييم (آخر شمعة عولجت، أو created_at) ---
+        last_proc = trade.get("last_processed_candle_ts")
+        eval_start_ts = safe_timestamp(last_proc) if last_proc is not None else created_at
 
-                                diagnostics = trade.get("diagnostics", {}) or {}
-                                diagnostics["protected_breakeven"] = True
-                                diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
-                                diagnostics["breakeven_protected_ts"] = now_ts
-                                diagnostics["original_sl_before_breakeven"] = current_sl
-                                diagnostics["sl_moved_to_entry"] = True
-                                diagnostics["sl_move_reason"] = reason or "market_block_protection"
-                                trade["diagnostics"] = diagnostics
-
-                                save_trade(redis_client, trade_key, trade)
-                                update_trade_history_snapshot(redis_client, trade)
-                                logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
-            except Exception as e:
-                logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
-
-        # --- Normal trade evaluation with evaluation_start_ts ---
-        evaluation_start_ts = created_at
-        protected_ts = trade.get("breakeven_protected_ts")
-        if trade.get("protected_breakeven") and protected_ts is not None:
-            evaluation_start_ts = safe_int(protected_ts, created_at)
+        # جمع الشموع الجديدة فقط (أحدث من eval_start_ts)
+        new_candles = []
+        for c in candles:
+            c_ts = safe_timestamp(c["ts"])
+            if c_ts > eval_start_ts:
+                new_candles.append((c_ts, c))
+        # ترتيب تصاعدي
+        new_candles.sort(key=lambda x: x[0])
 
         result = None
         state_changed = False
+        initial_last_proc = trade.get("last_processed_candle_ts")
 
-        for candle in candles:
-            candle_ts = candle["ts"]
-            if candle_ts > 10_000_000_000:
-                candle_ts = candle_ts // 1000
-
-            if candle_ts < evaluation_start_ts:
-                continue
+        # --- معالجة الشموع الجديدة ---
+        for c_ts, candle in new_candles:
+            trade["last_processed_candle_ts"] = c_ts
 
             result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
             trade = updated_trade
 
             if tp1_now and not trade.get("tp1_hit"):
                 ok = mark_tp1_hit(redis_client, trade_key, trade)
-
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
+                    # نضمن الاحتفاظ بقيمة last_processed_candle_ts
+                    trade["last_processed_candle_ts"] = c_ts
                     state_changed = True
                     logger.info(f"{symbol} → TP1 hit, SL moved to entry/effective entry")
                 else:
@@ -1310,7 +1327,6 @@ def update_open_trades(
 
                 if result == "tp2_win":
                     break
-
             else:
                 diagnostics = trade.get("diagnostics", {}) or {}
                 if diagnostics.get("pullback_triggered") and not state_changed:
@@ -1321,6 +1337,62 @@ def update_open_trades(
             if result:
                 break
 
+        # --- بعد انتهاء الشموع: تطبيق حماية breakeven فقط إذا ظلت الصفقة مفتوحة ---
+        if not result and trade.get("status") not in ("closed",):
+            # تحقق من حدوث تقدم في آخر شمعة معالَجة
+            if trade.get("last_processed_candle_ts") != initial_last_proc:
+                state_changed = True
+
+            mode_upper = str(market_mode or "").upper()
+            block_this_side = (
+                "BLOCK_ALL" in mode_upper
+                or mode_upper.strip() == "BLOCK"
+                or (side == "long" and "BLOCK_LONGS" in mode_upper)
+                or (side == "short" and "BLOCK_SHORTS" in mode_upper)
+            )
+
+            if protect_breakeven_on_block and block_this_side:
+                try:
+                    entry_price = safe_float(trade.get("entry"), 0.0)
+                    if entry_price > 0:
+                        if side == "long":
+                            current_profit_pct = ((current_price - entry_price) / entry_price) * 100
+                        else:
+                            current_profit_pct = ((entry_price - current_price) / entry_price) * 100
+
+                        if current_profit_pct >= breakeven_min_profit_pct:
+                            if not trade.get("protected_breakeven"):
+                                current_sl = safe_float(trade.get("sl"), 0.0)
+                                need_move = True
+                                if side == "long" and current_sl >= entry_price:
+                                    need_move = False
+                                elif side == "short" and current_sl <= entry_price:
+                                    need_move = False
+
+                                if need_move:
+                                    if trade.get("original_sl_before_breakeven") is None:
+                                        trade["original_sl_before_breakeven"] = current_sl
+                                    trade["sl"] = entry_price
+                                    trade["protected_breakeven"] = True
+                                    trade["breakeven_protection_reason"] = reason or "market_block_protection"
+                                    trade["breakeven_protected_ts"] = now_ts
+                                    trade["sl_moved_to_entry"] = True
+                                    trade["sl_move_reason"] = reason or "market_block_protection"
+
+                                    diagnostics = trade.get("diagnostics", {}) or {}
+                                    diagnostics["protected_breakeven"] = True
+                                    diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
+                                    diagnostics["breakeven_protected_ts"] = now_ts
+                                    diagnostics["original_sl_before_breakeven"] = current_sl
+                                    diagnostics["sl_moved_to_entry"] = True
+                                    diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                    trade["diagnostics"] = diagnostics
+                                    state_changed = True
+                                    logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
+                except Exception as e:
+                    logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
+
+        # --- معالجة نتيجة الإغلاق (إذا حدث أثناء المرور) ---
         if result:
             if result == "loss" and trade.get("protected_breakeven") and \
                abs(safe_float(trade.get("sl"), 0.0) - safe_float(trade.get("entry"), 0.0)) < 1e-12:
@@ -1333,11 +1405,15 @@ def update_open_trades(
                 mark_trade_closed(redis_client, trade_key, trade, result)
                 logger.info(f"{symbol} → trade closed as {result}")
         elif state_changed:
-            logger.info(f"{symbol} → trade updated")
+            # حفظ التقدم إذا بقيت الصفقة مفتوحة بعد التعديلات
+            if trade.get("status") not in ("closed",):
+                save_trade(redis_client, trade_key, trade)
+                update_trade_history_snapshot(redis_client, trade)
+                logger.info(f"{symbol} → trade updated")
 
 
 # ------------------------------------------------------------
-# LOAD TRADES
+# LOAD TRADES (with/without history)
 # ------------------------------------------------------------
 def load_trades(
     redis_client,
@@ -1360,7 +1436,6 @@ def load_trades(
             raw = redis_client.get(key)
             if not raw:
                 continue
-
             try:
                 trade = json.loads(raw)
             except Exception as e:
@@ -1370,8 +1445,7 @@ def load_trades(
             if since_ts is not None:
                 ts = get_trade_created_ts(trade)
                 if not ts:
-                    ts = safe_int(trade.get("candle_time", 0), 0)
-
+                    ts = safe_int(trade.get("candle_time"), 0)
                 if ts < since_ts:
                     continue
 
@@ -1397,9 +1471,9 @@ def load_trades_with_history(
 ) -> List[dict]:
     """
     تحميل الصفقات من trade:* و trade_history:* مع دمج وإزالة التكرار.
-    - الأولوية للـ trade:* للصفقات التي لا تزال مفتوحة/أحدث.
-    - التكرار: نفس (market_type, side, symbol, candle_time).
-    - الترتيب من الأحدث إلى الأقدم حسب created_at أو candle_time.
+    الأولوية للـ trade:* للصفقات التي لا تزال مفتوحة/أحدث.
+    التكرار: نفس (market_type, side, symbol, candle_time).
+    الترتيب من الأحدث إلى الأقدم حسب created_at أو candle_time.
     """
     if redis_client is None:
         return []
@@ -1409,7 +1483,7 @@ def load_trades_with_history(
     pattern_trade = f"trade:{mt}:{sd}:*"
     pattern_history = f"trade_history:{mt}:{sd}:*"
 
-    trades_dict = {}  # مفتاح (market_type, side, symbol, candle_time) -> trade dict
+    trades_dict = {}  # مفتاح (m, s, sym, ctime) -> trade
 
     def _dedup_key(trade_dict):
         m = normalize_market_type(trade_dict.get("market_type", "futures"))
@@ -1432,7 +1506,7 @@ def load_trades_with_history(
     except Exception as e:
         logger.error(f"load_trades_with_history trade scan error: {e}")
 
-    # قراءة trade_history:* وتجاوز التكرارات (الموجودة أصلاً من trade:*)
+    # قراءة trade_history:* مع إعطاء أولوية لـ trade:*
     try:
         for key in redis_client.scan_iter(pattern_history):
             raw = redis_client.get(key)
@@ -1454,7 +1528,7 @@ def load_trades_with_history(
         if since_ts is not None:
             ts = get_trade_created_ts(trade)
             if not ts:
-                ts = safe_int(trade.get("candle_time", 0), 0)
+                ts = safe_int(trade.get("candle_time"), 0)
             if ts < since_ts:
                 continue
 
@@ -1468,12 +1542,46 @@ def load_trades_with_history(
     # ترتيب من الأحدث إلى الأقدم
     trades.sort(
         key=lambda x: (
-            safe_int(x.get("created_at") or get_trade_created_ts(x) or x.get("candle_time", 0)),
+            get_trade_created_ts(x) or safe_int(x.get("candle_time"), 0)
         ),
         reverse=True,
     )
 
     return trades
+
+
+def get_all_trades_data(
+    redis_client,
+    market_type: str = None,
+    side: str = None,
+    since_ts: int = None,
+    use_history: bool = False,
+):
+    if redis_client is None:
+        return []
+
+    try:
+        cleanup_missing_trades_from_index(redis_client)
+    except Exception:
+        pass
+
+    if use_history:
+        return load_trades_with_history(
+            redis_client=redis_client,
+            market_type=market_type,
+            side=side,
+            since_ts=since_ts,
+            include_open=True,
+        )
+
+    # وضع use_history=False
+    return load_trades(
+        redis_client=redis_client,
+        market_type=market_type,
+        side=side,
+        since_ts=since_ts,
+        include_open=True,
+    )
 
 
 # ------------------------------------------------------------
@@ -1537,33 +1645,16 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 
     if redis_client is None:
         return {
-            "wins": 0,
-            "tp1_wins": 0,
-            "tp2_wins": 0,
-            "losses": 0,
-            "expired": 0,
-            "open": 0,
-            "closed": 0,
-            "tp1_hits": 0,
-            "tp1_rate": 0.0,
-            "winrate": 0.0,
-            "market_type": market_type,
-            "side": side,
-            "leverage": leverage,
-            "realized_raw_pnl_pct": 0.0,
-            "realized_leveraged_pnl_pct": 0.0,
-            "realized_pnl_pct": 0.0,
-            "gross_profit_pct": 0.0,
-            "gross_loss_pct": 0.0,
-            "avg_win_pct": 0.0,
-            "avg_loss_pct": 0.0,
-            "best_trade_pct": 0.0,
-            "worst_trade_pct": 0.0,
-            "risk_status": "normal",
-            "tp2_hits": 0,
-            "tp2_rate": 0.0,
-            "tp1_to_tp2_rate": 0.0,
-            "net_profit_pct": 0.0,
+            "wins": 0, "tp1_wins": 0, "tp2_wins": 0, "losses": 0,
+            "expired": 0, "open": 0, "closed": 0, "tp1_hits": 0,
+            "tp1_rate": 0.0, "winrate": 0.0, "market_type": market_type,
+            "side": side, "leverage": leverage,
+            "realized_raw_pnl_pct": 0.0, "realized_leveraged_pnl_pct": 0.0,
+            "realized_pnl_pct": 0.0, "gross_profit_pct": 0.0,
+            "gross_loss_pct": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
+            "best_trade_pct": 0.0, "worst_trade_pct": 0.0,
+            "risk_status": "normal", "tp2_hits": 0, "tp2_rate": 0.0,
+            "tp1_to_tp2_rate": 0.0, "net_profit_pct": 0.0,
             "breakeven_exits": 0,
         }
 
@@ -1617,19 +1708,16 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "market_type": market_type,
             "side": side,
             "leverage": leverage,
-
             "realized_raw_pnl_pct": financial_summary.get("realized_raw_pnl_pct", 0.0),
             "realized_leveraged_pnl_pct": financial_summary.get("realized_leveraged_pnl_pct", 0.0),
             "realized_pnl_pct": financial_summary.get("realized_pnl_pct", 0.0),
             "gross_profit_pct": financial_summary.get("gross_profit_pct", 0.0),
             "gross_loss_pct": financial_summary.get("gross_loss_pct", 0.0),
-
             "avg_win_pct": financial_summary.get("avg_win_pct", 0.0),
             "avg_loss_pct": financial_summary.get("avg_loss_pct", 0.0),
             "best_trade_pct": financial_summary.get("best_trade_pct", 0.0),
             "worst_trade_pct": financial_summary.get("worst_trade_pct", 0.0),
             "risk_status": financial_summary.get("risk_status", "normal"),
-
             "tp2_hits": safe_int(financial_summary.get("tp2_hits", tp2_wins)),
             "tp2_rate": safe_float(financial_summary.get("tp2_rate", 0.0)),
             "tp1_to_tp2_rate": safe_float(financial_summary.get("tp1_to_tp2_rate", 0.0)),
@@ -1643,33 +1731,16 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
     except Exception as e:
         logger.error(f"get_winrate_summary error: {e}")
         return {
-            "wins": 0,
-            "tp1_wins": 0,
-            "tp2_wins": 0,
-            "losses": 0,
-            "expired": 0,
-            "open": 0,
-            "closed": 0,
-            "tp1_hits": 0,
-            "tp1_rate": 0.0,
-            "winrate": 0.0,
-            "market_type": market_type,
-            "side": side,
-            "leverage": leverage,
-            "realized_raw_pnl_pct": 0.0,
-            "realized_leveraged_pnl_pct": 0.0,
-            "realized_pnl_pct": 0.0,
-            "gross_profit_pct": 0.0,
-            "gross_loss_pct": 0.0,
-            "avg_win_pct": 0.0,
-            "avg_loss_pct": 0.0,
-            "best_trade_pct": 0.0,
-            "worst_trade_pct": 0.0,
-            "risk_status": "normal",
-            "tp2_hits": 0,
-            "tp2_rate": 0.0,
-            "tp1_to_tp2_rate": 0.0,
-            "net_profit_pct": 0.0,
+            "wins": 0, "tp1_wins": 0, "tp2_wins": 0, "losses": 0,
+            "expired": 0, "open": 0, "closed": 0, "tp1_hits": 0,
+            "tp1_rate": 0.0, "winrate": 0.0, "market_type": market_type,
+            "side": side, "leverage": leverage,
+            "realized_raw_pnl_pct": 0.0, "realized_leveraged_pnl_pct": 0.0,
+            "realized_pnl_pct": 0.0, "gross_profit_pct": 0.0,
+            "gross_loss_pct": 0.0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
+            "best_trade_pct": 0.0, "worst_trade_pct": 0.0,
+            "risk_status": "normal", "tp2_hits": 0, "tp2_rate": 0.0,
+            "tp1_to_tp2_rate": 0.0, "net_profit_pct": 0.0,
             "breakeven_exits": 0,
         }
 
@@ -1688,7 +1759,6 @@ def get_trade_summary(
 
     side_norm = normalize_side(side or "long")
 
-    # استخدام الدالة الجديدة لتحميل الصفقات من trade + history دون تكرار
     trades = load_trades_with_history(
         redis_client,
         market_type=market_type,
@@ -1698,7 +1768,6 @@ def get_trade_summary(
     )
 
     summary = summarize_trades(trades)
-
     summary["market_type"] = market_type or "futures"
     summary["side"] = side_norm
 
@@ -1716,9 +1785,6 @@ def get_trade_summary(
     return summary
 
 
-# ------------------------------------------------------------
-# PERIOD HELPER
-# ------------------------------------------------------------
 def get_period_since_ts(period: str) -> Optional[int]:
     period = str(period or "all").strip().lower()
     now_ts = int(time.time())
@@ -1732,9 +1798,7 @@ def get_period_since_ts(period: str) -> Optional[int]:
             local_now.tm_year,
             local_now.tm_mon,
             local_now.tm_mday,
-            0,
-            0,
-            0,
+            0, 0, 0,
             local_now.tm_wday,
             local_now.tm_yday,
             local_now.tm_isdst,
@@ -1742,13 +1806,10 @@ def get_period_since_ts(period: str) -> Optional[int]:
 
     if period == "1d":
         return now_ts - (24 * 3600)
-
     if period == "7d":
         return now_ts - (7 * 24 * 3600)
-
     if period == "30d":
         return now_ts - (30 * 24 * 3600)
-
     if period == "all":
         return None
 
@@ -1762,7 +1823,6 @@ def get_period_summary(
     side: Optional[str] = None,
 ) -> dict:
     since_ts = get_period_since_ts(period)
-
     return get_trade_summary(
         redis_client=redis_client,
         market_type=market_type,
@@ -1784,8 +1844,6 @@ def get_exit_summary(
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
 
-    logger.info(f"get_exit_summary {market_type}/{side} use_history={use_history}")
-
     trades = get_all_trades_data(
         redis_client,
         market_type=market_type,
@@ -1799,7 +1857,6 @@ def get_exit_summary(
     exit_data["side"] = side
     exit_data["trades_count"] = len(trades)
     exit_data["since_ts"] = since_ts
-
     return exit_data
 
 
@@ -1874,8 +1931,6 @@ def get_daily_performance_summary(
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
 
-    logger.info(f"get_daily_performance_summary {market_type}/{side} days={days} history={use_history}")
-
     trades = get_all_trades_data(
         redis_client,
         market_type=market_type,
@@ -1890,38 +1945,31 @@ def get_daily_performance_summary(
         for day_key, day_trades in daily.items():
             if not day_trades:
                 continue
-
             summary = summarize_trades(day_trades)
             exit_data = summarize_exits(day_trades)
-
             rows.append({
                 "day": day_key,
                 "summary": summary,
                 "exit_summary": exit_data,
             })
-
     elif isinstance(daily, list):
         for row in daily:
             if not isinstance(row, dict):
                 continue
-
             day = row.get("day")
             summary = row.get("summary") or _empty_summary()
             exit_summary = row.get("exit_summary") or {}
-
             if not exit_summary:
                 day_trades = row.get("trades")
                 if isinstance(day_trades, list):
                     exit_summary = summarize_exits(day_trades)
                 else:
                     exit_summary = summarize_exits([])
-
             rows.append({
                 "day": day,
                 "summary": summary,
                 "exit_summary": exit_summary,
             })
-
     else:
         return []
 
@@ -1931,7 +1979,6 @@ def get_daily_performance_summary(
 
 def format_daily_performance_report(title: str, rows: list, side: str = "long") -> str:
     side = normalize_side(side)
-
     if not rows:
         return "لا توجد بيانات كافية"
 
@@ -1996,8 +2043,6 @@ def get_today_performance_summary(
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
 
-    logger.info(f"get_today_performance_summary {market_type}/{side} history={use_history}")
-
     trades = get_all_trades_data(
         redis_client,
         market_type=market_type,
@@ -2006,7 +2051,6 @@ def get_today_performance_summary(
     )
 
     today_data = summarize_today(trades) or {}
-
     return {
         "day": today_data.get("day", ""),
         "summary": today_data.get("summary", _empty_summary()),
@@ -2018,7 +2062,6 @@ def get_today_performance_summary(
 
 def format_today_performance_report(title: str, data: dict, side: str = "long") -> str:
     side = normalize_side(side)
-
     summary = data.get("summary", {}) or {}
     exit_summary = data.get("exit_summary", {}) or {}
     day = data.get("day", "")
@@ -2085,63 +2128,6 @@ def format_today_performance_report(title: str, data: dict, side: str = "long") 
 # ------------------------------------------------------------
 # DATA EXTRACTION FOR DIAGNOSTICS
 # ------------------------------------------------------------
-def get_all_trades_data(
-    redis_client,
-    market_type: str = None,
-    side: str = None,
-    since_ts: int = None,
-    use_history: bool = False,
-):
-    if redis_client is None:
-        return []
-
-    # تنظيف المفاتيح المنتهية من trades:all قبل أي قراءة
-    try:
-        cleanup_missing_trades_from_index(redis_client)
-    except Exception:
-        pass
-
-    # تحسين: استخدام load_trades_with_history عند use_history=True
-    if use_history:
-        return load_trades_with_history(
-            redis_client=redis_client,
-            market_type=market_type,
-            side=side,
-            since_ts=since_ts,
-            include_open=True,
-        )
-
-    # وضع use_history=False (الوضع الافتراضي)
-    trades = []
-
-    try:
-        trade_keys = list(redis_client.smembers(get_all_trades_set_key()))
-
-        for trade_key in trade_keys:
-            trade = load_trade(redis_client, trade_key)
-            if not trade:
-                continue
-
-            trade_market = normalize_market_type(trade.get("market_type", "futures"))
-            trade_side = normalize_side(trade.get("side", "long"))
-            created_ts = get_trade_created_ts(trade)
-            ts_for_filter = created_ts if created_ts else safe_int(trade.get("candle_time", 0), 0)
-
-            if market_type and trade_market != normalize_market_type(market_type):
-                continue
-            if side and trade_side != normalize_side(side):
-                continue
-            if since_ts is not None and ts_for_filter < since_ts:
-                continue
-
-            trades.append(trade)
-
-    except Exception as e:
-        logger.error(f"get_all_trades_data error: {e}")
-
-    return trades
-
-
 def summarize_by_field(
     redis_client,
     field_name: str,
@@ -2163,23 +2149,18 @@ def summarize_by_field(
 
     for trade in rows:
         diagnostics = trade.get("diagnostics", {}) or {}
-
         if field_name in trade:
             field_value = trade.get(field_name)
         else:
             field_value = diagnostics.get(field_name)
-
         field_value = str(field_value if field_value not in (None, "") else "unknown")
         _apply_trade_to_summary(grouped[field_value], trade)
 
     output = []
-
     for value, summary in grouped.items():
         _finalize_summary(summary)
-
         if summary["closed"] < min_closed:
             continue
-
         output.append({"field_value": value, **summary})
 
     output.sort(key=lambda x: (x["winrate"], x["closed"], x["wins"]), reverse=True)
@@ -2195,7 +2176,6 @@ def get_common_loss_reasons(
     trades: Optional[List[dict]] = None,
 ):
     if trades is None:
-        # استخدام load_trades_with_history ليشمل trade و trade_history
         trades = load_trades_with_history(
             redis_client,
             market_type=market_type,
@@ -2208,14 +2188,11 @@ def get_common_loss_reasons(
 
     for trade in (trades or []):
         result = str(trade.get("result", "") or "").lower().strip()
-
         if result != "loss":
             continue
-
         reasons = normalize_list(trade.get("reasons", []))
         warning_reasons = normalize_list(trade.get("warning_reasons", []))
         merged = list(reasons) + list(warning_reasons)
-
         for reason in merged:
             rr = str(reason or "").strip()
             if rr:
@@ -2268,8 +2245,8 @@ def format_period_summary(title: str, summary: dict) -> str:
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
     breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
-    decided = wins + losses + expired + breakeven_exits
-    closed = decided
+    decided = wins + losses + breakeven_exits
+    closed = wins + losses + expired + breakeven_exits
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
     gross_loss = safe_float(summary.get("gross_loss_pct", 0.0))
