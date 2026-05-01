@@ -2588,6 +2588,45 @@ def format_official_trade_status(trade: dict) -> str:
  except Exception:
     return ""
 
+# =========================
+# NEW HELPER: format_trade_status_line
+# =========================
+def format_trade_status_line(trade: dict) -> str:
+    """إرجاع سطر واحد يمثل حالة الصفقة بشكل واضح للاستخدام في Track."""
+    if not trade:
+        return "📌 حالة الصفقة: ⚪ غير معروفة"
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
+
+    if status == "pending_pullback":
+        return "📌 حالة الصفقة: ⏳ معلّقة | انتظار Pullback"
+    elif status == "open":
+        return "📌 حالة الصفقة: 🟢 مفتوحة"
+    elif status == "partial":
+        line = "📌 حالة الصفقة: 🟡 جزئية | ✅ TP1"
+        if sl_moved_to_entry:
+            line += " | 🔒 SL Entry"
+        return line
+    elif status == "closed":
+        if result == "tp2_win":
+            return "📌 حالة الصفقة: 🔵 مغلقة | 🎯 TP2"
+        elif result == "tp1_win":
+            return "📌 حالة الصفقة: 🟢 مغلقة | ✅ TP1"
+        elif result == "loss":
+            return "📌 حالة الصفقة: 🔴 مغلقة | ❌ SL"
+        elif result == "breakeven":
+            return "📌 حالة الصفقة: ⚪ مغلقة | 🔒 Breakeven"
+        elif result == "expired":
+            return "📌 حالة الصفقة: ⚫ مغلقة | ⏳ Expired"
+        elif result == "pending_expired":
+            return "📌 حالة الصفقة: ⚫ مغلقة | Pullback لم يتفعل"
+        else:
+            return "📌 حالة الصفقة: ⚫ مغلقة"
+    else:
+        return "📌 حالة الصفقة: ⚪ غير معروفة"
+
 def build_track_message(alert: dict) -> str:
  try:
     symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
@@ -2622,6 +2661,10 @@ def build_track_message(alert: dict) -> str:
         entry=effective_entry,
         side="long",
     )
+
+    # تحميل الصفقة المسجلة لعرض حالة الصفقة
+    trade = load_registered_trade_for_alert(alert)
+    status_line = format_trade_status_line(trade) if trade else format_trade_status_line(None)
 
     status_info = resolve_alert_official_or_estimated_status(alert)
     display_status = status_info["display_status"]
@@ -2662,6 +2705,7 @@ def build_track_message(alert: dict) -> str:
         f"🪙 {html.escape(symbol)}\n"
         f"📈 Long\n"
         f"⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
+        f"{status_line}\n"
         f"{recovery_extra}\n"
         f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
     )
