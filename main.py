@@ -224,6 +224,12 @@ PROTECT_ON_BLOCK_MIN_PROFIT_PCT = 0.15
 PROTECT_ON_BLOCK_BUFFER_PCT = 0.10
 
 # =========================
+# PULLBACK ENTRY CONFIG
+# =========================
+PULLBACK_ENTRY_WAIT_ENABLED = True
+PULLBACK_ENTRY_MAX_DISTANCE_PCT = 1.20
+
+# =========================
 # REDIS
 # =========================
 r = None
@@ -352,6 +358,34 @@ def set_global_cooldown() -> None:
     r.set("global_cooldown:long", "1", ex=GLOBAL_COOLDOWN_SECONDS)
  except Exception:
     pass
+
+# =========================
+# PULLBACK HELPER
+# =========================
+def should_wait_for_pullback_entry(candidate: dict) -> bool:
+    if not PULLBACK_ENTRY_WAIT_ENABLED:
+        return False
+    pullback_entry = candidate.get("pullback_entry")
+    pullback_low = candidate.get("pullback_low")
+    pullback_high = candidate.get("pullback_high")
+    if not pullback_entry or not pullback_low or not pullback_high or pullback_entry <= 0:
+        return False
+    opportunity_type = candidate.get("opportunity_type", "")
+    if "Breakout" not in opportunity_type:
+        return False
+    entry_timing = candidate.get("entry_timing", "")
+    if "🔴" in entry_timing:
+        return False
+    resistance_warning = candidate.get("resistance_warning", "")
+    if resistance_warning == "مقاومة قريبة جدًا قبل TP1":
+        return False
+    market_entry = candidate.get("market_entry", 0.0)
+    if market_entry <= 0:
+        return False
+    distance_pct = abs(pullback_entry - market_entry) / market_entry * 100.0
+    if distance_pct > PULLBACK_ENTRY_MAX_DISTANCE_PCT:
+        return False
+    return True
 
 # =========================
 # NEW HELPER: consolidated rejection logging
@@ -1467,7 +1501,9 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "extra_setups_details": candidate.get("extra_setups_details", {}),
         "has_pullback_plan": candidate.get("has_pullback_plan", False),
         "entry_mode": candidate.get("entry_mode", "market"),
-        "market_price": candidate.get("market_price", None),
+        "market_entry": candidate.get("market_entry", None),
+        "pullback_triggered": candidate.get("pullback_triggered", False),
+        "recommended_entry": candidate.get("recommended_entry", None),
     }
 
 
@@ -2210,11 +2246,11 @@ def handle_hard_reset(chat_id: str):
         # Caches
         r.delete(ALT_SNAPSHOT_CACHE_KEY)
         r.delete(MARKET_STATUS_SNAPSHOT_KEY)
-        r.delete(NEWS_CACHE_KEY)  # long-specific news cache
+        r.delete(NEWS_CACHE_KEY)
         r.delete(TELEGRAM_OFFSET_KEY)
         r.delete(TELEGRAM_BOOTSTRAP_DONE_KEY)
         r.delete(TELEGRAM_POLL_LOCK_KEY)
-        del_mode_cache += 3  # roughly count these as cache keys
+        del_mode_cache += 3
         # Candle caches long
         for key in r.scan_iter("candles:long:*"):
             r.delete(key)
@@ -2443,10 +2479,20 @@ def get_alert_status(alert: dict) -> str:
     entry = _safe_float(alert.get("entry"), 0)
     recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
     pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+    entry_mode = alert.get("entry_mode", "market")
+    pullback_triggered = bool(alert.get("pullback_triggered", False))
+    market_entry = _safe_float(alert.get("market_entry"), 0.0)
+
     if mode == MODE_RECOVERY_LONG and avg_planned > 0:
         effective_entry = avg_planned
+    elif entry_mode == "pullback_pending":
+        if pullback_triggered:
+            effective_entry = pullback_entry if pullback_entry > 0 else entry
+        else:
+            effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
     else:
-        effective_entry = recommended_entry if recommended_entry > 0 else pullback_entry if pullback_entry > 0 else entry
+        effective_entry = market_entry if market_entry > 0 else entry
+
     sl = _safe_float(alert.get("sl"), 0)
     tp1 = _safe_float(alert.get("tp1"), 0)
     tp2 = _safe_float(alert.get("tp2"), 0)
@@ -2499,14 +2545,12 @@ def load_registered_trade_for_alert(alert: dict):
  try:
     symbol = alert.get("symbol", "")
     candle_time = int(_safe_float(alert.get("candle_time"), 0))
-    # primary key
     trade_key = f"trade:futures:long:{symbol}:{candle_time}"
     raw = r.get(trade_key)
     if raw:
         data = json.loads(raw)
         if isinstance(data, dict):
             return data
-    # fallback to trade_history
     history_key = f"trade_history:futures:long:{symbol}:{candle_time}"
     raw = r.get(history_key)
     if raw:
@@ -2551,16 +2595,26 @@ def build_track_message(alert: dict) -> str:
     entry = _safe_float(alert.get("entry"), 0.0)
     recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
     pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+    market_entry = _safe_float(alert.get("market_entry"), 0.0)
+    entry_mode = alert.get("entry_mode", "market")
+    pullback_triggered = bool(alert.get("pullback_triggered", False))
     sl = _safe_float(alert.get("sl"), 0.0)
     tp1 = _safe_float(alert.get("tp1"), 0.0)
     tp2 = _safe_float(alert.get("tp2"), 0.0)
     candle_time = int(_safe_float(alert.get("candle_time"), 0))
     created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
     current_price = get_last_price(alert.get("symbol", ""))
+
     if mode == MODE_RECOVERY_LONG and avg_planned > 0:
         effective_entry = avg_planned
+    elif entry_mode == "pullback_pending":
+        if pullback_triggered:
+            effective_entry = pullback_entry if pullback_entry > 0 else entry
+        else:
+            effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
     else:
-        effective_entry = recommended_entry if recommended_entry > 0 else pullback_entry if pullback_entry > 0 else entry
+        effective_entry = market_entry if market_entry > 0 else entry
+
     favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
         symbol=alert.get("symbol", ""),
         since_ts=candle_time,
@@ -2568,7 +2622,6 @@ def build_track_message(alert: dict) -> str:
         side="long",
     )
 
-    # Resolve official vs estimated status (no extra loading of official trade here)
     status_info = resolve_alert_official_or_estimated_status(alert)
     display_status = status_info["display_status"]
     is_official = status_info["is_official"]
@@ -2605,11 +2658,18 @@ def build_track_message(alert: dict) -> str:
         f"📈 Long\n"
         f"⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
         f"{recovery_extra}\n"
+        f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
+    )
+    if entry_mode == "pullback_pending" and not pullback_triggered:
+        msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
+    msg += (
         f"💰 Signal Entry: {entry:.6f}\n"
     )
+    if entry_mode == "pullback_pending" and market_entry > 0:
+        msg += f"💵 سعر السوق عند الإرسال: {market_entry:.6f}\n"
     if recommended_entry > 0 and recommended_entry != entry:
         msg += f"📌 Recommended Entry: {recommended_entry:.6f}\n"
-    if effective_entry != entry and mode != MODE_RECOVERY_LONG:
+    if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
         msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
     msg += (
         f"🛑 SL: {sl:.6f}\n"
@@ -5424,7 +5484,7 @@ def build_message(
         )
     else:
         pullback_text = (
-            f"📥 <b>منطقة دخول البول باك:</b> "
+            f"📥 <b>منطقة بول باك مقترحة للمراقبة:</b> "
             f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
         )
  if is_reverse:
@@ -6166,12 +6226,10 @@ def fetch_funding_rates_parallel(symbols, max_workers=MAX_CANDLE_FETCH_WORKERS) 
 def cleanup_local_caches():
     """Prevent unlimited growth of local caches."""
     now = time.time()
-    # sent_cache: remove entries older than LOCAL_RECENT_SEND_SECONDS + 300 seconds margin
     margin = 300
     stale_send = [sym for sym, ts in sent_cache.items() if now - ts > LOCAL_RECENT_SEND_SECONDS + margin]
     for sym in stale_send:
         del sent_cache[sym]
-    # last_candle_cache: remove entries whose metadata timestamp is older than 1 hour (3600 seconds)
     horizon = 3600
     stale_candle = [sym for sym, ts in last_candle_cache_meta.items() if now - ts > horizon]
     for sym in stale_candle:
@@ -6269,7 +6327,6 @@ def run_scanner_loop():
         )
         current_mode = handle_market_mode_transition(mode_result)
 
-        # --- UPDATE OPEN TRADES WITH PROTECTION (supports buffer if available) ---
         try:
             update_open_trades(
                 r,
@@ -6283,7 +6340,7 @@ def run_scanner_loop():
                 reason=f"market_mode={current_mode}",
             )
         except TypeError:
-            logger.warning("update_open_trades does not accept breakeven_buffer_pct, using fallback without buffer (tracking/performance.py needs update)")
+            logger.warning("update_open_trades does not accept breakeven_buffer_pct, using fallback without buffer")
             try:
                 update_open_trades(
                     r,
@@ -6300,7 +6357,6 @@ def run_scanner_loop():
         except Exception as e:
             logger.error(f"update_open_trades error: {e}")
 
-        # Count protected trades
         if current_mode == MODE_BLOCK_LONGS and r:
             try:
                 trade_keys = list(r.smembers("open_trades:futures:long"))
@@ -6510,6 +6566,8 @@ def run_scanner_loop():
                         "tp1_close_pct": TP1_CLOSE_PCT,
                         "tp2_close_pct": TP2_CLOSE_PCT,
                         "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                        "entry_mode": "market",
+                        "pullback_triggered": True,
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
                     recovery_candidate = {
@@ -6603,6 +6661,11 @@ def run_scanner_loop():
                         "primary_extra_setup": "",
                         "extra_setups_details": {},
                         "current_mode": current_mode,
+                        "has_pullback_plan": False,
+                        "entry_mode": "market",
+                        "market_entry": entry1,
+                        "pullback_triggered": True,
+                        "recommended_entry": avg_entry,
                     }
                     register_ok = register_trade_from_candidate(recovery_candidate)
                     set_alert_registration_status(alert_id, register_ok)
@@ -7406,13 +7469,11 @@ def run_scanner_loop():
                 pullback_high = None
                 pullback_entry = None
 
-            # --- NEW: pullback plan handling ---
             has_pullback_plan = (
                 pullback_low is not None
                 and pullback_high is not None
                 and pullback_entry is not None
             )
-            # --- end new ---
 
             if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal and not has_extra_strong_setup:
                 log_long_rejection(
@@ -7656,9 +7717,29 @@ def run_scanner_loop():
 
             price = _safe_float(signal_row["close"], 0)
 
-            # --- NEW: determine effective entry for trade ---
-            entry_price_for_trade = pullback_entry if has_pullback_plan else price
-            # --- end new ---
+            # --- entry price determination ---
+            market_entry = price
+            entry_price_for_trade = price
+            entry_mode = "market"
+            pullback_triggered = True
+
+            # Build a temporary candidate to run pullback logic
+            candidate_decision = {
+                "market_entry": market_entry,
+                "pullback_entry": pullback_entry,
+                "pullback_low": pullback_low,
+                "pullback_high": pullback_high,
+                "opportunity_type": temp_opportunity_type,
+                "entry_timing": entry_timing_temp,
+                "resistance_warning": "",
+            }
+
+            if has_pullback_plan and should_wait_for_pullback_entry(candidate_decision):
+                entry_price_for_trade = pullback_entry
+                entry_mode = "pullback_pending"
+                pullback_triggered = False
+
+            # --- end entry price ---
 
             if breakout:
                 sl_type = "breakout"
@@ -7700,7 +7781,6 @@ def run_scanner_loop():
             resistance_rejected = False
             resistance_dynamic_penalty = 0.0
             
-            # early display_risk for near_resistance_guard
             explicit_warnings = score_result.get("warning_reasons") or []
             _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
             warnings_count_early = len(explicit_warnings) if explicit_warnings else len(inferred_warnings)
@@ -7780,7 +7860,6 @@ def run_scanner_loop():
                     "reason": early_resistance_warning
                 })
 
-            # Compute early setup_type_base
             wave_context_early = infer_wave_context(
                 entry_maturity_data=entry_maturity_data,
                 is_reverse=is_reverse,
@@ -8172,7 +8251,6 @@ def run_scanner_loop():
                 momentum_priority -= 0.30
             momentum_priority = round(momentum_priority, 2)
             alert_id = build_alert_id(symbol, candle_time)
-            # Redefine wave_context with possible overrides
             wave_context = infer_wave_context(
                 entry_maturity_data=entry_maturity_data,
                 is_reverse=is_reverse,
@@ -8251,7 +8329,6 @@ def run_scanner_loop():
                 momentum_priority -= 0.60
                 momentum_priority = round(momentum_priority, 2)
 
-            # --- FINAL risk label calculation ---
             final_explicit_warnings = score_result.get("warning_reasons") or []
             _, final_inferred_warnings = classify_reasons(score_result.get("reasons", []))
             final_warnings_count = len(final_explicit_warnings) if final_explicit_warnings else len(final_inferred_warnings)
@@ -8374,9 +8451,10 @@ def run_scanner_loop():
                 "res_dynamic_penalty": res_dynamic_penalty,
                 "signal_rating": score_result.get("signal_rating", "⚡ عادي"),
                 "has_pullback_plan": has_pullback_plan,
-                "market_price": price,
+                "market_entry": market_entry,
                 "recommended_entry": entry_price_for_trade,
-                "entry_mode": "pullback_pending" if has_pullback_plan else "market",
+                "entry_mode": entry_mode,
+                "pullback_triggered": pullback_triggered,
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -8396,7 +8474,6 @@ def run_scanner_loop():
             if not locked:
                 continue
 
-            # Build final message
             tv_link = build_tradingview_link(symbol)
             temp_score_result = {
                 "score": candidate["score"],
@@ -8479,10 +8556,12 @@ def run_scanner_loop():
                     "mode": current_mode,
                     "market_mode": current_mode,
                     "timeframe": TIMEFRAME,
-                    "market_entry": candidate["entry"],
+                    "market_entry": candidate.get("market_entry", candidate["entry"]),
                     "entry": candidate["entry"],
-                    "recommended_entry": candidate["entry"],
-                    "pullback_entry": candidate["pullback_entry"],
+                    "recommended_entry": candidate.get("recommended_entry", candidate["entry"]),
+                    "pullback_entry": candidate.get("pullback_entry"),
+                    "entry_mode": candidate.get("entry_mode", "market"),
+                    "pullback_triggered": candidate.get("pullback_triggered", candidate.get("entry_mode") == "market"),
                     "sl": candidate["sl"],
                     "tp1": candidate["tp1"],
                     "tp2": candidate["tp2"],
@@ -8509,8 +8588,6 @@ def run_scanner_loop():
                     "pullback_low": candidate["pullback_low"],
                     "pullback_high": candidate["pullback_high"],
                     "has_pullback_plan": candidate["has_pullback_plan"],
-                    "market_price": candidate["market_price"],
-                    "entry_mode": candidate["entry_mode"],
                     "market_guard_active": bool(market_guard.get("active", False)),
                     "market_guard_level": market_guard.get("level", "normal"),
                     "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
