@@ -3398,7 +3398,10 @@ def get_late_pump_risk(
  vwap_distance: float = 0.0,
  rsi_slope: float = 0.0,
  macd_hist_slope: float = 0.0,
+ entry_timing: str = "",
+ alt_mode: str = "",
 ) -> dict:
+ _is_simple_late_et = False
  try:
     reasons = []
     is_continuation = str(opportunity_type or "").strip() in ("استمرار", "continuation")
@@ -3425,12 +3428,51 @@ def get_late_pump_risk(
         reasons.append("macd_hist_falling")
     checks = sum([over_ma, hot_rsi, pump_volume, big_candle, fast_4h_move, (vwap_distance >= 2.4), (rsi_slope <= 0 and rsi_now >= 65), (macd_hist_slope < 0)])
     late_pump_risk = checks >= 3
+
+    # ── Entry-timing & alt_mode aware late risk (AMENDED) ─────────────────
+    _et = str(entry_timing or "")
+    _alt = str(alt_mode or "")
+
+    # Rule 1: "مطاردة حركة" or "متأخر جدًا" → reinforce late_pump_risk when 2+ conditions met
+    _is_chase_or_very_late = "مطاردة حركة" in _et or "متأخر جدًا" in _et
+    if _is_chase_or_very_late:
+        _et_conds = sum([
+            dist_ma >= 4.2,
+            rsi_now >= 67,
+            vol_ratio >= 1.8,
+            candle_strength >= 0.62,
+            "ضعيف" in _alt,
+        ])
+        if _et_conds >= 2:
+            late_pump_risk = True
+            if "late_entry_strong_conditions" not in reasons:
+                reasons.append("late_entry_strong_conditions")
+
+    # Rule 2: simple "متأخر" (not "مطاردة" and not "متأخر جدًا") → soft penalty marker only, no block
+    _is_simple_late_et = (
+        "متأخر" in _et
+        and not _is_chase_or_very_late
+        and "مطاردة" not in _et
+    )
+    if _is_simple_late_et:
+        if "late_entry_soft_penalty" not in reasons:
+            reasons.append("late_entry_soft_penalty")
+    # ──────────────────────────────────────────────────────────────────────
+
     extreme_late_pump = (
         dist_ma >= 5.2
         and rsi_now >= 70
         and vol_ratio >= 2.0
         and candle_strength >= 0.65
     )
+
+    # Rule 4: breakout/pre_breakout with extreme stretch → trigger extreme_late_pump
+    # (do NOT reset reasons — only add)
+    if (breakout or pre_breakout) and dist_ma >= 4.8 and vol_ratio >= 2.0:
+        extreme_late_pump = True
+        if "breakout_extreme_stretch" not in reasons:
+            reasons.append("breakout_extreme_stretch")
+
     bull_continuation_risk = (
         market_state == "bull_market"
         and is_continuation
@@ -3460,6 +3502,7 @@ def get_late_pump_risk(
         "should_block": bool(should_block),
         "reasons": reasons,
         "checks": checks,
+        "soft_late_penalty": 0.25 if _is_simple_late_et else 0.0,
     }
  except Exception:
     return {
@@ -3469,6 +3512,7 @@ def get_late_pump_risk(
         "should_block": False,
         "reasons": [],
         "checks": 0,
+        "soft_late_penalty": 0.0,
     }
 
 def append_late_pump_warnings(score_result: dict, late_guard: dict) -> dict:
@@ -6895,6 +6939,8 @@ def run_scanner_loop():
                 vwap_distance=vwap_distance,
                 rsi_slope=rsi_slope,
                 macd_hist_slope=macd_hist_slope,
+                entry_timing="",
+                alt_mode=alt_mode,
             )
             if late_guard.get("should_block") and not is_reverse:
                 log_long_rejection(
