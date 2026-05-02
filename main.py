@@ -122,6 +122,9 @@ ALT_MARKET_CANDLE_LIMIT = 60
 SCAN_LOCK_KEY = "scan:long:running"
 SCAN_LOCK_TTL = 600
 
+SCAN_LOOP_SLEEP_SECONDS = 5
+SCAN_IDLE_SLEEP_SECONDS = 8
+
 TELEGRAM_OFFSET_KEY = "telegram:offset:long"
 TELEGRAM_BOOTSTRAP_DONE_KEY = "telegram:bootstrap_done:long"
 TELEGRAM_POLL_LOCK_KEY = "telegram:poll:lock:long"
@@ -252,6 +255,7 @@ last_candle_cache = {}
 last_candle_cache_meta = {}
 last_global_send_ts = 0.0
 _local_news_cache = {"created_ts": 0, "events": []}
+_last_scan_skip_log_ts = 0.0
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -6298,7 +6302,7 @@ def run_command_poller():
     time.sleep(COMMAND_POLL_INTERVAL)
 
 def run_scanner_loop():
- global last_global_send_ts
+ global last_global_send_ts, _last_scan_skip_log_ts
  while True:
     try:
         cleanup_local_caches()
@@ -6308,8 +6312,11 @@ def run_scanner_loop():
     try:
         scan_locked = acquire_scan_lock()
         if not scan_locked:
-            logger.info("Another long scan is running --- skipping")
-            time.sleep(30)
+            _now_ts = time.time()
+            if _now_ts - _last_scan_skip_log_ts >= 60:
+                logger.debug("Another long scan is running --- skipping")
+                _last_scan_skip_log_ts = _now_ts
+            time.sleep(SCAN_IDLE_SLEEP_SECONDS)
             continue
         logger.info(f"LONG RUN START | pid={os.getpid()}")
 
@@ -7281,6 +7288,70 @@ def run_scanner_loop():
                     )
                 )
 
+                # ── Late Entry Guard Override (AMENDED) ──────────────────────
+                # Rule 3: breakout / pre_breakout → block only if extreme stretch
+                if hard_late_entry and (breakout or pre_breakout):
+                    if not (dist_ma >= 4.8 and vol_ratio >= 2.0):
+                        hard_late_entry = False
+                        pre_score_adjustments_log.append({
+                            "name": "late_breakout_warning_penalty",
+                            "value": -0.25,
+                            "reason": "late_entry_breakout_caution"
+                        })
+                        if not isinstance(entry_maturity_data.get("warning_reasons"), list):
+                            entry_maturity_data["warning_reasons"] = []
+                        entry_maturity_data["warning_reasons"].append("اختراق متأخر، يُنصح بالحذر")
+                        logger.info(
+                            f"{symbol} --> late breakout caution (no hard block): "
+                            f"dist_ma={dist_ma:.2f}, vol_ratio={vol_ratio:.2f}"
+                        )
+
+                # Rule 1: "متأخر جدًا" or "مطاردة حركة" → conditional block (need 2+ conditions)
+                elif hard_late_entry and (
+                    "متأخر جدًا" in str(entry_timing_temp)
+                    or "مطاردة حركة" in str(entry_timing_temp)
+                ):
+                    _late_cond_count = sum([
+                        dist_ma >= 4.2,
+                        rsi_now >= 67,
+                        vol_ratio >= 1.8,
+                        candle_strength >= 0.62,
+                        "ضعيف" in str(alt_mode),
+                    ])
+                    if _late_cond_count < 2:
+                        hard_late_entry = False
+                        pre_score_adjustments_log.append({
+                            "name": "late_entry_conditional_penalty",
+                            "value": -0.30,
+                            "reason": "late_entry_conditional_override"
+                        })
+                        if not isinstance(entry_maturity_data.get("warning_reasons"), list):
+                            entry_maturity_data["warning_reasons"] = []
+                        entry_maturity_data["warning_reasons"].append("دخول متأخر تحت الحد الحرج")
+                        logger.info(
+                            f"{symbol} --> late_entry conditional override "
+                            f"(conds={_late_cond_count}/5, no hard block): "
+                            f"dist_ma={dist_ma:.2f}, rsi={rsi_now:.1f}, "
+                            f"vol={vol_ratio:.2f}, cs={candle_strength:.2f}"
+                        )
+
+                # Rule 2: simple "متأخر" (not جدًا, not مطاردة) → penalty only, no hard block
+                elif hard_late_entry:
+                    hard_late_entry = False
+                    pre_score_adjustments_log.append({
+                        "name": "simple_late_entry_penalty",
+                        "value": -0.30,
+                        "reason": "simple_late_entry"
+                    })
+                    if not isinstance(entry_maturity_data.get("warning_reasons"), list):
+                        entry_maturity_data["warning_reasons"] = []
+                    entry_maturity_data["warning_reasons"].append("دخول متأخر نسبي")
+                    logger.info(
+                        f"{symbol} --> simple late entry → penalty only "
+                        f"(entry_timing={entry_timing_temp})"
+                    )
+                # ─────────────────────────────────────────────────────────────
+
                 if hard_late_entry:
                     wave5_eval = evaluate_wave5_htf_override(
                         entry_timing=entry_timing_temp,
@@ -7953,31 +8024,53 @@ def run_scanner_loop():
                 dynamic_threshold += 0.25
                 dynamic_threshold = round(dynamic_threshold, 2)
             if current_mode == MODE_STRONG_LONG_ONLY and "🔴" in entry_timing_temp:
-                log_long_rejection(
-                    symbol=symbol,
-                    reason="strong_only_late_entry",
-                    candle_time=candle_time,
-                    market_state=market_state,
-                    current_mode=current_mode,
-                    entry_timing=entry_timing_temp,
-                    opportunity_type=temp_opportunity_type,
-                    dist_ma=dist_ma,
-                    rsi_now=rsi_now,
-                    vol_ratio=vol_ratio,
-                    vwap_distance=vwap_distance,
-                    mtf_confirmed=mtf_confirmed,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                    is_reverse=is_reverse,
-                    extra={
-                        "has_extra_strong_setup": has_extra_strong_setup,
-                        "extra_setup_names": extra_setup_names,
-                        "primary_extra_setup": primary_extra_setup,
-                        "extra_setup_bonus": extra_setup_bonus,
-                    },
+                # ── STRONG_LONG_ONLY late entry: block only for chase/very-late AND conditions ──
+                _slo_is_chase_or_very_late = (
+                    "مطاردة حركة" in str(entry_timing_temp)
+                    or "متأخر جدًا" in str(entry_timing_temp)
                 )
-                logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: late entry)")
-                continue
+                _slo_late_block = (
+                    _slo_is_chase_or_very_late
+                    and (dist_ma >= 4.2 or "ضعيف" in str(alt_mode))
+                )
+                if _slo_late_block:
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="strong_only_late_entry",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
+                            "slo_chase_or_very_late": _slo_is_chase_or_very_late,
+                            "slo_dist_ma": dist_ma,
+                            "slo_alt_mode": alt_mode,
+                        },
+                    )
+                    logger.info(
+                        f"{symbol} --> skipped (STRONG_LONG_ONLY: late entry "
+                        f"chase/very-late, dist_ma={dist_ma:.2f}, alt_mode={alt_mode})"
+                    )
+                    continue
+                else:
+                    logger.info(
+                        f"{symbol} --> STRONG_LONG_ONLY: late '🔴' but not blocked "
+                        f"(chase_or_very_late={_slo_is_chase_or_very_late}, "
+                        f"dist_ma={dist_ma:.2f}, alt_mode={alt_mode})"
+                    )
 
             opportunity_type = temp_opportunity_type
             entry_timing = entry_timing_temp
@@ -8707,8 +8800,8 @@ def run_scanner_loop():
             logger.info(f"Global long cooldown set for {GLOBAL_COOLDOWN_SECONDS}s after {sent_count} alert(s)")
         logger.info(f"Sent long alerts this run: {sent_count}")
         logger.info(f"Tested {tested} pairs")
-        logger.info("Sleeping 60 seconds...")
-        time.sleep(60)
+        logger.info(f"Scan complete. Sleeping {SCAN_LOOP_SLEEP_SECONDS}s before next run...")
+        time.sleep(SCAN_LOOP_SLEEP_SECONDS)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         time.sleep(10)
