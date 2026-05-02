@@ -6925,6 +6925,19 @@ def run_scanner_loop():
             extra_setup_names = extra_setups.get("setups", [])
             extra_setup_bonus = float(extra_setups.get("score_bonus", 0.0) or 0.0)
             primary_extra_setup = extra_setups.get("primary_setup", "")
+            # حساب entry_timing أولي (بدون entry_maturity_data / بدون late_pump_risk)
+            # يُستخدم فقط لتزويد get_late_pump_risk بمعلومات "متأخر" / "مطاردة حركة"
+            # entry_timing_temp الحقيقي يُحسب لاحقًا بعد entry_maturity_data و late_guard
+            _preliminary_entry_timing = classify_entry_timing_long(
+                dist_ma=dist_ma,
+                breakout=breakout,
+                pre_breakout=pre_breakout,
+                vol_ratio=vol_ratio,
+                rsi_now=rsi_now,
+                candle_strength=candle_strength,
+                late_pump_risk=False,
+                entry_maturity_data={},
+            )
             late_guard = get_late_pump_risk(
                 market_state=market_state,
                 opportunity_type=temp_opportunity_type,
@@ -6939,7 +6952,7 @@ def run_scanner_loop():
                 vwap_distance=vwap_distance,
                 rsi_slope=rsi_slope,
                 macd_hist_slope=macd_hist_slope,
-                entry_timing="",
+                entry_timing=_preliminary_entry_timing,
                 alt_mode=alt_mode,
             )
             if late_guard.get("should_block") and not is_reverse:
