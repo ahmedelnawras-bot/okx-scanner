@@ -39,6 +39,15 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - status = "pending_pullback" حتى التفعيل، ثم يتحول إلى "open".
 - عند تفعيل البولباك تُحدَّث الأهداف وتُحفظ التغييرات فوراً.
 - إضافة تتبع تحليلي كامل للصفقات المعلّقة.
+
+**إصدار 3.4 – إصلاحات دقة التتبع (Refactor)**
+- 🔴 إصلاح حساب نقطة التعادل باستخدام effective_entry بدلاً من entry.
+- 🟡 حساب PnL مرجح للمخارج الجزئية (TP1 + TP2).
+- 🟢 تجاهل صفقات pullback_pending من جميع الإحصائيات.
+- 🟣 تحديث history snapshot بعد كل تغيير في الصفقة.
+- 🟤 تصنيف breakeven عند تساوي SL مع effective_entry.
+
+**إصدار 3.5 – تصحيحات Strict: Breakeven، عرض الخسائر، pullback، Winrate، تحويل TP2 إلى Trailing**
 """
 
 import json
@@ -500,6 +509,8 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "status": trade_data.get("status", "open"),
         "result": trade_data.get("result"),
         "tp1_hit": normalize_bool(trade_data.get("tp1_hit", False)),
+        "tp2_hit": normalize_bool(trade_data.get("tp2_hit", False)),
+        "tp2_hit_at": safe_timestamp(trade_data.get("tp2_hit_at")),
 
         "market_state": _get_field("market_state", "unknown"),
         "market_state_label": _get_field("market_state_label", "unknown"),
@@ -585,6 +596,7 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "original_sl_before_breakeven": _get_field("original_sl_before_breakeven"),
         "protected_breakeven_exit": normalize_bool(_get_field("protected_breakeven_exit", False)),
         "sl_moved_to_entry": normalize_bool(_get_field("sl_moved_to_entry", False)),
+        "sl_moved_to_tp1": normalize_bool(_get_field("sl_moved_to_tp1", False)),
         "sl_move_reason": _get_field("sl_move_reason", ""),
         "exit_reason": _get_field("exit_reason", ""),
         "last_processed_candle_ts": safe_timestamp(trade_data.get("last_processed_candle_ts"), 0),
@@ -972,6 +984,8 @@ def register_trade(
         "status": _status,
         "tp1_hit": False,
         "tp1_hit_at": None,
+        "tp2_hit": False,
+        "tp2_hit_at": None,
         "created_at": now_ts,
         "updated_at": now_ts,
         "closed_at": None,
@@ -1032,6 +1046,7 @@ def register_trade(
         "original_sl_before_breakeven": round_price(_get_val("original_sl_before_breakeven")) if _get_val("original_sl_before_breakeven") is not None else None,
         "protected_breakeven_exit": bool(_get_val("protected_breakeven_exit", False)),
         "sl_moved_to_entry": False,
+        "sl_moved_to_tp1": False,
         "sl_move_reason": "",
         # Fib/pullback/wave etc
         "fib_position": _get_val("fib_position", "unknown"),
@@ -1149,6 +1164,54 @@ def update_trade_history_snapshot(redis_client, trade_data: dict):
         return False
 
 
+def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candle_ts: int = None):
+    """
+    تسجيل وصول السعر إلى TP2 وتحويل SL إلى TP1 (trailing stop).
+    لا يغلق الصفقة، بل يبقيها مفتوحة بحالة tp2_partial.
+    """
+    if redis_client is None:
+        return False
+    if trade_data.get("tp2_hit"):
+        return True
+    try:
+        if processed_candle_ts is not None:
+            trade_data["last_processed_candle_ts"] = safe_timestamp(
+                processed_candle_ts,
+                trade_data.get("last_processed_candle_ts", 0)
+            )
+        side = normalize_side(trade_data.get("side", "long"))
+        tp1 = safe_float(trade_data["tp1"])
+        current_sl = safe_float(trade_data["sl"])
+
+        trade_data["tp2_hit"] = True
+        trade_data["tp2_hit_at"] = int(time.time())
+        trade_data["status"] = "tp2_partial"
+        trade_data["sl_moved_to_tp1"] = True
+        trade_data["sl_move_reason"] = "TP2 hit - SL moved to TP1"       # إضافة سبب الحركة
+        if side == "long":
+            trade_data["sl"] = max(current_sl, tp1)
+        else:
+            trade_data["sl"] = min(current_sl, tp1)
+
+        diagnostics = trade_data.get("diagnostics", {}) or {}
+        diagnostics["tp2_hit"] = True
+        diagnostics["tp2_hit_at"] = trade_data["tp2_hit_at"]
+        diagnostics["sl_moved_to_tp1"] = True
+        diagnostics["sl_move_reason"] = "TP2 hit - SL moved to TP1"      # إضافة في diagnostics
+        trade_data["diagnostics"] = diagnostics
+
+        market_type = normalize_market_type(trade_data.get("market_type", "futures"))
+        stats_key = get_stats_key(market_type, side)
+        redis_client.hincrby(stats_key, "tp2_hits", 1)
+
+        ok = save_trade(redis_client, trade_key, trade_data)
+        update_trade_history_snapshot(redis_client, trade_data)
+        return ok
+    except Exception as e:
+        logger.error(f"mark_tp2_hit error on {trade_key}: {e}")
+        return False
+
+
 def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: str):
     if redis_client is None:
         return False
@@ -1156,6 +1219,21 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
     market_type = normalize_market_type(trade_data.get("market_type", "futures"))
     side = normalize_side(trade_data.get("side", "long"))
     open_set_key = get_open_trades_set_key(market_type, side)
+
+    # معالجة breakeven / tp1_win عند ضرب SL قريب من effective_entry
+    effective_entry = get_trade_effective_entry(trade_data)
+    if result == "loss":
+        sl = safe_float(trade_data.get("sl"), 0.0)
+        if effective_entry > 0:
+            diff_pct = abs(sl - effective_entry) / effective_entry * 100
+            if diff_pct <= 0.03:
+                if trade_data.get("tp1_hit"):
+                    result = "tp1_win"
+                else:
+                    result = "breakeven"
+                trade_data["protected_breakeven_exit"] = True
+                if not trade_data.get("exit_reason"):
+                    trade_data["exit_reason"] = "breakeven_protected_sl"
 
     try:
         trade_data["status"] = "closed"
@@ -1213,7 +1291,6 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         if trade_data.get("tp1_hit"):
             return True
 
-        # تحديث آخر شمعة معالجة إن وُجدت
         if processed_candle_ts is not None:
             trade_data["last_processed_candle_ts"] = safe_timestamp(
                 processed_candle_ts,
@@ -1273,6 +1350,9 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
 # TRADE EVALUATION (per candle)
 # ------------------------------------------------------------
 def evaluate_trade_on_candle(trade: dict, candle: dict):
+    """
+    تقييم الصفقة على شمعة واحدة. لا يغلق تلقائياً عند TP2، فقط يسجل الحاجة لتفعيل mark_tp2_hit.
+    """
     side = normalize_side(trade.get("side", "long"))
     diagnostics = trade.get("diagnostics", {}) or {}
 
@@ -1283,25 +1363,21 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     tp1 = safe_float(trade["tp1"])
     tp2 = safe_float(trade["tp2"])
     tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
 
     low = safe_float(candle["low"])
     high = safe_float(candle["high"])
 
     result = None
     tp1_now = False
+    tp2_now = False  # لتحديد الحاجة لmark_tp2_hit
 
     pullback_entry = diagnostics.get("pullback_entry")
-    pullback_high = diagnostics.get("pullback_high")
-    pullback_low = diagnostics.get("pullback_low")
     pullback_triggered = normalize_bool(trade.get("pullback_triggered", diagnostics.get("pullback_triggered", False)))
-
-    # حقول الدخول المعلّق (v3.3)
     entry_mode = str(trade.get("entry_mode", diagnostics.get("entry_mode", "market")) or "market")
-    has_pullback_plan_flag = normalize_bool(
-        trade.get("has_pullback_plan", diagnostics.get("has_pullback_plan", False))
-    )
+    has_pullback_plan_flag = normalize_bool(trade.get("has_pullback_plan", diagnostics.get("has_pullback_plan", False)))
 
-    # --- منطق pullback_pending: لا تُقيَّم الصفقة حتى يلمس السعر pullback_entry ---
+    # منطق pullback pending
     if (
         side == "long"
         and entry_mode == "pullback_pending"
@@ -1309,78 +1385,78 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
         and not pullback_triggered
     ):
         pb_entry = safe_float(pullback_entry, 0.0)
-
         if pb_entry <= 0:
-            # لا توجد منطقة بولباك صالحة، اعتبرها مفتوحة
             trade["status"] = "open"
             trade["entry_mode"] = "market"
         elif low <= pb_entry:
-            # السعر لمس منطقة الدخول → تفعيل البولباك
             now_ts = int(time.time())
             candle_ts = safe_timestamp(candle["ts"])
-
-            # توحيد القيم في top-level و diagnostics
             trade["pullback_triggered"] = True
             trade["entry_mode"] = "pullback_triggered"
             trade["effective_entry"] = round_price(pb_entry)
             trade["activated_at"] = now_ts
             trade["activated_candle_ts"] = candle_ts
-
             diagnostics["pullback_triggered"] = True
             diagnostics["entry_mode"] = "pullback_triggered"
             diagnostics["effective_entry"] = round_price(pb_entry)
             diagnostics["activated_at"] = now_ts
             diagnostics["activated_candle_ts"] = candle_ts
-
             trade["status"] = "open"
             trade["diagnostics"] = diagnostics
-
             trade = recalc_targets_from_effective_entry(trade, pb_entry)
             effective_entry = pb_entry
             tp1 = safe_float(trade["tp1"])
             tp2 = safe_float(trade["tp2"])
             pullback_triggered = True
-
-            # بعد التفعيل نسمح بتقييم SL/TP على نفس الشمعة
         else:
-            # لم يلمس السعر منطقة الدخول بعد → لا تقييم
             trade["status"] = "pending_pullback"
             diagnostics["entry_mode"] = "pullback_pending"
             diagnostics["pullback_triggered"] = False
             trade["diagnostics"] = diagnostics
             return None, False, trade
 
-    # --- التقييم الطبيعي (بعد التفعيل أو للصفقات العادية) ---
+    # التقييم العادي
     if side == "long":
         if not tp1_hit:
             if low <= sl:
                 result = "loss"
             elif high >= tp1:
                 tp1_now = True
-                if high >= tp2:
-                    result = "tp2_win"
+                if high >= tp2 and not tp2_hit:
+                    tp2_now = True
         else:
-            if high >= tp2:
-                result = "tp2_win"
-            elif low <= sl:
-                result = "tp1_win"
+            if not tp2_hit and high >= tp2:
+                tp2_now = True
+            if low <= sl:
+                if tp2_hit:
+                    result = "tp2_win"
+                else:
+                    result = "tp1_win"
     else:  # short
         if not tp1_hit:
             if high >= sl:
                 result = "loss"
             elif low <= tp1:
                 tp1_now = True
-                if low <= tp2:
-                    result = "tp2_win"
+                if low <= tp2 and not tp2_hit:
+                    tp2_now = True
         else:
-            if low <= tp2:
-                result = "tp2_win"
-            elif high >= sl:
-                result = "tp1_win"
+            if not tp2_hit and low <= tp2:
+                tp2_now = True
+            if high >= sl:
+                if tp2_hit:
+                    result = "tp2_win"
+                else:
+                    result = "tp1_win"
 
+    # نمرر إشارة tp2_now لتُنفذ في update_open_trades، ولا نغلق
+    trade["_tp2_now"] = tp2_now
     return result, tp1_now, trade
 
 
+# ------------------------------------------------------------
+# UPDATE OPEN TRADES
+# ------------------------------------------------------------
 def update_open_trades(
     redis_client,
     market_type: str = "futures",
@@ -1418,7 +1494,6 @@ def update_open_trades(
                 pass
             continue
 
-        # الصفقات المغلقة فقط تُزال من open_set
         if trade.get("status") == "closed":
             try:
                 redis_client.srem(open_set_key, trade_key)
@@ -1426,18 +1501,30 @@ def update_open_trades(
                 pass
             continue
 
-        # صفقة "pending_pullback" تبقى في المجموعة وتُعالَج طبيعيًا
+        # --- استخراج trade_side الخاص بالصفقة الحالية ---
+        trade_side = normalize_side(trade.get("side", side))
+
         symbol = trade["symbol"]
         created_at = safe_timestamp(trade.get("created_at", now_ts))
 
+        # --- منطق انتهاء الصلاحية الجديد ---
         if now_ts - created_at > max_age_seconds:
-            # التعامل مع الصفقات المعلقة منتهية الصلاحية
             if trade.get("status") == "pending_pullback" and not trade.get("pullback_triggered"):
                 trade["pending_pullback_expired"] = True
                 trade["pending_pullback_expire_reason"] = "not_triggered_within_max_age"
+                trade.pop("_tp2_now", None)
                 mark_trade_closed(redis_client, trade_key, trade, "pending_expired")
                 logger.info(f"{symbol} → pending pullback expired without activation")
+            elif normalize_bool(trade.get("tp2_hit", False)):
+                trade.pop("_tp2_now", None)
+                mark_trade_closed(redis_client, trade_key, trade, "tp2_win")
+                logger.info(f"{symbol} → trade expired after TP2, closed as tp2_win")
+            elif normalize_bool(trade.get("tp1_hit", False)):
+                trade.pop("_tp2_now", None)
+                mark_trade_closed(redis_client, trade_key, trade, "tp1_win")
+                logger.info(f"{symbol} → trade expired after TP1, closed as tp1_win")
             else:
+                trade.pop("_tp2_now", None)
                 mark_trade_closed(redis_client, trade_key, trade, "expired")
                 logger.info(f"{symbol} → trade expired")
             continue
@@ -1449,47 +1536,70 @@ def update_open_trades(
 
         current_price = candles[-1]["close"]
 
-        # --- نقطة بدء التقييم (آخر شمعة عولجت، أو candle_time، أو created_at) ---
         last_proc = safe_timestamp(trade.get("last_processed_candle_ts"), 0)
         candle_ts_base = safe_timestamp(trade.get("candle_time"), 0)
         eval_start_ts = last_proc if last_proc > 0 else (candle_ts_base if candle_ts_base > 0 else created_at)
 
-        # جمع الشموع الجديدة فقط (أحدث من eval_start_ts)
         new_candles = []
         for c in candles:
             c_ts = safe_timestamp(c["ts"])
             if c_ts > eval_start_ts:
                 new_candles.append((c_ts, c))
-        # ترتيب تصاعدي
         new_candles.sort(key=lambda x: x[0])
 
         result = None
         state_changed = False
 
-        # --- معالجة الشموع الجديدة ---
         for c_ts, candle in new_candles:
-            # تسجيل آخر شمعة معالجة فوراً
             trade["last_processed_candle_ts"] = c_ts
 
             result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
             trade = updated_trade
 
+            # معالجة TP1
             if tp1_now and not trade.get("tp1_hit"):
+                trade.pop("_tp2_now", None)  # إزالة المفتاح المؤقت قبل الحفظ
                 ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
                     state_changed = True
-                    logger.info(f"{symbol} → TP1 hit, SL moved to entry/effective entry")
+                    logger.info(f"{symbol} → TP1 hit")
                 else:
                     logger.error(f"{symbol} → failed to mark TP1")
                     break
 
-                if result == "tp2_win":
+                # بعد TP1، ربما TP2 أيضاً في نفس الشمعة
+                if trade_side == "long" and safe_float(candle["high"], 0.0) >= safe_float(trade["tp2"], 0.0):
+                    if not trade.get("tp2_hit"):
+                        trade.pop("_tp2_now", None)
+                        ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
+                        if ok2:
+                            trade = load_trade(redis_client, trade_key) or trade
+                            state_changed = True
+                            logger.info(f"{symbol} → TP2 hit right after TP1")
+                elif trade_side == "short" and safe_float(candle["low"], 0.0) <= safe_float(trade["tp2"], 0.0):
+                    if not trade.get("tp2_hit"):
+                        trade.pop("_tp2_now", None)
+                        ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
+                        if ok2:
+                            trade = load_trade(redis_client, trade_key) or trade
+                            state_changed = True
+                            logger.info(f"{symbol} → TP2 hit right after TP1")
+                if result:
                     break
             else:
-                diagnostics = trade.get("diagnostics", {}) or {}
-                # حفظ التغييرات إذا تم تفعيل pullback أثناء هذه الدورة
+                # فحص TP2 عند عدم TP1_now (بعد TP1 سابق)
+                tp2_now = trade.pop("_tp2_now", False)
+                if tp2_now and not trade.get("tp2_hit"):
+                    trade.pop("_tp2_now", None)  # مضمون الحذف
+                    ok = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
+                    if ok:
+                        trade = load_trade(redis_client, trade_key) or trade
+                        state_changed = True
+                        logger.info(f"{symbol} → TP2 hit")
+                # pullback activation save
                 if trade.get("pullback_triggered") and not state_changed:
+                    trade.pop("_tp2_now", None)
                     save_trade(redis_client, trade_key, trade)
                     update_trade_history_snapshot(redis_client, trade)
                     state_changed = True
@@ -1497,9 +1607,8 @@ def update_open_trades(
             if result:
                 break
 
-        # --- بعد انتهاء الشموع: تطبيق حماية breakeven فقط إذا ظلت الصفقة مفتوحة ---
+        # حماية breakeven باستخدام trade_side
         if not result and trade.get("status") not in ("closed",):
-            # تحقق من حدوث تقدم في آخر شمعة معالَجة
             if trade.get("last_processed_candle_ts") != (eval_start_ts if eval_start_ts > 0 else None):
                 state_changed = True
 
@@ -1513,10 +1622,9 @@ def update_open_trades(
 
             if protect_breakeven_on_block and block_this_side:
                 try:
-                    # استخدام سعر الدخول الفعلي (قد يكون pullback_entry إن تفعّل)
                     entry_price = get_trade_effective_entry(trade)
                     if entry_price > 0:
-                        if side == "long":
+                        if trade_side == "long":
                             current_profit_pct = ((current_price - entry_price) / entry_price) * 100
                         else:
                             current_profit_pct = ((entry_price - current_price) / entry_price) * 100
@@ -1525,9 +1633,9 @@ def update_open_trades(
                             if not trade.get("protected_breakeven"):
                                 current_sl = safe_float(trade.get("sl"), 0.0)
                                 need_move = True
-                                if side == "long" and current_sl >= entry_price:
+                                if trade_side == "long" and current_sl >= entry_price:
                                     need_move = False
-                                elif side == "short" and current_sl <= entry_price:
+                                elif trade_side == "short" and current_sl <= entry_price:
                                     need_move = False
 
                                 if need_move:
@@ -1549,28 +1657,20 @@ def update_open_trades(
                                     diagnostics["sl_move_reason"] = reason or "market_block_protection"
                                     trade["diagnostics"] = diagnostics
                                     state_changed = True
-                                    logger.info(f"{symbol} → breakeven protected (SL moved to entry)")
+                                    logger.info(f"{symbol} → breakeven protected")
                 except Exception as e:
                     logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
 
-        # --- معالجة نتيجة الإغلاق (إذا حدث أثناء المرور) ---
+        # حفظ التغييرات النهائية
+        if state_changed and trade.get("status") not in ("closed",):
+            trade.pop("_tp2_now", None)  # تأكيد حذف المفتاح قبل الحفظ
+            save_trade(redis_client, trade_key, trade)
+            update_trade_history_snapshot(redis_client, trade)
+
         if result:
-            if result == "loss" and trade.get("protected_breakeven") and \
-               abs(safe_float(trade.get("sl"), 0.0) - safe_float(trade.get("entry"), 0.0)) < 1e-12:
-                trade["result"] = "breakeven"
-                trade["protected_breakeven_exit"] = True
-                trade["exit_reason"] = "breakeven_protected_sl"
-                mark_trade_closed(redis_client, trade_key, trade, "breakeven")
-                logger.info(f"{symbol} → trade closed as breakeven (protected)")
-            else:
-                mark_trade_closed(redis_client, trade_key, trade, result)
-                logger.info(f"{symbol} → trade closed as {result}")
-        elif state_changed:
-            # حفظ التقدم إذا بقيت الصفقة مفتوحة بعد التعديلات
-            if trade.get("status") not in ("closed",):
-                save_trade(redis_client, trade_key, trade)
-                update_trade_history_snapshot(redis_client, trade)
-                logger.info(f"{symbol} → trade updated")
+            trade.pop("_tp2_now", None)
+            mark_trade_closed(redis_client, trade_key, trade, result)
+            logger.info(f"{symbol} → trade closed as {result}")
 
 
 # ------------------------------------------------------------
@@ -1612,7 +1712,7 @@ def load_trades(
 
             if not include_open:
                 status = str(trade.get("status", "") or "").strip().lower()
-                if status in ("open", "partial", "pending_pullback"):
+                if status in ("open", "partial", "pending_pullback", "tp2_partial"):
                     continue
 
             trades.append(trade)
@@ -1630,12 +1730,6 @@ def load_trades_with_history(
     since_ts: Optional[int] = None,
     include_open: bool = True,
 ) -> List[dict]:
-    """
-    تحميل الصفقات من trade:* و trade_history:* مع دمج وإزالة التكرار.
-    الأولوية للـ trade:* للصفقات التي لا تزال مفتوحة/أحدث.
-    التكرار: نفس (market_type, side, symbol, candle_time).
-    الترتيب من الأحدث إلى الأقدم حسب created_at أو candle_time.
-    """
     if redis_client is None:
         return []
 
@@ -1644,7 +1738,7 @@ def load_trades_with_history(
     pattern_trade = f"trade:{mt}:{sd}:*"
     pattern_history = f"trade_history:{mt}:{sd}:*"
 
-    trades_dict = {}  # مفتاح (m, s, sym, ctime) -> trade
+    trades_dict = {}
 
     def _dedup_key(trade_dict):
         m = normalize_market_type(trade_dict.get("market_type", "futures"))
@@ -1653,7 +1747,6 @@ def load_trades_with_history(
         ctime = safe_timestamp(trade_dict.get("candle_time"), 0)
         return (m, s, sym, ctime)
 
-    # قراءة trade:* أولاً
     try:
         for key in redis_client.scan_iter(pattern_trade):
             raw = redis_client.get(key)
@@ -1667,7 +1760,6 @@ def load_trades_with_history(
     except Exception as e:
         logger.error(f"load_trades_with_history trade scan error: {e}")
 
-    # قراءة trade_history:* مع إعطاء أولوية لـ trade:*
     try:
         for key in redis_client.scan_iter(pattern_history):
             raw = redis_client.get(key)
@@ -1683,7 +1775,6 @@ def load_trades_with_history(
     except Exception as e:
         logger.error(f"load_trades_with_history history scan error: {e}")
 
-    # تحويل القاموس إلى قائمة وتطبيق الفلاتر
     trades = []
     for trade in trades_dict.values():
         if since_ts is not None:
@@ -1695,12 +1786,11 @@ def load_trades_with_history(
 
         if not include_open:
             status = str(trade.get("status", "") or "").strip().lower()
-            if status in ("open", "partial", "pending_pullback"):
+            if status in ("open", "partial", "pending_pullback", "tp2_partial"):
                 continue
 
         trades.append(trade)
 
-    # ترتيب من الأحدث إلى الأقدم
     trades.sort(
         key=lambda x: (
             get_trade_created_ts(x) or safe_timestamp(x.get("candle_time"), 0)
@@ -1735,7 +1825,6 @@ def get_all_trades_data(
             include_open=True,
         )
 
-    # وضع use_history=False
     return load_trades(
         redis_client=redis_client,
         market_type=market_type,
@@ -1743,6 +1832,65 @@ def get_all_trades_data(
         since_ts=since_ts,
         include_open=True,
     )
+
+
+# ------------------------------------------------------------
+# حساب PnL مرجح للصفقة (للإصلاحات)
+# ------------------------------------------------------------
+def _compute_weighted_trade_pnl(trade: dict) -> float:
+    """
+    حساب الربح/الخسارة بعد الرافعة لصفقة مغلقة، مع الأخذ في الاعتبار
+    المخارج الجزئية (tp1_close_pct, tp2_close_pct).
+    تُرجع النسبة المئوية بعد الرافعة.
+    """
+    side = normalize_side(trade.get("side", "long"))
+    leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
+    effective_entry = get_trade_effective_entry(trade)
+    result = trade.get("result", "")
+
+    if not result or result in ("expired", "pending_expired"):
+        return 0.0
+
+    tp1_close_pct = safe_float(trade.get("tp1_close_pct", 50.0), 50.0) / 100.0
+    tp2_close_pct = safe_float(trade.get("tp2_close_pct", 50.0), 50.0) / 100.0
+    tp1_hit = normalize_bool(trade.get("tp1_hit", False))
+    tp2_hit = normalize_bool(trade.get("tp2_hit", False))
+    tp1 = safe_float(trade.get("tp1"), 0.0)
+    tp2 = safe_float(trade.get("tp2"), 0.0)
+    sl = safe_float(trade.get("sl"), 0.0)
+
+    def long_pct(entry, exit_price):
+        if entry <= 0: return 0.0
+        return ((exit_price - entry) / entry) * 100.0
+    def short_pct(entry, exit_price):
+        if entry <= 0: return 0.0
+        return ((entry - exit_price) / entry) * 100.0
+    calc = long_pct if side == "long" else short_pct
+
+    if result == "tp2_win":
+        # جزء TP1 + جزء TP2 + باقي عند SL (الذي تم رفعه)
+        remaining_pct = max(0.0, 1.0 - tp1_close_pct - tp2_close_pct)
+        pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
+        pnl_tp2 = calc(effective_entry, tp2) * tp2_close_pct  # لأن tp2_hit صحيح
+        pnl_rem = calc(effective_entry, sl) * remaining_pct
+        pnl_raw = pnl_tp1 + pnl_tp2 + pnl_rem
+    elif result == "tp1_win":
+        remaining_pct = max(0.0, 1.0 - tp1_close_pct)
+        pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
+        pnl_rem = calc(effective_entry, sl) * remaining_pct
+        pnl_raw = pnl_tp1 + pnl_rem
+    elif result == "loss":
+        pnl_raw = calc(effective_entry, sl)
+    elif result == "breakeven":
+        if tp1_hit:
+            pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct
+            pnl_raw = pnl_tp1
+        else:
+            pnl_raw = 0.0
+    else:
+        pnl_raw = 0.0
+
+    return pnl_raw * leverage
 
 
 # ------------------------------------------------------------
@@ -1765,20 +1913,20 @@ def get_setup_type_stats(
 
     try:
         pattern = f"trade_history:{market_type}:{side}:*"
-
         for key in redis_client.scan_iter(pattern):
             raw = redis_client.get(key)
             if not raw:
                 continue
-
             try:
                 trade = json.loads(raw)
             except Exception:
                 continue
 
+            if trade.get("status") == "pending_pullback":
+                continue
+
             trade_setup = str(trade.get("setup_type", "unknown"))
             requested_setup = str(setup_type)
-
             if trade_setup != requested_setup and not trade_setup.startswith(requested_setup + "|"):
                 continue
 
@@ -1824,13 +1972,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 
     try:
         stats = redis_client.hgetall(stats_key) or {}
-
         wins = safe_int(redis_hash_get(stats, "wins", 0))
-        tp1_wins = safe_int(redis_hash_get(stats, "tp1_wins", 0))
-        tp2_wins = safe_int(redis_hash_get(stats, "tp2_wins", 0))
         losses = safe_int(redis_hash_get(stats, "losses", 0))
         expired = safe_int(redis_hash_get(stats, "expired", 0))
-        tp1_hits = safe_int(redis_hash_get(stats, "tp1_hits", 0))
         open_count = safe_int(redis_client.scard(open_set_key) or 0)
 
         financial_summary = get_trade_summary(
@@ -1842,18 +1986,21 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         wins = safe_int(financial_summary.get("wins", wins))
         losses = safe_int(financial_summary.get("losses", losses))
         expired = safe_int(financial_summary.get("expired", expired))
-        tp1_hits = safe_int(financial_summary.get("tp1_hits", tp1_hits))
-        tp1_wins = safe_int(financial_summary.get("tp1_wins", tp1_wins))
-        tp2_wins = safe_int(financial_summary.get("tp2_wins", tp2_wins))
         open_count = safe_int(financial_summary.get("open", open_count))
         breakeven_exits = safe_int(financial_summary.get("breakeven_exits", 0))
+        tp1_hits = safe_int(financial_summary.get("tp1_hits", 0))
+        tp2_hits_total = safe_int(financial_summary.get("tp2_hits", 0))
+        tp1_wins = safe_int(financial_summary.get("tp1_wins", 0))
+        tp2_wins = safe_int(financial_summary.get("tp2_wins", 0))
 
-        decided = wins + losses + breakeven_exits
+        decided = wins + losses
         closed = wins + losses + expired + breakeven_exits
         total_signals = closed + open_count
 
         winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
         tp1_rate = round((tp1_hits / total_signals) * 100, 2) if total_signals > 0 else 0.0
+        tp2_rate = round((tp2_hits_total / total_signals) * 100, 2) if total_signals > 0 else 0.0
+        tp1_to_tp2_rate = round((tp2_hits_total / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
 
         return {
             "wins": wins,
@@ -1865,6 +2012,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "closed": closed,
             "tp1_hits": tp1_hits,
             "tp1_rate": tp1_rate,
+            "tp2_hits": tp2_hits_total,
+            "tp2_rate": tp2_rate,
+            "tp1_to_tp2_rate": tp1_to_tp2_rate,
             "winrate": winrate,
             "market_type": market_type,
             "side": side,
@@ -1879,13 +2029,7 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
             "best_trade_pct": financial_summary.get("best_trade_pct", 0.0),
             "worst_trade_pct": financial_summary.get("worst_trade_pct", 0.0),
             "risk_status": financial_summary.get("risk_status", "normal"),
-            "tp2_hits": safe_int(financial_summary.get("tp2_hits", tp2_wins)),
-            "tp2_rate": safe_float(financial_summary.get("tp2_rate", 0.0)),
-            "tp1_to_tp2_rate": safe_float(financial_summary.get("tp1_to_tp2_rate", 0.0)),
-            "net_profit_pct": safe_float(financial_summary.get(
-                "net_profit_pct",
-                financial_summary.get("realized_leveraged_pnl_pct", 0.0)
-            )),
+            "net_profit_pct": safe_float(financial_summary.get("net_profit_pct", 0.0)),
             "breakeven_exits": breakeven_exits,
         }
 
@@ -1928,9 +2072,57 @@ def get_trade_summary(
         include_open=True,
     )
 
-    summary = summarize_trades(trades)
+    # فلترة pending_pullback
+    filtered_trades = [t for t in trades if t.get("status") != "pending_pullback"]
+
+    summary = summarize_trades(filtered_trades)
     summary["market_type"] = market_type or "futures"
     summary["side"] = side_norm
+
+    closed_trades = [t for t in filtered_trades if t.get("result") in ("tp1_win", "tp2_win", "loss", "breakeven")]
+    gross_profit = 0.0
+    gross_loss = 0.0
+    total_pnl = 0.0
+    win_pnls = []
+    loss_pnls = []
+    all_pnls = []
+
+    # عدادات TP2 بناءً على الحقل tp2_hit
+    tp2_hits_count = sum(1 for t in filtered_trades if normalize_bool(t.get("tp2_hit")))
+    tp2_wins_count = sum(1 for t in closed_trades if t.get("result") == "tp2_win")
+
+    for trade in closed_trades:
+        pnl = _compute_weighted_trade_pnl(trade)
+        all_pnls.append(pnl)
+        total_pnl += pnl
+        if pnl > 0:
+            gross_profit += pnl
+            win_pnls.append(pnl)
+        elif pnl < 0:
+            gross_loss += abs(pnl)
+            loss_pnls.append(pnl)
+
+    summary["realized_leveraged_pnl_pct"] = round(total_pnl, 4)
+    summary["gross_profit_pct"] = round(gross_profit, 4)
+    summary["gross_loss_pct"] = round(gross_loss, 4)
+    summary["net_profit_pct"] = round(total_pnl, 4)
+    summary["avg_win_pct"] = round(sum(win_pnls) / len(win_pnls), 4) if win_pnls else 0.0
+    summary["avg_loss_pct"] = round(sum(loss_pnls) / len(loss_pnls), 4) if loss_pnls else 0.0
+    summary["best_trade_pct"] = round(max(all_pnls), 4) if all_pnls else 0.0
+    summary["worst_trade_pct"] = round(min(all_pnls), 4) if all_pnls else 0.0
+
+    leverage = SHORT_REPORT_LEVERAGE if side_norm == "short" else REPORT_LEVERAGE
+    summary["realized_raw_pnl_pct"] = round(total_pnl / leverage, 4) if leverage else 0.0
+
+    # إضافة عدادات TP2 محدثة
+    summary["tp2_hits"] = tp2_hits_count
+    summary["tp2_wins"] = tp2_wins_count
+
+    # --- حساب TP2 rates ---
+    signals = safe_int(summary.get("signals", 0))
+    tp1_hits = safe_int(summary.get("tp1_hits", 0))
+    summary["tp2_rate"] = round((tp2_hits_count / signals) * 100, 2) if signals > 0 else 0.0
+    summary["tp1_to_tp2_rate"] = round((tp2_hits_count / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
 
     plan = get_report_sizing_plan(side_norm)
     for key in [
@@ -1952,7 +2144,6 @@ def get_period_since_ts(period: str) -> Optional[int]:
 
     if period == "1h":
         return now_ts - 3600
-
     if period == "today":
         local_now = time.localtime(now_ts)
         return int(time.mktime((
@@ -1964,7 +2155,6 @@ def get_period_since_ts(period: str) -> Optional[int]:
             local_now.tm_yday,
             local_now.tm_isdst,
         )))
-
     if period == "1d":
         return now_ts - (24 * 3600)
     if period == "7d":
@@ -1973,7 +2163,6 @@ def get_period_since_ts(period: str) -> Optional[int]:
         return now_ts - (30 * 24 * 3600)
     if period == "all":
         return None
-
     return now_ts - (24 * 3600)
 
 
@@ -2012,12 +2201,24 @@ def get_exit_summary(
         since_ts=since_ts,
         use_history=use_history,
     )
+    # استبعاد pending_pullback
+    trades = [t for t in trades if t.get("status") != "pending_pullback"]
 
     exit_data = summarize_exits(trades)
     exit_data["market_type"] = market_type
     exit_data["side"] = side
     exit_data["trades_count"] = len(trades)
     exit_data["since_ts"] = since_ts
+    # تحديث TP2 hits بناءً على الحقل
+    exit_data["tp2_hits"] = sum(1 for t in trades if normalize_bool(t.get("tp2_hit")))
+
+    # --- حساب TP2 rates ---
+    signals = safe_int(exit_data.get("signals", exit_data.get("trades_count", 0)))
+    tp1_hits = safe_int(exit_data.get("tp1_hits", 0))
+    tp2_hits = safe_int(exit_data.get("tp2_hits", 0))
+    exit_data["tp2_rate"] = round((tp2_hits / signals) * 100, 2) if signals > 0 else 0.0
+    exit_data["tp1_to_tp2_rate"] = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+
     return exit_data
 
 
@@ -2098,6 +2299,8 @@ def get_daily_performance_summary(
         side=side,
         use_history=use_history,
     )
+    # استبعاد pending_pullback
+    trades = [t for t in trades if t.get("status") != "pending_pullback"]
 
     daily = summarize_trades_by_day(trades, days=days)
     rows = []
@@ -2210,6 +2413,7 @@ def get_today_performance_summary(
         side=side,
         use_history=use_history,
     )
+    trades = [t for t in trades if t.get("status") != "pending_pullback"]
 
     today_data = summarize_today(trades) or {}
     return {
@@ -2305,6 +2509,7 @@ def summarize_by_field(
         since_ts=since_ts,
         use_history=use_history,
     )
+    rows = [t for t in rows if t.get("status") != "pending_pullback"]
 
     grouped = defaultdict(lambda: _empty_summary())
 
@@ -2344,10 +2549,11 @@ def get_common_loss_reasons(
             since_ts=since_ts,
             include_open=False,
         )
+    trades = [t for t in trades if t.get("status") != "pending_pullback"]
 
     reasons_counter = Counter()
 
-    for trade in (trades or []):
+    for trade in trades:
         result = str(trade.get("result", "") or "").lower().strip()
         if result != "loss":
             continue
@@ -2406,7 +2612,6 @@ def format_period_summary(title: str, summary: dict) -> str:
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
     breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
-    decided = wins + losses + breakeven_exits
     closed = wins + losses + expired + breakeven_exits
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
@@ -2424,9 +2629,9 @@ def format_period_summary(title: str, summary: dict) -> str:
     risk_status = summary.get("risk_status", "normal")
 
     tp1_hits = safe_int(summary.get("tp1_hits", 0))
-    tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
+    tp2_hits = safe_int(summary.get("tp2_hits", 0))
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
-    full_wins = safe_int(summary.get("tp2_wins", tp2_hits))
+    full_wins = safe_int(summary.get("tp2_wins", 0))
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
     tp2_rate = safe_float(summary.get("tp2_rate", 0))
     tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
@@ -2441,6 +2646,10 @@ def format_period_summary(title: str, summary: dict) -> str:
     net_pnl_usd = estimate_pct_to_usd(net_pnl, side=side)
 
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary, side=side)
+
+    # عرض الخسارة بالسالب
+    gross_loss_display = -gross_loss
+    gross_loss_usd_display = -gross_loss_usd
 
     if side == "short":
         settings_block = (
@@ -2499,7 +2708,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
         f"━━━━━━━━━━━━━━\n"
         f"🟢 <b>إجمالي الربح:</b> {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
-        f"🔴 <b>إجمالي الخسارة:</b> {gross_loss:+.2f}% = {gross_loss_usd:+.2f}$\n"
+        f"🔴 <b>إجمالي الخسارة:</b> {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
         f"⚖️ <b>صافي الربح/الخسارة:</b> {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
         f"💼 <b>التأثير الحقيقي على المحفظة:</b> {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
         f"━━━━━━━━━━━━━━\n"
@@ -2554,7 +2763,7 @@ def diagnose_performance_problem(
         winrate = None
     else:
         tp1_hits = safe_int(summary.get("tp1_hits", 0))
-        tp2_hits = safe_int(summary.get("tp2_hits", summary.get("tp2_wins", 0)))
+        tp2_hits = safe_int(summary.get("tp2_hits", 0))
         tp1_rate = safe_float(summary.get("tp1_rate", 0))
         tp2_rate = safe_float(summary.get("tp2_rate", 0))
         tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
@@ -2651,7 +2860,6 @@ def diagnose_performance_problem(
 # ------------------------------------------------------------
 def get_report_sizing_plan(side: str = "long") -> dict:
     side = normalize_side(side)
-
     if side == "short":
         return {
             "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
@@ -2662,10 +2870,8 @@ def get_report_sizing_plan(side: str = "long") -> dict:
             "notional_per_trade_usd": SHORT_REPORT_NOTIONAL_PER_TRADE_USD,
             "total_notional_exposure_usd": SHORT_REPORT_NOTIONAL_PER_TRADE_USD * SHORT_REPORT_ACTIVE_TRADE_SLOTS,
         }
-
     capital_used_usd = REPORT_ACCOUNT_BALANCE_USD * (REPORT_MAX_CAPITAL_USAGE_PCT / 100.0)
     margin_per_trade = capital_used_usd / REPORT_ACTIVE_TRADE_SLOTS if REPORT_ACTIVE_TRADE_SLOTS else 0.0
-
     return {
         "account_balance_usd": REPORT_ACCOUNT_BALANCE_USD,
         "max_capital_usage_pct": REPORT_MAX_CAPITAL_USAGE_PCT,
@@ -2691,30 +2897,26 @@ def estimate_pct_to_usd(pct_value: float, side: str = "long") -> float:
 
 def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct: float = None) -> tuple:
     side = normalize_side(side)
-
     realized_pct_sum = safe_float(
         summary.get("realized_leveraged_pnl_pct", summary.get("realized_pnl_pct", 0.0)),
         0.0,
     )
-
     if side == "short":
         margin_per_trade = SHORT_REPORT_MARGIN_PER_TRADE_USD
     else:
         plan = get_report_sizing_plan("long")
         margin_per_trade = plan["margin_per_trade_usd"]
-
     wallet_pnl_usd = margin_per_trade * (realized_pct_sum / 100.0)
     wallet_pnl_pct = (
         (wallet_pnl_usd / REPORT_ACCOUNT_BALANCE_USD) * 100.0
         if REPORT_ACCOUNT_BALANCE_USD > 0
         else 0.0
     )
-
     return wallet_pnl_pct, wallet_pnl_usd
 
 
 # ------------------------------------------------------------
-# PULLBACK PENDING TRACKING (NEW v3.3)
+# PULLBACK PENDING TRACKING
 # ------------------------------------------------------------
 def get_pending_pullback_summary(
     redis_client,
@@ -2723,14 +2925,8 @@ def get_pending_pullback_summary(
     since_ts: Optional[int] = None,
     use_history: bool = True,
 ) -> dict:
-    """
-    تحليل صفقات البولباك المعلّقة (pullback_pending).
-    تجلب الصفقات التي تحتوي على has_pullback_plan أو entry_mode يبدأ بـ "pullback".
-    """
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
-
-    # نجلب جميع الصفقات (بما فيها المعلقة) من history
     trades = get_all_trades_data(
         redis_client,
         market_type=market_type,
@@ -2738,8 +2934,6 @@ def get_pending_pullback_summary(
         since_ts=since_ts,
         use_history=use_history,
     )
-
-    # تصفية الصفقات التي تحتوي على خطة بولباك
     pullback_trades = []
     for trade in trades:
         entry_mode = str(trade.get("entry_mode", "") or "").lower()
@@ -2754,83 +2948,38 @@ def get_pending_pullback_summary(
         if normalize_bool(t.get("pullback_triggered", False))
         or str(t.get("entry_mode", "")).lower() == "pullback_triggered"
     )
-    expired_pending_count = sum(
-        1 for t in pullback_trades
-        if t.get("result") == "pending_expired"
-    )
+    expired_pending_count = sum(1 for t in pullback_trades if t.get("result") == "pending_expired")
 
-    # الصفقات التي اتفعلت ثم أغلقت (فقط التي تم تفعيلها فعليًا)
     triggered_closed_trades = [
         t for t in pullback_trades
         if (normalize_bool(t.get("pullback_triggered", False)) or
             str(t.get("entry_mode", "")).lower() == "pullback_triggered")
         and t.get("result") in ("tp1_win", "tp2_win", "loss", "breakeven")
     ]
-
-    triggered_wins = sum(
-        1 for t in triggered_closed_trades
-        if t.get("result") in ("tp1_win", "tp2_win")
-    )
-    triggered_losses = sum(
-        1 for t in triggered_closed_trades
-        if t.get("result") == "loss"
-    )
-    triggered_tp1_hits = sum(
-        1 for t in triggered_closed_trades
-        if normalize_bool(t.get("tp1_hit", False))
-    )
-    triggered_tp2_hits = sum(
-        1 for t in triggered_closed_trades
-        if t.get("result") == "tp2_win"
-    )
-
+    triggered_wins = sum(1 for t in triggered_closed_trades if t.get("result") in ("tp1_win", "tp2_win"))
+    triggered_losses = sum(1 for t in triggered_closed_trades if t.get("result") == "loss")
+    triggered_tp1_hits = sum(1 for t in triggered_closed_trades if normalize_bool(t.get("tp1_hit")))
+    triggered_tp2_hits = sum(1 for t in triggered_closed_trades if normalize_bool(t.get("tp2_hit")))
     decided_triggered = triggered_wins + triggered_losses
     triggered_winrate = (triggered_wins / decided_triggered * 100) if decided_triggered > 0 else 0.0
 
-    # حساب متوسط زمن التفعيل
     delays = []
     for t in pullback_trades:
         activated_at = safe_timestamp(t.get("activated_at"))
         created_at = safe_timestamp(t.get("created_at"))
         if activated_at > 0 and created_at > 0:
-            delays.append((activated_at - created_at) / 60.0)  # دقائق
+            delays.append((activated_at - created_at) / 60.0)
     avg_delay = round(sum(delays) / len(delays), 1) if delays else 0.0
 
-    # أفضل وأسوأ صفقة مفعلة - حساب يدوي باستخدام effective_entry
     best_pct = 0.0
     worst_pct = 0.0
     for t in triggered_closed_trades:
-        result = t.get("result")
-        side_t = normalize_side(t.get("side", "long"))
-        effective_entry = get_trade_effective_entry(t)
-        if effective_entry <= 0:
-            continue
-        exit_price = None
-        if result == "tp2_win":
-            exit_price = safe_float(t.get("tp2"), 0.0)
-        elif result == "tp1_win":
-            exit_price = safe_float(t.get("tp1"), 0.0)
-        elif result == "loss":
-            exit_price = safe_float(t.get("sl"), 0.0)
-        elif result == "breakeven":
-            pnl = 0.0
-        else:
-            continue
-        if result != "breakeven":
-            if exit_price is None or exit_price <= 0:
-                continue
-            if side_t == "long":
-                pnl = ((exit_price - effective_entry) / effective_entry) * 100
-            else:
-                pnl = ((effective_entry - exit_price) / effective_entry) * 100
-        leverage = SHORT_REPORT_LEVERAGE if side_t == "short" else REPORT_LEVERAGE
-        pnl *= leverage
+        pnl = _compute_weighted_trade_pnl(t)
         if pnl > best_pct:
             best_pct = pnl
         if pnl < worst_pct:
             worst_pct = pnl
 
-    # معدلات
     triggered_rate = (triggered_count / total_plans * 100) if total_plans > 0 else 0.0
     expired_rate = (expired_pending_count / total_plans * 100) if total_plans > 0 else 0.0
 
@@ -2855,24 +3004,18 @@ def get_pending_pullback_summary(
 
 
 def format_pending_pullback_summary(title: str, summary: dict) -> str:
-    """
-    تنسيق تقرير pullback pending للعرض بتنسيق HTML مناسب لتليجرام.
-    """
     total = summary["total_pullback_plans"]
     pending = summary["pending_now"]
     triggered = summary["triggered_count"]
     expired = summary["expired_pending_count"]
-
     triggered_rate = summary["triggered_rate"]
     expired_rate = summary["expired_rate"]
-
     wins = summary["triggered_wins"]
     losses = summary["triggered_losses"]
     tp1_hits = summary["triggered_tp1_hits"]
     tp2_hits = summary["triggered_tp2_hits"]
     winrate = summary["triggered_winrate"]
     avg_delay = summary["avg_trigger_delay_minutes"]
-
     best = summary["best_triggered_trade_pct"]
     worst = summary["worst_triggered_trade_pct"]
 
@@ -2894,15 +3037,12 @@ def format_pending_pullback_summary(title: str, summary: dict) -> str:
         f"• TP2 Hits: {tp2_hits}",
         f"• Winrate بعد التفعيل: {winrate:.1f}%",
     ]
-
     if avg_delay > 0:
         lines.append(f"⏱ <b>متوسط وقت التفعيل:</b> {avg_delay:.1f} دقيقة")
     if best != 0.0 or worst != 0.0:
         lines.append(f"• أفضل صفقة مفعلة: {best:+.2f}% | أسوأ صفقة: {worst:+.2f}%")
-
     lines.append("")
     lines.append("<b>🧠 التفسير:</b>")
-
     if total == 0:
         lines.append("• لا توجد بيانات كافية.")
     else:
@@ -2910,16 +3050,12 @@ def format_pending_pullback_summary(title: str, summary: dict) -> str:
             lines.append("• ⚠️ Trigger Rate منخفض جدًا، منطقة البولباك بعيدة أو شروط الاختيار محتاجة مراجعة.")
         elif triggered_rate > 70:
             lines.append("• ✅ Trigger Rate ممتاز، مناطق الدخول قريبة وفعالة.")
-
         if expired_rate > 40:
             lines.append("• 🔴 Expired Rate عالي جدًا، يمكن تقليل صلاحية الصفقة أو تقريب pullback_entry.")
-
         if winrate < 40 and triggered > 0:
             lines.append("• 🔴 Winrate بعد التفعيل ضعيف، راجع جودة المنطقة أو SL/TP بعد الدخول.")
         elif winrate > 60 and triggered >= 5:
             lines.append("• ✅ Winrate بعد التفعيل جيد، استمر.")
-
         if avg_delay > 60:
             lines.append("• ⏳ متوسط وقت التفعيل طويل (> 60 دقيقة)، قد تحتاج صبر أكبر أو تعديل زمن الصلاحية.")
-
     return "\n".join(lines)
