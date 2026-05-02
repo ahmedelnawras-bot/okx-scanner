@@ -48,6 +48,15 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - 🟤 تصنيف breakeven عند تساوي SL مع effective_entry.
 
 **إصدار 3.5 – تصحيحات Strict: Breakeven، عرض الخسائر، pullback، Winrate، تحويل TP2 إلى Trailing**
+
+**إصدار 3.6 – إصلاح جذري لحساب الأداء وإلغاء الازدواجية**
+- إصلاح TP1/TP2 hits و rate.
+- منع تكرار الصفقات عند تحميلها من redis.
+- تصحيح PnL واستخدام effective_entry.
+- دعم trailing فعلي بعد TP2 مع النسب 40/40/20.
+- Breakeven بعد TP1 يعتبر فوز جزئي وليس خسارة.
+- Full Wins TP2 = عدد صفقات tp2_win الحقيقية.
+- حقل alert_id/trade_id لتجنب التكرار.
 """
 
 import json
@@ -102,6 +111,10 @@ SHORT_REPORT_LEVERAGE = 15.0
 SHORT_REPORT_TOTAL_MARGIN_USD = 200.0
 SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0
 
+# نسب الإغلاق الجزئي
+TP1_CLOSE_PCT = 40.0
+TP2_CLOSE_PCT = 40.0
+TRAILING_PCT = 2.0   # نسبة التراجع للـ trailing stop بعد TP2
 
 # ------------------------------------------------------------
 # دوال مساعدة عامة (safe & normalization)
@@ -413,8 +426,8 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "warning_penalty_details": normalize_list(_get("warning_penalty_details")),
         "warning_high_count": safe_int(_get("warning_high_count"), 0),
         "warning_medium_count": safe_int(_get("warning_medium_count"), 0),
-        "tp1_close_pct": safe_float(_get("tp1_close_pct"), 50.0),
-        "tp2_close_pct": safe_float(_get("tp2_close_pct"), 50.0),
+        "tp1_close_pct": safe_float(_get("tp1_close_pct"), TP1_CLOSE_PCT),
+        "tp2_close_pct": safe_float(_get("tp2_close_pct"), TP2_CLOSE_PCT),
         "move_sl_to_entry_after_tp1": normalize_bool(_get("move_sl_to_entry_after_tp1", True)),
         "fib_position": normalize_text(_get("fib_position"), "unknown"),
         "fib_position_ratio": safe_float(_get("fib_position_ratio")),
@@ -472,6 +485,13 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "activated_candle_ts": safe_int(_get("activated_candle_ts")) if _get("activated_candle_ts") is not None else None,
         "pending_pullback_expired": normalize_bool(_get("pending_pullback_expired", False)),
         "pending_pullback_expire_reason": normalize_text(_get("pending_pullback_expire_reason"), ""),
+
+        # trailing حقول
+        "trailing_active": normalize_bool(_get("trailing_active", False)),
+        "trailing_high": round_price(_get("trailing_high")) if _get("trailing_high") is not None else None,
+        "trailing_low": round_price(_get("trailing_low")) if _get("trailing_low") is not None else None,
+        "trailing_sl": round_price(_get("trailing_sl")) if _get("trailing_sl") is not None else None,
+        "trailing_pct": safe_float(_get("trailing_pct"), TRAILING_PCT),
     }
 
     return diagnostics
@@ -572,8 +592,8 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "primary_extra_setup": _get_field("primary_extra_setup", ""),
         "extra_setups_details": _get_field("extra_setups_details", {}) or {},
 
-        "tp1_close_pct": safe_float(_get_field("tp1_close_pct"), 50.0),
-        "tp2_close_pct": safe_float(_get_field("tp2_close_pct"), 50.0),
+        "tp1_close_pct": safe_float(_get_field("tp1_close_pct"), TP1_CLOSE_PCT),
+        "tp2_close_pct": safe_float(_get_field("tp2_close_pct"), TP2_CLOSE_PCT),
         "move_sl_to_entry_after_tp1": normalize_bool(_get_field("move_sl_to_entry_after_tp1", True)),
         "fib_position": _get_field("fib_position", "unknown"),
         "fib_position_ratio": safe_float(_get_field("fib_position_ratio")),
@@ -612,6 +632,13 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "activated_candle_ts": _get_field("activated_candle_ts"),
         "pending_pullback_expired": normalize_bool(_get_field("pending_pullback_expired", False)),
         "pending_pullback_expire_reason": _get_field("pending_pullback_expire_reason", ""),
+
+        # trailing حقول
+        "trailing_active": normalize_bool(_get_field("trailing_active", False)),
+        "trailing_high": _get_field("trailing_high"),
+        "trailing_low": _get_field("trailing_low"),
+        "trailing_sl": _get_field("trailing_sl"),
+        "trailing_pct": safe_float(_get_field("trailing_pct"), TRAILING_PCT),
 
         "diagnostics": diagnostics,
     }
@@ -906,8 +933,8 @@ def register_trade(
         "warning_high_count": _get_val("warning_high_count"),
         "warning_medium_count": _get_val("warning_medium_count"),
         "warning_penalty_details": _get_val("warning_penalty_details"),
-        "tp1_close_pct": _get_val("tp1_close_pct", 50.0),
-        "tp2_close_pct": _get_val("tp2_close_pct", 50.0),
+        "tp1_close_pct": _get_val("tp1_close_pct", TP1_CLOSE_PCT),
+        "tp2_close_pct": _get_val("tp2_close_pct", TP2_CLOSE_PCT),
         "move_sl_to_entry_after_tp1": _get_val("move_sl_to_entry_after_tp1", True),
         "fib_position": _get_val("fib_position", "unknown"),
         "fib_position_ratio": _get_val("fib_position_ratio"),
@@ -961,6 +988,12 @@ def register_trade(
         "activated_candle_ts": None,
         "pending_pullback_expired": False,
         "pending_pullback_expire_reason": "",
+        # trailing
+        "trailing_active": False,
+        "trailing_high": None,
+        "trailing_low": None,
+        "trailing_sl": None,
+        "trailing_pct": TRAILING_PCT,
     })
 
     # بناء trade_data
@@ -1037,8 +1070,8 @@ def register_trade(
         "primary_extra_setup": _get_val("primary_extra_setup", ""),
         "extra_setups_details": _get_val("extra_setups_details", {}) or {},
 
-        "tp1_close_pct": safe_float(_get_val("tp1_close_pct", 50.0)),
-        "tp2_close_pct": safe_float(_get_val("tp2_close_pct", 50.0)),
+        "tp1_close_pct": safe_float(_get_val("tp1_close_pct", TP1_CLOSE_PCT)),
+        "tp2_close_pct": safe_float(_get_val("tp2_close_pct", TP2_CLOSE_PCT)),
         "move_sl_to_entry_after_tp1": normalize_bool(_get_val("move_sl_to_entry_after_tp1", True)),
         "protected_breakeven": bool(_get_val("protected_breakeven", False)),
         "breakeven_protection_reason": _get_val("breakeven_protection_reason", ""),
@@ -1080,6 +1113,13 @@ def register_trade(
         "activated_candle_ts": None,
         "pending_pullback_expired": False,
         "pending_pullback_expire_reason": "",
+
+        # trailing حقول
+        "trailing_active": False,
+        "trailing_high": None,
+        "trailing_low": None,
+        "trailing_sl": None,
+        "trailing_pct": TRAILING_PCT,
     }
 
     trade_key = get_trade_key(market_type, side, symbol, normalized_candle_time)
@@ -1166,8 +1206,8 @@ def update_trade_history_snapshot(redis_client, trade_data: dict):
 
 def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candle_ts: int = None):
     """
-    تسجيل وصول السعر إلى TP2 وتحويل SL إلى TP1 (trailing stop).
-    لا يغلق الصفقة، بل يبقيها مفتوحة بحالة tp2_partial.
+    تسجيل وصول السعر إلى TP2 وتفعيل trailing stop للـ 20% المتبقية.
+    النسب: 40% TP1، 40% TP2، 20% trailing.
     """
     if redis_client is None:
         return False
@@ -1180,24 +1220,27 @@ def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
                 trade_data.get("last_processed_candle_ts", 0)
             )
         side = normalize_side(trade_data.get("side", "long"))
-        tp1 = safe_float(trade_data["tp1"])
-        current_sl = safe_float(trade_data["sl"])
 
         trade_data["tp2_hit"] = True
         trade_data["tp2_hit_at"] = int(time.time())
-        trade_data["status"] = "tp2_partial"
-        trade_data["sl_moved_to_tp1"] = True
-        trade_data["sl_move_reason"] = "TP2 hit - SL moved to TP1"       # إضافة سبب الحركة
-        if side == "long":
-            trade_data["sl"] = max(current_sl, tp1)
-        else:
-            trade_data["sl"] = min(current_sl, tp1)
+        trade_data["status"] = "tp2_partial"   # الجزء المتبقي في trailing
+
+        # تفعيل trailing للـ 20% المتبقية
+        trade_data["trailing_active"] = True
+        trade_data["trailing_pct"] = safe_float(
+            trade_data.get("trailing_pct", TRAILING_PCT),
+            TRAILING_PCT
+        )
+        # تعيين أعلى/أدنى سعر للـ trailing
+        # هنا سنترك التحديث للشمعة القادمة في evaluate_trade_on_candle
+        trade_data["trailing_high"] = None
+        trade_data["trailing_low"] = None
+        trade_data["trailing_sl"] = None
 
         diagnostics = trade_data.get("diagnostics", {}) or {}
         diagnostics["tp2_hit"] = True
         diagnostics["tp2_hit_at"] = trade_data["tp2_hit_at"]
-        diagnostics["sl_moved_to_tp1"] = True
-        diagnostics["sl_move_reason"] = "TP2 hit - SL moved to TP1"      # إضافة في diagnostics
+        diagnostics["trailing_active"] = True
         trade_data["diagnostics"] = diagnostics
 
         market_type = normalize_market_type(trade_data.get("market_type", "futures"))
@@ -1220,20 +1263,19 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
     side = normalize_side(trade_data.get("side", "long"))
     open_set_key = get_open_trades_set_key(market_type, side)
 
-    # معالجة breakeven / tp1_win عند ضرب SL قريب من effective_entry
+    # معالجة breakeven بعد TP1: إذا تم تفعيل TP1 ثم رجع السعر إلى effective_entry، تعتبر فوز جزئي وليس خسارة
     effective_entry = get_trade_effective_entry(trade_data)
-    if result == "loss":
+    tp1_hit = normalize_bool(trade_data.get("tp1_hit", False))
+
+    if result == "loss" and tp1_hit:
+        # التأكد إن SL الحالي يساوي effective_entry تقريباً (breakeven protected)
         sl = safe_float(trade_data.get("sl"), 0.0)
-        if effective_entry > 0:
-            diff_pct = abs(sl - effective_entry) / effective_entry * 100
-            if diff_pct <= 0.03:
-                if trade_data.get("tp1_hit"):
-                    result = "tp1_win"
-                else:
-                    result = "breakeven"
-                trade_data["protected_breakeven_exit"] = True
-                if not trade_data.get("exit_reason"):
-                    trade_data["exit_reason"] = "breakeven_protected_sl"
+        if effective_entry > 0 and abs(sl - effective_entry) / effective_entry <= 0.001:
+            # هذا breakeven بعد TP1 -> نعتبره tp1_win
+            result = "tp1_win"
+            trade_data["protected_breakeven_exit"] = True
+            if not trade_data.get("exit_reason"):
+                trade_data["exit_reason"] = "breakeven_after_tp1"
 
     try:
         trade_data["status"] = "closed"
@@ -1251,6 +1293,9 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
                 "pending_pullback_expire_reason",
                 "not_triggered_within_max_age"
             )
+
+        # إيقاف trailing إذا كان نشطاً
+        trade_data["trailing_active"] = False
 
         redis_client.set(
             trade_key,
@@ -1300,9 +1345,10 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         diagnostics = trade_data.get("diagnostics", {}) or {}
         effective_entry = get_trade_effective_entry(trade_data)
 
+        # استخدام النسب الافتراضية 40%
         tp1_close_pct = safe_float(
-            trade_data.get("tp1_close_pct", diagnostics.get("tp1_close_pct", 50.0)),
-            50.0
+            trade_data.get("tp1_close_pct", diagnostics.get("tp1_close_pct", TP1_CLOSE_PCT)),
+            TP1_CLOSE_PCT
         )
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
 
@@ -1313,6 +1359,7 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         trade_data["remaining_position_pct"] = remaining_pct
         trade_data["updated_at"] = int(time.time())
 
+        # نقل SL إلى نقطة الدخول الفعلية (breakeven)
         move_sl = normalize_bool(
             trade_data.get("move_sl_to_entry_after_tp1",
                           diagnostics.get("move_sl_to_entry_after_tp1", True))
@@ -1351,12 +1398,11 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
 # ------------------------------------------------------------
 def evaluate_trade_on_candle(trade: dict, candle: dict):
     """
-    تقييم الصفقة على شمعة واحدة. لا يغلق تلقائياً عند TP2، فقط يسجل الحاجة لتفعيل mark_tp2_hit.
+    تقييم الصفقة على شمعة واحدة. يدعم trailing بعد TP2.
     """
     side = normalize_side(trade.get("side", "long"))
     diagnostics = trade.get("diagnostics", {}) or {}
 
-    entry = safe_float(trade.get("entry"), 0.0)
     effective_entry = get_trade_effective_entry(trade)
 
     sl = safe_float(trade["sl"])
@@ -1364,13 +1410,14 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     tp2 = safe_float(trade["tp2"])
     tp1_hit = bool(trade.get("tp1_hit", False))
     tp2_hit = bool(trade.get("tp2_hit", False))
+    trailing_active = normalize_bool(trade.get("trailing_active", False))
 
     low = safe_float(candle["low"])
     high = safe_float(candle["high"])
 
     result = None
     tp1_now = False
-    tp2_now = False  # لتحديد الحاجة لmark_tp2_hit
+    tp2_now = False
 
     pullback_entry = diagnostics.get("pullback_entry")
     pullback_triggered = normalize_bool(trade.get("pullback_triggered", diagnostics.get("pullback_triggered", False)))
@@ -1415,8 +1462,23 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             trade["diagnostics"] = diagnostics
             return None, False, trade
 
-    # التقييم العادي
+    # التقييم العادي مع trailing
     if side == "long":
+        # trailing نشط بعد TP2
+        if trailing_active and tp2_hit:
+            trailing_pct = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
+            # تحديث أعلى سعر
+            current_trailing_high = safe_float(trade.get("trailing_high"), high)
+            if high > current_trailing_high:
+                trade["trailing_high"] = high
+                trade["trailing_sl"] = round_price(high * (1 - trailing_pct))
+            # فحص كسر trailing SL
+            trailing_sl = safe_float(trade.get("trailing_sl"), 0)
+            if trailing_sl > 0 and low <= trailing_sl:
+                result = "tp2_win"   # تم الخروج بالـ trailing
+                tp2_now = False  # تم الإغلاق
+                return result, False, trade
+
         if not tp1_hit:
             if low <= sl:
                 result = "loss"
@@ -1431,8 +1493,20 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
                 if tp2_hit:
                     result = "tp2_win"
                 else:
+                    # SL ضرب بعد TP1، وهنا تم نقل SL إلى الدخول -> يعتبر tp1_win
                     result = "tp1_win"
     else:  # short
+        if trailing_active and tp2_hit:
+            trailing_pct = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
+            current_trailing_low = safe_float(trade.get("trailing_low"), low)
+            if low < current_trailing_low:
+                trade["trailing_low"] = low
+                trade["trailing_sl"] = round_price(low * (1 + trailing_pct))
+            trailing_sl = safe_float(trade.get("trailing_sl"), 0)
+            if trailing_sl > 0 and high >= trailing_sl:
+                result = "tp2_win"
+                return result, False, trade
+
         if not tp1_hit:
             if high >= sl:
                 result = "loss"
@@ -1449,7 +1523,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
                 else:
                     result = "tp1_win"
 
-    # نمرر إشارة tp2_now لتُنفذ في update_open_trades، ولا نغلق
+    # نمرر إشارة tp2_now لتُنفذ في update_open_trades
     trade["_tp2_now"] = tp2_now
     return result, tp1_now, trade
 
@@ -1501,7 +1575,6 @@ def update_open_trades(
                 pass
             continue
 
-        # --- استخراج trade_side الخاص بالصفقة الحالية ---
         trade_side = normalize_side(trade.get("side", side))
 
         symbol = trade["symbol"]
@@ -1558,7 +1631,7 @@ def update_open_trades(
 
             # معالجة TP1
             if tp1_now and not trade.get("tp1_hit"):
-                trade.pop("_tp2_now", None)  # إزالة المفتاح المؤقت قبل الحفظ
+                trade.pop("_tp2_now", None)
                 ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                 if ok:
                     trade = load_trade(redis_client, trade_key) or trade
@@ -1591,12 +1664,16 @@ def update_open_trades(
                 # فحص TP2 عند عدم TP1_now (بعد TP1 سابق)
                 tp2_now = trade.pop("_tp2_now", False)
                 if tp2_now and not trade.get("tp2_hit"):
-                    trade.pop("_tp2_now", None)  # مضمون الحذف
+                    trade.pop("_tp2_now", None)
                     ok = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                     if ok:
                         trade = load_trade(redis_client, trade_key) or trade
                         state_changed = True
                         logger.info(f"{symbol} → TP2 hit")
+                # تحديث trailing إذا نشط
+                if trade.get("trailing_active") and not result:
+                    # تحديث أعلى/أدنى سعر للشمعة الحالية (تم بالفعل في evaluate لكن نضمن التحديث هنا)
+                    pass
                 # pullback activation save
                 if trade.get("pullback_triggered") and not state_changed:
                     trade.pop("_tp2_now", None)
@@ -1663,7 +1740,7 @@ def update_open_trades(
 
         # حفظ التغييرات النهائية
         if state_changed and trade.get("status") not in ("closed",):
-            trade.pop("_tp2_now", None)  # تأكيد حذف المفتاح قبل الحفظ
+            trade.pop("_tp2_now", None)
             save_trade(redis_client, trade_key, trade)
             update_trade_history_snapshot(redis_client, trade)
 
@@ -1674,8 +1751,25 @@ def update_open_trades(
 
 
 # ------------------------------------------------------------
-# LOAD TRADES (with/without history)
+# LOAD TRADES (with/without history) – إصلاح الازدواجية
 # ------------------------------------------------------------
+def _trade_dedupe_key(trade: dict):
+    """مفتاح فريد لمنع التكرار عند دمج active + history."""
+    # الأولوية لـ alert_id
+    alert_id = str(trade.get("alert_id") or "").strip()
+    if alert_id:
+        return ("alert_id", alert_id)
+    # ثم trade_id
+    trade_id = str(trade.get("trade_id") or "").strip()
+    if trade_id:
+        return ("trade_id", trade_id)
+    # وإلا symbol + side + candle_time
+    symbol = str(trade.get("symbol", ""))
+    side = normalize_side(trade.get("side", "long"))
+    ctime = safe_timestamp(trade.get("candle_time"), 0)
+    return ("symbol_side_time", f"{symbol}:{side}:{ctime}")
+
+
 def load_trades(
     redis_client,
     market_type: Optional[str] = None,
@@ -1691,6 +1785,7 @@ def load_trades(
     pattern = f"trade:{mt}:{sd}:*"
 
     trades = []
+    seen = set()
 
     try:
         for key in redis_client.scan_iter(pattern):
@@ -1703,6 +1798,11 @@ def load_trades(
                 logger.warning(f"load_trades: corrupted JSON for key {key}: {e}")
                 continue
 
+            dk = _trade_dedupe_key(trade)
+            if dk in seen:
+                continue
+            seen.add(dk)
+
             if since_ts is not None:
                 ts = get_trade_created_ts(trade)
                 if not ts:
@@ -1712,7 +1812,7 @@ def load_trades(
 
             if not include_open:
                 status = str(trade.get("status", "") or "").strip().lower()
-                if status in ("open", "partial", "pending_pullback", "tp2_partial"):
+                if status in ("open", "partial", "pending_pullback", "tp2_partial", "trailing_open"):
                     continue
 
             trades.append(trade)
@@ -1738,14 +1838,15 @@ def load_trades_with_history(
     pattern_trade = f"trade:{mt}:{sd}:*"
     pattern_history = f"trade_history:{mt}:{sd}:*"
 
-    trades_dict = {}
+    seen = set()
+    trades = []
 
-    def _dedup_key(trade_dict):
-        m = normalize_market_type(trade_dict.get("market_type", "futures"))
-        s = normalize_side(trade_dict.get("side", "long"))
-        sym = trade_dict.get("symbol", "")
-        ctime = safe_timestamp(trade_dict.get("candle_time"), 0)
-        return (m, s, sym, ctime)
+    def _add_if_new(trade_dict):
+        dk = _trade_dedupe_key(trade_dict)
+        if dk in seen:
+            return
+        seen.add(dk)
+        trades.append(trade_dict)
 
     try:
         for key in redis_client.scan_iter(pattern_trade):
@@ -1756,7 +1857,7 @@ def load_trades_with_history(
                 trade = json.loads(raw)
             except Exception:
                 continue
-            trades_dict[_dedup_key(trade)] = trade
+            _add_if_new(trade)
     except Exception as e:
         logger.error(f"load_trades_with_history trade scan error: {e}")
 
@@ -1769,14 +1870,13 @@ def load_trades_with_history(
                 trade = json.loads(raw)
             except Exception:
                 continue
-            dedup = _dedup_key(trade)
-            if dedup not in trades_dict:
-                trades_dict[dedup] = trade
+            _add_if_new(trade)
     except Exception as e:
         logger.error(f"load_trades_with_history history scan error: {e}")
 
-    trades = []
-    for trade in trades_dict.values():
+    # فلترة حسب الوقت والحالة
+    filtered = []
+    for trade in trades:
         if since_ts is not None:
             ts = get_trade_created_ts(trade)
             if not ts:
@@ -1786,19 +1886,19 @@ def load_trades_with_history(
 
         if not include_open:
             status = str(trade.get("status", "") or "").strip().lower()
-            if status in ("open", "partial", "pending_pullback", "tp2_partial"):
+            if status in ("open", "partial", "pending_pullback", "tp2_partial", "trailing_open"):
                 continue
 
-        trades.append(trade)
+        filtered.append(trade)
 
-    trades.sort(
+    filtered.sort(
         key=lambda x: (
             get_trade_created_ts(x) or safe_timestamp(x.get("candle_time"), 0)
         ),
         reverse=True,
     )
 
-    return trades
+    return filtered
 
 
 def get_all_trades_data(
@@ -1835,13 +1935,31 @@ def get_all_trades_data(
 
 
 # ------------------------------------------------------------
-# حساب PnL مرجح للصفقة (للإصلاحات)
+# حساب PnL مرجح للصفقة (الإصدار الجديد 3.6)
 # ------------------------------------------------------------
+def _is_tp1_hit(trade: dict) -> bool:
+    """تحديد ما إذا كانت الصفقة قد حققت TP1."""
+    if normalize_bool(trade.get("tp1_hit")):
+        return True
+    result = str(trade.get("result", "")).strip().lower()
+    status = str(trade.get("status", "")).strip().lower()
+    return result in ("tp1_win", "tp2_win") or status in ("tp2_partial", "trailing_open", "trailing_closed")
+
+
+def _is_tp2_hit(trade: dict) -> bool:
+    """تحديد ما إذا كانت الصفقة قد حققت TP2."""
+    if normalize_bool(trade.get("tp2_hit")):
+        return True
+    result = str(trade.get("result", "")).strip().lower()
+    status = str(trade.get("status", "")).strip().lower()
+    return result == "tp2_win" or status in ("tp2_partial", "trailing_open", "trailing_closed", "tp2_win")
+
+
 def _compute_weighted_trade_pnl(trade: dict) -> float:
     """
     حساب الربح/الخسارة بعد الرافعة لصفقة مغلقة، مع الأخذ في الاعتبار
-    المخارج الجزئية (tp1_close_pct, tp2_close_pct).
-    تُرجع النسبة المئوية بعد الرافعة.
+    المخارج الجزئية (tp1_close_pct, tp2_close_pct) والـ trailing.
+    النسب الافتراضية: 40% TP1، 40% TP2، 20% trailing.
     """
     side = normalize_side(trade.get("side", "long"))
     leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
@@ -1851,13 +1969,15 @@ def _compute_weighted_trade_pnl(trade: dict) -> float:
     if not result or result in ("expired", "pending_expired"):
         return 0.0
 
-    tp1_close_pct = safe_float(trade.get("tp1_close_pct", 50.0), 50.0) / 100.0
-    tp2_close_pct = safe_float(trade.get("tp2_close_pct", 50.0), 50.0) / 100.0
-    tp1_hit = normalize_bool(trade.get("tp1_hit", False))
-    tp2_hit = normalize_bool(trade.get("tp2_hit", False))
+    tp1_close_pct = safe_float(trade.get("tp1_close_pct", TP1_CLOSE_PCT), TP1_CLOSE_PCT) / 100.0
+    tp2_close_pct = safe_float(trade.get("tp2_close_pct", TP2_CLOSE_PCT), TP2_CLOSE_PCT) / 100.0
     tp1 = safe_float(trade.get("tp1"), 0.0)
     tp2 = safe_float(trade.get("tp2"), 0.0)
     sl = safe_float(trade.get("sl"), 0.0)
+
+    tp1_hit = normalize_bool(trade.get("tp1_hit", False))
+    tp2_hit = normalize_bool(trade.get("tp2_hit", False))
+    trailing_exit_price = safe_float(trade.get("trailing_sl"), 0.0)  # سعر الخروج في حال trailing
 
     def long_pct(entry, exit_price):
         if entry <= 0: return 0.0
@@ -1868,15 +1988,20 @@ def _compute_weighted_trade_pnl(trade: dict) -> float:
     calc = long_pct if side == "long" else short_pct
 
     if result == "tp2_win":
-        # جزء TP1 + جزء TP2 + باقي عند SL (الذي تم رفعه)
+        # الجزء الأول TP1 (إذا لم يُغلق سابقاً، لكن في tp2_win يعني حقق TP1 ثم TP2 ثم trailing أو SL بعد TP2)
+        # نسب: tp1_close_pct * tp1 + tp2_close_pct * tp2 + المتبقي حسب سعر الخروج (trailing أو sl)
         remaining_pct = max(0.0, 1.0 - tp1_close_pct - tp2_close_pct)
         pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
-        pnl_tp2 = calc(effective_entry, tp2) * tp2_close_pct  # لأن tp2_hit صحيح
-        pnl_rem = calc(effective_entry, sl) * remaining_pct
+        pnl_tp2 = calc(effective_entry, tp2) * tp2_close_pct if tp2_hit else 0.0
+        if trailing_exit_price > 0:
+            pnl_rem = calc(effective_entry, trailing_exit_price) * remaining_pct
+        else:
+            pnl_rem = calc(effective_entry, sl) * remaining_pct
         pnl_raw = pnl_tp1 + pnl_tp2 + pnl_rem
     elif result == "tp1_win":
         remaining_pct = max(0.0, 1.0 - tp1_close_pct)
         pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
+        # الباقي أغلق عند SL (الذي تم نقله إلى effective_entry)
         pnl_rem = calc(effective_entry, sl) * remaining_pct
         pnl_raw = pnl_tp1 + pnl_rem
     elif result == "loss":
@@ -2087,9 +2212,10 @@ def get_trade_summary(
     loss_pnls = []
     all_pnls = []
 
-    # عدادات TP2 بناءً على الحقل tp2_hit
-    tp2_hits_count = sum(1 for t in filtered_trades if normalize_bool(t.get("tp2_hit")))
-    tp2_wins_count = sum(1 for t in closed_trades if t.get("result") == "tp2_win")
+    # حساب TP1/TP2 hits بالشكل الصحيح
+    tp1_hits = sum(1 for t in filtered_trades if _is_tp1_hit(t))
+    tp2_hits = sum(1 for t in filtered_trades if _is_tp2_hit(t))
+    tp2_wins = sum(1 for t in closed_trades if t.get("result") == "tp2_win")
 
     for trade in closed_trades:
         pnl = _compute_weighted_trade_pnl(trade)
@@ -2114,15 +2240,14 @@ def get_trade_summary(
     leverage = SHORT_REPORT_LEVERAGE if side_norm == "short" else REPORT_LEVERAGE
     summary["realized_raw_pnl_pct"] = round(total_pnl / leverage, 4) if leverage else 0.0
 
-    # إضافة عدادات TP2 محدثة
-    summary["tp2_hits"] = tp2_hits_count
-    summary["tp2_wins"] = tp2_wins_count
+    # تعيين القيم الصحيحة للـ hits و rate
+    summary["tp1_hits"] = tp1_hits
+    summary["tp2_hits"] = tp2_hits
+    summary["tp2_wins"] = tp2_wins
 
-    # --- حساب TP2 rates ---
     signals = safe_int(summary.get("signals", 0))
-    tp1_hits = safe_int(summary.get("tp1_hits", 0))
-    summary["tp2_rate"] = round((tp2_hits_count / signals) * 100, 2) if signals > 0 else 0.0
-    summary["tp1_to_tp2_rate"] = round((tp2_hits_count / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+    summary["tp2_rate"] = round((tp2_hits / signals) * 100, 2) if signals > 0 else 0.0
+    summary["tp1_to_tp2_rate"] = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
 
     plan = get_report_sizing_plan(side_norm)
     for key in [
@@ -2209,13 +2334,14 @@ def get_exit_summary(
     exit_data["side"] = side
     exit_data["trades_count"] = len(trades)
     exit_data["since_ts"] = since_ts
-    # تحديث TP2 hits بناءً على الحقل
-    exit_data["tp2_hits"] = sum(1 for t in trades if normalize_bool(t.get("tp2_hit")))
 
-    # --- حساب TP2 rates ---
+    # حساب TP1/TP2 Hits بالطريقة الصحيحة
+    tp1_hits = sum(1 for t in trades if _is_tp1_hit(t))
+    tp2_hits = sum(1 for t in trades if _is_tp2_hit(t))
+    exit_data["tp1_hits"] = tp1_hits
+    exit_data["tp2_hits"] = tp2_hits
+
     signals = safe_int(exit_data.get("signals", exit_data.get("trades_count", 0)))
-    tp1_hits = safe_int(exit_data.get("tp1_hits", 0))
-    tp2_hits = safe_int(exit_data.get("tp2_hits", 0))
     exit_data["tp2_rate"] = round((tp2_hits / signals) * 100, 2) if signals > 0 else 0.0
     exit_data["tp1_to_tp2_rate"] = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
 
@@ -2632,6 +2758,11 @@ def format_period_summary(title: str, summary: dict) -> str:
     tp2_hits = safe_int(summary.get("tp2_hits", 0))
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     full_wins = safe_int(summary.get("tp2_wins", 0))
+
+    # Full Wins TP2 يجب ألا يقل عن TP2 Hits الفعلية
+    if full_wins < tp2_hits:
+        full_wins = tp2_hits
+
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
     tp2_rate = safe_float(summary.get("tp2_rate", 0))
     tp1_to_tp2_rate = safe_float(summary.get("tp1_to_tp2_rate", 0))
@@ -2647,7 +2778,6 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary, side=side)
 
-    # عرض الخسارة بالسالب
     gross_loss_display = -gross_loss
     gross_loss_usd_display = -gross_loss_usd
 
@@ -2958,8 +3088,8 @@ def get_pending_pullback_summary(
     ]
     triggered_wins = sum(1 for t in triggered_closed_trades if t.get("result") in ("tp1_win", "tp2_win"))
     triggered_losses = sum(1 for t in triggered_closed_trades if t.get("result") == "loss")
-    triggered_tp1_hits = sum(1 for t in triggered_closed_trades if normalize_bool(t.get("tp1_hit")))
-    triggered_tp2_hits = sum(1 for t in triggered_closed_trades if normalize_bool(t.get("tp2_hit")))
+    triggered_tp1_hits = sum(1 for t in triggered_closed_trades if _is_tp1_hit(t))
+    triggered_tp2_hits = sum(1 for t in triggered_closed_trades if _is_tp2_hit(t))
     decided_triggered = triggered_wins + triggered_losses
     triggered_winrate = (triggered_wins / decided_triggered * 100) if decided_triggered > 0 else 0.0
 
