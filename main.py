@@ -166,8 +166,10 @@ ALERT_TTL_SECONDS = 14 * 24 * 3600
 TRACK_LEVERAGE = 15.0
 
 # Partial Take Profit Management
-TP1_CLOSE_PCT = 50
-TP2_CLOSE_PCT = 50
+TP1_CLOSE_PCT = 40           # إغلاق 40% عند TP1
+TP2_CLOSE_PCT = 40           # إغلاق 40% عند TP2
+TRAILING_POSITION_PCT = 20   # 20% تجري مع السوق بعد TP2
+TRAILING_PCT = 2.5           # trailing stop: 2.5% تحت أعلى سعر
 MOVE_SL_TO_ENTRY_AFTER_TP1 = True
 
 # Market Guard / Modes
@@ -1497,6 +1499,8 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "sl_notes": candidate.get("sl_notes", []),
         "tp1_close_pct": candidate.get("tp1_close_pct", TP1_CLOSE_PCT),
         "tp2_close_pct": candidate.get("tp2_close_pct", TP2_CLOSE_PCT),
+        "trailing_pct": candidate.get("trailing_pct", TRAILING_PCT),
+        "trailing_position_pct": candidate.get("trailing_position_pct", TRAILING_POSITION_PCT),
         "move_sl_to_entry_after_tp1": candidate.get("move_sl_to_entry_after_tp1", MOVE_SL_TO_ENTRY_AFTER_TP1),
         "has_extra_strong_setup": candidate.get("has_extra_strong_setup", False),
         "extra_setup_names": candidate.get("extra_setup_names", []),
@@ -1634,12 +1638,16 @@ def _trade_exit_bucket(trade: dict) -> str:
             return "breakeven_protected"
         if result == "tp2_win":
             return "tp2"
+        if result == "trailing_win":
+            return "trailing"
         if result == "tp1_win":
             return "tp1_only"
         if result == "loss":
             return "loss"
         if result == "expired":
             return "expired"
+        if status == "trailing":
+            return "trailing_open"
         if status == "partial":
             return "partial"
         if status == "open":
@@ -1707,6 +1715,19 @@ def _get_trade_pnl_pct(trade: dict) -> float:
             pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
         return round(pnl, 4)
 
+    if result == "trailing_win":
+        # TP1 (40%) + TP2 (40%) + trailing exit price (20%)
+        trailing_exit = _safe_float(trade.get("trailing_exit_price"), 0.0)
+        trailing_pct_alloc = _safe_float(trade.get("trailing_position_pct"), TRAILING_POSITION_PCT) / 100.0
+        pnl = 0.0
+        if tp1 > 0:
+            pnl += ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE * tp1_weight
+        if tp2 > 0:
+            pnl += ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE * tp2_weight
+        if trailing_exit > 0:
+            pnl += ((trailing_exit - entry) / entry) * 100 * TRACK_LEVERAGE * trailing_pct_alloc
+        return round(pnl, 4)
+
     if result == "tp1_win":
         if tp1 > 0:
             tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
@@ -1735,7 +1756,7 @@ def _get_trade_pnl_pct(trade: dict) -> float:
 
 
 def _is_trade_win_bucket(bucket: str) -> bool:
-    return bucket in ("tp2", "tp1_only", "partial", "breakeven_protected", "tp1_hit_open_or_unknown")
+    return bucket in ("tp2", "trailing", "tp1_only", "partial", "breakeven_protected", "tp1_hit_open_or_unknown")
 
 
 def _build_group_exit_stats(trades: list, group_field: str, max_items: int = 6) -> dict:
@@ -1813,6 +1834,8 @@ def _format_last_closed_trades(trades: list, max_items: int = 8) -> str:
 
         label = {
             "tp2": "🎯 TP2",
+            "trailing": "🔄 Trailing Win",
+            "trailing_open": "🔄 Trailing مفعّل",
             "tp1_only": "✅ TP1 فقط",
             "loss": "❌ SL",
             "expired": "⏳ Expired",
@@ -1847,8 +1870,11 @@ def build_exits_report_message() -> str:
         tp1_hit_other = [t for t in closed if _trade_exit_bucket(t) == "tp1_hit_open_or_unknown"]
 
         closed_count = len(closed)
-        tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(breakeven) + len(tp1_hit_other)
-        tp2_effective = len(tp2_wins)
+        tp2_wins_list = [t for t in closed if _trade_exit_bucket(t) == "tp2"]
+        trailing_wins_list = [t for t in closed if _trade_exit_bucket(t) == "trailing"]
+        trailing_open_list = [t for t in trades if _trade_exit_bucket(t) == "trailing_open"]
+        tp1_effective = len(tp2_wins) + len(tp1_only) + len(partial) + len(breakeven) + len(tp1_hit_other) + len(trailing_wins_list)
+        tp2_effective = len(tp2_wins) + len(trailing_wins_list)
         sl_count = len(losses)
         expired_count = len(expired)
 
@@ -1868,13 +1894,33 @@ def build_exits_report_message() -> str:
         setup_stats = _build_group_exit_stats(closed, "setup_type", max_items=6)
         timing_stats = _build_group_exit_stats(closed, "entry_timing", max_items=6)
 
+        trailing_block = ""
+        if trailing_open_list or trailing_wins_list:
+            trailing_lines = [f"\n<b>🔄 Trailing (20% مفتوح):</b>"]
+            if trailing_open_list:
+                for t in trailing_open_list[:5]:
+                    sym = clean_symbol_for_message(t.get("symbol", ""))
+                    t_high = _safe_float(t.get("trailing_high"), 0.0)
+                    t_sl = _safe_float(t.get("trailing_sl"), 0.0)
+                    entry_p = _safe_float(t.get("entry"), 0.0)
+                    gain = ((t_high - entry_p) / entry_p * 100) if entry_p > 0 and t_high > 0 else 0.0
+                    trailing_lines.append(
+                        f"• {html.escape(sym)} | 📈 High: {fmt_num(t_high, 6)} "
+                        f"(+{gain:.2f}%) | 🛑 Trailing SL: {fmt_num(t_sl, 6)}"
+                    )
+            if trailing_wins_list:
+                trailing_lines.append(f"• ✅ مغلق بـ trailing: {len(trailing_wins_list)}")
+            trailing_block = "\n".join(trailing_lines)
+
         lines = [
             "📊 <b>تقرير جودة الخروج الشامل - LONG</b>",
             "",
             f"• إجمالي الصفقات: {total}",
             f"• مفتوح: {len(open_trades)}",
+            f"• 🔄 Trailing مفعّل: {len(trailing_open_list)}",
             f"• مغلق: {closed_count}",
-            f"• 🎯 TP2: {tp2_effective}",
+            f"• 🎯 TP2: {len(tp2_wins_list)}",
+            f"• 🔄 Trailing Win: {len(trailing_wins_list)}",
             f"• ✅ TP1 فقط: {len(tp1_only)}",
             f"• ✅ Partial: {len(partial)}",
             f"• 🛡 Breakeven: {len(breakeven)}",
@@ -1891,6 +1937,7 @@ def build_exits_report_message() -> str:
             f"• Avg PnL: {_pct_safe(avg_pnl)}",
             f"• Avg Win: {_pct_safe(avg_win)}",
             f"• Avg Loss: {_pct_safe(avg_loss)}",
+            trailing_block,
             "",
             _format_group_exit_stats("📌 أداء setup_type", setup_stats),
             "",
@@ -5660,8 +5707,9 @@ def build_message(
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
 {pullback_text}
-🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 50%)
-🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 50%)
+🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
+🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
+🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
 🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}
@@ -5714,8 +5762,9 @@ def build_recovery_long_message(
 • متوسط الدخول المخطط: {fmt_num(avg_entry, 6)}
 
 🎯 <b>الأهداف:</b>
-• TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 50%)
-• TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 50%)
+• TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
+• TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
+• بعد TP2: 20% trailing ({TRAILING_PCT}% تحت الـ high)
 • بعد TP1: نقل SL إلى Entry
 
 🛑 <b>وقف الخسارة:</b>
