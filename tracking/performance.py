@@ -116,6 +116,10 @@ TP1_CLOSE_PCT = 40.0
 TP2_CLOSE_PCT = 40.0
 TRAILING_PCT = 2.0   # نسبة التراجع للـ trailing stop بعد TP2
 
+# Dedup index
+ALERT_ID_INDEX_PREFIX = "alert_id_index:"
+PENDING_PULLBACK_MAX_CANDLES = 30  # max شموع قبل انتهاء pending_pullback
+
 # ------------------------------------------------------------
 # دوال مساعدة عامة (safe & normalization)
 # ------------------------------------------------------------
@@ -330,6 +334,16 @@ def normalize_candles(raw):
             continue
     candles.sort(key=lambda x: x["ts"])
     return candles
+
+
+def get_trade_field(trade: dict, key: str, default=None):
+    """جلب قيمة من trade أو diagnostics بالأولوية لـ root."""
+    if not isinstance(trade, dict):
+        return default
+    val = trade.get(key)
+    if val is None:
+        val = (trade.get("diagnostics") or {}).get(key)
+    return val if val is not None else default
 
 
 # ------------------------------------------------------------
@@ -649,6 +663,28 @@ def build_history_snapshot(trade_data: dict) -> dict:
 # ------------------------------------------------------------
 # TRADE STORAGE (register / load / save / mark)
 # ------------------------------------------------------------
+def check_alert_id_duplicate(redis_client, alert_id: str) -> bool:
+    """يتحقق إذا alert_id موجود مسبقاً → True = مكرر."""
+    if not redis_client or not alert_id:
+        return False
+    try:
+        key = f"{ALERT_ID_INDEX_PREFIX}{alert_id}"
+        return bool(redis_client.exists(key))
+    except Exception:
+        return False
+
+
+def register_alert_id_index(redis_client, alert_id: str, trade_key: str):
+    """يسجل alert_id → trade_key في Redis."""
+    if not redis_client or not alert_id:
+        return
+    try:
+        key = f"{ALERT_ID_INDEX_PREFIX}{alert_id}"
+        redis_client.set(key, trade_key, ex=TRADE_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(f"register_alert_id_index failed for {alert_id}: {e}")
+
+
 def register_trade(
     redis_client,
     symbol: str,
@@ -765,6 +801,13 @@ def register_trade(
 
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
+
+    # ── Alert ID dedup (simplified) ────────────────────────────
+    _check_alert_id = str(alert_id or kwargs.get("alert_id", "") or "").strip() or None
+
+    if _check_alert_id and check_alert_id_duplicate(redis_client, _check_alert_id):
+        logger.debug(f"register_trade: duplicate alert_id={_check_alert_id} for {symbol}, skipping")
+        return False
 
     # تجميع كل الـ arguments المباشرة في قاموس للمقارنة مع kwargs
     direct_args = {
@@ -1135,10 +1178,19 @@ def register_trade(
             ex=TRADE_TTL_SECONDS,
         )
         if not created:
+            logger.debug(f"register_trade: trade already exists for {symbol} @ {normalized_candle_time}")
             return False
 
-        redis_client.sadd(open_set_key, trade_key)
-        redis_client.sadd(all_trades_key, trade_key)
+        # إضافة للـ sets مع logging لو فشل
+        try:
+            redis_client.sadd(open_set_key, trade_key)
+        except Exception as e:
+            logger.error(f"register_trade: failed to add to open_set for {symbol}: {e}")
+
+        try:
+            redis_client.sadd(all_trades_key, trade_key)
+        except Exception as e:
+            logger.error(f"register_trade: failed to add to all_trades for {symbol}: {e}")
 
         history_data = build_history_snapshot(trade_data)
         redis_client.set(
@@ -1146,11 +1198,16 @@ def register_trade(
             json.dumps(history_data, ensure_ascii=False),
             ex=TRADE_HISTORY_TTL_SECONDS,
         )
+        logger.info(f"register_trade: ✅ {symbol} registered | key={trade_key} | status={_status}")
+
+        # تسجيل alert_id index لمنع التكرار مستقبلاً
+        if _check_alert_id:
+            register_alert_id_index(redis_client, _check_alert_id, trade_key)
 
         return True
 
     except Exception as e:
-        logger.error(f"register_trade error on {symbol}: {e}")
+        logger.error(f"register_trade error on {symbol}: {e}", exc_info=True)
         return False
 
 
@@ -1204,7 +1261,7 @@ def update_trade_history_snapshot(redis_client, trade_data: dict):
         return False
 
 
-def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candle_ts: int = None):
+def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candle_ts: int = None, candle: dict = None):
     """
     تسجيل وصول السعر إلى TP2 وتفعيل trailing stop للـ 20% المتبقية.
     النسب: 40% TP1، 40% TP2، 20% trailing.
@@ -1227,15 +1284,31 @@ def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
 
         # تفعيل trailing للـ 20% المتبقية
         trade_data["trailing_active"] = True
-        trade_data["trailing_pct"] = safe_float(
-            trade_data.get("trailing_pct", TRAILING_PCT),
-            TRAILING_PCT
+        _trailing_pct_val = safe_float(
+            trade_data.get("trailing_pct", TRAILING_PCT), TRAILING_PCT
         )
-        # تعيين أعلى/أدنى سعر للـ trailing
-        # هنا سنترك التحديث للشمعة القادمة في evaluate_trade_on_candle
-        trade_data["trailing_high"] = None
-        trade_data["trailing_low"] = None
-        trade_data["trailing_sl"] = None
+        trade_data["trailing_pct"] = _trailing_pct_val
+        _side = normalize_side(trade_data.get("side", "long"))
+        _tp2_price = safe_float(trade_data.get("tp2"), 0.0)
+
+        if _side == "long":
+            # أعلى سعر: من الشمعة الحالية أو سعر TP2
+            _init_high = safe_float(candle.get("high"), _tp2_price) if candle else _tp2_price
+            _init_high = max(_init_high, _tp2_price)
+            trade_data["trailing_high"] = round_price(_init_high) if _init_high > 0 else None
+            trade_data["trailing_low"]  = None
+            trade_data["trailing_sl"]   = round_price(
+                _init_high * (1 - _trailing_pct_val / 100.0)
+            ) if _init_high > 0 else None
+        else:
+            # أدنى سعر: من الشمعة الحالية أو سعر TP2
+            _init_low = safe_float(candle.get("low"), _tp2_price) if candle else _tp2_price
+            _init_low = min(_init_low, _tp2_price) if _tp2_price > 0 else _init_low
+            trade_data["trailing_high"] = None
+            trade_data["trailing_low"]  = round_price(_init_low) if _init_low > 0 else None
+            trade_data["trailing_sl"]   = round_price(
+                _init_low * (1 + _trailing_pct_val / 100.0)
+            ) if _init_low > 0 else None
 
         diagnostics = trade_data.get("diagnostics", {}) or {}
         diagnostics["tp2_hit"] = True
@@ -1470,22 +1543,29 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     if side == "long":
         # trailing نشط بعد TP2
         if trailing_active and tp2_hit:
-            trailing_pct = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
+            trailing_pct_val = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
+            current_trailing_high = safe_float(trade.get("trailing_high"), 0.0)
+            # لو trailing_high غير مهيأ → هيأه من TP2
+            if current_trailing_high <= 0:
+                _tp2 = safe_float(trade.get("tp2"), 0.0)
+                current_trailing_high = max(high, _tp2) if _tp2 > 0 else high
+                trade["trailing_high"] = round_price(current_trailing_high)
+                trade["trailing_sl"]   = round_price(current_trailing_high * (1 - trailing_pct_val))
             # تحديث أعلى سعر
-            current_trailing_high = safe_float(trade.get("trailing_high"), high)
             if high > current_trailing_high:
-                trade["trailing_high"] = high
-                trade["trailing_sl"] = round_price(high * (1 - trailing_pct))
+                current_trailing_high = high
+                trade["trailing_high"] = round_price(current_trailing_high)
+                trade["trailing_sl"]   = round_price(current_trailing_high * (1 - trailing_pct_val))
             # فحص كسر trailing SL
-            trailing_sl = safe_float(trade.get("trailing_sl"), 0)
-            if trailing_sl > 0 and low <= trailing_sl:
-                # حفظ سعر الخروج قبل الإغلاق
-                trade["trailing_exit_price"] = trailing_sl
+            trailing_sl_val = safe_float(trade.get("trailing_sl"), 0.0)
+            if trailing_sl_val > 0 and low <= trailing_sl_val:
+                trade["trailing_exit_price"] = trailing_sl_val
                 diagnostics = trade.get("diagnostics", {}) or {}
-                diagnostics["trailing_exit_price"] = trailing_sl
+                diagnostics["trailing_exit_price"] = trailing_sl_val
+                diagnostics["trailing_high"]       = trade.get("trailing_high")
+                diagnostics["trailing_sl"]         = trade.get("trailing_sl")
                 trade["diagnostics"] = diagnostics
-                result = "trailing_win"
-                return result, False, trade
+                return "trailing_win", False, trade
 
         if not tp1_hit:
             if low <= sl:
@@ -1498,26 +1578,30 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             if not tp2_hit and high >= tp2:
                 tp2_now = True
             if low <= sl:
-                if tp2_hit:
-                    result = "tp2_win"
-                else:
-                    # SL ضرب بعد TP1، وهنا تم نقل SL إلى الدخول -> يعتبر tp1_win
-                    result = "tp1_win"
+                result = "tp2_win" if tp2_hit else "tp1_win"
+
     else:  # short
         if trailing_active and tp2_hit:
-            trailing_pct = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
-            current_trailing_low = safe_float(trade.get("trailing_low"), low)
+            trailing_pct_val = safe_float(trade.get("trailing_pct", TRAILING_PCT), TRAILING_PCT) / 100.0
+            current_trailing_low = safe_float(trade.get("trailing_low"), 0.0)
+            if current_trailing_low <= 0:
+                _tp2 = safe_float(trade.get("tp2"), 0.0)
+                current_trailing_low = min(low, _tp2) if _tp2 > 0 else low
+                trade["trailing_low"] = round_price(current_trailing_low)
+                trade["trailing_sl"]  = round_price(current_trailing_low * (1 + trailing_pct_val))
             if low < current_trailing_low:
-                trade["trailing_low"] = low
-                trade["trailing_sl"] = round_price(low * (1 + trailing_pct))
-            trailing_sl = safe_float(trade.get("trailing_sl"), 0)
-            if trailing_sl > 0 and high >= trailing_sl:
-                trade["trailing_exit_price"] = trailing_sl
+                current_trailing_low = low
+                trade["trailing_low"] = round_price(current_trailing_low)
+                trade["trailing_sl"]  = round_price(current_trailing_low * (1 + trailing_pct_val))
+            trailing_sl_val = safe_float(trade.get("trailing_sl"), 0.0)
+            if trailing_sl_val > 0 and high >= trailing_sl_val:
+                trade["trailing_exit_price"] = trailing_sl_val
                 diagnostics = trade.get("diagnostics", {}) or {}
-                diagnostics["trailing_exit_price"] = trailing_sl
+                diagnostics["trailing_exit_price"] = trailing_sl_val
+                diagnostics["trailing_low"]        = trade.get("trailing_low")
+                diagnostics["trailing_sl"]         = trade.get("trailing_sl")
                 trade["diagnostics"] = diagnostics
-                result = "trailing_win"
-                return result, False, trade
+                return "trailing_win", False, trade
 
         if not tp1_hit:
             if high >= sl:
@@ -1530,10 +1614,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             if not tp2_hit and low <= tp2:
                 tp2_now = True
             if high >= sl:
-                if tp2_hit:
-                    result = "tp2_win"
-                else:
-                    result = "tp1_win"
+                result = "tp2_win" if tp2_hit else "tp1_win"
 
     # نمرر إشارة tp2_now لتُنفذ في update_open_trades
     trade["_tp2_now"] = tp2_now
@@ -1572,194 +1653,220 @@ def update_open_trades(
     max_age_seconds = max_age_hours * 3600
 
     for trade_key in trade_keys:
-        trade = load_trade(redis_client, trade_key)
-        if not trade:
-            try:
-                redis_client.srem(open_set_key, trade_key)
-            except Exception:
-                pass
-            continue
+        try:
+            trade = load_trade(redis_client, trade_key)
+            if not trade:
+                logger.warning(f"update_open_trades: trade_key not found in Redis, removing from set: {trade_key}")
+                try:
+                    redis_client.srem(open_set_key, trade_key)
+                except Exception as e2:
+                    logger.error(f"update_open_trades: failed to remove stale key {trade_key}: {e2}")
+                continue
 
-        if trade.get("status") == "closed":
-            try:
-                redis_client.srem(open_set_key, trade_key)
-            except Exception:
-                pass
-            continue
+            if trade.get("status") == "closed":
+                try:
+                    redis_client.srem(open_set_key, trade_key)
+                except Exception:
+                    pass
+                continue
 
-        trade_side = normalize_side(trade.get("side", side))
+            trade_side = normalize_side(trade.get("side", side))
+            symbol = trade.get("symbol", trade_key)
+            created_at = safe_timestamp(trade.get("created_at", now_ts))
 
-        symbol = trade["symbol"]
-        created_at = safe_timestamp(trade.get("created_at", now_ts))
+            # ── Stuck trade warning ──────────────────────────────
+            updated_at = safe_timestamp(trade.get("updated_at", created_at))
+            if now_ts - updated_at > 3600 and trade.get("status") not in ("closed", "pending_pullback"):
+                logger.warning(
+                    f"{symbol} → stuck trade: no update for "
+                    f"{(now_ts - updated_at) // 60}م | status={trade.get('status')}"
+                )
 
-        # --- منطق انتهاء الصلاحية الجديد ---
-        if now_ts - created_at > max_age_seconds:
-            if trade.get("status") == "pending_pullback" and not trade.get("pullback_triggered"):
-                trade["pending_pullback_expired"] = True
-                trade["pending_pullback_expire_reason"] = "not_triggered_within_max_age"
-                trade.pop("_tp2_now", None)
-                mark_trade_closed(redis_client, trade_key, trade, "pending_expired")
-                logger.info(f"{symbol} → pending pullback expired without activation")
-            elif normalize_bool(trade.get("tp2_hit", False)):
-                trade.pop("_tp2_now", None)
-                mark_trade_closed(redis_client, trade_key, trade, "tp2_win")
-                logger.info(f"{symbol} → trade expired after TP2, closed as tp2_win")
-            elif normalize_bool(trade.get("tp1_hit", False)):
-                trade.pop("_tp2_now", None)
-                mark_trade_closed(redis_client, trade_key, trade, "tp1_win")
-                logger.info(f"{symbol} → trade expired after TP1, closed as tp1_win")
-            else:
-                trade.pop("_tp2_now", None)
-                mark_trade_closed(redis_client, trade_key, trade, "expired")
-                logger.info(f"{symbol} → trade expired")
-            continue
-
-        raw_candles = fetch_recent_candles(symbol, timeframe=timeframe, limit=100)
-        candles = normalize_candles(raw_candles)
-        if not candles:
-            continue
-
-        current_price = candles[-1]["close"]
-
-        last_proc = safe_timestamp(trade.get("last_processed_candle_ts"), 0)
-        candle_ts_base = safe_timestamp(trade.get("candle_time"), 0)
-        eval_start_ts = last_proc if last_proc > 0 else (candle_ts_base if candle_ts_base > 0 else created_at)
-
-        new_candles = []
-        for c in candles:
-            c_ts = safe_timestamp(c["ts"])
-            if c_ts > eval_start_ts:
-                new_candles.append((c_ts, c))
-        new_candles.sort(key=lambda x: x[0])
-
-        result = None
-        state_changed = False
-
-        for c_ts, candle in new_candles:
-            trade["last_processed_candle_ts"] = c_ts
-
-            result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
-            trade = updated_trade
-
-            # معالجة TP1
-            if tp1_now and not trade.get("tp1_hit"):
-                trade.pop("_tp2_now", None)
-                ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
-                if ok:
-                    trade = load_trade(redis_client, trade_key) or trade
-                    state_changed = True
-                    logger.info(f"{symbol} → TP1 hit")
-                else:
-                    logger.error(f"{symbol} → failed to mark TP1")
-                    break
-
-                # بعد TP1، ربما TP2 أيضاً في نفس الشمعة
-                if trade_side == "long" and safe_float(candle["high"], 0.0) >= safe_float(trade["tp2"], 0.0):
-                    if not trade.get("tp2_hit"):
-                        trade.pop("_tp2_now", None)
-                        ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
-                        if ok2:
-                            trade = load_trade(redis_client, trade_key) or trade
-                            state_changed = True
-                            logger.info(f"{symbol} → TP2 hit right after TP1")
-                elif trade_side == "short" and safe_float(candle["low"], 0.0) <= safe_float(trade["tp2"], 0.0):
-                    if not trade.get("tp2_hit"):
-                        trade.pop("_tp2_now", None)
-                        ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
-                        if ok2:
-                            trade = load_trade(redis_client, trade_key) or trade
-                            state_changed = True
-                            logger.info(f"{symbol} → TP2 hit right after TP1")
-                if result:
-                    break
-            else:
-                # فحص TP2 عند عدم TP1_now (بعد TP1 سابق)
-                tp2_now = trade.pop("_tp2_now", False)
-                if tp2_now and not trade.get("tp2_hit"):
+            # --- انتهاء الصلاحية ---
+            if now_ts - created_at > max_age_seconds:
+                if trade.get("status") == "pending_pullback" and not trade.get("pullback_triggered"):
+                    trade["pending_pullback_expired"] = True
+                    trade["pending_pullback_expire_reason"] = "not_triggered_within_max_age"
                     trade.pop("_tp2_now", None)
-                    ok = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
+                    mark_trade_closed(redis_client, trade_key, trade, "pending_expired")
+                    logger.info(f"{symbol} → pending pullback expired without activation")
+                elif normalize_bool(trade.get("tp2_hit", False)):
+                    trade.pop("_tp2_now", None)
+                    mark_trade_closed(redis_client, trade_key, trade, "tp2_win")
+                    logger.info(f"{symbol} → trade expired after TP2, closed as tp2_win")
+                elif normalize_bool(trade.get("tp1_hit", False)):
+                    trade.pop("_tp2_now", None)
+                    mark_trade_closed(redis_client, trade_key, trade, "tp1_win")
+                    logger.info(f"{symbol} → trade expired after TP1, closed as tp1_win")
+                else:
+                    trade.pop("_tp2_now", None)
+                    mark_trade_closed(redis_client, trade_key, trade, "expired")
+                    logger.info(f"{symbol} → trade expired")
+                continue
+
+            raw_candles = fetch_recent_candles(symbol, timeframe=timeframe, limit=100)
+            candles = normalize_candles(raw_candles)
+            if not candles:
+                logger.debug(f"{symbol} → no candles fetched, skipping")
+                continue
+
+            current_price = candles[-1]["close"]
+
+            last_proc = safe_timestamp(trade.get("last_processed_candle_ts"), 0)
+            candle_ts_base = safe_timestamp(trade.get("candle_time"), 0)
+            eval_start_ts = last_proc if last_proc > 0 else (candle_ts_base if candle_ts_base > 0 else created_at)
+
+            new_candles = []
+            for c in candles:
+                c_ts = safe_timestamp(c["ts"])
+                if c_ts > eval_start_ts:
+                    new_candles.append((c_ts, c))
+            new_candles.sort(key=lambda x: x[0])
+
+            result = None
+            state_changed = False
+
+            for c_ts, candle in new_candles:
+                trade["last_processed_candle_ts"] = c_ts
+
+                result, tp1_now, updated_trade = evaluate_trade_on_candle(trade, candle)
+                trade = updated_trade
+
+                # معالجة TP1
+                if tp1_now and not trade.get("tp1_hit"):
+                    trade.pop("_tp2_now", None)
+                    ok = mark_tp1_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts)
                     if ok:
                         trade = load_trade(redis_client, trade_key) or trade
                         state_changed = True
-                        logger.info(f"{symbol} → TP2 hit")
-                # تحديث trailing إذا نشط
-                if trade.get("trailing_active") and not result:
-                    # تحديث أعلى/أدنى سعر للشمعة الحالية (تم بالفعل في evaluate لكن نضمن التحديث هنا)
-                    pass
-                # pullback activation save
-                if trade.get("pullback_triggered") and not state_changed:
-                    trade.pop("_tp2_now", None)
-                    save_trade(redis_client, trade_key, trade)
-                    update_trade_history_snapshot(redis_client, trade)
+                        logger.info(f"{symbol} → TP1 hit")
+                    else:
+                        logger.error(f"{symbol} → failed to mark TP1")
+                        break
+
+                    # بعد TP1، ربما TP2 أيضاً في نفس الشمعة
+                    if trade_side == "long" and safe_float(candle["high"], 0.0) >= safe_float(trade["tp2"], 0.0):
+                        if not trade.get("tp2_hit"):
+                            trade.pop("_tp2_now", None)
+                            ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts, candle=candle)
+                            if ok2:
+                                trade = load_trade(redis_client, trade_key) or trade
+                                state_changed = True
+                                logger.info(f"{symbol} → TP2 hit right after TP1")
+                    elif trade_side == "short" and safe_float(candle["low"], 0.0) <= safe_float(trade["tp2"], 0.0):
+                        if not trade.get("tp2_hit"):
+                            trade.pop("_tp2_now", None)
+                            ok2 = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts, candle=candle)
+                            if ok2:
+                                trade = load_trade(redis_client, trade_key) or trade
+                                state_changed = True
+                                logger.info(f"{symbol} → TP2 hit right after TP1")
+                    if result:
+                        break
+                else:
+                    # فحص TP2 عند عدم TP1_now (بعد TP1 سابق)
+                    tp2_now = trade.pop("_tp2_now", False)
+                    if tp2_now and not trade.get("tp2_hit"):
+                        trade.pop("_tp2_now", None)
+                        ok = mark_tp2_hit(redis_client, trade_key, trade, processed_candle_ts=c_ts, candle=candle)
+                        if ok:
+                            trade = load_trade(redis_client, trade_key) or trade
+                            state_changed = True
+                            logger.info(f"{symbol} → TP2 hit")
+
+                    # حفظ تحديثات trailing (تم تحديثها في evaluate_trade_on_candle)
+                    if trade.get("trailing_active") and not result:
+                        save_trade(redis_client, trade_key, trade)
+                        update_trade_history_snapshot(redis_client, trade)
+                        state_changed = True
+
+                    # pullback activation save
+                    if trade.get("pullback_triggered") and not state_changed:
+                        trade.pop("_tp2_now", None)
+                        save_trade(redis_client, trade_key, trade)
+                        update_trade_history_snapshot(redis_client, trade)
+                        state_changed = True
+
+                if result:
+                    break
+
+            # حماية breakeven باستخدام trade_side
+            if not result and trade.get("status") not in ("closed",):
+                if trade.get("last_processed_candle_ts") != (eval_start_ts if eval_start_ts > 0 else None):
                     state_changed = True
 
+                mode_upper = str(market_mode or "").upper()
+                block_this_side = (
+                    "BLOCK_ALL" in mode_upper
+                    or mode_upper.strip() == "BLOCK"
+                    or (side == "long" and "BLOCK_LONGS" in mode_upper)
+                    or (side == "short" and "BLOCK_SHORTS" in mode_upper)
+                )
+
+                if protect_breakeven_on_block and block_this_side:
+                    try:
+                        entry_price = get_trade_effective_entry(trade)
+                        if entry_price > 0:
+                            if trade_side == "long":
+                                current_profit_pct = ((current_price - entry_price) / entry_price) * 100
+                            else:
+                                current_profit_pct = ((entry_price - current_price) / entry_price) * 100
+
+                            if current_profit_pct >= breakeven_min_profit_pct:
+                                if not trade.get("protected_breakeven"):
+                                    current_sl = safe_float(trade.get("sl"), 0.0)
+                                    need_move = True
+                                    if trade_side == "long" and current_sl >= entry_price:
+                                        need_move = False
+                                    elif trade_side == "short" and current_sl <= entry_price:
+                                        need_move = False
+
+                                    if need_move:
+                                        if trade.get("original_sl_before_breakeven") is None:
+                                            trade["original_sl_before_breakeven"] = current_sl
+                                        trade["sl"] = entry_price
+                                        trade["protected_breakeven"] = True
+                                        trade["breakeven_protection_reason"] = reason or "market_block_protection"
+                                        trade["breakeven_protected_ts"] = now_ts
+                                        trade["sl_moved_to_entry"] = True
+                                        trade["sl_move_reason"] = reason or "market_block_protection"
+
+                                        diagnostics = trade.get("diagnostics", {}) or {}
+                                        diagnostics["protected_breakeven"] = True
+                                        diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
+                                        diagnostics["breakeven_protected_ts"] = now_ts
+                                        diagnostics["original_sl_before_breakeven"] = current_sl
+                                        diagnostics["sl_moved_to_entry"] = True
+                                        diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                        trade["diagnostics"] = diagnostics
+                                        state_changed = True
+                                        logger.info(f"{symbol} → breakeven protected")
+                    except Exception as e:
+                        logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
+
+            # حفظ التغييرات النهائية
+            if state_changed and trade.get("status") not in ("closed",):
+                trade.pop("_tp2_now", None)
+                save_trade(redis_client, trade_key, trade)
+                update_trade_history_snapshot(redis_client, trade)
+
             if result:
-                break
+                trade.pop("_tp2_now", None)
+                _result_effective = result
+                # لو SL ضرب بعد TP1 وSL كان على entry → tp1_win بدل loss
+                if result == "loss" and normalize_bool(trade.get("tp1_hit", False)):
+                    _entry_price = get_trade_effective_entry(trade)
+                    _sl_now = safe_float(trade.get("sl"), 0.0)
+                    if _entry_price > 0 and _sl_now > 0 and abs(_sl_now - _entry_price) / _entry_price <= 0.001:
+                        _result_effective = "tp1_win"
+                        trade["protected_breakeven_exit"] = True
+                        trade["exit_reason"] = "breakeven_after_tp1"
+                        logger.info(f"{symbol} → SL hit on entry → reclassified as tp1_win")
+                mark_trade_closed(redis_client, trade_key, trade, _result_effective)
+                logger.info(f"{symbol} → trade closed as {_result_effective}")
 
-        # حماية breakeven باستخدام trade_side
-        if not result and trade.get("status") not in ("closed",):
-            if trade.get("last_processed_candle_ts") != (eval_start_ts if eval_start_ts > 0 else None):
-                state_changed = True
-
-            mode_upper = str(market_mode or "").upper()
-            block_this_side = (
-                "BLOCK_ALL" in mode_upper
-                or mode_upper.strip() == "BLOCK"
-                or (side == "long" and "BLOCK_LONGS" in mode_upper)
-                or (side == "short" and "BLOCK_SHORTS" in mode_upper)
-            )
-
-            if protect_breakeven_on_block and block_this_side:
-                try:
-                    entry_price = get_trade_effective_entry(trade)
-                    if entry_price > 0:
-                        if trade_side == "long":
-                            current_profit_pct = ((current_price - entry_price) / entry_price) * 100
-                        else:
-                            current_profit_pct = ((entry_price - current_price) / entry_price) * 100
-
-                        if current_profit_pct >= breakeven_min_profit_pct:
-                            if not trade.get("protected_breakeven"):
-                                current_sl = safe_float(trade.get("sl"), 0.0)
-                                need_move = True
-                                if trade_side == "long" and current_sl >= entry_price:
-                                    need_move = False
-                                elif trade_side == "short" and current_sl <= entry_price:
-                                    need_move = False
-
-                                if need_move:
-                                    if trade.get("original_sl_before_breakeven") is None:
-                                        trade["original_sl_before_breakeven"] = current_sl
-                                    trade["sl"] = entry_price
-                                    trade["protected_breakeven"] = True
-                                    trade["breakeven_protection_reason"] = reason or "market_block_protection"
-                                    trade["breakeven_protected_ts"] = now_ts
-                                    trade["sl_moved_to_entry"] = True
-                                    trade["sl_move_reason"] = reason or "market_block_protection"
-
-                                    diagnostics = trade.get("diagnostics", {}) or {}
-                                    diagnostics["protected_breakeven"] = True
-                                    diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
-                                    diagnostics["breakeven_protected_ts"] = now_ts
-                                    diagnostics["original_sl_before_breakeven"] = current_sl
-                                    diagnostics["sl_moved_to_entry"] = True
-                                    diagnostics["sl_move_reason"] = reason or "market_block_protection"
-                                    trade["diagnostics"] = diagnostics
-                                    state_changed = True
-                                    logger.info(f"{symbol} → breakeven protected")
-                except Exception as e:
-                    logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
-
-        # حفظ التغييرات النهائية
-        if state_changed and trade.get("status") not in ("closed",):
-            trade.pop("_tp2_now", None)
-            save_trade(redis_client, trade_key, trade)
-            update_trade_history_snapshot(redis_client, trade)
-
-        if result:
-            trade.pop("_tp2_now", None)
-            mark_trade_closed(redis_client, trade_key, trade, result)
-            logger.info(f"{symbol} → trade closed as {result}")
+        except Exception as _trade_exc:
+            logger.error(f"update_open_trades: exception processing {trade_key}: {_trade_exc}", exc_info=True)
 
 
 # ------------------------------------------------------------
@@ -1970,10 +2077,7 @@ def _is_tp2_hit(trade: dict) -> bool:
 def _compute_weighted_trade_pnl(trade: dict) -> float:
     """
     حساب الربح/الخسارة بعد الرافعة لصفقة مغلقة.
-    يستخدم calc_trade_result_pct من summary_helpers (الإصلاح الجذري).
-    النسب: 40% TP1 / 40% TP2 / 20% trailing.
-    - initial_sl للخسائر (لا يتأثر بحركة SL بعد TP1)
-    - cap الخسارة عند -100%
+    يستخدم calc_trade_result_pct من summary_helpers.
     """
     side = normalize_side(trade.get("side", "long"))
     leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
@@ -1982,11 +2086,216 @@ def _compute_weighted_trade_pnl(trade: dict) -> float:
     if not result or result in ("expired", "pending_expired"):
         return 0.0
 
+    # validation: effective_entry لازم يكون > 0
+    effective_entry = get_trade_effective_entry(trade)
+    if effective_entry <= 0:
+        logger.warning(f"_compute_weighted_trade_pnl: invalid effective_entry={effective_entry} for {trade.get('symbol', '?')}, skipping")
+        return 0.0
+
     raw_pct = calc_trade_result_pct(trade)
     if raw_pct is None:
         return 0.0
 
     return raw_pct * leverage
+
+
+def calculate_trade_pnl(trade: dict) -> dict:
+    """
+    Single source of truth لحساب PnL الصفقة.
+
+    يرجع dict يحتوي:
+    - pnl_pct         : الربح/الخسارة الخام بدون رافعة
+    - pnl_leveraged   : الربح/الخسارة بعد الرافعة
+    - is_win          : True لو tp1_win / tp2_win / trailing_win
+    - is_loss         : True لو loss
+    - is_breakeven    : True لو breakeven
+    - is_tp1          : True لو tp1 أو أعلى
+    - is_tp2          : True لو tp2 أو trailing_win
+    - is_pending      : True لو pending_pullback (لا تدخل في إحصائيات)
+    - skipped         : True لو الصفقة مش مكتملة
+
+    القواعد:
+    - يستخدم effective_entry دائماً
+    - pending_pullback → skipped
+    - SL == effective_entry → breakeven (إذا لم يكن TP1 قد لمس)
+    - TP1 hit ثم breakeven → win
+    - 40% TP1 / 40% TP2 / 20% trailing
+    """
+    if not isinstance(trade, dict):
+        return _empty_pnl_result()
+
+    side        = normalize_side(trade.get("side", "long"))
+    leverage    = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
+    result      = str(trade.get("result", "") or "").lower()
+    status      = str(trade.get("status", "") or "").lower()
+    tp1_hit     = normalize_bool(trade.get("tp1_hit", False))
+
+    # pending_pullback → مش داخل في الإحصائيات
+    if status == "pending_pullback" or result == "pending_expired":
+        return _empty_pnl_result(is_pending=True)
+
+    # صفقات مفتوحة أو غير مكتملة
+    if status in ("open", "partial", "tp2_partial", "trailing_open", "trailing") and not result:
+        return _empty_pnl_result(skipped=True)
+
+    # validation
+    effective_entry = get_trade_effective_entry(trade)
+    if effective_entry <= 0:
+        return _empty_pnl_result(skipped=True)
+
+    sl          = safe_float(trade.get("sl"), 0.0)
+    initial_sl  = safe_float(trade.get("initial_sl", sl), 0.0)
+    tp1         = safe_float(trade.get("tp1"), 0.0)
+    tp2         = safe_float(trade.get("tp2"), 0.0)
+
+    # فحص breakeven: SL == effective_entry
+    _sl_for_check = initial_sl if initial_sl > 0 else sl
+    _is_sl_on_entry = (
+        _sl_for_check > 0
+        and effective_entry > 0
+        and abs(_sl_for_check - effective_entry) / effective_entry <= 0.001
+    )
+
+    # تصنيف خاص: loss لكن SL على entry → breakeven أو tp1_win
+    _effective_result = result
+    if result == "loss" and _is_sl_on_entry:
+        if tp1_hit:
+            _effective_result = "tp1_win"  # TP1 ثم رجع entry → win
+        else:
+            _effective_result = "breakeven"
+
+    # احسب PnL من calc_trade_result_pct
+    _trade_for_calc = dict(trade)
+    _trade_for_calc["result"] = _effective_result
+    raw_pct = calc_trade_result_pct(_trade_for_calc)
+    if raw_pct is None:
+        raw_pct = 0.0
+
+    pnl_leveraged = raw_pct * leverage
+
+    is_win       = _effective_result in ("tp1_win", "tp2_win", "trailing_win")
+    is_loss      = _effective_result == "loss"
+    is_breakeven = _effective_result == "breakeven"
+    is_tp1       = tp1_hit or _effective_result in ("tp1_win", "tp2_win", "trailing_win")
+    is_tp2       = normalize_bool(trade.get("tp2_hit", False)) or _effective_result in ("tp2_win", "trailing_win")
+
+    return {
+        "pnl_pct":         round(raw_pct, 4),
+        "pnl_leveraged":   round(pnl_leveraged, 4),
+        "is_win":          is_win,
+        "is_loss":         is_loss,
+        "is_breakeven":    is_breakeven,
+        "is_tp1":          is_tp1,
+        "is_tp2":          is_tp2,
+        "is_pending":      False,
+        "skipped":         False,
+        "effective_result": _effective_result,
+        "leverage":        leverage,
+    }
+
+
+def _empty_pnl_result(is_pending: bool = False, skipped: bool = False) -> dict:
+    return {
+        "pnl_pct":         0.0,
+        "pnl_leveraged":   0.0,
+        "is_win":          False,
+        "is_loss":         False,
+        "is_breakeven":    False,
+        "is_tp1":          False,
+        "is_tp2":          False,
+        "is_pending":      is_pending,
+        "skipped":         skipped,
+        "effective_result": "",
+        "leverage":        REPORT_LEVERAGE,
+    }
+
+
+def debug_trade_pnl(trade: dict) -> dict:
+    """
+    تقرير تشخيصي كامل لحساب PnL صفقة واحدة.
+    مفيد للـ debugging والتحقق من صحة الأرقام.
+    """
+    if not isinstance(trade, dict):
+        return {"error": "invalid trade"}
+
+    side            = normalize_side(trade.get("side", "long"))
+    leverage        = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
+    entry           = safe_float(trade.get("entry"), 0.0)
+    effective_entry = get_trade_effective_entry(trade)
+    sl              = safe_float(trade.get("sl"), 0.0)
+    initial_sl      = safe_float(trade.get("initial_sl", sl), 0.0)
+    tp1             = safe_float(trade.get("tp1"), 0.0)
+    tp2             = safe_float(trade.get("tp2"), 0.0)
+    result          = str(trade.get("result", "") or "")
+    status          = str(trade.get("status", "") or "")
+    tp1_hit         = normalize_bool(trade.get("tp1_hit", False))
+    tp2_hit         = normalize_bool(trade.get("tp2_hit", False))
+    trailing_active = normalize_bool(trade.get("trailing_active", False))
+    trailing_high   = safe_float(trade.get("trailing_high"), 0.0)
+    trailing_sl_v   = safe_float(trade.get("trailing_sl"), 0.0)
+    trailing_exit   = safe_float(trade.get("trailing_exit_price"), 0.0)
+
+    pnl_data = calculate_trade_pnl(trade)
+
+    # حساب نسب الأهداف
+    tp1_pct = tp2_pct = trailing_pct_gain = 0.0
+    if effective_entry > 0:
+        if side == "long":
+            tp1_pct           = ((tp1 - effective_entry) / effective_entry * 100) if tp1 > 0 else 0.0
+            tp2_pct           = ((tp2 - effective_entry) / effective_entry * 100) if tp2 > 0 else 0.0
+            trailing_pct_gain = ((trailing_exit - effective_entry) / effective_entry * 100) if trailing_exit > 0 else 0.0
+        else:
+            tp1_pct           = ((effective_entry - tp1) / effective_entry * 100) if tp1 > 0 else 0.0
+            tp2_pct           = ((effective_entry - tp2) / effective_entry * 100) if tp2 > 0 else 0.0
+            trailing_pct_gain = ((effective_entry - trailing_exit) / effective_entry * 100) if trailing_exit > 0 else 0.0
+
+    sl_pct = 0.0
+    _sl_ref = initial_sl if initial_sl > 0 else sl
+    if effective_entry > 0 and _sl_ref > 0:
+        if side == "long":
+            sl_pct = ((_sl_ref - effective_entry) / effective_entry * 100)
+        else:
+            sl_pct = ((effective_entry - _sl_ref) / effective_entry * 100)
+
+    return {
+        "symbol":             trade.get("symbol", "?"),
+        "side":               side,
+        "status":             status,
+        "result":             result,
+        "effective_result":   pnl_data["effective_result"],
+        "entry":              entry,
+        "effective_entry":    effective_entry,
+        "sl":                 sl,
+        "initial_sl":         initial_sl,
+        "sl_pct":             round(sl_pct, 3),
+        "tp1":                tp1,
+        "tp1_pct":            round(tp1_pct, 3),
+        "tp2":                tp2,
+        "tp2_pct":            round(tp2_pct, 3),
+        "tp1_hit":            tp1_hit,
+        "tp2_hit":            tp2_hit,
+        "trailing_active":    trailing_active,
+        "trailing_high":      trailing_high,
+        "trailing_sl":        trailing_sl_v,
+        "trailing_exit_price": trailing_exit,
+        "trailing_pct_gain":  round(trailing_pct_gain, 3),
+        "pnl_raw_pct":        pnl_data["pnl_pct"],
+        "pnl_leveraged_pct":  pnl_data["pnl_leveraged"],
+        "leverage":           leverage,
+        "is_win":             pnl_data["is_win"],
+        "is_loss":            pnl_data["is_loss"],
+        "is_breakeven":       pnl_data["is_breakeven"],
+        "is_tp1":             pnl_data["is_tp1"],
+        "is_tp2":             pnl_data["is_tp2"],
+        "is_pending":         pnl_data["is_pending"],
+        "skipped":            pnl_data["skipped"],
+        "breakdown": {
+            "tp1_40pct":      round(tp1_pct * 0.4, 3) if tp1_hit else 0.0,
+            "tp2_40pct":      round(tp2_pct * 0.4, 3) if tp2_hit else 0.0,
+            "trailing_20pct": round(trailing_pct_gain * 0.2, 3) if trailing_exit > 0 else 0.0,
+            "total_raw":      pnl_data["pnl_pct"],
+        },
+    }
 
 
 # ------------------------------------------------------------
@@ -2196,7 +2505,10 @@ def get_trade_summary(
     trailing_wins = sum(1 for t in closed_trades if t.get("result") == "trailing_win")
 
     for trade in closed_trades:
-        pnl = _compute_weighted_trade_pnl(trade)
+        pnl_data = calculate_trade_pnl(trade)
+        if pnl_data["skipped"] or pnl_data["is_pending"]:
+            continue
+        pnl = pnl_data["pnl_leveraged"]
         all_pnls.append(pnl)
         total_pnl += pnl
         if pnl > 0:
@@ -3044,7 +3356,7 @@ def get_open_trades_summary(
         return []
 
     market_type = normalize_market_type(market_type)
-    side_norm = normalize_side(side)
+    side_norm   = normalize_side(side)
     open_set_key = get_open_trades_set_key(market_type, side_norm)
 
     try:
@@ -3063,25 +3375,40 @@ def get_open_trades_summary(
         if trade.get("status") == "closed":
             continue
 
-        symbol = trade.get("symbol", "")
-        entry = safe_float(trade.get("entry"), 0.0)
+        symbol         = trade.get("symbol", "")
+        entry          = safe_float(trade.get("entry"), 0.0)
         effective_entry = get_trade_effective_entry(trade)
-        sl = safe_float(trade.get("sl"), 0.0)
-        tp1 = safe_float(trade.get("tp1"), 0.0)
-        tp2 = safe_float(trade.get("tp2"), 0.0)
-        initial_sl = safe_float(trade.get("initial_sl", sl), 0.0)
-        score = safe_float(trade.get("score"), 0.0)
-        status = str(trade.get("status", "open"))
-        tp1_hit = normalize_bool(trade.get("tp1_hit", False))
-        tp2_hit = normalize_bool(trade.get("tp2_hit", False))
+        sl             = safe_float(trade.get("sl"), 0.0)
+        initial_sl     = safe_float(trade.get("initial_sl", sl), 0.0)
+        tp1            = safe_float(trade.get("tp1"), 0.0)
+        tp2            = safe_float(trade.get("tp2"), 0.0)
+        score          = safe_float(trade.get("score"), 0.0)
+        status         = str(trade.get("status", "open")).lower()
+        tp1_hit        = normalize_bool(trade.get("tp1_hit", False))
+        tp2_hit        = normalize_bool(trade.get("tp2_hit", False))
+        sl_moved       = normalize_bool(trade.get("sl_moved_to_entry", False))
         trailing_active = normalize_bool(trade.get("trailing_active", False))
-        trailing_high = safe_float(trade.get("trailing_high"), 0.0)
-        trailing_sl = safe_float(trade.get("trailing_sl"), 0.0)
-        created_at = safe_timestamp(trade.get("created_at"), now_ts)
-        timeframe = trade.get("timeframe", "15m")
-        entry_mode = str(trade.get("entry_mode", "market"))
+        trailing_high  = safe_float(trade.get("trailing_high"), 0.0)
+        trailing_sl_v  = safe_float(trade.get("trailing_sl"), 0.0)
+        created_at     = safe_timestamp(trade.get("created_at"), now_ts)
+        timeframe      = trade.get("timeframe", "15m")
+        entry_mode     = str(trade.get("entry_mode", "market"))
 
-        # حساب المدة
+        # ── Phase detection (محسّن) ─────────────────────────────
+        if status in ("tp2_partial", "trailing_open", "trailing"):
+            phase = "trailing"
+        elif trailing_active and tp2_hit:
+            phase = "trailing"
+        elif tp2_hit:
+            phase = "tp2_hit"
+        elif tp1_hit or status == "partial":
+            phase = "tp1_hit"
+        elif status == "pending_pullback":
+            phase = "pending_pullback"
+        else:
+            phase = "open"
+
+        # ── المدة ───────────────────────────────────────────────
         age_seconds = now_ts - created_at
         age_minutes = age_seconds // 60
         if age_minutes < 60:
@@ -3091,17 +3418,49 @@ def get_open_trades_summary(
         else:
             age_str = f"{age_minutes // 1440}ي {(age_minutes % 1440) // 60}س"
 
-        # SL% من effective_entry
+        # ── السعر الحالي من OKX ──────────────────────────────────
+        current_price = 0.0
+        try:
+            raw = fetch_recent_candles(symbol, timeframe="1m", limit=1)
+            if raw:
+                candles = normalize_candles(raw)
+                if candles:
+                    current_price = safe_float(candles[-1]["close"], 0.0)
+        except Exception:
+            pass
+
+        # ── PnL الحالي ───────────────────────────────────────────
+        current_pnl_pct = 0.0
+        current_pnl_leveraged = 0.0
+        pnl_label = "تعادل"
+        pnl_emoji = "🟡"
+        if effective_entry > 0 and current_price > 0:
+            if side_norm == "long":
+                current_pnl_pct = ((current_price - effective_entry) / effective_entry) * 100
+            else:
+                current_pnl_pct = ((effective_entry - current_price) / effective_entry) * 100
+            current_pnl_leveraged = current_pnl_pct * REPORT_LEVERAGE
+            if current_pnl_pct > 0.3:
+                pnl_label = "رابح"
+                pnl_emoji = "🟢"
+            elif current_pnl_pct < -0.3:
+                pnl_label = "خاسر"
+                pnl_emoji = "🔴"
+
+        # ── SL% ──────────────────────────────────────────────────
         sl_pct = 0.0
+        sl_is_entry = False
         if effective_entry > 0 and sl > 0:
             if side_norm == "long":
                 sl_pct = ((sl - effective_entry) / effective_entry) * 100
             else:
                 sl_pct = ((effective_entry - sl) / effective_entry) * 100
+            # لو SL اتنقل لـ entry بعد TP1
+            if sl_moved or abs(sl_pct) < 0.05:
+                sl_is_entry = True
 
-        # TP1% و TP2%
-        tp1_pct = 0.0
-        tp2_pct = 0.0
+        # ── TP1% / TP2% ──────────────────────────────────────────
+        tp1_pct = tp2_pct = 0.0
         if effective_entry > 0:
             if side_norm == "long":
                 tp1_pct = ((tp1 - effective_entry) / effective_entry) * 100 if tp1 > 0 else 0.0
@@ -3110,48 +3469,47 @@ def get_open_trades_summary(
                 tp1_pct = ((effective_entry - tp1) / effective_entry) * 100 if tp1 > 0 else 0.0
                 tp2_pct = ((effective_entry - tp2) / effective_entry) * 100 if tp2 > 0 else 0.0
 
-        # تحديد مرحلة الصفقة
-        if trailing_active and tp2_hit:
-            phase = "trailing"
-        elif tp2_hit:
-            phase = "tp2_hit"
-        elif tp1_hit:
-            phase = "tp1_hit"
-        elif status == "pending_pullback":
-            phase = "pending_pullback"
-        else:
-            phase = "open"
-
-        # TradingView link
-        clean_sym = symbol.replace("-SWAP", "").replace("-", "")
-        tv_link = f"https://www.tradingview.com/chart/?symbol=OKX:{clean_sym}&interval={timeframe.replace('m', '').replace('H', '60').replace('h', '60')}"
+        # ── TradingView link ─────────────────────────────────────
+        clean_sym = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
+        tv_sym    = f"OKX:{clean_sym}.P"
+        tf_map    = {"1m": "1", "3m": "3", "5m": "5", "15m": "15",
+                     "30m": "30", "1H": "60", "4H": "240"}
+        tv_tf     = tf_map.get(timeframe, "15")
+        tv_link   = f"https://www.tradingview.com/chart/?symbol={tv_sym}&interval={tv_tf}"
 
         open_trades.append({
-            "symbol": symbol,
-            "entry": entry,
-            "effective_entry": effective_entry,
-            "sl": sl,
-            "sl_pct": sl_pct,
-            "initial_sl": initial_sl,
-            "tp1": tp1,
-            "tp1_pct": tp1_pct,
-            "tp2": tp2,
-            "tp2_pct": tp2_pct,
-            "score": score,
-            "status": status,
-            "phase": phase,
-            "tp1_hit": tp1_hit,
-            "tp2_hit": tp2_hit,
-            "trailing_active": trailing_active,
-            "trailing_high": trailing_high,
-            "trailing_sl": trailing_sl,
-            "trailing_pct": safe_float(trade.get("trailing_pct"), TRAILING_PCT),
-            "created_at": created_at,
-            "age_str": age_str,
-            "timeframe": timeframe,
-            "entry_mode": entry_mode,
-            "tv_link": tv_link,
-            "setup_type": trade.get("setup_type", ""),
+            "symbol":               symbol,
+            "entry":                entry,
+            "effective_entry":      effective_entry,
+            "sl":                   sl,
+            "sl_pct":               sl_pct,
+            "sl_is_entry":          sl_is_entry,
+            "initial_sl":           initial_sl,
+            "tp1":                  tp1,
+            "tp1_pct":              tp1_pct,
+            "tp2":                  tp2,
+            "tp2_pct":              tp2_pct,
+            "score":                score,
+            "status":               status,
+            "phase":                phase,
+            "tp1_hit":              tp1_hit,
+            "tp2_hit":              tp2_hit,
+            "sl_is_entry":          sl_is_entry,
+            "trailing_active":      trailing_active,
+            "trailing_high":        trailing_high,
+            "trailing_sl":          trailing_sl_v,
+            "trailing_pct":         safe_float(trade.get("trailing_pct"), TRAILING_PCT),
+            "current_price":        current_price,
+            "current_pnl_pct":      round(current_pnl_pct, 2),
+            "current_pnl_leveraged": round(current_pnl_leveraged, 2),
+            "pnl_label":            pnl_label,
+            "pnl_emoji":            pnl_emoji,
+            "created_at":           created_at,
+            "age_str":              age_str,
+            "timeframe":            timeframe,
+            "entry_mode":           entry_mode,
+            "tv_link":              tv_link,
+            "setup_type":           trade.get("setup_type", ""),
         })
 
     open_trades.sort(key=lambda x: x["created_at"], reverse=True)
@@ -3160,15 +3518,17 @@ def get_open_trades_summary(
 
 def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
     """
-    تنسيق رسالة /open_trades بالعربي مع ملخص سريع لكل صفقة.
+    تنسيق رسالة /open_trades بالعربي مع ملخص واضح لكل صفقة.
     """
     if not trades:
         return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
 
-    total = len(trades)
-    trailing_count = sum(1 for t in trades if t.get("phase") == "trailing")
-    tp1_hit_count = sum(1 for t in trades if t.get("tp1_hit") and not t.get("tp2_hit"))
-    pending_count = sum(1 for t in trades if t.get("phase") == "pending_pullback")
+    total           = len(trades)
+    trailing_count  = sum(1 for t in trades if t.get("phase") == "trailing")
+    tp1_hit_count   = sum(1 for t in trades if t.get("phase") == "tp1_hit")
+    pending_count   = sum(1 for t in trades if t.get("phase") == "pending_pullback")
+    winning_count   = sum(1 for t in trades if t.get("current_pnl_pct", 0) > 0.3)
+    losing_count    = sum(1 for t in trades if t.get("current_pnl_pct", 0) < -0.3)
 
     lines = [
         f"📋 <b>الصفقات المفتوحة ({total} صفقة)</b>",
@@ -3176,50 +3536,81 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
     ]
 
     for i, t in enumerate(trades, 1):
-        sym = t["symbol"].replace("-SWAP", "")
-        phase = t["phase"]
-        score = t["score"]
-        age = t["age_str"]
-        sl_pct = t["sl_pct"]
-        tp1_pct = t["tp1_pct"]
-        tp2_pct = t["tp2_pct"]
-        entry = t["effective_entry"]
-        sl = t["sl"]
-        tp1 = t["tp1"]
-        tp2 = t["tp2"]
+        sym             = t["symbol"].replace("-SWAP", "")
+        phase           = t.get("phase", "open")
+        score           = t.get("score", 0.0)
+        age             = t.get("age_str", "")
+        sl_pct          = t.get("sl_pct", 0.0)
+        sl_is_entry     = t.get("sl_is_entry", False)
+        tp1_pct         = t.get("tp1_pct", 0.0)
+        tp2_pct         = t.get("tp2_pct", 0.0)
+        entry           = t.get("effective_entry", t.get("entry", 0.0))
+        sl              = t.get("sl", 0.0)
+        tp1             = t.get("tp1", 0.0)
+        tp2             = t.get("tp2", 0.0)
+        current_price   = t.get("current_price", 0.0)
+        pnl_pct         = t.get("current_pnl_pct", 0.0)
+        pnl_lev         = t.get("current_pnl_leveraged", 0.0)
+        pnl_emoji       = t.get("pnl_emoji", "🟡")
+        pnl_label       = t.get("pnl_label", "تعادل")
+        trailing_high   = t.get("trailing_high", 0.0)
+        trailing_sl_v   = t.get("trailing_sl", 0.0)
 
-        # أيقونة المرحلة
+        # ── أيقونة المرحلة ──────────────────────────────────────
         if phase == "trailing":
-            phase_icon = "🔄 Trailing"
-            phase_detail = f"High: {round_price(t['trailing_high'])} | SL: {round_price(t['trailing_sl'])}"
+            phase_line = "🔄 <b>Trailing شغال</b> (20% متبقي)"
         elif phase == "tp2_hit":
-            phase_icon = "🏁 بعد TP2"
-            phase_detail = ""
+            phase_line = "🏁 بعد TP2"
         elif phase == "tp1_hit":
-            phase_icon = "🎯 بعد TP1"
-            phase_detail = f"SL → Entry"
+            phase_line = "🎯 بعد TP1 | 🔒 SL محمي على Entry"
         elif phase == "pending_pullback":
-            phase_icon = "⏳ انتظار Pullback"
-            phase_detail = f"دخول عند: {round_price(entry)}"
+            phase_line = "⏳ انتظار Pullback"
         else:
-            phase_icon = "🟢 مفتوحة"
-            phase_detail = ""
+            phase_line = "🟢 مفتوحة"
 
-        lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | {age}")
-        lines.append(f"   {phase_icon}" + (f" | {phase_detail}" if phase_detail else ""))
-        lines.append(f"   💰 دخول: {round_price(entry)}")
-        lines.append(f"   🛑 SL: {round_price(sl)} ({sl_pct:+.2f}%)")
+        # ── سطر العملة والأساسيات ───────────────────────────────
+        lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | ⏱ {age}")
+        lines.append(f"   {phase_line}")
 
-        if phase in ("open", "pending_pullback"):
-            lines.append(f"   🎯 TP1: {round_price(tp1)} (+{tp1_pct:.2f}%)")
-            lines.append(f"   🏁 TP2: {round_price(tp2)} (+{tp2_pct:.2f}%)")
+        # ── PnL الحالي ──────────────────────────────────────────
+        if current_price > 0:
+            lines.append(
+                f"   {pnl_emoji} <b>{pnl_label}</b>: {pnl_pct:+.2f}% "
+                f"({pnl_lev:+.1f}% بعد الرافعة)"
+            )
+            lines.append(f"   💵 السعر الحالي: {_fmt_price_perf(current_price)}")
+        
+        # ── أسعار الدخول والـ SL ────────────────────────────────
+        lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
+
+        if sl_is_entry:
+            lines.append(f"   🔒 SL: محمي على Entry ({_fmt_price_perf(sl)})")
+        else:
+            lines.append(f"   🛑 SL: {_fmt_price_perf(sl)} ({sl_pct:+.2f}%)")
+
+        # ── الأهداف حسب المرحلة ─────────────────────────────────
+        if phase == "trailing":
+            if trailing_high > 0 and trailing_sl_v > 0:
+                lines.append(f"   📈 أعلى سعر: {_fmt_price_perf(trailing_high)}")
+                lines.append(f"   🔄 Trailing SL: {_fmt_price_perf(trailing_sl_v)}")
+            else:
+                lines.append(f"   🔄 Trailing | جاري التهيئة...")
+        elif phase in ("open", "pending_pullback"):
+            lines.append(f"   🎯 TP1: {_fmt_price_perf(tp1)} (+{tp1_pct:.2f}%)")
+            lines.append(f"   🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
         elif phase == "tp1_hit":
-            lines.append(f"   🏁 TP2: {round_price(tp2)} (+{tp2_pct:.2f}%)")
+            lines.append(f"   🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
 
+        # ── رابط TradingView ─────────────────────────────────────
         lines.append(f'   📊 <a href="{t["tv_link"]}">TradingView</a>')
 
+    # ── ملخص ─────────────────────────────────────────────────────
     lines.append("\n━━━━━━━━━━━━━━")
     lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة")
+    if winning_count:
+        lines.append(f"🟢 رابحة الآن: {winning_count}")
+    if losing_count:
+        lines.append(f"🔴 خاسرة الآن: {losing_count}")
     if trailing_count:
         lines.append(f"🔄 في مرحلة Trailing: {trailing_count}")
     if tp1_hit_count:
@@ -3228,6 +3619,18 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         lines.append(f"⏳ انتظار Pullback: {pending_count}")
 
     return "\n".join(lines)
+
+
+def _fmt_price_perf(value) -> str:
+    """تنسيق سعر ديناميكي."""
+    v = safe_float(value, 0.0)
+    if v <= 0:
+        return "—"
+    if v >= 100:
+        return f"{v:.4f}"
+    if v >= 1:
+        return f"{v:.6f}"
+    return f"{v:.8f}"
 
 
 # ------------------------------------------------------------
