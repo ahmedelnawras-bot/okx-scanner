@@ -1312,6 +1312,10 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
         elif result == "tp2_win":
             redis_client.hincrby(stats_key, "tp2_wins", 1)
             redis_client.hincrby(stats_key, "wins", 1)
+        elif result == "trailing_win":
+            redis_client.hincrby(stats_key, "trailing_wins", 1)
+            redis_client.hincrby(stats_key, "tp2_wins", 1)
+            redis_client.hincrby(stats_key, "wins", 1)
         elif result == "loss":
             redis_client.hincrby(stats_key, "losses", 1)
         elif result == "expired":
@@ -1475,8 +1479,12 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             # فحص كسر trailing SL
             trailing_sl = safe_float(trade.get("trailing_sl"), 0)
             if trailing_sl > 0 and low <= trailing_sl:
-                result = "tp2_win"   # تم الخروج بالـ trailing
-                tp2_now = False  # تم الإغلاق
+                # حفظ سعر الخروج قبل الإغلاق
+                trade["trailing_exit_price"] = trailing_sl
+                diagnostics = trade.get("diagnostics", {}) or {}
+                diagnostics["trailing_exit_price"] = trailing_sl
+                trade["diagnostics"] = diagnostics
+                result = "trailing_win"
                 return result, False, trade
 
         if not tp1_hit:
@@ -1504,7 +1512,11 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
                 trade["trailing_sl"] = round_price(low * (1 + trailing_pct))
             trailing_sl = safe_float(trade.get("trailing_sl"), 0)
             if trailing_sl > 0 and high >= trailing_sl:
-                result = "tp2_win"
+                trade["trailing_exit_price"] = trailing_sl
+                diagnostics = trade.get("diagnostics", {}) or {}
+                diagnostics["trailing_exit_price"] = trailing_sl
+                trade["diagnostics"] = diagnostics
+                result = "trailing_win"
                 return result, False, trade
 
         if not tp1_hit:
@@ -1957,65 +1969,24 @@ def _is_tp2_hit(trade: dict) -> bool:
 
 def _compute_weighted_trade_pnl(trade: dict) -> float:
     """
-    حساب الربح/الخسارة بعد الرافعة لصفقة مغلقة، مع الأخذ في الاعتبار
-    المخارج الجزئية (tp1_close_pct, tp2_close_pct) والـ trailing.
-    النسب الافتراضية: 40% TP1، 40% TP2، 20% trailing.
+    حساب الربح/الخسارة بعد الرافعة لصفقة مغلقة.
+    يستخدم calc_trade_result_pct من summary_helpers (الإصلاح الجذري).
+    النسب: 40% TP1 / 40% TP2 / 20% trailing.
+    - initial_sl للخسائر (لا يتأثر بحركة SL بعد TP1)
+    - cap الخسارة عند -100%
     """
     side = normalize_side(trade.get("side", "long"))
     leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
-    effective_entry = get_trade_effective_entry(trade)
-    result = trade.get("result", "")
+    result = str(trade.get("result", "") or "").lower()
 
     if not result or result in ("expired", "pending_expired"):
         return 0.0
 
-    tp1_close_pct = safe_float(trade.get("tp1_close_pct", TP1_CLOSE_PCT), TP1_CLOSE_PCT) / 100.0
-    tp2_close_pct = safe_float(trade.get("tp2_close_pct", TP2_CLOSE_PCT), TP2_CLOSE_PCT) / 100.0
-    tp1 = safe_float(trade.get("tp1"), 0.0)
-    tp2 = safe_float(trade.get("tp2"), 0.0)
-    sl = safe_float(trade.get("sl"), 0.0)
+    raw_pct = calc_trade_result_pct(trade)
+    if raw_pct is None:
+        return 0.0
 
-    tp1_hit = normalize_bool(trade.get("tp1_hit", False))
-    tp2_hit = normalize_bool(trade.get("tp2_hit", False))
-    trailing_exit_price = safe_float(trade.get("trailing_sl"), 0.0)  # سعر الخروج في حال trailing
-
-    def long_pct(entry, exit_price):
-        if entry <= 0: return 0.0
-        return ((exit_price - entry) / entry) * 100.0
-    def short_pct(entry, exit_price):
-        if entry <= 0: return 0.0
-        return ((entry - exit_price) / entry) * 100.0
-    calc = long_pct if side == "long" else short_pct
-
-    if result == "tp2_win":
-        # الجزء الأول TP1 (إذا لم يُغلق سابقاً، لكن في tp2_win يعني حقق TP1 ثم TP2 ثم trailing أو SL بعد TP2)
-        # نسب: tp1_close_pct * tp1 + tp2_close_pct * tp2 + المتبقي حسب سعر الخروج (trailing أو sl)
-        remaining_pct = max(0.0, 1.0 - tp1_close_pct - tp2_close_pct)
-        pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
-        pnl_tp2 = calc(effective_entry, tp2) * tp2_close_pct if tp2_hit else 0.0
-        if trailing_exit_price > 0:
-            pnl_rem = calc(effective_entry, trailing_exit_price) * remaining_pct
-        else:
-            pnl_rem = calc(effective_entry, sl) * remaining_pct
-        pnl_raw = pnl_tp1 + pnl_tp2 + pnl_rem
-    elif result == "tp1_win":
-        remaining_pct = max(0.0, 1.0 - tp1_close_pct)
-        pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct if tp1_hit else 0.0
-        # الباقي أغلق عند SL (الذي تم نقله إلى effective_entry)
-        pnl_rem = calc(effective_entry, sl) * remaining_pct
-        pnl_raw = pnl_tp1 + pnl_rem
-    elif result == "loss":
-        pnl_raw = calc(effective_entry, sl)
-    elif result == "breakeven":
-        if tp1_hit:
-            pnl_tp1 = calc(effective_entry, tp1) * tp1_close_pct
-            pnl_raw = pnl_tp1
-        else:
-            pnl_raw = 0.0
-    else:
-        pnl_raw = 0.0
-
-    return pnl_raw * leverage
+    return raw_pct * leverage
 
 
 # ------------------------------------------------------------
@@ -2204,7 +2175,13 @@ def get_trade_summary(
     summary["market_type"] = market_type or "futures"
     summary["side"] = side_norm
 
-    closed_trades = [t for t in filtered_trades if t.get("result") in ("tp1_win", "tp2_win", "loss", "breakeven")]
+    # إعادة حساب PnL عبر _compute_weighted_trade_pnl (يستخدم summary_helpers الآن)
+    closed_trades = [
+        t for t in filtered_trades
+        if str(t.get("result", "")).lower() in (
+            "tp1_win", "tp2_win", "trailing_win", "loss", "breakeven"
+        )
+    ]
     gross_profit = 0.0
     gross_loss = 0.0
     total_pnl = 0.0
@@ -2215,7 +2192,8 @@ def get_trade_summary(
     # حساب TP1/TP2 hits بالشكل الصحيح
     tp1_hits = sum(1 for t in filtered_trades if _is_tp1_hit(t))
     tp2_hits = sum(1 for t in filtered_trades if _is_tp2_hit(t))
-    tp2_wins = sum(1 for t in closed_trades if t.get("result") == "tp2_win")
+    tp2_wins = sum(1 for t in closed_trades if t.get("result") in ("tp2_win", "trailing_win"))
+    trailing_wins = sum(1 for t in closed_trades if t.get("result") == "trailing_win")
 
     for trade in closed_trades:
         pnl = _compute_weighted_trade_pnl(trade)
@@ -2229,8 +2207,9 @@ def get_trade_summary(
             loss_pnls.append(pnl)
 
     summary["realized_leveraged_pnl_pct"] = round(total_pnl, 4)
+    summary["realized_pnl_pct"] = round(total_pnl, 4)
     summary["gross_profit_pct"] = round(gross_profit, 4)
-    summary["gross_loss_pct"] = round(gross_loss, 4)
+    summary["gross_loss_pct"] = round(-gross_loss, 4)
     summary["net_profit_pct"] = round(total_pnl, 4)
     summary["avg_win_pct"] = round(sum(win_pnls) / len(win_pnls), 4) if win_pnls else 0.0
     summary["avg_loss_pct"] = round(sum(loss_pnls) / len(loss_pnls), 4) if loss_pnls else 0.0
@@ -2240,12 +2219,14 @@ def get_trade_summary(
     leverage = SHORT_REPORT_LEVERAGE if side_norm == "short" else REPORT_LEVERAGE
     summary["realized_raw_pnl_pct"] = round(total_pnl / leverage, 4) if leverage else 0.0
 
-    # تعيين القيم الصحيحة للـ hits و rate
+    # hits و rates
     summary["tp1_hits"] = tp1_hits
     summary["tp2_hits"] = tp2_hits
     summary["tp2_wins"] = tp2_wins
+    summary["trailing_wins"] = trailing_wins
 
     signals = safe_int(summary.get("signals", 0))
+    summary["tp1_rate"] = round((tp1_hits / signals) * 100, 2) if signals > 0 else 0.0
     summary["tp2_rate"] = round((tp2_hits / signals) * 100, 2) if signals > 0 else 0.0
     summary["tp1_to_tp2_rate"] = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
 
@@ -2758,6 +2739,7 @@ def format_period_summary(title: str, summary: dict) -> str:
     tp2_hits = safe_int(summary.get("tp2_hits", 0))
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     full_wins = safe_int(summary.get("tp2_wins", 0))
+    trailing_wins = safe_int(summary.get("trailing_wins", 0))
 
     # Full Wins TP2 يجب ألا يقل عن TP2 Hits الفعلية
     if full_wins < tp2_hits:
@@ -2820,6 +2802,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"\n\n🎯 <b>أداء الأهداف:</b>\n"
         f"• TP1 Hits: {tp1_hits} | TP2 Hits: {tp2_hits}\n"
         f"• TP1 Only: {tp1_only} | Full Wins TP2: {full_wins}\n"
+        + (f"• 🔄 Trailing Wins: {trailing_wins}\n" if trailing_wins > 0 else "") +
         f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
         f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%"
     )
@@ -3043,6 +3026,208 @@ def estimate_wallet_pnl(summary: dict, side: str = "long", max_capital_usage_pct
         else 0.0
     )
     return wallet_pnl_pct, wallet_pnl_usd
+
+
+# ------------------------------------------------------------
+# الصفقات المفتوحة - /open_trades command
+# ------------------------------------------------------------
+def get_open_trades_summary(
+    redis_client,
+    market_type: str = "futures",
+    side: str = "long",
+) -> List[dict]:
+    """
+    جلب الصفقات المفتوحة مع بيانات كاملة لعرضها في /open_trades.
+    تُرجع قائمة مرتبة من الأحدث للأقدم.
+    """
+    if redis_client is None:
+        return []
+
+    market_type = normalize_market_type(market_type)
+    side_norm = normalize_side(side)
+    open_set_key = get_open_trades_set_key(market_type, side_norm)
+
+    try:
+        trade_keys = list(redis_client.smembers(open_set_key))
+    except Exception as e:
+        logger.error(f"get_open_trades_summary read error: {e}")
+        return []
+
+    open_trades = []
+    now_ts = int(time.time())
+
+    for trade_key in trade_keys:
+        trade = load_trade(redis_client, trade_key)
+        if not trade:
+            continue
+        if trade.get("status") == "closed":
+            continue
+
+        symbol = trade.get("symbol", "")
+        entry = safe_float(trade.get("entry"), 0.0)
+        effective_entry = get_trade_effective_entry(trade)
+        sl = safe_float(trade.get("sl"), 0.0)
+        tp1 = safe_float(trade.get("tp1"), 0.0)
+        tp2 = safe_float(trade.get("tp2"), 0.0)
+        initial_sl = safe_float(trade.get("initial_sl", sl), 0.0)
+        score = safe_float(trade.get("score"), 0.0)
+        status = str(trade.get("status", "open"))
+        tp1_hit = normalize_bool(trade.get("tp1_hit", False))
+        tp2_hit = normalize_bool(trade.get("tp2_hit", False))
+        trailing_active = normalize_bool(trade.get("trailing_active", False))
+        trailing_high = safe_float(trade.get("trailing_high"), 0.0)
+        trailing_sl = safe_float(trade.get("trailing_sl"), 0.0)
+        created_at = safe_timestamp(trade.get("created_at"), now_ts)
+        timeframe = trade.get("timeframe", "15m")
+        entry_mode = str(trade.get("entry_mode", "market"))
+
+        # حساب المدة
+        age_seconds = now_ts - created_at
+        age_minutes = age_seconds // 60
+        if age_minutes < 60:
+            age_str = f"{age_minutes}د"
+        elif age_minutes < 1440:
+            age_str = f"{age_minutes // 60}س {age_minutes % 60}د"
+        else:
+            age_str = f"{age_minutes // 1440}ي {(age_minutes % 1440) // 60}س"
+
+        # SL% من effective_entry
+        sl_pct = 0.0
+        if effective_entry > 0 and sl > 0:
+            if side_norm == "long":
+                sl_pct = ((sl - effective_entry) / effective_entry) * 100
+            else:
+                sl_pct = ((effective_entry - sl) / effective_entry) * 100
+
+        # TP1% و TP2%
+        tp1_pct = 0.0
+        tp2_pct = 0.0
+        if effective_entry > 0:
+            if side_norm == "long":
+                tp1_pct = ((tp1 - effective_entry) / effective_entry) * 100 if tp1 > 0 else 0.0
+                tp2_pct = ((tp2 - effective_entry) / effective_entry) * 100 if tp2 > 0 else 0.0
+            else:
+                tp1_pct = ((effective_entry - tp1) / effective_entry) * 100 if tp1 > 0 else 0.0
+                tp2_pct = ((effective_entry - tp2) / effective_entry) * 100 if tp2 > 0 else 0.0
+
+        # تحديد مرحلة الصفقة
+        if trailing_active and tp2_hit:
+            phase = "trailing"
+        elif tp2_hit:
+            phase = "tp2_hit"
+        elif tp1_hit:
+            phase = "tp1_hit"
+        elif status == "pending_pullback":
+            phase = "pending_pullback"
+        else:
+            phase = "open"
+
+        # TradingView link
+        clean_sym = symbol.replace("-SWAP", "").replace("-", "")
+        tv_link = f"https://www.tradingview.com/chart/?symbol=OKX:{clean_sym}&interval={timeframe.replace('m', '').replace('H', '60').replace('h', '60')}"
+
+        open_trades.append({
+            "symbol": symbol,
+            "entry": entry,
+            "effective_entry": effective_entry,
+            "sl": sl,
+            "sl_pct": sl_pct,
+            "initial_sl": initial_sl,
+            "tp1": tp1,
+            "tp1_pct": tp1_pct,
+            "tp2": tp2,
+            "tp2_pct": tp2_pct,
+            "score": score,
+            "status": status,
+            "phase": phase,
+            "tp1_hit": tp1_hit,
+            "tp2_hit": tp2_hit,
+            "trailing_active": trailing_active,
+            "trailing_high": trailing_high,
+            "trailing_sl": trailing_sl,
+            "trailing_pct": safe_float(trade.get("trailing_pct"), TRAILING_PCT),
+            "created_at": created_at,
+            "age_str": age_str,
+            "timeframe": timeframe,
+            "entry_mode": entry_mode,
+            "tv_link": tv_link,
+            "setup_type": trade.get("setup_type", ""),
+        })
+
+    open_trades.sort(key=lambda x: x["created_at"], reverse=True)
+    return open_trades
+
+
+def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
+    """
+    تنسيق رسالة /open_trades بالعربي مع ملخص سريع لكل صفقة.
+    """
+    if not trades:
+        return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
+
+    total = len(trades)
+    trailing_count = sum(1 for t in trades if t.get("phase") == "trailing")
+    tp1_hit_count = sum(1 for t in trades if t.get("tp1_hit") and not t.get("tp2_hit"))
+    pending_count = sum(1 for t in trades if t.get("phase") == "pending_pullback")
+
+    lines = [
+        f"📋 <b>الصفقات المفتوحة ({total} صفقة)</b>",
+        "━━━━━━━━━━━━━━",
+    ]
+
+    for i, t in enumerate(trades, 1):
+        sym = t["symbol"].replace("-SWAP", "")
+        phase = t["phase"]
+        score = t["score"]
+        age = t["age_str"]
+        sl_pct = t["sl_pct"]
+        tp1_pct = t["tp1_pct"]
+        tp2_pct = t["tp2_pct"]
+        entry = t["effective_entry"]
+        sl = t["sl"]
+        tp1 = t["tp1"]
+        tp2 = t["tp2"]
+
+        # أيقونة المرحلة
+        if phase == "trailing":
+            phase_icon = "🔄 Trailing"
+            phase_detail = f"High: {round_price(t['trailing_high'])} | SL: {round_price(t['trailing_sl'])}"
+        elif phase == "tp2_hit":
+            phase_icon = "🏁 بعد TP2"
+            phase_detail = ""
+        elif phase == "tp1_hit":
+            phase_icon = "🎯 بعد TP1"
+            phase_detail = f"SL → Entry"
+        elif phase == "pending_pullback":
+            phase_icon = "⏳ انتظار Pullback"
+            phase_detail = f"دخول عند: {round_price(entry)}"
+        else:
+            phase_icon = "🟢 مفتوحة"
+            phase_detail = ""
+
+        lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | {age}")
+        lines.append(f"   {phase_icon}" + (f" | {phase_detail}" if phase_detail else ""))
+        lines.append(f"   💰 دخول: {round_price(entry)}")
+        lines.append(f"   🛑 SL: {round_price(sl)} ({sl_pct:+.2f}%)")
+
+        if phase in ("open", "pending_pullback"):
+            lines.append(f"   🎯 TP1: {round_price(tp1)} (+{tp1_pct:.2f}%)")
+            lines.append(f"   🏁 TP2: {round_price(tp2)} (+{tp2_pct:.2f}%)")
+        elif phase == "tp1_hit":
+            lines.append(f"   🏁 TP2: {round_price(tp2)} (+{tp2_pct:.2f}%)")
+
+        lines.append(f"   📊 <a href='{t['tv_link']}'>TradingView</a>")
+
+    lines.append("\n━━━━━━━━━━━━━━")
+    lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة", )
+    if trailing_count:
+        lines.append(f"🔄 في مرحلة Trailing: {trailing_count}")
+    if tp1_hit_count:
+        lines.append(f"🎯 بعد TP1: {tp1_hit_count}")
+    if pending_count:
+        lines.append(f"⏳ انتظار Pullback: {pending_count}")
+
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------
