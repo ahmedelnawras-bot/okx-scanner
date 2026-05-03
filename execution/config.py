@@ -14,7 +14,6 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 MIN_EXECUTION_SCORE = float(os.getenv("MIN_EXECUTION_SCORE", "7.0"))
 
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").strip()
-
 REQUEST_TIMEOUT = 15
 
 SAFE_MODES = {"scanner", "paper", "demo", "live_small"}
@@ -32,3 +31,15 @@ MOVE_SL_TO_ENTRY_AFTER_TP1 = os.getenv(
     "MOVE_SL_TO_ENTRY_AFTER_TP1",
     "true"
 ).strip().lower() == "true"
+
+
+# Market Block Protection
+MODE_BLOCK_LONGS = "BLOCK_LONGS"
+
+PROTECT_ON_BLOCK_MIN_PROFIT_PCT = float(
+    os.getenv("PROTECT_ON_BLOCK_MIN_PROFIT_PCT", "0.15")
+)
+
+PROTECT_ON_BLOCK_BUFFER_PCT = float(
+    os.getenv("PROTECT_ON_BLOCK_BUFFER_PCT", "0.10")
+)
