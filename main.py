@@ -1663,99 +1663,15 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    for field in [
-        "realized_leveraged_pnl_pct",
-        "leveraged_pnl_pct",
-        "pnl_pct",
-        "result_pct",
-        "realized_pnl_pct",
-        "raw_pnl_pct",
-    ]:
-        val = trade.get(field)
-        if val is not None:
-            try:
-                f = float(val)
-                if f != f:
-                    continue
-                return f
-            except Exception:
-                continue
-
-    entry = _safe_float(trade.get("entry"), None)
-    if entry is None or entry <= 0:
+    """
+    حساب PnL لصفقة — single source of truth عبر calc_trade_result_pct.
+    يستخدم effective_entry + initial_sl + نسب 40/40/20.
+    """
+    from tracking.summary_helpers import calc_trade_result_pct
+    raw = calc_trade_result_pct(trade)
+    if raw is None:
         return 0.0
-
-    result = str(trade.get("result", "") or "").lower()
-    status = str(trade.get("status", "") or "").lower()
-
-    tp1 = _safe_float(trade.get("tp1"), 0.0)
-    tp2 = _safe_float(trade.get("tp2"), 0.0)
-    sl = _safe_float(trade.get("sl"), 0.0)
-
-    tp1_hit = bool(trade.get("tp1_hit", False))
-    protected_breakeven_exit = bool(trade.get("protected_breakeven_exit", False))
-
-    tp1_close_pct = _safe_float(trade.get("tp1_close_pct"), TP1_CLOSE_PCT)
-    tp2_close_pct = _safe_float(trade.get("tp2_close_pct"), TP2_CLOSE_PCT)
-
-    tp1_weight = max(0.0, min(100.0, tp1_close_pct)) / 100.0
-    tp2_weight = max(0.0, min(100.0, tp2_close_pct)) / 100.0
-
-    if result == "loss":
-        if sl > 0:
-            return round(((sl - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
-        return 0.0
-
-    if result == "tp2_win":
-        pnl = 0.0
-        if tp1 > 0:
-            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
-            pnl += tp1_pnl * tp1_weight
-        if tp2 > 0:
-            tp2_pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
-            pnl += tp2_pnl * tp2_weight
-        if pnl == 0.0 and tp2 > 0:
-            pnl = ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE
-        return round(pnl, 4)
-
-    if result == "trailing_win":
-        # TP1 (40%) + TP2 (40%) + trailing exit price (20%)
-        trailing_exit = _safe_float(trade.get("trailing_exit_price"), 0.0)
-        trailing_pct_alloc = _safe_float(trade.get("trailing_position_pct"), TRAILING_POSITION_PCT) / 100.0
-        pnl = 0.0
-        if tp1 > 0:
-            pnl += ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE * tp1_weight
-        if tp2 > 0:
-            pnl += ((tp2 - entry) / entry) * 100 * TRACK_LEVERAGE * tp2_weight
-        if trailing_exit > 0:
-            pnl += ((trailing_exit - entry) / entry) * 100 * TRACK_LEVERAGE * trailing_pct_alloc
-        return round(pnl, 4)
-
-    if result == "tp1_win":
-        if tp1 > 0:
-            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
-            return round(tp1_pnl * tp1_weight, 4)
-        return 0.0
-
-    if protected_breakeven_exit or "breakeven" in result:
-        if tp1_hit and tp1 > 0:
-            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
-            return round(tp1_pnl * tp1_weight, 4)
-        return 0.0
-
-    if status == "partial" or tp1_hit:
-        if tp1 > 0:
-            tp1_pnl = ((tp1 - entry) / entry) * 100 * TRACK_LEVERAGE
-            return round(tp1_pnl * tp1_weight, 4)
-        return 0.0
-
-    if result == "expired":
-        last_price = _safe_float(trade.get("last_price"), 0.0)
-        if last_price > 0:
-            return round(((last_price - entry) / entry) * 100 * TRACK_LEVERAGE, 4)
-        return 0.0
-
-    return 0.0
+    return round(raw * TRACK_LEVERAGE, 4)
 
 
 def _is_trade_win_bucket(bucket: str) -> bool:
