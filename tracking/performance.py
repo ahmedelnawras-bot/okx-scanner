@@ -3216,10 +3216,10 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         elif phase == "tp1_hit":
             lines.append(f"   🏁 TP2: {round_price(tp2)} (+{tp2_pct:.2f}%)")
 
-        lines.append(f"   📊 <a href='{t['tv_link']}'>TradingView</a>")
+        lines.append(f'   📊 <a href="{t["tv_link"]}">TradingView</a>')
 
     lines.append("\n━━━━━━━━━━━━━━")
-    lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة", )
+    lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة")
     if trailing_count:
         lines.append(f"🔄 في مرحلة Trailing: {trailing_count}")
     if tp1_hit_count:
