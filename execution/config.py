@@ -21,3 +21,14 @@ SAFE_MODES = {"scanner", "paper", "demo", "live_small"}
 
 if TRADING_MODE not in SAFE_MODES:
     TRADING_MODE = "scanner"
+
+
+# Partial Take Profit Management
+TP1_CLOSE_PCT = float(os.getenv("TP1_CLOSE_PCT", "40"))
+TP2_CLOSE_PCT = float(os.getenv("TP2_CLOSE_PCT", "40"))
+TRAILING_POSITION_PCT = float(os.getenv("TRAILING_POSITION_PCT", "20"))
+TRAILING_PCT = float(os.getenv("TRAILING_PCT", "2.5"))
+MOVE_SL_TO_ENTRY_AFTER_TP1 = os.getenv(
+    "MOVE_SL_TO_ENTRY_AFTER_TP1",
+    "true"
+).strip().lower() == "true"
