@@ -183,6 +183,51 @@ def _get_close_pcts(trade: dict) -> tuple:
     return tp1_pct, tp2_pct, trail_pct
 
 
+def is_valid_trade_for_pnl(trade: dict) -> bool:
+    """
+    يتحقق من صلاحية الصفقة للدخول في حساب PnL.
+    يرجع False لو أي سعر أساسي = 0 أو None أو الصفقة pending غير مفعّلة.
+    """
+    if not isinstance(trade, dict):
+        return False
+
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+
+    # pending_pullback غير مفعّلة → لا تدخل في PnL
+    if status == "pending_pullback":
+        return False
+    if result == "pending_expired":
+        return False
+    if result == "unknown" or (not result and status in ("open", "partial", "trailing_open", "tp2_partial")):
+        return False
+
+    effective_entry = safe_float(
+        trade.get("effective_entry") or
+        (trade.get("diagnostics") or {}).get("effective_entry") or
+        trade.get("entry"),
+        0.0
+    )
+    if effective_entry <= 0:
+        return False
+
+    # فحص حسب نوع النتيجة
+    if result == "loss":
+        initial_sl = safe_float(trade.get("initial_sl", trade.get("sl")), 0.0)
+        if initial_sl <= 0:
+            return False
+
+    if result in ("tp1_win",):
+        if safe_float(trade.get("tp1"), 0.0) <= 0:
+            return False
+
+    if result in ("tp2_win", "trailing_win"):
+        if safe_float(trade.get("tp2"), 0.0) <= 0:
+            return False
+
+    return True
+
+
 def calc_trade_result_pct(trade: dict) -> Optional[float]:
     """
     النسبة المئوية الخام لنتيجة الصفقة بدون رافعة.
