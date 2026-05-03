@@ -2327,6 +2327,30 @@ def handle_hard_reset(chat_id: str):
         send_telegram_reply(chat_id, f"❌ Hard reset failed: {html.escape(str(e))}")
 
 
+def _send_open_trades(chat_id: str):
+ """إرسال /open_trades مع تقسيم الرسالة لو > 4096 حرف"""
+ try:
+    msg = build_open_trades_message()
+    if len(msg) <= 4000:
+        send_telegram_reply(chat_id, msg)
+        return
+    # تقسيم على الصفقات (كل صفقة تبدأ بـ \n1️⃣ أو \n2️⃣ إلخ)
+    import re
+    parts = re.split(r'(?=\n\d️⃣)', msg)
+    chunk = parts[0]
+    for part in parts[1:]:
+        if len(chunk) + len(part) <= 4000:
+            chunk += part
+        else:
+            send_telegram_reply(chat_id, chunk)
+            chunk = part
+    if chunk:
+        send_telegram_reply(chat_id, chunk)
+ except Exception as e:
+    logger.error(f"_send_open_trades error: {e}", exc_info=True)
+    send_telegram_reply(chat_id, f"❌ خطأ في جلب الصفقات: {html.escape(str(e))}")
+
+
 def build_open_trades_message() -> str:
  """بناء رسالة الصفقات المفتوحة لأمر /open_trades"""
  try:
@@ -2335,8 +2359,8 @@ def build_open_trades_message() -> str:
     trades = get_open_trades_summary(r, market_type="futures", side="long")
     return format_open_trades_message(trades, side="long")
  except Exception as e:
-    logger.error(f"build_open_trades_message error: {e}")
-    return f"❌ خطأ في جلب الصفقات المفتوحة: {e}"
+    logger.error(f"build_open_trades_message error: {e}", exc_info=True)
+    return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
 
 
 COMMAND_HANDLERS = {
@@ -2344,7 +2368,7 @@ COMMAND_HANDLERS = {
  "/mood": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
- "/open_trades": lambda chat_id: send_telegram_reply(chat_id, build_open_trades_message()),
+ "/open_trades": lambda chat_id: _send_open_trades(chat_id),
  "/market_status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market_mode": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
@@ -2587,21 +2611,29 @@ def get_alert_status(alert: dict) -> str:
     return "🔴 خطأ"
 
 def get_track_state_badge(status: str, current_move: float) -> str:
- if "Pending Pullback" in status:
-    return "⏳ Pending"
+ if "Pending Pullback" in status or "انتظار Pullback" in status:
+    return "⏳ Pending Pullback"
+ if "Trailing Win" in status or "trailing_win" in status.lower():
+    return "🔄 Trailing Win ✅"
+ if "Trailing شغال" in status or "trailing_open" in status.lower():
+    return "🔄 Trailing شغال"
  if "TP2" in status:
-    return "🎯 TP2 Hit"
+    return "🏁 TP2 Hit"
+ if "TP1" in status and "مغلقة" in status:
+    return "✅ TP1 فقط"
  if "TP1" in status:
     return "✅ TP1 Hit"
- if "SL" in status:
+ if "SL" in status and "مغلقة" in status:
     return "❌ SL Hit"
+ if "Breakeven" in status or "breakeven" in status.lower():
+    return "🔒 Breakeven"
+ if "Expired" in status or "expired" in status.lower():
+    return "⏳ Expired"
  if current_move > 0.30:
     return "🟢 ربح"
  if current_move < -0.30:
     return "🔴 خسارة"
- if -0.30 <= current_move <= 0.30:
-    return "🟡 تعادل"
- return "⚪ غير محدد"
+ return "🟡 تعادل"
 
 def build_track_tradingview_link(symbol: str) -> str:
  base = symbol.replace("-USDT-SWAP", "").replace("-SWAP", "").replace("-", "")
@@ -2638,16 +2670,31 @@ def format_official_trade_status(trade: dict) -> str:
     status = str(trade.get("status", "") or "").lower()
     result = str(trade.get("result", "") or "").lower()
     tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    trailing_active = bool(trade.get("trailing_active", False))
+
+    if status == "pending_pullback":
+        return "⏳ انتظار Pullback"
+    if status in ("tp2_partial", "trailing_open", "trailing") or (tp2_hit and trailing_active):
+        return "🔄 Trailing شغال (20% متبقي)"
     if status == "partial":
-        return "✅ TP1 Hit / الصفقة جزئية"
-    if result == "tp1_win":
-        return "✅ TP1 ثم رجوع Entry"
+        return "✅ TP1 Hit / الصفقة جزئية (40% مغلق)"
+    if result == "trailing_win":
+        return "🔄 Trailing Win ✅ (TP1+TP2+Trailing)"
     if result == "tp2_win":
-        return "🎯 TP2 Hit"
+        return "🏁 TP2 Hit ✅ (TP1+TP2+Trailing)"
+    if result == "tp1_win":
+        return "✅ TP1 فقط (40%) | الباقي Breakeven"
     if result == "loss":
         return "❌ SL Hit"
+    if result == "breakeven":
+        return "🔒 Breakeven (TP1 ثم Entry)"
     if result == "expired":
+        if tp1_hit:
+            return "⏳ Expired بعد TP1"
         return "⏳ Expired"
+    if result == "pending_expired":
+        return "⚫ Pullback لم يتفعل"
     if status == "open":
         return "⏳ Open"
     if tp1_hit:
@@ -2656,6 +2703,18 @@ def format_official_trade_status(trade: dict) -> str:
  except Exception:
     return ""
 
+def _fmt_price(value) -> str:
+    """تنسيق سعر بعدد منازل ديناميكي."""
+    v = _safe_float(value, 0.0)
+    if v <= 0:
+        return "—"
+    if v >= 100:
+        return f"{v:.4f}"
+    if v >= 1:
+        return f"{v:.6f}"
+    return f"{v:.8f}"
+
+
 # =========================
 # NEW HELPER: format_trade_status_line
 # =========================
@@ -2663,37 +2722,66 @@ def format_trade_status_line(trade: dict) -> str:
     """إرجاع سطر واحد يمثل حالة الصفقة بشكل واضح للاستخدام في Track."""
     if not trade:
         return "📌 حالة الصفقة: ⚪ غير معروفة"
+
     status = str(trade.get("status", "") or "").lower()
     result = str(trade.get("result", "") or "").lower()
     tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    trailing_active = bool(trade.get("trailing_active", False))
     sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
+    trailing_high = _safe_float(trade.get("trailing_high"), 0.0)
+    trailing_sl  = _safe_float(trade.get("trailing_sl"), 0.0)
 
+    # ── مفتوحة / معلّقة ─────────────────────────────────────────
     if status == "pending_pullback":
         return "📌 حالة الصفقة: ⏳ معلّقة | انتظار Pullback"
-    elif status == "open":
+
+    if status == "open":
         return "📌 حالة الصفقة: 🟢 مفتوحة"
-    elif status == "partial":
-        line = "📌 حالة الصفقة: 🟡 جزئية | ✅ TP1"
+
+    # ── جزئية بعد TP1 ────────────────────────────────────────────
+    if status == "partial":
+        line = "📌 حالة الصفقة: 🟡 جزئية | ✅ TP1 (40% مغلق)"
         if sl_moved_to_entry:
-            line += " | 🔒 SL Entry"
+            line += " | 🔒 SL → Entry"
         return line
-    elif status == "closed":
+
+    # ── trailing شغال بعد TP2 (20% متبقي) ───────────────────────
+    if status in ("tp2_partial", "trailing_open", "trailing") or (tp2_hit and trailing_active):
+        line = "📌 حالة الصفقة: 🔵 جزئية | 🏁 TP2 (40% مغلق) | 🔄 Trailing شغال (20%)"
+        if trailing_high > 0:
+            line += f"\n   📈 أعلى سعر: {_fmt_price(trailing_high)}"
+        if trailing_sl > 0:
+            line += f" | 🛑 Trailing SL: {_fmt_price(trailing_sl)}"
+        return line
+
+    # ── مغلقة ────────────────────────────────────────────────────
+    if status == "closed":
+        if result == "trailing_win":
+            t_exit = _safe_float(trade.get("trailing_exit_price"), 0.0)
+            line = "📌 حالة الصفقة: 🟢 مغلقة | 🔄 Trailing Win (TP1+TP2+Trailing)"
+            if t_exit > 0:
+                line += f" | خروج: {_fmt_price(t_exit)}"
+            return line
         if result == "tp2_win":
-            return "📌 حالة الصفقة: 🔵 مغلقة | 🎯 TP2"
-        elif result == "tp1_win":
-            return "📌 حالة الصفقة: 🟢 مغلقة | ✅ TP1"
-        elif result == "loss":
+            return "📌 حالة الصفقة: 🟢 مغلقة | 🏁 TP2 (TP1+TP2+Trailing)"
+        if result == "tp1_win":
+            if bool(trade.get("protected_breakeven_exit", False)):
+                return "📌 حالة الصفقة: 🟢 مغلقة | ✅ TP1 | الباقي Breakeven على Entry"
+            return "📌 حالة الصفقة: 🟢 مغلقة | ✅ TP1 فقط (40%)"
+        if result == "loss":
             return "📌 حالة الصفقة: 🔴 مغلقة | ❌ SL"
-        elif result == "breakeven":
-            return "📌 حالة الصفقة: ⚪ مغلقة | 🔒 Breakeven"
-        elif result == "expired":
+        if result == "breakeven":
+            return "📌 حالة الصفقة: ⚪ مغلقة | 🔒 Breakeven (TP1 ثم Entry)"
+        if result == "expired":
+            if tp1_hit:
+                return "📌 حالة الصفقة: ⚪ مغلقة | ⏳ Expired بعد TP1"
             return "📌 حالة الصفقة: ⚫ مغلقة | ⏳ Expired"
-        elif result == "pending_expired":
+        if result == "pending_expired":
             return "📌 حالة الصفقة: ⚫ مغلقة | Pullback لم يتفعل"
-        else:
-            return "📌 حالة الصفقة: ⚫ مغلقة"
-    else:
-        return "📌 حالة الصفقة: ⚪ غير معروفة"
+        return "📌 حالة الصفقة: ⚫ مغلقة"
+
+    return "📌 حالة الصفقة: ⚪ غير معروفة"
 
 def build_track_message(alert: dict) -> str:
  try:
@@ -2790,8 +2878,9 @@ def build_track_message(alert: dict) -> str:
         msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
     msg += (
         f"🛑 SL: {sl:.6f}\n"
-        f"🎯 TP1: {tp1:.6f} | إغلاق 50%\n"
-        f"🏁 TP2: {tp2:.6f} | إغلاق 50%\n"
+        f"🎯 TP1: {tp1:.6f} | إغلاق 40%\n"
+        f"🏁 TP2: {tp2:.6f} | إغلاق 40%\n"
+        f"🔄 بعد TP2: Trailing Stop 20% ({TRAILING_PCT}% تحت الـ High)\n"
         f"🛡 بعد TP1: نقل SL إلى Entry\n\n"
         f"{state_badge}\n"
         f"📊 {html.escape(display_status)}"
@@ -2800,6 +2889,23 @@ def build_track_message(alert: dict) -> str:
         msg += "\n🏛️ <b>حالة رسمية</b> (مستندة إلى سجل الصفقة)"
     else:
         msg += "\n⚠️ <b>حالة تقديرية</b> لعدم توفر صفقة مسجلة"
+
+    # ── trailing block لو الصفقة في مرحلة trailing ─────────────
+    if trade:
+        trailing_active = bool(trade.get("trailing_active", False))
+        tp2_hit_flag = bool(trade.get("tp2_hit", False))
+        t_high = _safe_float(trade.get("trailing_high"), 0.0)
+        t_sl   = _safe_float(trade.get("trailing_sl"), 0.0)
+        t_pct  = _safe_float(trade.get("trailing_pct"), TRAILING_PCT)
+        if trailing_active and tp2_hit_flag:
+            gain_from_entry = 0.0
+            if effective_entry > 0 and t_high > 0:
+                gain_from_entry = ((t_high - effective_entry) / effective_entry) * 100
+            msg += (
+                f"\n\n🔄 <b>Trailing Stop شغال (20%)</b>\n"
+                f"• أعلى سعر وصله: {_fmt_price(t_high)} (+{gain_from_entry:.2f}%)\n"
+                f"• Trailing SL الحالي: {_fmt_price(t_sl)} ({t_pct:.1f}% تحت الـ High)"
+            )
     msg += (
         f"\n💵 السعر الحالي: {current_price:.6f}\n"
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
