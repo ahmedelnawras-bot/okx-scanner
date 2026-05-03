@@ -28,6 +28,8 @@ from tracking.performance import (
  get_trade_summary, 
  format_period_summary, 
  get_setup_type_stats, 
+ get_open_trades_summary, 
+ format_open_trades_message, 
 ) 
 from analysis.rejection_tracking import (
     log_rejected_candidate,
@@ -1256,6 +1258,7 @@ def build_help_message() -> str:
 <b>⚡ أوامر سريعة:</b>
 /mood - حالة السوق والمود الحالي
 /status - نفس أمر /mood
+/open_trades - الصفقات المفتوحة وملخص سريع
 /report_1h - تقرير آخر ساعة
 /report_today - تقرير اليوم
 /report_7d - تقرير آخر 7 أيام
@@ -2323,11 +2326,25 @@ def handle_hard_reset(chat_id: str):
         logger.error(f"Hard reset error: {e}")
         send_telegram_reply(chat_id, f"❌ Hard reset failed: {html.escape(str(e))}")
 
+
+def build_open_trades_message() -> str:
+ """بناء رسالة الصفقات المفتوحة لأمر /open_trades"""
+ try:
+    if not r:
+        return "❌ لا يوجد اتصال بقاعدة البيانات"
+    trades = get_open_trades_summary(r, market_type="futures", side="long")
+    return format_open_trades_message(trades, side="long")
+ except Exception as e:
+    logger.error(f"build_open_trades_message error: {e}")
+    return f"❌ خطأ في جلب الصفقات المفتوحة: {e}"
+
+
 COMMAND_HANDLERS = {
  "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
  "/mood": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
+ "/open_trades": lambda chat_id: send_telegram_reply(chat_id, build_open_trades_message()),
  "/market_status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market_mode": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
@@ -4238,11 +4255,11 @@ def calculate_stop_loss(price, atr_value, signal_type="standard"):
  multiplier = multipliers.get(signal_type, 2.8)
  try:
     sl = round(float(price) - (float(atr_value) * multiplier), 6)
-    min_sl = round(float(price) * 0.990, 6)
-    max_sl = round(float(price) * 0.960, 6)
+    min_sl = round(float(price) * 0.985, 6)   # -1.5% min (كان 0.990 = -1%)
+    max_sl = round(float(price) * 0.965, 6)   # -3.5% max (كان 0.960 = -4%)
     return max(max_sl, min(min_sl, sl))
  except Exception:
-    return round(float(price) * 0.975, 6)
+    return round(float(price) * 0.978, 6)
 
 def calculate_sl_percent(entry, sl):
  try:
@@ -5090,8 +5107,8 @@ SMART_TP1_ROUND_LEVELS_ENABLED = True
 SMART_SL_ENABLED = True
 SMART_SL_SUPPORT_LOOKBACK = 50
 SMART_SL_ATR_BUFFER = 0.35
-SMART_SL_MIN_PCT = 0.80
-SMART_SL_MAX_PCT = 5.00
+SMART_SL_MIN_PCT = 1.50   # كان 0.80 → breathing room للـ SL
+SMART_SL_MAX_PCT = 3.50   # كان 5.00 → منع SL بعيد جداً
 SMART_SL_FALLBACK_ATR_MULT = 2.8
 
 def get_rr_targets_long(signal_type="standard", entry_timing=""):
