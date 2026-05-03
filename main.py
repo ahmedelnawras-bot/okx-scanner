@@ -36,6 +36,23 @@ from analysis.rejection_tracking import (
     build_rejections_report_message,
 )
 
+# Execution folder integration (safe preview only)
+try:
+    from execution.executor import process_trade_candidate
+    from execution.telegram_commands import (
+        build_exec_status_message,
+        build_exec_mode_message,
+    )
+    EXECUTION_AVAILABLE = True
+except ImportError:
+    EXECUTION_AVAILABLE = False
+    def process_trade_candidate(*args, **kwargs):
+        return {"status": "unavailable", "reason": "execution_module_not_found"}
+    def build_exec_status_message(*args, **kwargs):
+        return "⚠️ وحدة التنفيذ غير متاحة"
+    def build_exec_mode_message(*args, **kwargs):
+        return "⚠️ وحدة التنفيذ غير متاحة"
+
 # محاولة استيراد دالة تقدير تأثير المحفظة 
 try: 
  from tracking.performance import estimate_wallet_pnl 
@@ -163,6 +180,9 @@ MARKET_STATUS_SNAPSHOT_TTL = 180
 ALERT_KEY_PREFIX = "alert:long"
 ALERT_BY_MESSAGE_KEY_PREFIX = "alertmsg:long"
 ALERT_TTL_SECONDS = 14 * 24 * 3600
+
+# Execution control
+EXECUTION_PAUSE_KEY = "execution:paused:long"
 
 # Track leverage display
 TRACK_LEVERAGE = 15.0
@@ -1265,6 +1285,12 @@ def build_help_message() -> str:
 /report_30d - تقرير آخر 30 يوم
 /report_all - كل الصفقات
 
+<b>⚙️ التنفيذ:</b>
+/exec_status - اختبار اتصال OKX API
+/exec_mode - عرض وضع التنفيذ الحالي
+/stop_trading - إيقاف الدخول في صفقات جديدة فقط
+/resume_trading - إعادة السماح بالدخول في صفقات جديدة
+
 <b>📊 تحليل الأداء:</b>
 /report_deep - تحليل متقدم شامل
 /report_exits - جودة الخروج TP1/TP2/SL
@@ -2243,6 +2269,47 @@ def handle_hard_reset(chat_id: str):
         send_telegram_reply(chat_id, f"❌ Hard reset failed: {html.escape(str(e))}")
 
 
+def is_execution_paused() -> bool:
+    """يتحقق إذا كان الدخول في صفقات جديدة موقوفاً."""
+    if not r:
+        return False
+    try:
+        return bool(r.exists(EXECUTION_PAUSE_KEY))
+    except Exception:
+        return False
+
+
+def build_exec_pause_message() -> str:
+    if not r:
+        return "⚠️ Redis غير متصل، لا يمكن إيقاف التداول الآن."
+    try:
+        r.set(EXECUTION_PAUSE_KEY, "1")
+        return (
+            "⛔ <b>تم إيقاف الدخول في صفقات جديدة</b>\n\n"
+            "📌 الصفقات المفتوحة ستظل كما هي.\n"
+            "📌 لن يتم فتح صفقات جديدة حتى إعادة التشغيل.\n"
+            "✅ هذا لا يغلق أي مركز مفتوح."
+        )
+    except Exception as e:
+        logger.exception(f"build_exec_pause_message error: {e}")
+        return f"❌ فشل إيقاف التداول\nالسبب: {html.escape(str(e))}"
+
+
+def build_exec_resume_message() -> str:
+    if not r:
+        return "⚠️ Redis غير متصل، لا يمكن إعادة التداول الآن."
+    try:
+        r.delete(EXECUTION_PAUSE_KEY)
+        return (
+            "✅ <b>تمت إعادة تفعيل الدخول في صفقات جديدة</b>\n\n"
+            "📌 البوت يستطيع الآن قبول فرص جديدة حسب شروط التنفيذ.\n"
+            "📌 هذا لا يغير حالة الصفقات المفتوحة."
+        )
+    except Exception as e:
+        logger.exception(f"build_exec_resume_message error: {e}")
+        return f"❌ فشل إعادة التداول\nالسبب: {html.escape(str(e))}"
+
+
 def _send_open_trades(chat_id: str):
  """إرسال /open_trades مع تقسيم الرسالة لو > 4096 حرف"""
  try:
@@ -2285,6 +2352,10 @@ COMMAND_HANDLERS = {
  "/status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/open_trades": lambda chat_id: _send_open_trades(chat_id),
+ "/exec_status": lambda chat_id: send_telegram_reply(chat_id, build_exec_status_message()),
+ "/exec_mode": lambda chat_id: send_telegram_reply(chat_id, build_exec_mode_message()),
+ "/stop_trading": lambda chat_id: send_telegram_reply(chat_id, build_exec_pause_message()),
+ "/resume_trading": lambda chat_id: send_telegram_reply(chat_id, build_exec_resume_message()),
  "/market_status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market_mode": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/how_it_work": lambda chat_id: send_telegram_reply(chat_id, build_how_it_work_message()),
@@ -2618,6 +2689,56 @@ def format_official_trade_status(trade: dict) -> str:
     return ""
  except Exception:
     return ""
+
+def format_price_dynamic(price) -> str:
+    """تنسيق سعر ديناميكي حسب حجم الرقم — يدعم العملات الصغيرة جداً."""
+    try:
+        v = float(price)
+        if v <= 0:
+            return "—"
+        if v >= 100:
+            return f"{v:.4f}"
+        if v >= 1:
+            return f"{v:.6f}"
+        if v >= 0.01:
+            return f"{v:.8f}"
+        if v >= 0.0001:
+            return f"{v:.10f}"
+        return f"{v:.12f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def validate_signal_prices(candidate: dict) -> bool:
+    """
+    يتحقق من صحة أسعار الإشارة قبل الإرسال والتسجيل.
+    يرجع False إذا كان أي سعر أساسي = 0 أو None.
+    """
+    symbol = candidate.get("symbol", "?")
+    entry        = _safe_float(candidate.get("entry"), 0.0)
+    sl           = _safe_float(candidate.get("sl"), 0.0)
+    tp1          = _safe_float(candidate.get("tp1"), 0.0)
+    tp2          = _safe_float(candidate.get("tp2"), 0.0)
+    market_price = _safe_float(
+        candidate.get("market_entry", candidate.get("entry")), 0.0
+    )
+    if entry <= 0:
+        logger.warning(f"validate_signal_prices: invalid_price_data | {symbol} | entry={entry}")
+        return False
+    if sl <= 0:
+        logger.warning(f"validate_signal_prices: invalid_price_data | {symbol} | sl={sl}")
+        return False
+    if tp1 <= 0:
+        logger.warning(f"validate_signal_prices: invalid_price_data | {symbol} | tp1={tp1}")
+        return False
+    if tp2 <= 0:
+        logger.warning(f"validate_signal_prices: invalid_price_data | {symbol} | tp2={tp2}")
+        return False
+    if market_price <= 0:
+        logger.warning(f"validate_signal_prices: zero_price_signal | {symbol} | market_price={market_price}")
+        return False
+    return True
+
 
 def _fmt_price(value) -> str:
     """تنسيق سعر بعدد منازل ديناميكي."""
@@ -8763,6 +8884,12 @@ def run_scanner_loop():
             if not locked:
                 continue
 
+            # ── validate أسعار الإشارة قبل الإرسال ──────────────
+            if not validate_signal_prices(candidate):
+                logger.warning(f"SKIP {symbol}: invalid_price_data — entry/sl/tp1/tp2/market_price contains zero")
+                release_signal_slot(symbol, candidate["candle_time"], "long")
+                continue
+
             tv_link = build_tradingview_link(symbol)
             temp_score_result = {
                 "score": candidate["score"],
@@ -8937,7 +9064,28 @@ def run_scanner_loop():
                 register_ok = register_trade_from_candidate(candidate)
                 set_alert_registration_status(candidate_alert_id, register_ok)
                 if not register_ok:
-                    logger.error(f"REGISTRATION FAILED after send: symbol={symbol}, alert_id={candidate_alert_id}, setup={candidate['setup_type']}, mode={current_mode}, message_id={message_id}")
+                    logger.error(
+                        f"REGISTRATION FAILED after send: symbol={symbol}, "
+                        f"alert_id={candidate_alert_id}, setup={candidate['setup_type']}, "
+                        f"mode={current_mode}, entry={candidate.get('entry')}, "
+                        f"sl={candidate.get('sl')}, tp1={candidate.get('tp1')}, "
+                        f"tp2={candidate.get('tp2')}"
+                    )
+
+                # ── Execution preview (safe — no real orders) ────────
+                try:
+                    if is_execution_paused():
+                        logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
+                    elif EXECUTION_AVAILABLE:
+                        exec_result = process_trade_candidate(r, symbol, candidate)
+                        if exec_result.get("status") == "accepted_preview":
+                            logger.info(f"EXEC PREVIEW ACCEPTED: {symbol}")
+                        else:
+                            logger.info(
+                                f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
+                            )
+                except Exception as _exec_e:
+                    logger.error(f"Execution preview error for {symbol}: {_exec_e}")
                 logger.info(f"✅ SENT LONG ---> {symbol}")
             else:
                 release_signal_slot(symbol, candidate["candle_time"], "long")
