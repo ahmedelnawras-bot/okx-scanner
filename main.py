@@ -1730,6 +1730,10 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "pullback_triggered": pullback_triggered,
         "market_entry": candidate.get("market_entry", None),
         "recommended_entry": candidate.get("recommended_entry", None),
+        "execution_entry": candidate.get("execution_entry"),
+        "execution_sl": candidate.get("execution_sl"),
+        "execution_tp1": candidate.get("execution_tp1"),
+        "execution_tp2": candidate.get("execution_tp2"),
     }
 
 
@@ -2238,7 +2242,7 @@ def load_market_status_snapshot(max_age_seconds: int = 240):
     return None
 
 # =========================
-# MARKET MODE ARABIC DESCRIPTION (جديد)
+# MARKET MODE ARABIC DESCRIPTION
 # =========================
 def get_market_mode_arabic_description(mode: str) -> str:
     mapping = {
@@ -5926,7 +5930,8 @@ def build_message(
  has_pullback_plan=False,
  market_price=None,
  sl_method="",
- context_setups=None,           # NEW parameter
+ context_setups=None,
+ execution_entry=None,         # NEW
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -5964,11 +5969,16 @@ def build_message(
             f"📥 <b>منطقة دخول البول باك:</b> "
             f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
         )
+        if execution_entry:
+            pullback_text += f"🎯 <b>Execution Entry:</b> {fmt_num(execution_entry, 6)}\n"
     else:
         pullback_text = (
             f"📥 <b>منطقة بول باك مقترحة للمراقبة:</b> "
             f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
         )
+        if execution_entry:
+            pullback_text += f"🎯 <b>Execution Entry:</b> {fmt_num(execution_entry, 6)}\n"
+
  if is_reverse:
     if reversal_4h_confirmed:
         reversal_4h_block = (
@@ -6920,7 +6930,7 @@ def run_scanner_loop():
         }
         save_market_status_snapshot(snapshot_data)
 
-        # ---------- Periodic market mode reminder ----------
+        # Periodic market mode reminder
         REMINDER_INTERVAL = 1800  # 30 minutes
         now_ts_local = int(time.time())
         if r:
@@ -7971,7 +7981,7 @@ def run_scanner_loop():
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: no valid strong setup)")
                     continue
 
-                # New strict allowed setups filter
+                # Strict allowed setups filter
                 setup_match = any(
                     s in (extra_setup_names or []) + [primary_extra_setup] + [setup_type]
                     for s in STRONG_ONLY_ALLOWED_SETUPS
@@ -8073,6 +8083,65 @@ def run_scanner_loop():
                 and pullback_high is not None
                 and pullback_entry is not None
             )
+
+            # --- حساب execution entry و SL/TP للـ pullback لو موجودة ---
+            execution_entry = None
+            execution_sl = None
+            execution_tp1 = None
+            execution_tp2 = None
+            if has_pullback_plan:
+                # pullback_mid_entry = (low + high)/2
+                pullback_mid_entry = (float(pullback_low) + float(pullback_high)) / 2.0
+                # جمع مرشحات الدعم
+                support_candidates = []
+                # nearest_support من smart_sl (سوف نحصل عليه لاحقاً لكننا نحتاجه الآن)
+                # سنستدعي smart_sl مؤقتاً للحصول على nearest_support
+                temp_smart_sl = build_smart_sl_long(
+                    df=df,
+                    entry=pullback_mid_entry,
+                    atr_value=atr_value,
+                    signal_type="standard",
+                    market_state=market_state,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                    is_reverse=is_reverse,
+                )
+                nearest_support_candidate = temp_smart_sl.get("nearest_support")
+                if nearest_support_candidate is not None:
+                    support_candidates.append(nearest_support_candidate)
+                # swing_low: أقل سعر في آخر 20 شمعة
+                try:
+                    swing_low_val = df["low"].iloc[max(0, signal_idx - 20):signal_idx].astype(float).min()
+                    support_candidates.append(swing_low_val)
+                except Exception:
+                    pass
+                # pullback_low نفسه
+                support_candidates.append(float(pullback_low))
+                # إزالة التكرار
+                support_candidates = list(set(support_candidates))
+                pullback_sl = min(support_candidates) if support_candidates else float(pullback_low) * 0.997
+                # تأكد أن السعر أقل من pullback_mid_entry
+                pullback_sl = min(pullback_sl, float(pullback_low) * 0.997)
+                risk = pullback_mid_entry - pullback_sl
+                if risk <= 0 or (risk / pullback_mid_entry) < 0.002:
+                    pullback_sl = float(pullback_low) * 0.995
+                    risk = pullback_mid_entry - pullback_sl
+                if risk <= 0:
+                    # fallback إلى SL الأصلي (لم يحسب بعد، لكننا سنستخدم stop_loss لاحقاً)
+                    # سنؤجل الحل، لكن يمكننا وضع قيمة أولية مؤقتة ثم تعديل
+                    pullback_sl = None  # سنستخدم fallback لاحقاً
+                    risk = None
+
+                # rr1, rr2 من candidate (لم يتم تعيينهما بعد، سنستخدم القيم الحالية من rr1, rr2 التي سنحسبها)
+                # سنحفظها مؤقتاً
+                # سنقوم بحساب rr1 و rr2 بعد قليل، لذا سنؤجل حساب tp1 و tp2 إلى ما بعد حساب القيم الأصلية
+                # لكننا نحتاج execution_entry الآن، لذا سنضع قيماً مؤقتة:
+                execution_entry = pullback_mid_entry
+                execution_sl = pullback_sl
+                # سيتم تحديث execution_tp1 و execution_tp2 لاحقاً بعد حساب rr1, rr2
+                # سنضيف علامة مؤقتة
+
+            # نهاية حساب execution pullback
 
             if vol_ratio < 1.02 and not breakout and not pre_breakout and not early_signal and not has_extra_strong_setup:
                 log_long_rejection(
@@ -8368,6 +8437,21 @@ def run_scanner_loop():
             nearest_support = smart_sl.get("nearest_support")
             sl_method = smart_sl.get("sl_method", "atr")
             sl_notes = smart_sl.get("sl_notes", [])
+
+            # إذا كان لدينا execution_entry ونحتاج لإكمال حساب execution_tp1 و execution_tp2
+            if execution_entry is not None:
+                # استخدم stop_loss المحسوب كـ fallback إذا لزم
+                if execution_sl is None:
+                    # fallback إلى stop_loss الأساسي
+                    execution_sl = stop_loss
+                risk_exec = execution_entry - execution_sl
+                if risk_exec <= 0:
+                    execution_sl = stop_loss
+                    risk_exec = execution_entry - execution_sl
+                execution_tp1 = execution_entry + (risk_exec * rr1)
+                execution_tp2 = execution_entry + (risk_exec * rr2)
+                # إذا كان risk صغير جداً، قد يكون غير منطقي، لكن نترك
+                # إضافة إلى candidate لاحقاً
 
             smart_targets_early = build_smart_tp1_long(
                 df=df,
@@ -8984,6 +9068,7 @@ def run_scanner_loop():
             final_base_risk = get_base_risk_label(score_result, final_warnings_count)
             final_display_risk = adjust_risk_with_entry_timing(final_base_risk, entry_timing)
 
+            # بناء candidate
             candidate = {
                 "symbol": symbol,
                 "candle_time": candle_time,
@@ -9105,6 +9190,11 @@ def run_scanner_loop():
                 "recommended_entry": recommended,
                 "entry_mode": entry_mode,
                 "pullback_triggered": pullback_triggered,
+                # حقول التنفيذ الجديدة
+                "execution_entry": execution_entry,
+                "execution_sl": execution_sl,
+                "execution_tp1": execution_tp1,
+                "execution_tp2": execution_tp2,
             }
             candidate["bucket"] = get_candidate_bucket(candidate)
             candidates.append(candidate)
@@ -9138,6 +9228,7 @@ def run_scanner_loop():
                 "signal_rating": candidate.get("signal_rating", "⚡ عادي"),
                 "fake_signal": candidate.get("fake_signal", False),
             }
+            # تمرير execution_entry لرسالة الإشارة
             message = build_message(
                 symbol=symbol,
                 price=candidate["entry"],
@@ -9191,6 +9282,7 @@ def run_scanner_loop():
                 market_price=candidate.get("market_entry", candidate["entry"]),
                 sl_method=candidate["sl_method"],
                 context_setups=candidate.get("context_setups", []),
+                execution_entry=candidate.get("execution_entry"),
             )
             reply_markup = build_track_reply_markup(candidate["alert_id"])
 
@@ -9303,6 +9395,10 @@ def run_scanner_loop():
                     "tp1_close_pct": TP1_CLOSE_PCT,
                     "tp2_close_pct": TP2_CLOSE_PCT,
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                    "execution_entry": candidate.get("execution_entry"),
+                    "execution_sl": candidate.get("execution_sl"),
+                    "execution_tp1": candidate.get("execution_tp1"),
+                    "execution_tp2": candidate.get("execution_tp2"),
                 }
                 save_alert_snapshot(alert_snapshot, message_id=message_id)
                 candidate_alert_id = candidate["alert_id"]
@@ -9317,16 +9413,17 @@ def run_scanner_loop():
                         f"tp2={candidate.get('tp2')}"
                     )
 
+                # تعديل #1: إرسال execution_message في حالتي accepted_preview و pending_pullback_preview
                 try:
                     if is_execution_paused():
                         logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                     elif EXECUTION_AVAILABLE:
                         exec_result = process_trade_candidate(r, symbol, candidate)
-                        if exec_result.get("status") == "accepted_preview":
-                            logger.info(f"EXEC PREVIEW ACCEPTED: {symbol}")
+                        if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
                             execution_message = exec_result.get("execution_message")
                             if execution_message:
                                 send_telegram_message(execution_message)
+                            logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
                         else:
                             logger.info(
                                 f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
