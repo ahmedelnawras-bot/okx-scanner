@@ -1177,6 +1177,12 @@ def register_trade(
             nx=True,
             ex=TRADE_TTL_SECONDS,
         )
+        if created is None:
+            logger.warning(
+                f"register_trade: Redis returned None for {symbol} @ {normalized_candle_time} "
+                f"— treating as failure (possible connection issue)"
+            )
+            return False
         if not created:
             logger.debug(f"register_trade: trade already exists for {symbol} @ {normalized_candle_time}")
             return False
@@ -3491,17 +3497,46 @@ def get_open_trades_summary(
         except Exception:
             pass
 
-        # ── PnL الحالي ───────────────────────────────────────────
+        # ── PnL الحالي + Weighted PnL الفعلي ────────────────────────
         current_pnl_pct = 0.0
         current_pnl_leveraged = 0.0
+        weighted_pnl_pct = 0.0
+        weighted_pnl_leveraged = 0.0
         pnl_label = "تعادل"
         pnl_emoji = "🟡"
-        if effective_entry > 0 and current_price > 0:
+
+        # pending_pullback لا تُحسب PnL
+        if status == "pending_pullback":
+            current_pnl_pct = 0.0
+            current_pnl_leveraged = 0.0
+            weighted_pnl_pct = 0.0
+            weighted_pnl_leveraged = 0.0
+        elif effective_entry > 0 and current_price > 0:
             if side_norm == "long":
                 current_pnl_pct = ((current_price - effective_entry) / effective_entry) * 100
             else:
                 current_pnl_pct = ((effective_entry - current_price) / effective_entry) * 100
             current_pnl_leveraged = current_pnl_pct * REPORT_LEVERAGE
+
+            # Weighted PnL الفعلي حسب 40/40/20
+            _tp1_pct_move = ((tp1 - effective_entry) / effective_entry * 100) if tp1 > 0 and effective_entry > 0 else 0.0
+            _tp2_pct_move = ((tp2 - effective_entry) / effective_entry * 100) if tp2 > 0 and effective_entry > 0 else 0.0
+            if side_norm == "short":
+                _tp1_pct_move = -_tp1_pct_move
+                _tp2_pct_move = -_tp2_pct_move
+
+            if phase == "trailing":
+                # TP1 40% + TP2 40% + current 20%
+                weighted_pnl_pct = (_tp1_pct_move * 0.40) + (_tp2_pct_move * 0.40) + (current_pnl_pct * 0.20)
+            elif phase == "tp1_hit":
+                # TP1 40% + current 60%
+                weighted_pnl_pct = (_tp1_pct_move * 0.40) + (current_pnl_pct * 0.60)
+            else:
+                # قبل TP1: الربح = حركة السعر الحالية 100%
+                weighted_pnl_pct = current_pnl_pct
+
+            weighted_pnl_leveraged = weighted_pnl_pct * REPORT_LEVERAGE
+
             if current_pnl_pct > 0.3:
                 pnl_label = "رابح"
                 pnl_emoji = "🟢"
@@ -3562,10 +3597,12 @@ def get_open_trades_summary(
             "trailing_sl":          trailing_sl_v,
             "trailing_pct":         safe_float(trade.get("trailing_pct"), TRAILING_PCT),
             "current_price":        current_price,
-            "current_pnl_pct":      round(current_pnl_pct, 2),
-            "current_pnl_leveraged": round(current_pnl_leveraged, 2),
-            "pnl_label":            pnl_label,
-            "pnl_emoji":            pnl_emoji,
+            "current_pnl_pct":        round(current_pnl_pct, 2),
+            "current_pnl_leveraged":  round(current_pnl_leveraged, 2),
+            "weighted_pnl_pct":       round(weighted_pnl_pct, 2),
+            "weighted_pnl_leveraged": round(weighted_pnl_leveraged, 2),
+            "pnl_label":              pnl_label,
+            "pnl_emoji":              pnl_emoji,
             "created_at":           created_at,
             "age_str":              age_str,
             "timeframe":            timeframe,
@@ -3635,12 +3672,22 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         lines.append(f"   {phase_line}")
 
         # ── PnL الحالي ──────────────────────────────────────────
-        if current_price > 0:
+        if phase == "pending_pullback":
+            lines.append(f"   ⏳ في انتظار لمس منطقة الدخول")
+        elif current_price > 0:
             lines.append(
-                f"   {pnl_emoji} <b>{pnl_label}</b>: {pnl_pct:+.2f}% "
-                f"({pnl_lev:+.1f}% بعد الرافعة)"
+                f"   {pnl_emoji} <b>{pnl_label}</b>: "
+                f"<code>{pnl_pct:+.2f}%</code> "
+                f"(<code>{pnl_lev:+.1f}%</code> بعد الرافعة)"
             )
-            lines.append(f"   💵 السعر الحالي: {_fmt_price_perf(current_price)}")
+            w_pnl = t.get("weighted_pnl_pct", 0.0)
+            w_lev = t.get("weighted_pnl_leveraged", 0.0)
+            if phase in ("tp1_hit", "trailing") and abs(w_pnl - pnl_pct) > 0.01:
+                lines.append(
+                    f"   ⚖️ مرجّح فعلي: <code>{w_pnl:+.2f}%</code> "
+                    f"(<code>{w_lev:+.1f}%</code> بعد الرافعة)"
+                )
+            lines.append(f"   💵 السعر الحالي: <code>{_fmt_price_perf(current_price)}</code>")
         
         # ── أسعار الدخول والـ SL ────────────────────────────────
         lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
