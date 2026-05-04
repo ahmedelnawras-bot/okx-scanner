@@ -1537,9 +1537,25 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "primary_extra_setup": candidate.get("primary_extra_setup", ""),
         "extra_setups_details": candidate.get("extra_setups_details", {}),
         "has_pullback_plan": candidate.get("has_pullback_plan", False),
-        "entry_mode": candidate.get("entry_mode", "market"),
+        # ── Entry mode توحيد: لا تسجل Pullback كـ Market ──────────
+        # should_wait_for_pullback_entry يحدد الوضع الصحيح
+        "entry_mode": (
+            "pullback_pending"
+            if (
+                candidate.get("has_pullback_plan", False)
+                and should_wait_for_pullback_entry(candidate)
+            )
+            else candidate.get("entry_mode", "market")
+        ),
         "market_entry": candidate.get("market_entry", None),
-        "pullback_triggered": candidate.get("pullback_triggered", False),
+        "pullback_triggered": (
+            False
+            if (
+                candidate.get("has_pullback_plan", False)
+                and should_wait_for_pullback_entry(candidate)
+            )
+            else candidate.get("pullback_triggered", False)
+        ),
         "recommended_entry": candidate.get("recommended_entry", None),
     }
 
