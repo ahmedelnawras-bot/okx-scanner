@@ -207,6 +207,7 @@ MODE_NORMAL_LONG = "NORMAL_LONG"
 MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
 MODE_BLOCK_LONGS = "BLOCK_LONGS"
 MODE_RECOVERY_LONG = "RECOVERY_LONG"
+MODE_CAUTIOUS_LONGS = "CAUTIOUS_LONGS"   # NEW
 
 MODE_TRANSITION_MIN_INTERVAL = 240
 RECOVERY_CHECK_INTERVAL = 120
@@ -255,6 +256,17 @@ PROTECT_ON_BLOCK_BUFFER_PCT = 0.10
 # =========================
 PULLBACK_ENTRY_WAIT_ENABLED = True
 PULLBACK_ENTRY_MAX_DISTANCE_PCT = 1.20
+
+# =========================
+# CAUTIOUS MODE RESTRICTIONS
+# =========================
+CAUTIOUS_ALLOWED_SETUPS = {
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+}
+CAUTIOUS_MIN_SCORE = 8.0
+CAUTIOUS_MIN_VOL_RATIO = 1.2
 
 # =========================
 # REDIS
@@ -857,11 +869,187 @@ def detect_support_bounce_confirmed(df, vol_ratio: float, mtf_confirmed: bool = 
     except Exception:
         return result
 
+# ==================== NEW CONTEXT SETUPS (analysis only) ====================
+
+def detect_compression_before_expansion(df, vol_ratio, atr_value, rsi_now, dist_ma) -> dict:
+    """
+    Compression before expansion: range tight last 8-12 candles,
+    ATR relatively low, price near high of range, vol_ratio >=1.10, RSI 48-65.
+    """
+    result = {"detected": False, "score_bonus": 0.0, "reason": "compression_before_expansion", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 20:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 12:
+            return result
+
+        # lookback 12 candles (skip current)
+        start = max(0, idx - 12)
+        end = idx
+        range_high = df["high"].iloc[start:end].astype(float).max()
+        range_low = df["low"].iloc[start:end].astype(float).min()
+        range_pct = (range_high - range_low) / range_low * 100 if range_low > 0 else 100
+        if range_pct > 8.0:
+            return result
+
+        # ATR relatively low: compare current ATR with average of last 12 ATR
+        atr_series = df["atr"].iloc[max(0, idx-12):idx].astype(float)
+        if len(atr_series) < 8:
+            return result
+        avg_atr = atr_series.mean()
+        if avg_atr <= 0 or atr_value <= 0:
+            return result
+        if atr_value > avg_atr * 1.15:
+            return result
+
+        # price near high of range
+        close = _safe_float(signal_row.get("close"), 0.0)
+        if range_high <= 0 or close <= 0:
+            return result
+        proximity = (range_high - close) / range_high * 100
+        if proximity > 1.5:
+            return result
+
+        if vol_ratio < 1.10:
+            return result
+        if not (48 <= rsi_now <= 65):
+            return result
+
+        result["detected"] = True
+        result["details"] = {"range_high": range_high, "range_low": range_low, "avg_atr": avg_atr, "atr": atr_value}
+        return result
+    except Exception:
+        return result
+
+def detect_bull_flag_breakout(df, vol_ratio, atr_value, rsi_now, mtf_confirmed) -> dict:
+    """
+    Bull flag: impulse up last 20 candles, pullback 20-50%, higher low clear,
+    breakout above flag or reclaim MA/VWAP, vol_ratio >=1.15.
+    """
+    result = {"detected": False, "score_bonus": 0.0, "reason": "bull_flag_breakout", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 30:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 20:
+            return result
+
+        # impulse up: find highest high in last 20 candles and lowest low in last 20 candles
+        lookback = 20
+        start = max(0, idx - lookback)
+        highs = df["high"].iloc[start:idx+1].astype(float)
+        lows = df["low"].iloc[start:idx+1].astype(float)
+        if highs.empty or lows.empty:
+            return result
+        peak = highs.max()
+        trough = lows.min()
+        if peak <= 0 or trough <= 0:
+            return result
+        move_pct = (peak - trough) / trough * 100
+        if move_pct < 4.0:
+            return result
+
+        # pullback from peak
+        pullback_pct = (peak - _safe_float(signal_row.get("close"), peak)) / peak * 100 if peak > 0 else 0
+        if not (20 <= pullback_pct <= 50):
+            return result
+
+        # higher low detection: compare last swing low to previous swing low
+        lows_series = df["low"].iloc[start:idx+1].astype(float)
+        # find recent swing low (minimum of last 8 candles)
+        recent_min = lows_series.tail(8).min()
+        prev_min = lows_series.iloc[:-8].min() if len(lows_series) > 8 else recent_min
+        if recent_min <= prev_min:
+            return result
+
+        # breakout: close above recent high (flag high) OR reclaim MA/VWAP
+        recent_high_flag = highs.tail(8).max()
+        close = _safe_float(signal_row.get("close"), 0.0)
+        if close <= recent_high_flag and close <= _safe_float(signal_row.get("ma"), 0.0) and close <= _safe_float(signal_row.get("vwap"), 0.0):
+            return result
+
+        if vol_ratio < 1.15:
+            return result
+
+        result["detected"] = True
+        result["details"] = {"peak": peak, "trough": trough, "pullback_pct": pullback_pct}
+        return result
+    except Exception:
+        return result
+
+def detect_liquidity_sweep_reclaim(df, vol_ratio, atr_value, rsi_now) -> dict:
+    """
+    Liquidity sweep: breaks low of last 10-20 candles, then closes back above that level,
+    lower wick visible, strong close, vol_ratio >=1.10.
+    """
+    result = {"detected": False, "score_bonus": 0.0, "reason": "liquidity_sweep_reclaim", "details": {}}
+    try:
+        if df is None or df.empty or len(df) < 25:
+            return result
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return result
+        idx = signal_row.name
+        if idx is None or idx < 20:
+            return result
+
+        # lookback for swing low
+        lookback = 20
+        start = max(0, idx - lookback)
+        previous_lows = df["low"].iloc[start:idx].astype(float)
+        if previous_lows.empty:
+            return result
+        swing_low = previous_lows.min()
+        current_low = _safe_float(signal_row.get("low"), 0.0)
+        close = _safe_float(signal_row.get("close"), 0.0)
+        if current_low <= 0 or swing_low <= 0 or close <= 0:
+            return result
+        if current_low >= swing_low:
+            return result   # no breakout below
+
+        # reclaim: close above the swing low
+        if close <= swing_low:
+            return result
+
+        # lower wick visible: wick length > 0.5 * body? want clear rejection
+        high = _safe_float(signal_row.get("high"), close)
+        low = current_low
+        open_ = _safe_float(signal_row.get("open"), close)
+        body = abs(close - open_)
+        lower_wick = min(open_, close) - low
+        if body <= 0 or lower_wick <= body * 0.4:
+            return result
+
+        # strong close: close above open and in upper half
+        if close <= open_:
+            return result
+        candle_range = high - low
+        close_position = (close - low) / candle_range if candle_range > 0 else 0.5
+        if close_position < 0.55:
+            return result
+
+        if vol_ratio < 1.10:
+            return result
+
+        result["detected"] = True
+        result["details"] = {"swing_low": swing_low, "current_low": current_low, "close": close}
+        return result
+    except Exception:
+        return result
+
+# ----------------------------------------------------------------------------
+
 def get_change_8(df) -> float:
     try:
         if df is None or df.empty or len(df) < 8:
             return 0.0
-        # Use signal row instead of raw last row for consistency
         signal_row = get_signal_row(df)
         if signal_row is None:
             return 0.0
@@ -884,11 +1072,13 @@ def detect_extra_strong_long_setups(
     rsi_now: float,
     vol_ratio: float,
     mtf_confirmed: bool,
+    atr_value: float,              # NEW parameter
 ) -> dict:
     setups = []
     total_bonus = 0.0
     primary_setup = ""
     details = {}
+    context_setups = []          # NEW: for analysis-only setups
 
     detectors = [
         detect_failed_breakdown_trap,
@@ -920,6 +1110,23 @@ def detect_extra_strong_long_setups(
         if not primary_setup:
             primary_setup = rel_res["reason"]
 
+    # ---- NEW context setups (analysis only, no score bonus) ----
+    comp_res = detect_compression_before_expansion(df, vol_ratio, atr_value, rsi_now, dist_ma)
+    if comp_res.get("detected"):
+        context_setups.append(comp_res["reason"])
+        details[comp_res["reason"]] = comp_res.get("details", {})
+
+    flag_res = detect_bull_flag_breakout(df, vol_ratio, atr_value, rsi_now, mtf_confirmed)
+    if flag_res.get("detected"):
+        context_setups.append(flag_res["reason"])
+        details[flag_res["reason"]] = flag_res.get("details", {})
+
+    liq_res = detect_liquidity_sweep_reclaim(df, vol_ratio, atr_value, rsi_now)
+    if liq_res.get("detected"):
+        context_setups.append(liq_res["reason"])
+        details[liq_res["reason"]] = liq_res.get("details", {})
+    # -------------------------------------------------------------
+
     total_bonus = min(total_bonus, 0.60)
 
     return {
@@ -928,6 +1135,7 @@ def detect_extra_strong_long_setups(
         "score_bonus": round(total_bonus, 2),
         "primary_setup": primary_setup,
         "details": details,
+        "context_setups": context_setups,    # NEW
     }
 
 # =========================
@@ -2129,6 +2337,7 @@ def build_market_status_message() -> str:
         MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
         MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
         MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
+        MODE_CAUTIOUS_LONGS: "🟡 CAUTIOUS LONGS",      # NEW
     }.get(current_mode, html.escape(str(current_mode)))
 
     suggested_mode_ar = {
@@ -2136,12 +2345,15 @@ def build_market_status_message() -> str:
         MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
         MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
         MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
+        MODE_CAUTIOUS_LONGS: "🟡 CAUTIOUS LONGS",
     }.get(suggested_mode, html.escape(str(suggested_mode)))
 
     if current_mode == MODE_NORMAL_LONG:
         action = "✅ مسموح باللونج العادي مع الالتزام بالفلاتر."
     elif current_mode == MODE_STRONG_LONG_ONLY:
         action = "⚠️ لا تدخل إلا الفرص القوية جدًا: Breakout / Pre-Breakout / MTF وفوليوم واضح."
+    elif current_mode == MODE_CAUTIOUS_LONGS:
+        action = "⚠️ السوق ضعيف لكن توجد فرص انتقائية. يسمح فقط بأقوى الـ setups (vwap_reclaim, retest_breakout_confirmed, wave_3) مع Score ≥ 8.0 و Vol ratio ≥ 1.2."
     elif current_mode == MODE_BLOCK_LONGS:
         action = "🛑 الأفضل وقف اللونج الجديد مؤقتًا وانتظار خروج السوق من الضغط."
     elif current_mode == MODE_RECOVERY_LONG:
@@ -5785,6 +5997,7 @@ def build_message(
  has_pullback_plan=False,
  market_price=None,
  sl_method="",
+ context_setups=None,           # NEW parameter
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -5889,6 +6102,12 @@ def build_message(
  if primary_extra_setup:
     extra_setup_text = f"\n🧩 <b>Setup إضافي:</b> {html.escape(primary_extra_setup)}"
 
+ # NEW: context setups line
+ context_text = ""
+ if context_setups:
+    context_joined = " | ".join(html.escape(s) for s in context_setups)
+    context_text = f"\n🧩 <b>Context:</b> {context_joined}"
+
  sl_method_text = ""
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
@@ -5908,7 +6127,7 @@ def build_message(
 🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
@@ -6013,6 +6232,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "avg_change_15m": 0.0,
         "btc_change_15m": 0.0,
         "reason": "disabled",
+        "alt_weak_cautious": False,      # NEW
     }
  if not ranked_pairs:
     return {
@@ -6024,6 +6244,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "avg_change_15m": 0.0,
         "btc_change_15m": 0.0,
         "reason": "no ranked pairs",
+        "alt_weak_cautious": False,
     }
  try:
     sample = sorted(
@@ -6060,6 +6281,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
             "avg_change_15m": 0.0,
             "btc_change_15m": 0.0,
             "reason": f"valid={valid} < {MARKET_GUARD_MIN_VALID}",
+            "alt_weak_cautious": False,
         }
     red_ratio = round(red_count / valid, 4)
     avg_change = round(sum(changes) / len(changes), 4) if changes else 0.0
@@ -6074,15 +6296,21 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
     block = False
     reason = ""
     alt_mode_str = str(alt_snapshot.get("alt_mode", ""))
+    alt_weak_cautious = False
     if red_ratio >= MARKET_GUARD_RED_RATIO_BLOCK and avg_change <= MARKET_GUARD_AVG_CHANGE_15M_BLOCK:
         block = True
         reason = f"red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f}"
     elif btc_change <= MARKET_GUARD_BTC_CHANGE_15M_BLOCK and red_ratio >= 0.55:
         block = True
         reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
-    elif MARKET_GUARD_ALT_WEAK_BLOCK and "ضعيف" in alt_mode_str and red_ratio >= 0.60:
-        block = True
-        reason = f"alt_weak & red_ratio={red_ratio:.2f}"
+    elif MARKET_GUARD_ALT_WEAK_BLOCK and "ضعيف" in alt_mode_str:
+        # NEW: if alt_weak but btc_up -> cautious mode, not block
+        if "صاعد" in btc_mode:
+            alt_weak_cautious = True
+            reason = f"alt_weak & btc_up -> cautious mode"
+        else:
+            block = True
+            reason = f"alt_weak & red_ratio={red_ratio:.2f} and btc not up"
     return {
         "active": True,
         "block_longs": bool(block),
@@ -6092,6 +6320,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "avg_change_15m": avg_change,
         "btc_change_15m": btc_change,
         "reason": reason,
+        "alt_weak_cautious": alt_weak_cautious,   # NEW
     }
  except Exception as e:
     logger.error(f"Market guard snapshot error: {e}")
@@ -6104,6 +6333,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "avg_change_15m": 0.0,
         "btc_change_15m": 0.0,
         "reason": f"error: {e}",
+        "alt_weak_cautious": False,
     }
 
 # =====================
@@ -6115,6 +6345,7 @@ def normalize_market_mode(mode: str) -> str:
     MODE_STRONG_LONG_ONLY,
     MODE_BLOCK_LONGS,
     MODE_RECOVERY_LONG,
+    MODE_CAUTIOUS_LONGS,
  }
  if mode in allowed:
     return mode
@@ -6186,6 +6417,7 @@ def determine_long_market_mode(
  avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
  btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
  alt_mode = alt_snapshot.get("alt_mode", "")
+ alt_weak_cautious = market_guard.get("alt_weak_cautious", False)
  last_transition_ts = 0
  last_recovery_check_ts = 0
  normal_candidate_since = 0
@@ -6208,6 +6440,9 @@ def determine_long_market_mode(
     elif btc_change <= -0.70 and red_ratio >= 0.55:
         crash_triggered = True
         crash_reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
+    elif alt_weak_cautious:
+        # NEW: this leads to CAUTIOUS_LONGS (handled below)
+        pass
     elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
         crash_triggered = True
         crash_reason = f"alt_weak & red_ratio={red_ratio:.2f}"
@@ -6219,6 +6454,18 @@ def determine_long_market_mode(
         except Exception:
             pass
     return {"mode": MODE_BLOCK_LONGS, "reason": f"كراش: {crash_reason}"}
+ 
+ # NEW: CAUTIOUS_LONGS handling
+ if alt_weak_cautious:
+    if allow_state_writes and r:
+        try:
+            r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+            r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+        except Exception:
+            pass
+    return {"mode": MODE_CAUTIOUS_LONGS, "reason": "alt ضعيف + BTC صاعد → وضع حذر (سماح فقط بأقوى الـ setups)"}
+
+ # rest of the mode determination (unchanged logic but may add CAUTIOUS state later)
  if current_mode == MODE_BLOCK_LONGS:
     if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
         if allow_state_writes and r:
@@ -6319,6 +6566,27 @@ def determine_long_market_mode(
         except Exception:
             pass
     return {"mode": MODE_RECOVERY_LONG, "reason": "ما زلنا في وضع الريكافري"}
+ if current_mode == MODE_CAUTIOUS_LONGS:
+    # transition from CAUTIOUS to NORMAL if market improves
+    if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
+        if normal_candidate_since == 0:
+            if allow_state_writes and r:
+                try:
+                    r.set(MARKET_MODE_NORMAL_CANDIDATE_KEY, str(now_ts))
+                except Exception:
+                    pass
+            return {"mode": MODE_CAUTIOUS_LONGS, "reason": "بدأ مرشح الرجوع للوضع الطبيعي"}
+        if now_ts - normal_candidate_since >= NORMAL_CANDIDATE_DURATION:
+            if allow_state_writes and r:
+                try:
+                    r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                except Exception:
+                    pass
+            return {"mode": MODE_NORMAL_LONG, "reason": "السوق تحسن، رجوع للوضع الطبيعي"}
+        return {"mode": MODE_CAUTIOUS_LONGS, "reason": f"...جاري التأكد من الاستقرار ({now_ts - normal_candidate_since}s/{NORMAL_CANDIDATE_DURATION}s)"}
+    # else remain cautious
+    return {"mode": MODE_CAUTIOUS_LONGS, "reason": "الوضع الحذر مستمر"}
+
  if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
     if allow_state_writes and r:
         try:
@@ -6379,6 +6647,14 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         f"• Entry 1 = {RECOVERY_ENTRY1_SIZE_PCT}%",
         f"• Entry 2 = {RECOVERY_ENTRY2_SIZE_PCT}%"
     ]
+ elif new_mode == MODE_CAUTIOUS_LONGS:
+    lines = [
+        "🟡 <b>Mode Changed: CAUTIOUS LONGS</b>",
+        "• السوق ضعيف لكن BTC صاعد، فرص انتقائية",
+        "• يسمح فقط بأقوى الـ setups (vwap_reclaim, retest_breakout_confirmed, wave_3)",
+        "• Score ≥ 8.0 و Vol ratio ≥ 1.2",
+        f"• الانتقال: {transition}",
+    ]
  else:
     lines = [f"Mode: {html.escape(new_mode)}"]
  if reason:
@@ -6413,6 +6689,33 @@ def handle_market_mode_transition(mode_result: dict) -> str:
  except Exception as e:
     logger.error(f"handle_market_mode_transition error: {e}")
  return new_mode
+
+# =========================
+# CAUTIOUS MODE ALLOWANCE CHECK
+# =========================
+def is_allowed_in_cautious_mode(candidate: dict) -> bool:
+    """Check if a candidate is allowed in CAUTIOUS_LONGS mode."""
+    # Allowed setup types (extra setups)
+    setup_type = str(candidate.get("setup_type", "") or "")
+    extra_setups = candidate.get("extra_setup_names", []) or []
+    primary_extra = candidate.get("primary_extra_setup", "") or ""
+    allowed = False
+    for allowed_name in CAUTIOUS_ALLOWED_SETUPS:
+        if allowed_name in setup_type or allowed_name in extra_setups or allowed_name == primary_extra:
+            allowed = True
+            break
+    if not allowed:
+        return False
+    # Score and volume
+    if candidate.get("score", 0.0) < CAUTIOUS_MIN_SCORE:
+        return False
+    if candidate.get("vol_ratio", 0.0) < CAUTIOUS_MIN_VOL_RATIO:
+        return False
+    # No late entries
+    entry_timing = candidate.get("entry_timing", "")
+    if "🔴" in entry_timing:
+        return False
+    return True
 
 # =========================
 # TELEGRAM LOOP
@@ -6756,10 +7059,13 @@ def run_scanner_loop():
             )
             time.sleep(60)
             continue
-        if current_mode == MODE_BLOCK_LONGS:
-            logger.warning("MODE BLOCK LONGS - blocking new long signals before candidate scan")
-            time.sleep(60)
-            continue
+        if current_mode in (MODE_BLOCK_LONGS, MODE_CAUTIOUS_LONGS):
+            if current_mode == MODE_BLOCK_LONGS:
+                logger.warning("MODE BLOCK LONGS - blocking new long signals before candidate scan")
+                time.sleep(60)
+                continue
+            # CAUTIOUS_LONGS: continue to scanning but will filter later
+            logger.info("CAUTIOUS_LONGS mode active - will allow only strongest setups")
         upcoming_events = get_upcoming_high_impact_events()
         has_high_impact_news = len(upcoming_events) > 0
         news_warning_text = format_news_warning(upcoming_events)
@@ -7025,7 +7331,7 @@ def run_scanner_loop():
             logger.info("Sleeping 60 seconds (recovery mode)...")
             time.sleep(60)
             continue
-        # ---------- NORMAL / STRONG ----------
+        # ---------- NORMAL / STRONG / CAUTIOUS ----------
         scan_pairs = ranked_pairs
         max_alerts = MAX_ALERTS_PER_RUN
         filtered_scan_pairs = [
@@ -7165,14 +7471,14 @@ def run_scanner_loop():
                 rsi_now=rsi_now,
                 vol_ratio=vol_ratio,
                 mtf_confirmed=mtf_confirmed,
+                atr_value=atr_value,          # NEW
             )
             has_extra_strong_setup = bool(extra_setups.get("has_extra_setup"))
             extra_setup_names = extra_setups.get("setups", [])
             extra_setup_bonus = float(extra_setups.get("score_bonus", 0.0) or 0.0)
             primary_extra_setup = extra_setups.get("primary_setup", "")
-            # حساب entry_timing أولي (بدون entry_maturity_data / بدون late_pump_risk)
-            # يُستخدم فقط لتزويد get_late_pump_risk بمعلومات "متأخر" / "مطاردة حركة"
-            # entry_timing_temp الحقيقي يُحسب لاحقًا بعد entry_maturity_data و late_guard
+            context_setups = extra_setups.get("context_setups", [])   # NEW
+            # حساب entry_timing أولي
             _preliminary_entry_timing = classify_entry_timing_long(
                 dist_ma=dist_ma,
                 breakout=breakout,
@@ -7592,8 +7898,7 @@ def run_scanner_loop():
                     )
                 )
 
-                # ── Late Entry Guard Override (AMENDED) ──────────────────────
-                # Rule 3: breakout / pre_breakout → block only if extreme stretch
+                # Late Entry Guard Override (breakout/pre_breakout)
                 if hard_late_entry and (breakout or pre_breakout):
                     if not (dist_ma >= 4.8 and vol_ratio >= 2.0):
                         hard_late_entry = False
@@ -7610,7 +7915,6 @@ def run_scanner_loop():
                             f"dist_ma={dist_ma:.2f}, vol_ratio={vol_ratio:.2f}"
                         )
 
-                # Rule 1: "متأخر جدًا" or "مطاردة حركة" → conditional block (need 2+ conditions)
                 elif hard_late_entry and (
                     "متأخر جدًا" in str(entry_timing_temp)
                     or "مطاردة حركة" in str(entry_timing_temp)
@@ -7639,7 +7943,6 @@ def run_scanner_loop():
                             f"vol={vol_ratio:.2f}, cs={candle_strength:.2f}"
                         )
 
-                # Rule 2: simple "متأخر" (not جدًا, not مطاردة) → penalty only, no hard block
                 elif hard_late_entry:
                     hard_late_entry = False
                     pre_score_adjustments_log.append({
@@ -7654,7 +7957,6 @@ def run_scanner_loop():
                         f"{symbol} --> simple late entry → penalty only "
                         f"(entry_timing={entry_timing_temp})"
                     )
-                # ─────────────────────────────────────────────────────────────
 
                 if hard_late_entry:
                     wave5_eval = evaluate_wave5_htf_override(
@@ -7876,6 +8178,22 @@ def run_scanner_loop():
                     )
                     logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: weak breakout)")
                     continue
+
+            # --- NEW: CAUTIOUS_LONGS filtering ---
+            if current_mode == MODE_CAUTIOUS_LONGS:
+                # Build a temporary candidate dict for the filter
+                temp_candidate = {
+                    "setup_type": setup_type,
+                    "extra_setup_names": extra_setup_names,
+                    "primary_extra_setup": primary_extra_setup,
+                    "score": 0.0,  # will be filled later but we need score after calculation
+                    "vol_ratio": vol_ratio,
+                    "entry_timing": entry_timing_temp,
+                }
+                # We'll filter later after score is computed, but we also need to skip many candidates early
+                # For efficiency, we can apply a stricter prefilter on vol_ratio and score later.
+                # We'll delay the final decision until after score is calculated.
+                pass
 
             signal_idx = signal_row.name
             lookback_start = max(0, signal_idx - 20)
@@ -8147,7 +8465,6 @@ def run_scanner_loop():
             entry_mode = "market"
             pullback_triggered = True
 
-            # Build a temporary candidate to run pullback logic
             candidate_decision = {
                 "market_entry": market_entry,
                 "pullback_entry": pullback_entry,
@@ -8328,7 +8645,6 @@ def run_scanner_loop():
                 dynamic_threshold += 0.25
                 dynamic_threshold = round(dynamic_threshold, 2)
             if current_mode == MODE_STRONG_LONG_ONLY and "🔴" in entry_timing_temp:
-                # ── STRONG_LONG_ONLY late entry: block only for chase/very-late AND conditions ──
                 _slo_is_chase_or_very_late = (
                     "مطاردة حركة" in str(entry_timing_temp)
                     or "متأخر جدًا" in str(entry_timing_temp)
@@ -8375,6 +8691,48 @@ def run_scanner_loop():
                         f"(chase_or_very_late={_slo_is_chase_or_very_late}, "
                         f"dist_ma={dist_ma:.2f}, alt_mode={alt_mode})"
                     )
+
+            # --- CAUTIOUS_LONGS final filtering after score is known ---
+            if current_mode == MODE_CAUTIOUS_LONGS:
+                temp_cand = {
+                    "setup_type": setup_type,
+                    "extra_setup_names": extra_setup_names,
+                    "primary_extra_setup": primary_extra_setup,
+                    "score": score_result["score"],
+                    "vol_ratio": vol_ratio,
+                    "entry_timing": entry_timing_temp,
+                }
+                if not is_allowed_in_cautious_mode(temp_cand):
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="cautious_mode_filter",
+                        candle_time=candle_time,
+                        score=score_result["score"],
+                        raw_score=raw_score,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        opportunity_type=temp_opportunity_type,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
+                        vol_ratio=vol_ratio,
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={
+                            "required_score": CAUTIOUS_MIN_SCORE,
+                            "min_vol_ratio": CAUTIOUS_MIN_VOL_RATIO,
+                            "allowed_setups": list(CAUTIOUS_ALLOWED_SETUPS),
+                            "has_extra_strong_setup": has_extra_strong_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_bonus": extra_setup_bonus,
+                        },
+                    )
+                    logger.info(f"{symbol} -> skipped by CAUTIOUS_LONGS mode filter")
+                    continue
 
             opportunity_type = temp_opportunity_type
             entry_timing = entry_timing_temp
@@ -8471,6 +8829,9 @@ def run_scanner_loop():
 
             if current_mode == MODE_STRONG_LONG_ONLY and final_threshold_min is not None:
                 final_threshold = max(final_threshold, final_threshold_min)
+            # In CAUTIOUS_LONGS, raise threshold further
+            if current_mode == MODE_CAUTIOUS_LONGS:
+                final_threshold = max(final_threshold, CAUTIOUS_MIN_SCORE + 0.2)  # ensure min 8.2
 
             final_threshold = round(final_threshold, 2)
 
@@ -8862,6 +9223,7 @@ def run_scanner_loop():
                 "extra_setup_bonus": extra_setup_bonus,
                 "primary_extra_setup": primary_extra_setup,
                 "extra_setups_details": extra_setups.get("details", {}),
+                "context_setups": context_setups,   # NEW
                 "target_method": target_method,
                 "nearest_resistance": nearest_resistance,
                 "nearest_support": nearest_support,
@@ -8987,6 +9349,7 @@ def run_scanner_loop():
                 has_pullback_plan=candidate["has_pullback_plan"],
                 market_price=candidate.get("market_entry", candidate["entry"]),
                 sl_method=candidate["sl_method"],
+                context_setups=candidate.get("context_setups", []),   # NEW
             )
             reply_markup = build_track_reply_markup(candidate["alert_id"])
 
@@ -9096,6 +9459,7 @@ def run_scanner_loop():
                     "extra_setup_bonus": candidate["extra_setup_bonus"],
                     "primary_extra_setup": candidate["primary_extra_setup"],
                     "extra_setups_details": candidate.get("extra_setups_details", {}),
+                    "context_setups": candidate.get("context_setups", []),   # NEW
                     "tp1_close_pct": TP1_CLOSE_PCT,
                     "tp2_close_pct": TP2_CLOSE_PCT,
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
