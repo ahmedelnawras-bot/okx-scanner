@@ -1,5 +1,6 @@
 import time
 import logging
+import html
 
 from execution.config import (
     TRADING_MODE,
@@ -45,6 +46,30 @@ def is_setup_allowed_for_execution(candidate: dict) -> dict:
         "reason": "setup_not_whitelisted",
         "setup_type": setup_type,
     }
+
+
+def build_execution_preview_message(order: dict, setup_type: str, order_id: str) -> str:
+    tp_plan = order.get("tp_plan", {}) or {}
+
+    return "\n".join([
+        "🧪 <b>تم قبول التنفيذ التجريبي</b>",
+        "",
+        f"🪙 <b>العملة:</b> {html.escape(str(order.get('symbol', '')))}",
+        f"🧠 <b>Setup:</b> {html.escape(str(setup_type or ''))}",
+        f"🧭 <b>Mode:</b> {html.escape(str(TRADING_MODE))}",
+        f"🆔 <b>Order ID:</b> {html.escape(str(order_id))}",
+        "",
+        f"⚙️ <b>Leverage:</b> {html.escape(str(order.get('leverage', '')))}x",
+        f"📍 <b>Entry:</b> {html.escape(str(order.get('entry', '')))}",
+        f"🛑 <b>SL:</b> {html.escape(str(order.get('sl', '')))}",
+        f"🎯 <b>TP1:</b> {html.escape(str(order.get('tp1', '')))} | إغلاق {html.escape(str(tp_plan.get('tp1_close_pct', '')))}%",
+        f"🎯 <b>TP2:</b> {html.escape(str(order.get('tp2', '')))} | إغلاق {html.escape(str(tp_plan.get('tp2_close_pct', '')))}%",
+        f"🏃 <b>Trailing:</b> {html.escape(str(tp_plan.get('trailing_position_pct', '')))}% | {html.escape(str(tp_plan.get('trailing_pct', '')))}%",
+        "",
+        "🔒 <b>بعد TP1:</b> SL → Entry",
+        "",
+        "⚠️ <b>Simulation فقط - لم يتم إرسال أمر حقيقي إلى OKX</b>",
+    ])
 
 
 def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
@@ -111,4 +136,9 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "order_id": order_id,
         "order": order,
         "setup_type": setup_decision.get("setup_type"),
+        "execution_message": build_execution_preview_message(
+            order,
+            setup_decision.get("setup_type"),
+            order_id,
+        ),
     }
