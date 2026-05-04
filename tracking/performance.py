@@ -114,7 +114,7 @@ SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0
 # نسب الإغلاق الجزئي
 TP1_CLOSE_PCT = 40.0
 TP2_CLOSE_PCT = 40.0
-TRAILING_PCT = 2.0   # نسبة التراجع للـ trailing stop بعد TP2
+TRAILING_PCT = 2.5   # نسبة التراجع للـ trailing stop بعد TP2 — موحد مع main.py
 
 # Dedup index
 ALERT_ID_INDEX_PREFIX = "alert_id_index:"
@@ -1520,6 +1520,7 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             trade["effective_entry"] = round_price(pb_entry)
             trade["activated_at"] = now_ts
             trade["activated_candle_ts"] = candle_ts
+            trade["last_processed_candle_ts"] = candle_ts
             diagnostics["pullback_triggered"] = True
             diagnostics["entry_mode"] = "pullback_triggered"
             diagnostics["effective_entry"] = round_price(pb_entry)
@@ -1528,10 +1529,13 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
             trade["status"] = "open"
             trade["diagnostics"] = diagnostics
             trade = recalc_targets_from_effective_entry(trade, pb_entry)
-            effective_entry = pb_entry
-            tp1 = safe_float(trade["tp1"])
-            tp2 = safe_float(trade["tp2"])
-            pullback_triggered = True
+            # ── منع تقييم TP/SL على نفس شمعة التفعيل ──────────────
+            # ترتيب الحركة داخل الشمعة غير معروف، نبدأ من الشمعة التالية
+            logger.info(
+                f"{trade.get('symbol', '?')} → pullback triggered @ {pb_entry} "
+                f"| skip same-candle TP/SL evaluation"
+            )
+            return None, False, trade
         else:
             trade["status"] = "pending_pullback"
             diagnostics["entry_mode"] = "pullback_pending"
@@ -2020,6 +2024,58 @@ def load_trades_with_history(
     return filtered
 
 
+def load_all_trades_for_report(
+    redis_client,
+    market_type: Optional[str] = None,
+    side: Optional[str] = None,
+    since_ts: Optional[int] = None,
+    include_open: bool = True,
+) -> List[dict]:
+    """
+    مصدر موحد لتحميل كل الصفقات للتقارير.
+    يمنع التكرار بين trade:* و trade_history:*.
+    كل التقارير يجب أن تستخدم هذه الدالة لضمان تطابق الأعداد.
+    """
+    trades = load_trades_with_history(
+        redis_client=redis_client,
+        market_type=market_type,
+        side=side,
+        since_ts=since_ts,
+        include_open=include_open,
+    )
+
+    # dedupe بـ alert_id أو symbol+candle_time+side
+    seen = set()
+    deduped = []
+    for trade in trades:
+        diagnostics = trade.get("diagnostics", {}) or {}
+        alert_id = (
+            trade.get("alert_id")
+            or diagnostics.get("alert_id")
+        )
+        if alert_id:
+            key = f"alert:{alert_id}"
+        else:
+            sym   = trade.get("symbol", "")
+            ct    = safe_timestamp(trade.get("candle_time"), 0)
+            sd    = normalize_side(trade.get("side", "long"))
+            key   = f"{sym}:{ct}:{sd}"
+
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # فلتر pending_pullback من الإحصائيات المالية لو مش include_open
+        if not include_open:
+            status = str(trade.get("status", "") or "").lower()
+            if status == "pending_pullback":
+                continue
+
+        deduped.append(trade)
+
+    return deduped
+
+
 def get_all_trades_data(
     redis_client,
     market_type: str = None,
@@ -2469,7 +2525,7 @@ def get_trade_summary(
 
     side_norm = normalize_side(side or "long")
 
-    trades = load_trades_with_history(
+    trades = load_all_trades_for_report(
         redis_client,
         market_type=market_type,
         side=side_norm,
@@ -3052,10 +3108,14 @@ def format_period_summary(title: str, summary: dict) -> str:
     tp1_only = safe_int(summary.get("tp1_then_entry", summary.get("tp1_only", summary.get("tp1_wins", 0))))
     full_wins = safe_int(summary.get("tp2_wins", 0))
     trailing_wins = safe_int(summary.get("trailing_wins", 0))
+    trailing_open_count = safe_int(summary.get("trailing_open", 0))
 
     # Full Wins TP2 يجب ألا يقل عن TP2 Hits الفعلية
     if full_wins < tp2_hits:
         full_wins = tp2_hits
+
+    # TP2 Reached = tp2_win + trailing_win + trailing_open
+    tp2_reached = full_wins + trailing_wins + trailing_open_count
 
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
     tp2_rate = safe_float(summary.get("tp2_rate", 0))
@@ -3067,13 +3127,14 @@ def format_period_summary(title: str, summary: dict) -> str:
     margin_per_trade = plan["margin_per_trade_usd"]
 
     gross_profit_usd = estimate_pct_to_usd(gross_profit, side=side)
-    gross_loss_usd = estimate_pct_to_usd(gross_loss, side=side)
+    gross_loss_usd = estimate_pct_to_usd(abs(gross_loss), side=side)
     net_pnl_usd = estimate_pct_to_usd(net_pnl, side=side)
 
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary, side=side)
 
-    gross_loss_display = -gross_loss
-    gross_loss_usd_display = -gross_loss_usd
+    # الخسارة تُعرض دائماً بالسالب بوضوح
+    gross_loss_display = -abs(gross_loss)
+    gross_loss_usd_display = -abs(gross_loss_usd)
 
     if side == "short":
         settings_block = (
@@ -3112,11 +3173,12 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     performance_block = (
         f"\n\n🎯 <b>أداء الأهداف:</b>\n"
-        f"• TP1 Hits: {tp1_hits} | TP2 Hits: {tp2_hits}\n"
-        f"• TP1 Only: {tp1_only} | Full Wins TP2: {full_wins}\n"
-        + (f"• 🔄 Trailing Wins: {trailing_wins}\n" if trailing_wins > 0 else "") +
+        f"• TP1 Hits: {tp1_hits} | TP2 Reached: {tp2_reached}\n"
+        f"• TP1 Only: {tp1_only} | Full TP2 Closed: {full_wins}\n"
+        + (f"• 🔄 Trailing Wins: {trailing_wins}\n" if trailing_wins > 0 else "")
+        + (f"• 🔄 Trailing Open: {trailing_open_count}\n" if trailing_open_count > 0 else "") +
         f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
-        f"• TP1 → TP2 Rate: {tp1_to_tp2_rate:.1f}%"
+        f"• TP1 → TP2 Conversion: {tp1_to_tp2_rate:.1f}%"
     )
     if breakeven_exits > 0:
         performance_block += f"\n• Breakeven Protected Exits: {breakeven_exits}"
