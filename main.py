@@ -5724,6 +5724,26 @@ def format_entry_maturity_block(entry_maturity_data: dict) -> str:
     return ""
 
 # =====================
+# EXECUTION BADGE
+# =====================
+def is_candidate_for_execution(candidate: dict) -> bool:
+    """يحدد إذا كانت الإشارة مرشحة للتنفيذ التجريبي."""
+    setup_type = str(candidate.get("setup_type", "") or "")
+    execution_keywords = ("vwap_reclaim", "retest_breakout_confirmed", "wave_3")
+    return any(k in setup_type for k in execution_keywords)
+
+
+def build_execution_badge_line(candidate: dict) -> str:
+    """شارة الإشارة المرشحة للتنفيذ — فارغ لو مش مرشحة."""
+    if not is_candidate_for_execution(candidate):
+        return ""
+    return (
+        "🚀🔥 <b>مرشحة للتنفيذ التجريبي</b> 🔥🚀\n"
+        "⚡ <b>Execution Candidate</b>"
+    )
+
+
+# =====================
 # BUILD MESSAGE (normal)
 # =====================
 def build_message(
@@ -8970,6 +8990,11 @@ def run_scanner_loop():
             )
             reply_markup = build_track_reply_markup(candidate["alert_id"])
 
+            # ── شارة التنفيذ لو الإشارة مرشحة ───────────────────────
+            badge = build_execution_badge_line(candidate)
+            if badge:
+                message = badge + "\n\n" + message
+
             sent_data = send_telegram_message(
                 message,
                 reply_markup=reply_markup,
@@ -9096,6 +9121,9 @@ def run_scanner_loop():
                         exec_result = process_trade_candidate(r, symbol, candidate)
                         if exec_result.get("status") == "accepted_preview":
                             logger.info(f"EXEC PREVIEW ACCEPTED: {symbol}")
+                            execution_message = exec_result.get("execution_message")
+                            if execution_message:
+                                send_telegram_message(execution_message)
                         else:
                             logger.info(
                                 f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
