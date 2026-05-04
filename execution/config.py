@@ -43,3 +43,24 @@ PROTECT_ON_BLOCK_MIN_PROFIT_PCT = float(
 PROTECT_ON_BLOCK_BUFFER_PCT = float(
     os.getenv("PROTECT_ON_BLOCK_BUFFER_PCT", "0.10")
 )
+
+
+# Live / Simulation Execution Setup Whitelist
+# يسمح للتنفيذ فقط بأفضل setup types، بينما باقي الإشارات تظل تظهر وتدخل التقارير والتراكنج.
+LIVE_EXECUTION_SETUP_WHITELIST_ENABLED = os.getenv(
+    "LIVE_EXECUTION_SETUP_WHITELIST_ENABLED",
+    "true"
+).strip().lower() == "true"
+
+LIVE_EXECUTION_SETUP_WHITELIST = {
+    "breakout|mtf_yes|vol_high|bull_market|vwap_reclaim",
+    "breakout|mtf_yes|vol_high|bull_market|retest_breakout_confirmed",
+    "continuation|mtf_yes|vol_low|bull_market|wave_3",
+}
+
+# Fallback keywords لأن setup_type قد يكون أطول أو فيه طبقات إضافية
+LIVE_EXECUTION_SETUP_KEYWORDS = {
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+}
