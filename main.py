@@ -222,6 +222,41 @@ STRONG_ONLY_ALLOWED_SETUPS = {
 STRONG_ONLY_MIN_SCORE = 8.0
 STRONG_ONLY_MIN_VOL_RATIO = 1.2
 
+# Setups that are allowed to pass some guards as warnings/penalties instead of hard blocks.
+# This applies only to execution-quality contexts and does NOT open the gate for weak/random signals.
+RELAXED_EXECUTION_SETUPS = {
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+    "relative_strength_vs_btc",
+    "higher_low_continuation",
+    "liquidity_sweep_reclaim",
+    "support_bounce_confirmed",
+}
+
+def is_relaxed_execution_setup(
+    setup_type: str = "",
+    extra_setup_names=None,
+    primary_extra_setup: str = "",
+    mtf_confirmed: bool = False,
+    vol_ratio: float = 0.0,
+    score: float = 0.0,
+) -> bool:
+    try:
+        parts = []
+        if setup_type:
+            parts.append(str(setup_type))
+        if primary_extra_setup:
+            parts.append(str(primary_extra_setup))
+        if extra_setup_names:
+            parts.extend([str(x) for x in extra_setup_names if x])
+        blob = "|".join(parts)
+        has_setup = any(s in blob for s in RELAXED_EXECUTION_SETUPS)
+        # Keep this conservative: a strong setup also needs either MTF, volume, or score support.
+        return bool(has_setup and (mtf_confirmed or float(vol_ratio or 0) >= 1.35 or float(score or 0) >= 7.5))
+    except Exception:
+        return False
+
 MODE_TRANSITION_MIN_INTERVAL = 240
 RECOVERY_CHECK_INTERVAL = 120
 NORMAL_CANDIDATE_DURATION = 180
@@ -1358,46 +1393,84 @@ def answer_callback_query(callback_query_id: str, text: str = " ") -> None:
     payload["text"] = text
  telegram_api_call("answerCallbackQuery", payload)
 
+def _telegram_chunks(message: str, limit: int = 3900) -> list:
+    """Split long Telegram messages safely so reports do not fail with 400 message too long."""
+    text = str(message or "")
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current = ""
+    for line in text.splitlines(True):
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def _send_telegram_payload(chat_id: str, text: str, reply_markup=None, use_html: bool = True) -> dict:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if use_html:
+        payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api_call("sendMessage", payload)
+
+
 def send_telegram_message(message: str, reply_markup=None) -> dict:
- if not BOT_TOKEN or not CHAT_ID:
-    logger.error("❌ Telegram config missing")
-    return {"ok": False}
- payload = {
-    "chat_id": CHAT_ID,
-    "text": message,
-    "parse_mode": "HTML",
-    "disable_web_page_preview": True,
- }
- if reply_markup:
-    payload["reply_markup"] = reply_markup
- return telegram_api_call("sendMessage", payload)
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.error("❌ Telegram config missing")
+        return {"ok": False}
+    last = {"ok": True}
+    chunks = _telegram_chunks(message)
+    for i, chunk in enumerate(chunks):
+        rm = reply_markup if i == 0 else None
+        data = _send_telegram_payload(CHAT_ID, chunk, reply_markup=rm, use_html=True)
+        if not data.get("ok"):
+            logger.warning(f"Telegram HTML send failed, retrying plain text: {data.get('description') or data.get('error')}")
+            data = _send_telegram_payload(CHAT_ID, chunk, reply_markup=rm, use_html=False)
+        last = data
+    return last
 
 
 def send_telegram_message_plain(message: str, reply_markup=None) -> dict:
- if not BOT_TOKEN or not CHAT_ID:
-    logger.error("❌ Telegram config missing")
-    return {"ok": False}
- payload = {
-    "chat_id": CHAT_ID,
-    "text": message,
-    "disable_web_page_preview": True,
- }
- if reply_markup:
-    payload["reply_markup"] = reply_markup
- return telegram_api_call("sendMessage", payload)
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.error("❌ Telegram config missing")
+        return {"ok": False}
+    last = {"ok": True}
+    chunks = _telegram_chunks(message)
+    for i, chunk in enumerate(chunks):
+        last = _send_telegram_payload(CHAT_ID, chunk, reply_markup=(reply_markup if i == 0 else None), use_html=False)
+    return last
+
 
 def send_telegram_reply(chat_id: str, message: str) -> bool:
- if not BOT_TOKEN or not chat_id:
-    logger.error("❌ Telegram reply config missing")
-    return False
- payload = {
-    "chat_id": chat_id,
-    "text": message,
-    "parse_mode": "HTML",
-    "disable_web_page_preview": True,
- }
- data = telegram_api_call("sendMessage", payload)
- return bool(data.get("ok"))
+    if not BOT_TOKEN or not chat_id:
+        logger.error("❌ Telegram reply config missing")
+        return False
+    ok_all = True
+    chunks = _telegram_chunks(message)
+    for chunk in chunks:
+        data = _send_telegram_payload(chat_id, chunk, use_html=True)
+        if not data.get("ok"):
+            logger.warning(f"Telegram reply HTML failed, retrying plain text: {data.get('description') or data.get('error')}")
+            data = _send_telegram_payload(chat_id, chunk, use_html=False)
+        ok_all = ok_all and bool(data.get("ok"))
+    return ok_all
 
 def get_telegram_updates(offset: int = 0):
  if not BOT_TOKEN:
@@ -5593,8 +5666,11 @@ SMART_TP1_RESISTANCE_BUFFER_ATR = 0.20
 SMART_TP1_NEAR_RESISTANCE_RR = 1.2
 # Ignore micro/noise resistance levels that are too close to entry.
 # These tiny levels were causing excessive near_resistance_before_tp1 rejections.
-SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.004  # 0.40%
+SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.005  # 0.50% | noise/micro level, ignore completely
 SMART_TP1_IGNORE_NEAR_ROUND_PCT = 0.005       # 0.50%
+SMART_TP1_WARNING_RESISTANCE_PCT = 0.012      # 1.20% | warning band, not automatic rejection
+SMART_TP1_HARD_REJECT_RR = 1.0                # normal setups reject below 1R
+SMART_TP1_RELAXED_HARD_REJECT_RR = 0.75       # strong execution setups get warning unless RR is extremely bad
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
@@ -6991,7 +7067,7 @@ def run_scanner_loop():
             if not scan_locked:
                 _now_ts = time.time()
                 if _now_ts - _last_scan_skip_log_ts >= 60:
-                    logger.debug("Another long scan is running --- skipping")
+                    logger.info("⏳ Scan lock active, waiting...")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
                 continue
@@ -7934,29 +8010,49 @@ def run_scanner_loop():
                     logger.info(f"{symbol} --> late breakout guard BLOCKED: {guard['reason']}")
                     continue
                 if guard["retest_required"]:
-                    log_long_rejection(
-                        symbol=symbol,
-                        reason="retest_required",
-                        candle_time=candle_time,
-                        market_state=market_state,
-                        current_mode=current_mode,
-                        entry_timing=entry_timing_temp,
-                        dist_ma=dist_ma,
-                        rsi_now=rsi_now,
-                        vol_ratio=vol_ratio,
-                        vwap_distance=vwap_distance,
+                    relaxed_retest_allowed = is_relaxed_execution_setup(
+                        setup_type=setup_type,
+                        extra_setup_names=extra_setup_names,
+                        primary_extra_setup=primary_extra_setup,
                         mtf_confirmed=mtf_confirmed,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                        is_reverse=is_reverse,
-                        extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
-                               "has_extra_strong_setup": has_extra_strong_setup,
-                               "extra_setup_names": extra_setup_names,
-                               "primary_extra_setup": primary_extra_setup,
-                               "extra_setup_bonus": extra_setup_bonus},
+                        vol_ratio=vol_ratio,
+                        score=score_result.get("score", 0.0),
                     )
-                    logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
-                    continue
+                    if not relaxed_retest_allowed:
+                        log_long_rejection(
+                            symbol=symbol,
+                            reason="retest_required",
+                            candle_time=candle_time,
+                            market_state=market_state,
+                            current_mode=current_mode,
+                            entry_timing=entry_timing_temp,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            is_reverse=is_reverse,
+                            extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
+                                   "has_extra_strong_setup": has_extra_strong_setup,
+                                   "extra_setup_names": extra_setup_names,
+                                   "primary_extra_setup": primary_extra_setup,
+                                   "extra_setup_bonus": extra_setup_bonus},
+                        )
+                        logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
+                        continue
+                    else:
+                        logger.info(f"{symbol} --> retest required but allowed as relaxed execution setup: {guard['reason']}")
+                        if not isinstance(entry_maturity_data.get("warning_reasons"), list):
+                            entry_maturity_data["warning_reasons"] = []
+                        entry_maturity_data["warning_reasons"].append("Retest مطلوب لكن setup قوي؛ تم السماح مع تحذير")
+                        pre_score_adjustments_log = locals().get("pre_score_adjustments_log", [])
+                        pre_score_adjustments_log.append({
+                            "name": "relaxed_retest_warning_penalty",
+                            "value": -0.20,
+                            "reason": "relaxed_execution_retest_allowed",
+                        })
 
                 strong_bull_pullback = (
                     market_state in ("bull_market", "alt_season")
@@ -8096,6 +8192,24 @@ def run_scanner_loop():
                                 entry_maturity_data["warning_reasons"] = []
                             entry_maturity_data["warning_reasons"].append(warning_msg)
                             logger.info(f"{symbol} --> wave5 overridden: {wave5_eval['label']}, penalty={wave5_eval['penalty']}")
+                        elif is_relaxed_execution_setup(
+                            setup_type=setup_type,
+                            extra_setup_names=extra_setup_names,
+                            primary_extra_setup=primary_extra_setup,
+                            mtf_confirmed=mtf_confirmed,
+                            vol_ratio=vol_ratio,
+                            score=score_result.get("score", 0.0),
+                        ):
+                            hard_late_entry = False
+                            pre_score_adjustments_log.append({
+                                "name": "relaxed_late_entry_penalty",
+                                "value": -0.45,
+                                "reason": "late_entry_allowed_for_strong_execution_setup",
+                            })
+                            if "warning_reasons" not in entry_maturity_data:
+                                entry_maturity_data["warning_reasons"] = []
+                            entry_maturity_data["warning_reasons"].append("دخول متأخر لكن setup قوي؛ تم السماح مع خصم")
+                            logger.info(f"{symbol} --> late entry allowed as relaxed execution setup, penalty=-0.45")
                         else:
                             reason_specific = wave5_eval["label"] or classify_hard_late_rejection_reason(
                                 entry_timing=entry_timing_temp,
@@ -8628,21 +8742,48 @@ def run_scanner_loop():
                 sl_method = smart_sl.get("sl_method", "atr")
                 sl_notes = smart_sl.get("sl_notes", [])
 
-                smart_targets_early = build_smart_tp1_long(
-                    df=df,
-                    entry=entry_price_for_trade,
-                    sl=stop_loss,
-                    rr1=rr1,
-                    rr2=rr2,
-                    atr_value=atr_value,
-                    market_state=market_state,
-                    breakout=breakout,
-                    pre_breakout=pre_breakout,
-                )
-                early_resistance_warning = smart_targets_early.get("resistance_warning", "")
-                early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
+                # Default values before Smart TP / relaxed guards.
+                # مهم: تمنع UnboundLocal/free-variable errors لو أي شرط اتخطى أو smart target فشل.
+                smart_targets_early = {
+                    "tp1": calc_tp_long(entry_price_for_trade, stop_loss, rr=rr1),
+                    "tp2": calc_tp_long(entry_price_for_trade, stop_loss, rr=rr2),
+                    "target_method": "rr",
+                    "nearest_resistance": None,
+                    "nearest_resistance_source": None,
+                    "resistance_warning": "",
+                    "support_warning": "",
+                    "target_notes": [],
+                    "rr1_effective": rr1,
+                    "rr2_effective": rr2,
+                }
+                early_resistance_warning = ""
+                early_nearest_resistance = None
                 resistance_rejected = False
                 resistance_dynamic_penalty = 0.0
+                target_method = "rr"
+                target_notes = []
+                nearest_resistance = None
+                nearest_resistance_source = None
+                resistance_warning = ""
+                support_warning = ""
+
+                try:
+                    smart_targets_early = build_smart_tp1_long(
+                        df=df,
+                        entry=entry_price_for_trade,
+                        sl=stop_loss,
+                        rr1=rr1,
+                        rr2=rr2,
+                        atr_value=atr_value,
+                        market_state=market_state,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                    ) or smart_targets_early
+                except Exception as _smart_tp_build_error:
+                    logger.warning(f"smart target build error for {symbol}: {_smart_tp_build_error}")
+
+                early_resistance_warning = smart_targets_early.get("resistance_warning", "")
+                early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
 
                 try:
                     _risk_for_quality = float(entry_price_for_trade) - float(stop_loss)
@@ -8650,7 +8791,22 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-                        if _res_dist_pct < 1.0 or _res_r < 1.2:
+                        relaxed_resistance_allowed = is_relaxed_execution_setup(
+                            setup_type=setup_type,
+                            extra_setup_names=extra_setup_names,
+                            primary_extra_setup=primary_extra_setup,
+                            mtf_confirmed=mtf_confirmed,
+                            vol_ratio=vol_ratio,
+                            score=score_result.get("score", 0.0),
+                        )
+                        # Smart Resistance Balance:
+                        # - ignored micro-resistance was already filtered earlier (<0.5%).
+                        # - normal setups reject only below 1R.
+                        # - strong execution setups convert close resistance to warning unless RR is extremely poor.
+                        hard_reject_rr = SMART_TP1_RELAXED_HARD_REJECT_RR if relaxed_resistance_allowed else SMART_TP1_HARD_REJECT_RR
+                        hard_near_resistance = (_res_r < hard_reject_rr)
+
+                        if hard_near_resistance:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="near_resistance_before_tp1",
@@ -8674,10 +8830,22 @@ def run_scanner_loop():
                                     "resistance_distance_pct": _res_dist_pct,
                                     "resistance_r": _res_r,
                                     "category": "trade_quality",
+                                    "relaxed_execution_setup": relaxed_resistance_allowed,
+                                    "hard_reject_rr": hard_reject_rr,
                                 },
                             )
-                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
+                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed}")
                             continue
+                        elif _res_dist_pct < (SMART_TP1_WARNING_RESISTANCE_PCT * 100.0) or _res_r < SMART_TP1_MIN_RR:
+                            early_resistance_warning = "مقاومة قريبة قبل TP1 - تحذير فقط"
+                            try:
+                                if isinstance(smart_targets_early.get("target_notes"), list):
+                                    smart_targets_early["target_notes"].append(
+                                        f"near_resistance_warning dist={_res_dist_pct:.2f}% rr={_res_r:.2f} relaxed={relaxed_resistance_allowed}"
+                                    )
+                            except Exception:
+                                pass
+                            logger.info(f"⚠️ {symbol} near resistance warning only | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed}")
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
@@ -9411,9 +9579,9 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     "momentum_priority": momentum_priority,
                     "now": now,
-                    "relative_strength_short": round(get_change_8(df) - get_change_8(btc_df), 4),
-                    "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4),
-                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_df), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
+                    "relative_strength_short": relative_strength_short,
+                    "relative_strength_24": relative_strength_24,
+                    "relative_strength_vs_btc": relative_strength_vs_btc,
                     "block_exception": False,
                     "current_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
