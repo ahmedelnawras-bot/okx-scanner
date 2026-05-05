@@ -151,6 +151,69 @@ def _get_all_trades(redis_client):
 # =========================
 # RESULT DETECTION FIXED
 # =========================
+
+
+def _trade_diagnostics(trade: dict) -> dict:
+    try:
+        diagnostics = trade.get("diagnostics", {}) or {}
+        return diagnostics if isinstance(diagnostics, dict) else {}
+    except Exception:
+        return {}
+
+
+def _get_trade_value(trade: dict, key: str, default=None):
+    try:
+        if key in trade and trade.get(key) is not None:
+            return trade.get(key)
+        diagnostics = _trade_diagnostics(trade)
+        if key in diagnostics and diagnostics.get(key) is not None:
+            return diagnostics.get(key)
+    except Exception:
+        pass
+    return default
+
+
+def _trade_entry_mode(trade: dict) -> str:
+    try:
+        return str(_get_trade_value(trade, "entry_mode", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _trade_is_pending_pullback(trade: dict) -> bool:
+    try:
+        status = _trade_status_text(trade)
+        result = _trade_result_text(trade)
+        entry_mode = _trade_entry_mode(trade)
+        return (
+            status in ("pending_pullback", "pullback_pending")
+            or result in ("pending_pullback", "pullback_pending")
+            or entry_mode in ("pending_pullback", "pullback_pending")
+        ) and not _safe_bool(_get_trade_value(trade, "pullback_triggered", False))
+    except Exception:
+        return False
+
+
+def _trade_is_breakeven(trade: dict) -> bool:
+    try:
+        result = _trade_result_text(trade)
+        status = _trade_status_text(trade)
+        return (
+            result in ("breakeven", "be", "protected_breakeven_exit")
+            or status in ("breakeven", "be", "protected_breakeven_exit")
+            or _safe_bool(_get_trade_value(trade, "protected_breakeven_exit", False))
+        )
+    except Exception:
+        return False
+
+
+def _trade_pnl_pct(trade: dict):
+    for key in ("pnl_pct", "final_pnl_pct", "realized_pnl_pct", "profit_pct"):
+        v = _safe_float(_get_trade_value(trade, key, None), None)
+        if v is not None:
+            return v
+    return None
+
 def _trade_result_text(trade: dict) -> str:
     try:
         return str(trade.get("result", "") or "").strip().lower()
@@ -241,6 +304,8 @@ def _trade_is_loss(trade: dict) -> bool:
         result = _trade_result_text(trade)
         status = _trade_status_text(trade)
 
+        if _trade_is_breakeven(trade):
+            return False
         return result == "loss" or status == "loss"
     except Exception:
         return False
@@ -251,23 +316,31 @@ def _trade_is_expired(trade: dict) -> bool:
         result = _trade_result_text(trade)
         status = _trade_status_text(trade)
 
-        return result == "expired" or status == "expired"
+        return result in ("expired", "pending_expired") or status in ("expired", "pending_expired")
     except Exception:
         return False
 
 
 def _trade_is_open(trade: dict) -> bool:
     """
-    الصفقة Open فقط لو ليست Win / Loss / Expired.
+    الصفقة Open فقط لو مفتوحة فعليًا.
+    Pending Pullback لا يُحسب Open حتى يتفعل الدخول.
+    Breakeven خروج محسوم وليس Open.
     """
     try:
-        if _trade_is_win(trade) or _trade_is_loss(trade) or _trade_is_expired(trade):
+        if (
+            _trade_is_pending_pullback(trade)
+            or _trade_is_win(trade)
+            or _trade_is_loss(trade)
+            or _trade_is_expired(trade)
+            or _trade_is_breakeven(trade)
+        ):
             return False
 
         result = _trade_result_text(trade)
         status = _trade_status_text(trade)
 
-        if status in ("open", "partial"):
+        if status in ("open", "partial", "pullback_triggered"):
             return True
 
         if result in ("", "open", "partial"):
@@ -298,13 +371,19 @@ def _summarize_group(trades):
 
     losses = sum(1 for t in trades if _trade_is_loss(t))
     expired = sum(1 for t in trades if _trade_is_expired(t))
+    breakeven = sum(1 for t in trades if _trade_is_breakeven(t))
+    pending_pullback = sum(1 for t in trades if _trade_is_pending_pullback(t))
     open_count = sum(1 for t in trades if _trade_is_open(t))
 
-    closed = wins + losses + expired
+    closed = wins + losses + expired + breakeven
     decided = wins + losses
 
     winrate = round((wins / decided) * 100, 2) if decided > 0 else 0.0
     tp1_rate = round((tp1_hits / total) * 100, 2) if total > 0 else 0.0
+    tp2_rate = round((full_wins / total) * 100, 2) if total > 0 else 0.0
+
+    pnl_values = [p for p in (_trade_pnl_pct(t) for t in trades) if p is not None]
+    avg_pnl_pct = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
     return {
         "total": total,
@@ -314,10 +393,14 @@ def _summarize_group(trades):
         "tp1_only": tp1_only,
         "losses": losses,
         "expired": expired,
+        "breakeven": breakeven,
+        "pending_pullback": pending_pullback,
         "open": open_count,
         "tp1_hits": tp1_hits,
         "winrate": winrate,
         "tp1_rate": tp1_rate,
+        "tp2_rate": tp2_rate,
+        "avg_pnl_pct": avg_pnl_pct,
     }
 
 
@@ -366,9 +449,10 @@ def _format_group_line(name: str, trades: list) -> str:
     s = _summarize_group(trades)
     decided = s["wins"] + s["losses"]
 
+    avg_pnl = "N/A" if s.get("avg_pnl_pct") is None else f"{s['avg_pnl_pct']}%"
     return (
-        f"• {name}: {s['winrate']}% "
-        f"({s['wins']}/{decided})"
+        f"• {name}: Win {s['winrate']}% ({s['wins']}/{decided}) | "
+        f"TP1 {s['tp1_rate']}% | TP2 {s['tp2_rate']}% | AvgPnL {avg_pnl}"
     )
 
 
@@ -477,11 +561,15 @@ def build_deep_report(redis_client, market_type: str = None, side: str = None) -
         f"  - Full Wins (TP2): {overall['full_wins']}\n"
         f"  - TP1 Only: {overall['tp1_only']}\n"
         f"• Losses: {overall['losses']}\n"
+        f"• Breakeven: {overall['breakeven']}\n"
         f"• Expired: {overall['expired']}\n"
+        f"• Pending Pullback: {overall['pending_pullback']}\n"
         f"• Open: {overall['open']}\n"
         f"• TP1 Hits: {overall['tp1_hits']}\n"
         f"• Win Rate: {overall['winrate']}%\n"
-        f"• TP1 Rate: {overall['tp1_rate']}%\n\n"
+        f"• TP1 Rate: {overall['tp1_rate']}%\n"
+        f"• TP2 Rate: {overall['tp2_rate']}%\n"
+        f"• Avg PnL: {('N/A' if overall['avg_pnl_pct'] is None else str(overall['avg_pnl_pct']) + '%')}\n\n"
         f"🎯 <b>حسب السكور:</b>\n"
         f"{chr(10).join(bucket_lines) if bucket_lines else '• لا يوجد'}\n\n"
         f"🧠 <b>حسب نوع الإشارة:</b>\n"
