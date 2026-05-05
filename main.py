@@ -7585,6 +7585,27 @@ def run_scanner_loop():
                 final_threshold_min = None
                 tested += 1
                 symbol = pair_data["instId"]
+                # =========================
+                # SAFE PER-SYMBOL DEFAULTS
+                # =========================
+                # Keep these defined before any early Smart TP / relaxed-guard block.
+                # This prevents a single candidate from crashing the whole scan when a
+                # later block references a value that is only assigned on some branches.
+                setup_type = "unknown"
+                setup_type_base = "unknown"
+                setup_type_candidate = {}
+                setup_type_candidate_final = {}
+                relative_strength = 0.0
+                relative_strength_short = 0.0
+                relative_strength_24 = 0.0
+                relative_strength_vs_btc = False
+                nearest_resistance = None
+                nearest_resistance_source = None
+                resistance_warning = ""
+                target_method = "rr"
+                target_notes = []
+                support_warning = ""
+                res_dynamic_penalty = 0.0
                 change_24h = extract_24h_change_percent(pair_data)
                 candles = candles_map.get(symbol, [])
                 if not candles:
@@ -8799,6 +8820,34 @@ def run_scanner_loop():
                 resistance_warning = ""
                 support_warning = ""
 
+                # Build a provisional setup_type before Smart Resistance checks.
+                # The final setup_type is rebuilt later after all final context is known.
+                try:
+                    wave_context_early_for_resistance = infer_wave_context(
+                        entry_maturity_data=entry_maturity_data,
+                        is_reverse=is_reverse,
+                        dist_ma=dist_ma,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                    )
+                    if primary_extra_setup:
+                        wave_context_early_for_resistance = primary_extra_setup
+                    setup_type_candidate = {
+                        "is_reverse": is_reverse,
+                        "breakout": breakout,
+                        "pre_breakout": pre_breakout,
+                        "mtf_confirmed": mtf_confirmed,
+                        "vol_ratio": vol_ratio,
+                        "market_state": market_state,
+                        "wave_context": wave_context_early_for_resistance,
+                    }
+                    setup_type = build_setup_type(setup_type_candidate)
+                    setup_type_base = "|".join(str(setup_type).split("|")[:4])
+                except Exception as _setup_type_early_error:
+                    logger.warning(f"setup_type early build skipped for {symbol}: {_setup_type_early_error}")
+                    setup_type = "unknown"
+                    setup_type_base = "unknown"
+
                 try:
                     smart_targets_early = build_smart_tp1_long(
                         df=df,
@@ -9515,6 +9564,36 @@ def run_scanner_loop():
                 final_warnings_count = len(final_explicit_warnings) if final_explicit_warnings else len(final_inferred_warnings)
                 final_base_risk = get_base_risk_label(score_result, final_warnings_count)
                 final_display_risk = adjust_risk_with_entry_timing(final_base_risk, entry_timing)
+
+                # Relative-strength defaults/calc for BLOCK_LONGS exceptions and reports.
+                # These are intentionally fail-safe: if BTC comparison data is unavailable,
+                # they stay neutral instead of crashing the scan.
+                try:
+                    btc_change_24h_safe = float(globals().get("btc_change_24h", 0.0) or 0.0)
+                except Exception:
+                    btc_change_24h_safe = 0.0
+                try:
+                    btc_change_short_safe = float(globals().get("btc_change_15m", 0.0) or globals().get("btc_change_8", 0.0) or 0.0)
+                except Exception:
+                    btc_change_short_safe = 0.0
+                try:
+                    coin_short_change_safe = float(change_4h or 0.0)
+                except Exception:
+                    coin_short_change_safe = 0.0
+                try:
+                    relative_strength_short = round(coin_short_change_safe - btc_change_short_safe, 4)
+                except Exception:
+                    relative_strength_short = 0.0
+                try:
+                    relative_strength_24 = round(float(change_24h or 0.0) - btc_change_24h_safe, 4)
+                except Exception:
+                    relative_strength_24 = 0.0
+                relative_strength_vs_btc = bool(
+                    relative_strength_short >= 1.5
+                    or relative_strength_24 >= 2.0
+                    or ("relative_strength_vs_btc" in str(setup_type))
+                    or ("relative_strength_vs_btc" in [str(x) for x in (extra_setup_names or [])])
+                )
 
                 candidate = {
                     "symbol": symbol,
