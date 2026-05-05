@@ -1358,14 +1358,53 @@ def answer_callback_query(callback_query_id: str, text: str = " ") -> None:
     payload["text"] = text
  telegram_api_call("answerCallbackQuery", payload)
 
+def _telegram_plain_text(message: str) -> str:
+ try:
+    import re
+    text = str(message or "")
+    text = re.sub(r"<a\s+href=[^>]*>(.*?)</a>", r"\1", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?(b|i|u|s|code|pre|strong|em)[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text)
+ except Exception:
+    return str(message or "")
+
+def _send_telegram_payload_safe(chat_id: str, message: str, reply_markup=None) -> dict:
+ if not BOT_TOKEN or not chat_id:
+    logger.error("❌ Telegram config missing")
+    return {"ok": False}
+ payload = {
+    "chat_id": chat_id,
+    "text": message,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True,
+ }
+ if reply_markup:
+    payload["reply_markup"] = reply_markup
+ data = telegram_api_call("sendMessage", payload)
+ if data.get("ok"):
+    return data
+ logger.warning("⚠️ Telegram HTML send failed; retrying as plain text")
+ plain_payload = {
+    "chat_id": chat_id,
+    "text": _telegram_plain_text(message),
+    "disable_web_page_preview": True,
+ }
+ if reply_markup:
+    plain_payload["reply_markup"] = reply_markup
+ return telegram_api_call("sendMessage", plain_payload)
+
 def send_telegram_message(message: str, reply_markup=None) -> dict:
+ return _send_telegram_payload_safe(CHAT_ID, message, reply_markup=reply_markup)
+
+
+def send_telegram_message_plain(message: str, reply_markup=None) -> dict:
  if not BOT_TOKEN or not CHAT_ID:
     logger.error("❌ Telegram config missing")
     return {"ok": False}
  payload = {
     "chat_id": CHAT_ID,
-    "text": message,
-    "parse_mode": "HTML",
+    "text": _telegram_plain_text(message),
     "disable_web_page_preview": True,
  }
  if reply_markup:
@@ -1373,16 +1412,7 @@ def send_telegram_message(message: str, reply_markup=None) -> dict:
  return telegram_api_call("sendMessage", payload)
 
 def send_telegram_reply(chat_id: str, message: str) -> bool:
- if not BOT_TOKEN or not chat_id:
-    logger.error("❌ Telegram reply config missing")
-    return False
- payload = {
-    "chat_id": chat_id,
-    "text": message,
-    "parse_mode": "HTML",
-    "disable_web_page_preview": True,
- }
- data = telegram_api_call("sendMessage", payload)
+ data = _send_telegram_payload_safe(chat_id, message)
  return bool(data.get("ok"))
 
 def get_telegram_updates(offset: int = 0):
@@ -1458,7 +1488,16 @@ def _limit_telegram_message(text: str, limit: int = 3900) -> str:
         text = str(text or "")
         if len(text) <= limit:
             return text
-        return text[:limit - 200] + "\n\n⚠️ تم اختصار التقرير لأن حجمه أكبر من حد Telegram."
+        suffix = "\n\n⚠️ تم اختصار التقرير لأن حجمه أكبر من حد Telegram."
+        cut = max(0, limit - len(suffix) - 20)
+        shortened = text[:cut]
+        last_nl = shortened.rfind("\n")
+        if last_nl > int(cut * 0.70):
+            shortened = shortened[:last_nl]
+        # Avoid ending in a broken HTML tag; send fallback still protects if any tag is malformed.
+        if shortened.rfind("<") > shortened.rfind(">"):
+            shortened = shortened[:shortened.rfind("<")].rstrip()
+        return shortened.rstrip() + suffix
     except Exception:
         return "❌ فشل اختصار الرسالة"
 
@@ -2426,6 +2465,60 @@ def is_strong_exception(candidate: dict) -> bool:
         return False
 
 
+def _human_setup_name(setup: str) -> str:
+    """Compact user-facing setup label for reports and Telegram messages."""
+    try:
+        raw = str(setup or "unknown")
+        low = raw.lower()
+        labels = []
+        if "wave_3" in low:
+            labels.append("Wave 3 Continuation")
+        if "vwap_reclaim" in low:
+            labels.append("VWAP Reclaim")
+        if "retest_breakout_confirmed" in low:
+            labels.append("Retest Breakout")
+        if "liquidity_sweep_reclaim" in low:
+            labels.append("Liquidity Sweep")
+        if "support_bounce_confirmed" in low:
+            labels.append("Support Bounce")
+        if "higher_low_continuation" in low:
+            labels.append("Higher Low")
+        if "relative_strength_vs_btc" in low:
+            labels.append("Relative Strength")
+        if "golden_pullback" in low:
+            labels.append("Golden Pullback")
+        if "breakout" in low and not labels:
+            labels.append("Breakout")
+        if "continuation" in low and not any("Continuation" in x for x in labels):
+            labels.append("Continuation")
+        if "reverse" in low or "reversal" in low:
+            labels.append("Reversal")
+        if not labels:
+            labels.append(raw.replace("|", " / ")[:36])
+        extra = []
+        if "mtf_yes" in low:
+            extra.append("MTF ✅")
+        elif "mtf_no" in low:
+            extra.append("MTF ❌")
+        if "vol_high" in low:
+            extra.append("Vol عالي")
+        elif "vol_mid" in low:
+            extra.append("Vol متوسط")
+        if "bull_market" in low:
+            extra.append("Bull")
+        return " + ".join(dict.fromkeys(labels)) + (" | " + " | ".join(extra) if extra else "")
+    except Exception:
+        return "Unknown Setup"
+
+def _fmt_trade_price(value, digits: int = 6) -> str:
+    try:
+        v = float(value)
+        if v <= 0:
+            return "N/A"
+        return fmt_num(v, digits)
+    except Exception:
+        return "N/A"
+
 def is_execution_candidate_trade(trade: dict) -> bool:
     diagnostics = trade.get("diagnostics", {}) or {}
     setup_type = str(trade.get("setup_type") or diagnostics.get("setup_type") or "")
@@ -2456,24 +2549,41 @@ def build_execution_report_message() -> str:
         trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
         if not trades:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
-        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
-        for trade in trades[:12]:
+
+        lines = [
+            "🚀 <b>تقرير صفقات التنفيذ</b>",
+            f"📊 العدد: <b>{len(trades)}</b>",
+            "",
+        ]
+        for i, trade in enumerate(trades[:10], 1):
             symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-            status = html.escape(str(trade.get("status", "?") or "?"))
-            result = html.escape(str(trade.get("result", "") or ""))
-            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
-            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
+            status = str(trade.get("status", "?") or "?")
+            result = str(trade.get("result", "") or "")
+            setup_raw = str(_trade_field(trade, "setup_type", "") or "")
+            setup_name = html.escape(_human_setup_name(setup_raw))
+            entry_mode = str(_trade_field(trade, "entry_mode", "market") or "market")
+            has_pullback = entry_mode in ("pullback_pending", "pullback_triggered") or bool(_trade_field(trade, "has_pullback_plan", False))
+            decision = "انتظار Pullback" if has_pullback and not bool(trade.get("pullback_triggered", False)) else "Market Entry" if not has_pullback else "Pullback مفعّل"
+            market_entry = _trade_field(trade, "market_entry", trade.get("entry", None))
+            approved_entry = _trade_field(trade, "execution_entry", None) or _trade_field(trade, "recommended_entry", None) or trade.get("entry")
             score = _trade_field(trade, "score", "N/A")
+            block_exception = bool(_trade_field(trade, "block_exception", False))
             lines.extend([
-                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
-                f"  setup: {setup_type}",
-                f"  score: {score} | entry_mode: {entry_mode}",
-                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
-                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
-                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
-                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
-                "",
+                f"<b>{i}) {symbol}</b>",
+                f"📌 الحالة: {html.escape(status)}{('/' + html.escape(result)) if result else ''}",
+                f"🧠 النوع: {setup_name}",
+                f"⭐ السكور: {html.escape(str(score))}",
+                f"💵 سعر السوق: {_fmt_trade_price(market_entry)}",
+                f"📌 قرار الدخول: {decision}",
+                f"🎯 سعر الدخول المعتمد: {_fmt_trade_price(approved_entry)}",
+                f"🛑 SL: {_fmt_trade_price(_trade_field(trade, 'execution_sl', None) or trade.get('sl'))}",
+                f"🎯 TP1: {_fmt_trade_price(_trade_field(trade, 'execution_tp1', None) or trade.get('tp1'))} | إغلاق 40%",
+                f"🏁 TP2: {_fmt_trade_price(_trade_field(trade, 'execution_tp2', None) or trade.get('tp2'))} | إغلاق 40%",
+                f"🔄 آخر 20%: Trailing بعد TP2",
             ])
+            if block_exception:
+                lines.append("🔥 استثناء BLOCK_LONGS")
+            lines.append("")
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
@@ -2492,21 +2602,33 @@ def build_setup_performance_report_message() -> str:
             b["total"] += 1
             status = str(trade.get("status", "") or "").lower()
             result = str(trade.get("result", "") or "").lower()
-            if status == "open": b["open"] += 1
-            if status == "pending_pullback": b["pending"] += 1
-            if trade.get("tp1_hit"): b["tp1"] += 1
-            if trade.get("tp2_hit") or result == "tp2_win": b["tp2"] += 1
-            if "breakeven" in result or trade.get("protected_breakeven_exit"): b["breakeven"] += 1
-            if result == "expired": b["expired"] += 1
+            if status == "open":
+                b["open"] += 1
+            if status == "pending_pullback":
+                b["pending"] += 1
+            if trade.get("tp1_hit"):
+                b["tp1"] += 1
+            if trade.get("tp2_hit") or result == "tp2_win":
+                b["tp2"] += 1
+            if "breakeven" in result or trade.get("protected_breakeven_exit"):
+                b["breakeven"] += 1
+            if result in ("expired", "pending_expired"):
+                b["expired"] += 1
             if result in ("tp1_win", "tp2_win", "trailing_win", "win") or trade.get("tp1_hit"):
                 b["wins"] += 1
-            if result == "loss": b["losses"] += 1
-            try: b["scores"].append(float(_trade_field(trade, "score", 0) or 0))
-            except Exception: pass
+            if result == "loss":
+                b["losses"] += 1
+            try:
+                b["scores"].append(float(_trade_field(trade, "score", 0) or 0))
+            except Exception:
+                pass
             try:
                 pnl = _get_trade_pnl_pct(trade)
-                if pnl != 0: b["pnls"].append(float(pnl))
-            except Exception: pass
+                if pnl != 0:
+                    b["pnls"].append(float(pnl))
+            except Exception:
+                pass
+
         def enrich(item):
             setup, b = item
             total = max(1, b["total"])
@@ -2519,19 +2641,31 @@ def build_setup_performance_report_message() -> str:
                 "avg_score": _avg(b["scores"]),
                 "avg_pnl": _avg(b["pnls"]) if b["pnls"] else None,
             }
+
         rows = [enrich(x) for x in buckets.items()]
         rows.sort(key=lambda x: (x["winrate"], x["tp2_rate"], x["total"]), reverse=True)
-        def fmt_row(x):
+
+        def fmt_row(x, idx):
             pnl = f"{x['avg_pnl']:+.2f}%" if x["avg_pnl"] is not None else "N/A"
-            name = html.escape(x["setup"][:55])
-            return (f"• {name}\n  total={x['total']} | W/L={x['wins']}/{x['losses']} | open={x['open']} | pending={x['pending']}\n"
-                    f"  WR={x['winrate']:.1f}% | TP1={x['tp1_rate']:.1f}% | TP2={x['tp2_rate']:.1f}% | BE={x['breakeven']} | Exp={x['expired']}\n"
-                    f"  avg_score={x['avg_score']:.2f} | avg_pnl={pnl}")
-        lines = ["🧠 <b>Setup Performance</b>", f"إجمالي الصفقات: {len(trades)}", "", "✅ <b>أفضل 8 Setups</b>"]
-        lines += [fmt_row(x) for x in rows[:8]]
-        lines += ["", "⚠️ <b>أضعف 8 Setups</b>"]
-        weak = sorted(rows, key=lambda x: (x["winrate"], x["tp2_rate"], -x["losses"]))[:8]
-        lines += [fmt_row(x) for x in weak]
+            name = html.escape(_human_setup_name(x["setup"]))
+            return (
+                f"<b>{idx}) {name}</b>\n"
+                f"📊 العدد: {x['total']} | ✅ {x['wins']} / ❌ {x['losses']} | مفتوح: {x['open']} | معلق: {x['pending']}\n"
+                f"🏆 Winrate: {x['winrate']:.1f}% | TP1: {x['tp1_rate']:.1f}% | TP2: {x['tp2_rate']:.1f}%\n"
+                f"⚪ Breakeven: {x['breakeven']} | ⏳ Expired: {x['expired']}\n"
+                f"⭐ Avg Score: {x['avg_score']:.2f} | 💰 Avg PnL: {pnl}"
+            )
+
+        lines = [
+            "🧠 <b>Setup Performance</b>",
+            f"📊 إجمالي الصفقات: <b>{len(trades)}</b>",
+            "",
+            "✅ <b>أفضل 5 Setups</b>",
+        ]
+        lines += [fmt_row(x, i + 1) for i, x in enumerate(rows[:5])]
+        lines += ["", "⚠️ <b>أضعف 5 Setups</b>"]
+        weak = sorted(rows, key=lambda x: (x["winrate"], x["tp2_rate"], -x["losses"]))[:5]
+        lines += [fmt_row(x, i + 1) for i, x in enumerate(weak)]
         return _limit_telegram_message("\n\n".join(lines))
     except Exception as e:
         logger.error(f"build_setup_performance_report_message error: {e}", exc_info=True)
@@ -3221,6 +3355,35 @@ def build_track_message(alert: dict) -> str:
         current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
     state_badge = get_track_state_badge(display_status, current_move)
     tv_link = build_track_tradingview_link(alert.get("symbol", ""))
+
+    # Clear pending-pullback tracking: do not show PnL/TP progress before activation.
+    if entry_mode == "pullback_pending" and not pullback_triggered:
+        pullback_low = _safe_float(alert.get("pullback_low"), 0.0)
+        pullback_high = _safe_float(alert.get("pullback_high"), 0.0)
+        approved_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
+        current_display = _fmt_price(current_price) if current_price and current_price > 0 else "N/A"
+        zone_display = "N/A"
+        if pullback_low > 0 and pullback_high > 0:
+            zone_display = f"{_fmt_price(pullback_low)} → {_fmt_price(pullback_high)}"
+        return (
+            f"📌 <b>Alert Track</b>\n\n"
+            f"🪙 {html.escape(symbol)}\n"
+            f"📈 Long | ⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
+            f"{status_line}\n\n"
+            f"💵 <b>سعر السوق الحالي:</b> {current_display}\n"
+            f"📌 <b>قرار الدخول:</b> انتظار Pullback\n"
+            f"🎯 <b>منطقة الدخول:</b> {zone_display}\n"
+            f"⚡ <b>سعر الدخول المعتمد:</b> {_fmt_price(approved_entry)}\n"
+            f"🛑 <b>SL:</b> {_fmt_price(sl)}\n"
+            f"🎯 <b>TP1:</b> {_fmt_price(tp1)} | إغلاق 40%\n"
+            f"🏁 <b>TP2:</b> {_fmt_price(tp2)} | إغلاق 40%\n"
+            f"🔄 <b>آخر 20%:</b> Trailing بعد TP2 ({TRAILING_PCT}% تحت الـ High)\n\n"
+            f"⏳ <b>الحالة:</b> لم يتفعل دخول Pullback بعد.\n"
+            f"ℹ️ لا يوجد ربح/خسارة فعلي أو TP progress قبل تفعيل الدخول.\n\n"
+            f"⏳ المدة منذ الإشارة: {duration_h}h {duration_m}m\n"
+            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
+        )
+
     leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
     leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
     leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
@@ -3234,6 +3397,11 @@ def build_track_message(alert: dict) -> str:
             f"• Entry 2: {entry2:.6f}\n"
             f"• Avg Planned Entry: {avg_planned:.6f}"
         )
+    current_display = _fmt_price(current_price) if current_price and current_price > 0 else "N/A"
+    if entry_mode == "pullback_pending" and pullback_triggered:
+        decision_line = "Pullback مفعّل"
+    else:
+        decision_line = "Market Entry"
     msg = (
         f"📌 <b>Alert Track</b>\n\n"
         f"🪙 {html.escape(symbol)}\n"
@@ -3241,25 +3409,14 @@ def build_track_message(alert: dict) -> str:
         f"⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
         f"{status_line}\n"
         f"{recovery_extra}\n"
-        f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
-    )
-    if entry_mode == "pullback_pending" and not pullback_triggered:
-        msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
-    msg += (
-        f"💰 Signal Entry: {entry:.6f}\n"
-    )
-    if entry_mode == "pullback_pending" and market_entry > 0:
-        msg += f"💵 سعر السوق عند الإرسال: {market_entry:.6f}\n"
-    if recommended_entry > 0 and recommended_entry != entry:
-        msg += f"📌 Recommended Entry: {recommended_entry:.6f}\n"
-    if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
-        msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
-    msg += (
-        f"🛑 SL: {sl:.6f}\n"
-        f"🎯 TP1: {tp1:.6f} | إغلاق 40%\n"
-        f"🏁 TP2: {tp2:.6f} | إغلاق 40%\n"
-        f"🔄 بعد TP2: Trailing Stop 20% ({TRAILING_PCT}% تحت الـ High)\n"
-        f"🛡 بعد TP1: نقل SL إلى Entry\n\n"
+        f"💵 <b>سعر السوق الحالي:</b> {current_display}\n"
+        f"📌 <b>قرار الدخول:</b> {decision_line}\n"
+        f"🎯 <b>سعر الدخول المعتمد:</b> {_fmt_price(effective_entry)}\n"
+        f"🛑 <b>SL:</b> {_fmt_price(sl)}\n"
+        f"🎯 <b>TP1:</b> {_fmt_price(tp1)} | إغلاق 40%\n"
+        f"🏁 <b>TP2:</b> {_fmt_price(tp2)} | إغلاق 40%\n"
+        f"🔄 <b>آخر 20%:</b> Trailing بعد TP2 ({TRAILING_PCT}% تحت الـ High)\n"
+        f"🛡 <b>بعد TP1:</b> نقل SL إلى Entry\n\n"
         f"{state_badge}\n"
         f"📊 {html.escape(display_status)}"
     )
@@ -5632,197 +5789,169 @@ def is_major_round_level(price: float) -> bool:
     return False
 
 def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50) -> bool:
-    """Accept round numbers as resistance only when recent price action rejected them."""
     try:
-        if df is None or getattr(df, "empty", True) or level <= entry:
+        if level <= entry:
             return False
-
-        recent = df.tail(lookback)
-        touches = 0
-        rejections = 0
-
-        for _, row in recent.iterrows():
-            high = float(row.get("high", 0) or 0)
-            close = float(row.get("close", 0) or 0)
-            open_ = float(row.get("open", 0) or 0)
-
-            if high <= 0 or close <= 0 or level <= 0:
-                continue
-
-            near_level = abs(high - level) / level <= 0.003
-            rejected = near_level and close < level and close <= open_
-
-            if near_level:
-                touches += 1
-            if rejected:
-                rejections += 1
-
-        return touches >= 1 and rejections >= 1
+        signal_row = get_signal_row(df)
+        if signal_row is None:
+            return False
+        idx = signal_row.name
+        start = max(0, idx - lookback)
+        work = df.iloc[start:idx].copy()
+        if work.empty:
+            return False
+        tolerance = 0.002
+        touches_rejected = 0
+        close_above_count = 0
+        for _, row in work.iterrows():
+            high = float(row["high"])
+            close = float(row["close"])
+            low = float(row["low"])
+            open_c = float(row["open"])
+            if abs(high - level) / level <= tolerance:
+                if close < level:
+                    touches_rejected += 1
+                else:
+                    close_above_count += 1
+            if high >= level and max(open_c, close) < level:
+                touches_rejected += 1
+        if close_above_count >= 2:
+            return False
+        return touches_rejected >= 1
     except Exception as e:
         logger.warning(f"is_valid_round_resistance error: {e}")
         return False
 
-
-def collect_resistance_candidates_long(df, entry: float, lookback: int = 50) -> list:
-    """Collect real resistance candidates above entry from structure, bands and confirmed round levels."""
+def _collect_resistance_candidates_long(df, entry: float) -> list:
     candidates = []
     try:
-        if df is None or getattr(df, "empty", True) or entry <= 0:
+        if df is None or df.empty or entry <= 0:
             return candidates
 
-        recent = df.tail(lookback).copy()
-        if recent.empty:
+        signal_row = get_signal_row(df)
+        if signal_row is None:
             return candidates
 
-        # 1) Real swing highs: local pivot high, not any previous high.
-        highs = recent["high"].astype(float).tolist()
-        for i in range(2, len(highs) - 2):
-            level = highs[i]
-            if (
-                level > entry
-                and level > highs[i - 1]
-                and level > highs[i - 2]
-                and level > highs[i + 1]
-                and level > highs[i + 2]
-            ):
-                candidates.append({"price": level, "level": level, "source": "swing_high", "strength": 3})
+        idx = signal_row.name
+        if idx is None:
+            return candidates
 
-        # 2) Recent high from the last 20 candles.
-        try:
-            recent20 = df.tail(20)
-            level = float(recent20["high"].astype(float).max())
-            if level > entry:
-                candidates.append({"price": level, "level": level, "source": "recent_20_high", "strength": 2})
-        except Exception:
-            pass
+        start = max(0, idx - SMART_TP1_LOOKBACK_SWING)
+        work = df.iloc[start:idx].copy()
+        if work.empty:
+            return candidates
 
-        # 3) Bollinger upper band if available.
-        for col in ("bb_upper", "bollinger_upper", "upper_band"):
-            if col in df.columns:
-                try:
-                    level = float(df.iloc[-1].get(col, 0) or 0)
-                    if level > entry:
-                        candidates.append({"price": level, "level": level, "source": "bb_upper", "strength": 2})
-                    break
-                except Exception:
-                    pass
+        highs = work["high"].astype(float)
+        closes = work["close"].astype(float)
 
-        # 4) Previous rejection levels: upper wick rejection above entry.
-        for _, row in recent.iterrows():
-            try:
-                high = float(row.get("high", 0) or 0)
-                close = float(row.get("close", 0) or 0)
-                open_ = float(row.get("open", 0) or 0)
-                low = float(row.get("low", 0) or 0)
-                if high <= entry or high <= 0:
-                    continue
-                candle_range = high - low
-                if candle_range <= 0:
-                    continue
-                upper_wick = high - max(open_, close)
-                rejected = (upper_wick / candle_range) >= 0.35 and close < high
-                if rejected:
-                    candidates.append({"price": high, "level": high, "source": "previous_rejection", "strength": 3})
-            except Exception:
-                continue
+        for h in highs.tail(30).tolist():
+            h = _safe_float(h, 0.0)
+            if h > entry:
+                candidates.append({
+                    "price": h,
+                    "source": "swing_high"
+                })
 
-        # 5) Confirmed round levels only.
+        for c in closes.tail(30).tolist():
+            c = _safe_float(c, 0.0)
+            if c > entry:
+                candidates.append({
+                    "price": c,
+                    "source": "recent_close_high"
+                })
+
+        bb_upper = _safe_float(signal_row.get("bb_upper"), 0.0)
+        if bb_upper > entry:
+            candidates.append({
+                "price": bb_upper,
+                "source": "bb_upper"
+            })
+
+        if len(work) >= 20:
+            prev_high = _safe_float(work["high"].tail(20).max(), 0.0)
+            if prev_high > entry:
+                candidates.append({
+                    "price": prev_high,
+                    "source": "prev_20_high"
+                })
+
         if SMART_TP1_ROUND_LEVELS_ENABLED:
+            round_levels = []
+            if entry >= 100:
+                step = 5.0
+            elif entry >= 10:
+                step = 0.5
+            elif entry >= 1:
+                step = 0.05
+            elif entry >= 0.1:
+                step = 0.005
+            elif entry >= 0.01:
+                step = 0.0005
+            else:
+                step = 0.00005
+
             try:
-                if entry >= 100:
-                    steps = [1, 5, 10]
-                elif entry >= 10:
-                    steps = [0.1, 0.5, 1]
-                elif entry >= 1:
-                    steps = [0.01, 0.05, 0.1]
-                elif entry >= 0.1:
-                    steps = [0.001, 0.005, 0.01]
-                elif entry >= 0.01:
-                    steps = [0.0001, 0.0005, 0.001]
-                else:
-                    steps = [entry * 0.01, entry * 0.05, entry * 0.1]
-
-                for step in steps:
-                    if step <= 0:
-                        continue
-                    next_level = round(((entry // step) + 1) * step, 12)
-                    if next_level > entry and is_valid_round_resistance(df, next_level, entry, lookback=lookback):
-                        candidates.append({
-                            "price": next_level,
-                            "level": next_level,
-                            "source": "round_level_confirmed",
-                            "strength": 1,
-                        })
+                base = int(entry / step) * step
+                for i in range(1, 8):
+                    level = base + step * i
+                    if level > entry:
+                        round_levels.append(level)
             except Exception:
-                pass
+                round_levels = []
 
-        # Merge duplicates/near-duplicates, keeping the stronger source.
+            for level in round_levels:
+                if is_valid_round_resistance(df, level, entry):
+                    candidates.append({
+                        "price": level,
+                        "source": "round_level_confirmed"
+                    })
+
         cleaned = []
-        for c in candidates:
-            try:
-                level = float(c.get("price", c.get("level", 0)) or 0)
-                if level <= entry:
-                    continue
-                duplicate = False
-                for old in cleaned:
-                    old_level = float(old.get("price", old.get("level", 0)) or 0)
-                    if old_level > 0 and abs(level - old_level) / old_level <= 0.002:
-                        duplicate = True
-                        if c.get("strength", 0) > old.get("strength", 0):
-                            old.update(c)
-                            old["price"] = level
-                            old["level"] = level
-                        break
-                if not duplicate:
-                    c["price"] = level
-                    c["level"] = level
-                    cleaned.append(c)
-            except Exception:
+        seen = set()
+        for item in candidates:
+            price = _safe_float(item.get("price"), 0.0)
+            if price <= entry:
                 continue
+            key = round(price, 10)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append({
+                "price": price,
+                "source": item.get("source", "unknown")
+            })
 
-        cleaned.sort(key=lambda x: float(x.get("price", 0) or 0))
+        cleaned.sort(key=lambda x: x["price"])
         return cleaned
+
     except Exception as e:
-        logger.warning(f"collect_resistance_candidates_long error: {e}")
+        logger.warning(f"_collect_resistance_candidates_long error: {e}")
         return candidates
 
 
-# Backward-compatible alias for older calls in this file.
-def _collect_resistance_candidates_long(df, entry: float) -> list:
-    return collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
-
-
-def find_nearest_resistance_long(df, entry: float) -> dict:
+def find_nearest_resistance_long(df, entry: float):
     try:
-        candidates = collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
+        candidates = _collect_resistance_candidates_long(df, entry)
+        if not candidates:
+            return None
+        source_order = {
+            "swing_high": 0,
+            "recent_close_high": 1,
+            "prev_20_high": 2,
+            "bb_upper": 3,
+            "round_level_confirmed": 4,
+            "major_round_level": 5,
+        }
         valid = []
         for c in candidates:
-            try:
-                level = float(c.get("price", c.get("level", 0)) or 0)
-                if level > entry:
-                    valid.append(c)
-            except Exception:
-                pass
-
+            source = c.get("source", "unknown")
+            order = source_order.get(source, 99)
+            valid.append((order, c["price"], c))
         if not valid:
             return None
-
-        source_priority = {
-            "swing_high": 1,
-            "previous_rejection": 2,
-            "recent_20_high": 3,
-            "bb_upper": 4,
-            "round_level_confirmed": 5,
-        }
-        valid.sort(
-            key=lambda c: (
-                float(c.get("price", c.get("level", 0)) or 0),
-                source_priority.get(c.get("source", ""), 99),
-            )
-        )
-        return valid[0]
-    except Exception as e:
-        logger.warning(f"find_nearest_resistance_long error: {e}")
+        valid.sort(key=lambda x: (x[1], x[0]))
+        return valid[0][2]
+    except Exception:
         return None
 
 
@@ -5884,7 +6013,6 @@ def build_smart_tp1_long(
         "tp1": calc_tp_long(entry, sl, rr=rr1),
         "tp2": calc_tp_long(entry, sl, rr=rr2),
         "nearest_resistance": None,
-        "nearest_resistance_source": None,
         "nearest_support": None,
         "target_method": "rr",
         "target_notes": [],
@@ -5916,7 +6044,6 @@ def build_smart_tp1_long(
         if nearest_resistance_data:
             nearest_resistance = _safe_float(nearest_resistance_data.get("price"), 0.0)
             result["nearest_resistance"] = _round_price_dynamic(nearest_resistance)
-            result["nearest_resistance_source"] = nearest_resistance_data.get("source", "unknown")
         else:
             nearest_resistance = 0.0
 
@@ -6143,9 +6270,10 @@ def build_message(
  warnings_text = "\n".join(f"• {html.escape(w)}" for w in warnings) if warnings else ""
  funding_text = score_result.get("funding_label", "🟡 محايد")
  signal_rating = score_result.get("signal_rating", "⚡ عادي")
- sl_pct = calculate_sl_percent(price, stop_loss)
- tp1_pct = round(((tp1 - price) / price) * 100, 2) if price else 0.0
- tp2_pct = round(((tp2 - price) / price) * 100, 2) if price else 0.0
+ entry_price_for_targets = float(price or 0)
+ sl_pct = calculate_sl_percent(entry_price_for_targets, stop_loss)
+ tp1_pct = round(((tp1 - entry_price_for_targets) / entry_price_for_targets) * 100, 2) if entry_price_for_targets else 0.0
+ tp2_pct = round(((tp2 - entry_price_for_targets) / entry_price_for_targets) * 100, 2) if entry_price_for_targets else 0.0
  new_tag = "\n🆕 <b>عملة جديدة</b>" if is_new else ""
  reverse_banner = get_reverse_banner_long(is_reverse)
  reverse_note = get_reverse_style_note_long(is_reverse)
@@ -6154,29 +6282,29 @@ def build_message(
  safe_1h = rtl_fix("1H")
  safe_24h = rtl_fix("24H")
  pullback_text = ""
- if pullback_low is not None and pullback_high is not None:
-    if has_pullback_plan and market_price is not None:
-        pullback_text = ""
-        if execution_entry is not None:
-            pullback_text += (
-                f"📌 <b>Pullback Entry:</b> {fmt_num(pullback_low, 6)} → {fmt_num(pullback_high, 6)}\n"
-                f"🎯 <b>Execution Entry:</b> {fmt_num(execution_entry, 6)}\n"
-                f"💰 <b>سعر السوق الحالي:</b> {fmt_num(market_price, 6)}\n"
-            )
-        # Execution SL/TP lines
-        if execution_sl is not None:
-            pullback_text += f"🛑 <b>Execution SL:</b> {fmt_num(execution_sl, 6)}\n"
-        if execution_tp1 is not None:
-            pullback_text += f"🎯 <b>Execution TP1:</b> {fmt_num(execution_tp1, 6)}\n"
-        if execution_tp2 is not None:
-            pullback_text += f"🏁 <b>Execution TP2:</b> {fmt_num(execution_tp2, 6)}\n"
-    else:
-        pullback_text = (
-            f"📥 <b>منطقة بول باك مقترحة للمراقبة:</b> "
-            f"من {fmt_num(pullback_low, 6)} إلى {fmt_num(pullback_high, 6)}\n"
-        )
-        if execution_entry is not None:
-            pullback_text += f"🎯 <b>Execution Entry:</b> {fmt_num(execution_entry, 6)}\n"
+ decision_text = ""
+ if has_pullback_plan and pullback_low is not None and pullback_high is not None:
+    approved_entry = execution_entry if execution_entry is not None else price
+    decision_text = (
+        f"💵 <b>سعر السوق الحالي:</b> {fmt_num(market_price if market_price is not None else price, 6)}\n"
+        f"📌 <b>قرار الدخول:</b> انتظار Pullback\n"
+        f"🎯 <b>منطقة الدخول:</b> {fmt_num(pullback_low, 6)} → {fmt_num(pullback_high, 6)}\n"
+        f"⚡ <b>سعر الدخول المعتمد:</b> {fmt_num(approved_entry, 6)}\n"
+        f"ℹ️ <b>لا تدخل Market الآن؛ يتم الانتظار داخل منطقة Pullback.</b>\n"
+    )
+ elif pullback_low is not None and pullback_high is not None:
+    decision_text = (
+        f"💵 <b>سعر السوق الحالي:</b> {fmt_num(market_price if market_price is not None else price, 6)}\n"
+        f"📌 <b>قرار الدخول:</b> Market Entry\n"
+        f"🎯 <b>سعر الدخول:</b> {fmt_num(price, 6)}\n"
+        f"📥 <b>منطقة Pullback للمراقبة فقط:</b> {fmt_num(pullback_low, 6)} → {fmt_num(pullback_high, 6)}\n"
+    )
+ else:
+    decision_text = (
+        f"💵 <b>سعر السوق الحالي:</b> {fmt_num(market_price if market_price is not None else price, 6)}\n"
+        f"📌 <b>قرار الدخول:</b> Market Entry\n"
+        f"🎯 <b>سعر الدخول:</b> {fmt_num(price, 6)}\n"
+    )
 
  if is_reverse:
     if reversal_4h_confirmed:
@@ -6249,16 +6377,13 @@ def build_message(
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
 
- if has_pullback_plan and market_price is not None:
-    price_line = f"🎯 <b>الدخول المخطط:</b> {fmt_num(price, 6)} | 💰 <b>السوق:</b> {fmt_num(market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
- else:
-    price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+ price_line = f"⏱ <b>الفريم:</b> {safe_15m}"
 
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 {price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
-{pullback_text}
+{decision_text}
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
 🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
@@ -8641,8 +8766,6 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-                        _tp1_structure = _nearest_res * 0.995
-                        _min_tp1 = float(entry_price_for_trade) + (_risk_for_quality * 1.2)
                         if _res_dist_pct < 1.0 or _res_r < 1.2:
                             log_long_rejection(
                                 symbol=symbol,
@@ -8664,42 +8787,12 @@ def run_scanner_loop():
                                 is_reverse=is_reverse,
                                 extra={
                                     "nearest_resistance": _nearest_res,
-                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
                                     "resistance_distance_pct": _res_dist_pct,
                                     "resistance_r": _res_r,
                                     "category": "trade_quality",
                                 },
                             )
                             logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
-                            continue
-                        if _tp1_structure < _min_tp1:
-                            log_long_rejection(
-                                symbol=symbol,
-                                reason="tp1_not_rewarding_before_resistance",
-                                candle_time=candle_time,
-                                score=score_result.get("score"),
-                                raw_score=raw_score,
-                                market_state=market_state,
-                                current_mode=current_mode,
-                                entry_timing=entry_timing_temp,
-                                opportunity_type=temp_opportunity_type,
-                                dist_ma=dist_ma,
-                                rsi_now=rsi_now,
-                                vol_ratio=vol_ratio,
-                                vwap_distance=vwap_distance,
-                                mtf_confirmed=mtf_confirmed,
-                                breakout=breakout,
-                                pre_breakout=pre_breakout,
-                                is_reverse=is_reverse,
-                                extra={
-                                    "nearest_resistance": _nearest_res,
-                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
-                                    "tp1_structure": _tp1_structure,
-                                    "min_tp1": _min_tp1,
-                                    "category": "trade_quality",
-                                },
-                            )
-                            logger.info(f"⛔ {symbol} rejected: tp1_not_rewarding_before_resistance | res={_nearest_res} | tp1_structure={_tp1_structure} | min_tp1={_min_tp1}")
                             continue
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
@@ -9732,11 +9825,36 @@ def run_scanner_loop():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                         elif EXECUTION_AVAILABLE:
                             exec_result = process_trade_candidate(r, symbol, candidate)
-                            if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
+                            status = exec_result.get("status")
+                            if status in ("accepted_preview", "pending_pullback_preview"):
                                 execution_message = exec_result.get("execution_message")
                                 if execution_message:
-                                    send_telegram_message(execution_message)
-                                logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
+                                    send_result = send_telegram_message(execution_message)
+                                    if not send_result.get("ok"):
+                                        logger.warning(
+                                            f"⚠️ Execution message HTML failed | status={status} | symbol={symbol} | "
+                                            f"error={send_result.get('description') or send_result}"
+                                        )
+                                        plain_result = send_telegram_message_plain(execution_message)
+                                        if plain_result.get("ok"):
+                                            logger.info(
+                                                f"✅ Execution message sent as plain text | status={status} | symbol={symbol}"
+                                            )
+                                        else:
+                                            logger.error(
+                                                f"❌ Execution message failed completely | status={status} | symbol={symbol} | "
+                                                f"error={plain_result.get('description') or plain_result}"
+                                            )
+                                    else:
+                                        logger.info(
+                                            f"✅ Execution message sent | status={status} | symbol={symbol}"
+                                        )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ Execution status matched but no execution_message | "
+                                        f"status={status} | symbol={symbol}"
+                                    )
+                                logger.info(f"EXEC {status}: {symbol}")
                             else:
                                 logger.info(
                                     f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
