@@ -1,3 +1,5 @@
+[file name]: main.py (full content with modifications)
+[file content]
 import os 
 import sys 
 import time 
@@ -6983,7 +6985,12 @@ def run_scanner_loop():
                 symbol = pair_data["instId"]
                 candles = get_candles(symbol, TIMEFRAME, 100)
                 if not candles:
-                    log_long_rejection(symbol=symbol, reason="no_candles", candle_time=None, market_state=market_state, current_mode=current_mode)
+                    # retry once for data error
+                    time.sleep(0.4)
+                    candles = get_candles(symbol, TIMEFRAME, 100)
+                if not candles:
+                    log_long_rejection(symbol=symbol, reason="data_error_no_candles", candle_time=None, market_state=market_state, current_mode=current_mode, extra={"category": "data_error", "original_reason": "no_candles", "data_error_type": "empty_response_or_too_few", "details": "Retry failed for recovery scan"})
+                    logger.warning(f"DATA ERROR | {symbol} | no_candles | recovery scan")
                     continue
                 df = to_dataframe(candles)
                 if df is None or df.empty:
@@ -7270,7 +7277,18 @@ def run_scanner_loop():
             change_24h = extract_24h_change_percent(pair_data)
             candles = candles_map.get(symbol, [])
             if not candles:
-                log_long_rejection(symbol=symbol, reason="no_candles", candle_time=None, market_state=market_state, current_mode=current_mode)
+                # data error retry once
+                time.sleep(0.4)
+                candles = get_candles(symbol, TIMEFRAME, 100)
+            if not candles:
+                log_long_rejection(symbol=symbol, reason="data_error_no_candles", candle_time=None, market_state=market_state, current_mode=current_mode,
+                    extra={
+                        "category": "data_error",
+                        "original_reason": "no_candles",
+                        "data_error_type": "empty_response_or_too_few",
+                        "details": "Retry failed for main scan"
+                    })
+                logger.warning(f"DATA ERROR | {symbol} | no_candles | main scan")
                 continue
             df = to_dataframe(candles)
             if df is None or df.empty:
@@ -8094,7 +8112,7 @@ def run_scanner_loop():
                 pullback_mid_entry = (float(pullback_low) + float(pullback_high)) / 2.0
                 # جمع مرشحات الدعم
                 support_candidates = []
-                # nearest_support من smart_sl (سوف نحصل عليه لاحقاً لكننا نحتاجه الآن)
+                # nearest_support from smart_sl (سوف نحصل عليه لاحقاً لكننا نحتاجه الآن)
                 # سنستدعي smart_sl مؤقتاً للحصول على nearest_support
                 temp_smart_sl = build_smart_sl_long(
                     df=df,
@@ -8404,10 +8422,12 @@ def run_scanner_loop():
                 wait_pullback = should_wait_for_pullback_entry(temp_cand_dec)
 
             if wait_pullback:
-                entry_price_for_trade = pullback_entry
+                # استخدم execution_entry إن وجد بدل pullback_entry
+                final_pullback_entry = execution_entry if execution_entry else pullback_entry
+                entry_price_for_trade = final_pullback_entry
                 entry_mode = "pullback_pending"
                 pullback_triggered = False
-                recommended = pullback_entry
+                recommended = final_pullback_entry
             else:
                 entry_price_for_trade = price
                 entry_mode = "market"
@@ -8438,20 +8458,48 @@ def run_scanner_loop():
             sl_method = smart_sl.get("sl_method", "atr")
             sl_notes = smart_sl.get("sl_notes", [])
 
-            # إذا كان لدينا execution_entry ونحتاج لإكمال حساب execution_tp1 و execution_tp2
-            if execution_entry is not None:
-                # استخدم stop_loss المحسوب كـ fallback إذا لزم
-                if execution_sl is None:
-                    # fallback إلى stop_loss الأساسي
-                    execution_sl = stop_loss
+            # إعادة حساب execution pullback بشكل نهائي بعد معرفة stop_loss و rr1, rr2
+            if wait_pullback or has_pullback_plan:
+                if not execution_entry:
+                    execution_entry = (float(pullback_low) + float(pullback_high)) / 2.0
+                support_candidates = []
+                for v in (nearest_support, execution_sl, float(pullback_low)):
+                    try:
+                        vf = float(v)
+                        if vf > 0:
+                            support_candidates.append(vf)
+                    except Exception:
+                        pass
+                if support_candidates:
+                    execution_sl = min(support_candidates)
+                else:
+                    execution_sl = float(pullback_low) * 0.997
+                execution_sl = min(execution_sl, float(pullback_low) * 0.997)
                 risk_exec = execution_entry - execution_sl
-                if risk_exec <= 0:
-                    execution_sl = stop_loss
+                if risk_exec <= 0 or (risk_exec / execution_entry) < 0.002:
+                    execution_sl = float(pullback_low) * 0.995
                     risk_exec = execution_entry - execution_sl
-                execution_tp1 = execution_entry + (risk_exec * rr1)
-                execution_tp2 = execution_entry + (risk_exec * rr2)
-                # إذا كان risk صغير جداً، قد يكون غير منطقي، لكن نترك
-                # إضافة إلى candidate لاحقاً
+                if risk_exec <= 0:
+                    execution_sl = float(stop_loss)
+                    risk_exec = execution_entry - execution_sl
+                execution_tp1 = execution_entry + (risk_exec * float(rr1))
+                execution_tp2 = execution_entry + (risk_exec * float(rr2))
+                # Store execution fields
+                candidate["execution_entry"] = execution_entry
+                candidate["execution_sl"] = execution_sl
+                candidate["execution_tp1"] = execution_tp1
+                candidate["execution_tp2"] = execution_tp2
+                candidate["has_pullback_plan"] = True
+                if wait_pullback:
+                    candidate["entry_mode"] = "pullback_pending"
+                else:
+                    candidate["entry_mode"] = "market"  # may be set above
+            else:
+                # Ensure execution slots are cleared
+                candidate["execution_entry"] = None
+                candidate["execution_sl"] = None
+                candidate["execution_tp1"] = None
+                candidate["execution_tp2"] = None
 
             smart_targets_early = build_smart_tp1_long(
                 df=df,
@@ -9190,7 +9238,7 @@ def run_scanner_loop():
                 "recommended_entry": recommended,
                 "entry_mode": entry_mode,
                 "pullback_triggered": pullback_triggered,
-                # حقول التنفيذ الجديدة
+                # حقول التنفيذ الجديدة (updated later if needed)
                 "execution_entry": execution_entry,
                 "execution_sl": execution_sl,
                 "execution_tp1": execution_tp1,
