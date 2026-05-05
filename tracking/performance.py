@@ -57,6 +57,11 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - Breakeven بعد TP1 يعتبر فوز جزئي وليس خسارة.
 - Full Wins TP2 = عدد صفقات tp2_win الحقيقية.
 - حقل alert_id/trade_id لتجنب التكرار.
+
+**إصدار 3.7 – تثبيت حقول التنفيذ والتحليل**
+- حفظ execution_entry/execution_sl/execution_tp1/execution_tp2 top-level وداخل diagnostics/history.
+- حفظ block_exception وrelative_strength_* حتى تظهر في /report_execution و/ report_setups بعد Redis.
+- حفظ nearest_resistance_source وخطة 40/40/20 كاملة بدون تغيير register_trade signature.
 """
 
 import json
@@ -284,8 +289,34 @@ def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> 
     if effective_entry <= 0 or sl <= 0:
         return trade
 
+    # مهم: لو main.py حسب Smart TP مسبقًا بناءً على final_pullback_entry،
+    # لا نعيد كتابة TP1/TP2 هنا عند تفعيل البولباك.
+    # هذه الدالة تظل fallback فقط للصفقات القديمة أو التي لا تحتوي خطة أهداف ذكية.
+    target_method = str(
+        trade.get("target_method")
+        or diagnostics.get("target_method")
+        or ""
+    ).lower()
+    has_existing_targets = safe_float(trade.get("tp1"), 0.0) > 0 and safe_float(trade.get("tp2"), 0.0) > 0
+    smart_or_execution_targets = (
+        "smart" in target_method
+        or safe_float(trade.get("execution_tp1"), 0.0) > 0
+        or safe_float(trade.get("execution_tp2"), 0.0) > 0
+        or safe_float(diagnostics.get("execution_tp1"), 0.0) > 0
+        or safe_float(diagnostics.get("execution_tp2"), 0.0) > 0
+    )
+
+    diagnostics["effective_entry"] = round_price(effective_entry)
+    diagnostics["rr1"] = rr1
+    diagnostics["rr2"] = rr2
+
+    if has_existing_targets and smart_or_execution_targets:
+        trade["diagnostics"] = diagnostics
+        return trade
+
     risk = abs(effective_entry - sl)
     if risk <= 0:
+        trade["diagnostics"] = diagnostics
         return trade
 
     if side == "short":
@@ -295,8 +326,6 @@ def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> 
         trade["tp1"] = round_price(effective_entry + (risk * rr1))
         trade["tp2"] = round_price(effective_entry + (risk * rr2))
 
-    diagnostics["rr1"] = rr1
-    diagnostics["rr2"] = rr2
     trade["diagnostics"] = diagnostics
     return trade
 
@@ -494,6 +523,21 @@ def build_trade_diagnostics(extra_fields: dict = None) -> dict:
         "recommended_entry": round_price(_get("recommended_entry")) if _get("recommended_entry") is not None else None,
         "has_pullback_plan": normalize_bool(_get("has_pullback_plan", False)),
 
+        # حقول التنفيذ والتحليل (v3.7)
+        "execution_entry": round_price(_get("execution_entry")) if _get("execution_entry") is not None else None,
+        "execution_sl": round_price(_get("execution_sl")) if _get("execution_sl") is not None else None,
+        "execution_tp1": round_price(_get("execution_tp1")) if _get("execution_tp1") is not None else None,
+        "execution_tp2": round_price(_get("execution_tp2")) if _get("execution_tp2") is not None else None,
+        "execution_risk": safe_float(_get("execution_risk")) if _get("execution_risk") is not None else None,
+        "block_exception": normalize_bool(_get("block_exception", False)),
+        "relative_strength_short": safe_float(_get("relative_strength_short"), 0.0),
+        "relative_strength_24": safe_float(_get("relative_strength_24"), 0.0),
+        "relative_strength_vs_btc": normalize_bool(_get("relative_strength_vs_btc", False)),
+        "nearest_resistance_source": normalize_text(_get("nearest_resistance_source"), ""),
+        "tp1_plan_pct": safe_float(_get("tp1_plan_pct"), safe_float(_get("tp1_close_pct"), TP1_CLOSE_PCT)),
+        "tp2_plan_pct": safe_float(_get("tp2_plan_pct"), safe_float(_get("tp2_close_pct"), TP2_CLOSE_PCT)),
+        "trailing_position_pct": safe_float(_get("trailing_position_pct"), 20.0),
+
         # حقول تتبع تفعيل البولباك
         "activated_at": safe_int(_get("activated_at")) if _get("activated_at") is not None else None,
         "activated_candle_ts": safe_int(_get("activated_candle_ts")) if _get("activated_candle_ts") is not None else None,
@@ -640,6 +684,21 @@ def build_history_snapshot(trade_data: dict) -> dict:
         "market_entry": _get_field("market_entry"),
         "recommended_entry": _get_field("recommended_entry"),
         "has_pullback_plan": normalize_bool(_get_field("has_pullback_plan", False)),
+
+        # حقول التنفيذ والتحليل (v3.7)
+        "execution_entry": _get_field("execution_entry"),
+        "execution_sl": _get_field("execution_sl"),
+        "execution_tp1": _get_field("execution_tp1"),
+        "execution_tp2": _get_field("execution_tp2"),
+        "execution_risk": _get_field("execution_risk"),
+        "block_exception": normalize_bool(_get_field("block_exception", False)),
+        "relative_strength_short": safe_float(_get_field("relative_strength_short"), 0.0),
+        "relative_strength_24": safe_float(_get_field("relative_strength_24"), 0.0),
+        "relative_strength_vs_btc": normalize_bool(_get_field("relative_strength_vs_btc", False)),
+        "nearest_resistance_source": _get_field("nearest_resistance_source", ""),
+        "tp1_plan_pct": safe_float(_get_field("tp1_plan_pct"), safe_float(_get_field("tp1_close_pct"), TP1_CLOSE_PCT)),
+        "tp2_plan_pct": safe_float(_get_field("tp2_plan_pct"), safe_float(_get_field("tp2_close_pct"), TP2_CLOSE_PCT)),
+        "trailing_position_pct": safe_float(_get_field("trailing_position_pct"), 20.0),
 
         # حقول تتبع تفعيل البولباك (v3.3)
         "activated_at": _get_field("activated_at"),
@@ -891,6 +950,20 @@ def register_trade(
         "market_entry": market_entry,
         "recommended_entry": recommended_entry,
         "has_pullback_plan": has_pullback_plan,
+        # حقول التنفيذ والتحليل (v3.7) — تأتي غالبًا من kwargs في main.py
+        "execution_entry": kwargs.get("execution_entry"),
+        "execution_sl": kwargs.get("execution_sl"),
+        "execution_tp1": kwargs.get("execution_tp1"),
+        "execution_tp2": kwargs.get("execution_tp2"),
+        "execution_risk": kwargs.get("execution_risk"),
+        "block_exception": kwargs.get("block_exception"),
+        "relative_strength_short": kwargs.get("relative_strength_short"),
+        "relative_strength_24": kwargs.get("relative_strength_24"),
+        "relative_strength_vs_btc": kwargs.get("relative_strength_vs_btc"),
+        "nearest_resistance_source": kwargs.get("nearest_resistance_source"),
+        "tp1_plan_pct": kwargs.get("tp1_plan_pct"),
+        "tp2_plan_pct": kwargs.get("tp2_plan_pct"),
+        "trailing_position_pct": kwargs.get("trailing_position_pct"),
     }
 
     def _get_val(key, default=None):
@@ -1018,6 +1091,20 @@ def register_trade(
         "market_entry": _get_val("market_entry"),
         "recommended_entry": _get_val("recommended_entry"),
         "has_pullback_plan": _has_pullback_plan,
+        # حقول التنفيذ والتحليل (v3.7)
+        "execution_entry": _get_val("execution_entry"),
+        "execution_sl": _get_val("execution_sl"),
+        "execution_tp1": _get_val("execution_tp1"),
+        "execution_tp2": _get_val("execution_tp2"),
+        "execution_risk": _get_val("execution_risk"),
+        "block_exception": _get_val("block_exception", False),
+        "relative_strength_short": _get_val("relative_strength_short", 0.0),
+        "relative_strength_24": _get_val("relative_strength_24", 0.0),
+        "relative_strength_vs_btc": _get_val("relative_strength_vs_btc", False),
+        "nearest_resistance_source": _get_val("nearest_resistance_source", ""),
+        "tp1_plan_pct": _get_val("tp1_plan_pct", _get_val("tp1_close_pct", TP1_CLOSE_PCT)),
+        "tp2_plan_pct": _get_val("tp2_plan_pct", _get_val("tp2_close_pct", TP2_CLOSE_PCT)),
+        "trailing_position_pct": _get_val("trailing_position_pct", 20.0),
         # حماية
         "protected_breakeven": _get_val("protected_breakeven", False),
         "breakeven_protection_reason": _get_val("breakeven_protection_reason", ""),
@@ -1148,6 +1235,21 @@ def register_trade(
         "market_entry": round_price(_get_val("market_entry")) if _get_val("market_entry") is not None else None,
         "recommended_entry": round_price(_get_val("recommended_entry")) if _get_val("recommended_entry") is not None else None,
         "has_pullback_plan": _has_pullback_plan,
+
+        # حقول التنفيذ والتحليل top-level (v3.7)
+        "execution_entry": round_price(_get_val("execution_entry")) if _get_val("execution_entry") is not None else None,
+        "execution_sl": round_price(_get_val("execution_sl")) if _get_val("execution_sl") is not None else None,
+        "execution_tp1": round_price(_get_val("execution_tp1")) if _get_val("execution_tp1") is not None else None,
+        "execution_tp2": round_price(_get_val("execution_tp2")) if _get_val("execution_tp2") is not None else None,
+        "execution_risk": safe_float(_get_val("execution_risk")) if _get_val("execution_risk") is not None else None,
+        "block_exception": normalize_bool(_get_val("block_exception", False)),
+        "relative_strength_short": safe_float(_get_val("relative_strength_short"), 0.0),
+        "relative_strength_24": safe_float(_get_val("relative_strength_24"), 0.0),
+        "relative_strength_vs_btc": normalize_bool(_get_val("relative_strength_vs_btc", False)),
+        "nearest_resistance_source": _get_val("nearest_resistance_source", ""),
+        "tp1_plan_pct": safe_float(_get_val("tp1_plan_pct", _get_val("tp1_close_pct", TP1_CLOSE_PCT))),
+        "tp2_plan_pct": safe_float(_get_val("tp2_plan_pct", _get_val("tp2_close_pct", TP2_CLOSE_PCT))),
+        "trailing_position_pct": safe_float(_get_val("trailing_position_pct", 20.0)),
 
         # حقول تتبع تفعيل البولباك (v3.3)
         "pullback_triggered": _pullback_triggered,
