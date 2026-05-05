@@ -214,6 +214,10 @@ STRONG_ONLY_ALLOWED_SETUPS = {
     "vwap_reclaim",
     "retest_breakout_confirmed",
     "wave_3",
+    "liquidity_sweep_reclaim",
+    "support_bounce_confirmed",
+    "higher_low_continuation",
+    "relative_strength_vs_btc",
 }
 STRONG_ONLY_MIN_SCORE = 8.0
 STRONG_ONLY_MIN_VOL_RATIO = 1.2
@@ -401,26 +405,58 @@ def set_global_cooldown() -> None:
 # PULLBACK HELPER
 # =========================
 def should_wait_for_pullback_entry(candidate: dict) -> bool:
+    """Decide whether to delay entry for a pullback plan.
+
+    Pullback is now reserved mainly for ordinary/retest breakouts. Strong reclaim,
+    relative-strength, and support-bounce setups should enter at market so the bot
+    does not miss fast continuation moves.
+    """
     if not PULLBACK_ENTRY_WAIT_ENABLED:
         return False
+
+    setup_type = str(candidate.get("setup_type", "") or "")
+    force_market_setups = [
+        "vwap_reclaim",
+        "liquidity_sweep_reclaim",
+        "support_bounce_confirmed",
+        "higher_low_continuation",
+        "relative_strength_vs_btc",
+    ]
+    if any(name in setup_type for name in force_market_setups):
+        return False
+
+    try:
+        vol_ratio = float(candidate.get("vol_ratio", 0.0) or 0.0)
+    except Exception:
+        vol_ratio = 0.0
+    if vol_ratio >= 1.6:
+        return False
+
     pullback_entry = candidate.get("pullback_entry")
     pullback_low = candidate.get("pullback_low")
     pullback_high = candidate.get("pullback_high")
     if not pullback_entry or not pullback_low or not pullback_high or pullback_entry <= 0:
         return False
+
     opportunity_type = candidate.get("opportunity_type", "")
-    if "Breakout" not in opportunity_type:
+    if "Breakout" not in opportunity_type and "retest_breakout_confirmed" not in setup_type:
         return False
+
     entry_timing = candidate.get("entry_timing", "")
     if "🔴" in entry_timing:
         return False
+
     resistance_warning = candidate.get("resistance_warning", "")
     if resistance_warning == "مقاومة قريبة جدًا قبل TP1":
         return False
+
     market_entry = candidate.get("market_entry", 0.0)
     if market_entry <= 0:
         return False
-    distance_pct = abs(pullback_entry - market_entry) / market_entry * 100.0
+
+    distance_pct = abs(float(pullback_entry) - float(market_entry)) / float(market_entry) * 100.0
+    if distance_pct > 0.8:
+        return False
     if distance_pct > PULLBACK_ENTRY_MAX_DISTANCE_PCT:
         return False
     return True
@@ -1096,8 +1132,11 @@ def detect_extra_strong_long_setups(
 
     liq_res = detect_liquidity_sweep_reclaim(df, vol_ratio, atr_value, rsi_now)
     if liq_res.get("detected"):
-        context_setups.append(liq_res["reason"])
+        setups.append(liq_res["reason"])
+        total_bonus += liq_res.get("score_bonus", 0.0)
         details[liq_res["reason"]] = liq_res.get("details", {})
+        if not primary_setup:
+            primary_setup = liq_res["reason"]
 
     total_bonus = min(total_bonus, 0.60)
 
@@ -1468,6 +1507,7 @@ def build_help_message() -> str:
 <b>📊 تحليل الأداء:</b>
 /report_deep - تحليل متقدم شامل
 /report_exits - جودة الخروج TP1/TP2/SL
+/report_execution - صفقات مرشحة للتنفيذ فقط
 /report_rejections - تحليل أسباب رفض الفرص
 /report_setups - أفضل وأسوأ أنواع الإشارات
 /report_scores - تحليل السكور
@@ -2348,6 +2388,155 @@ def build_market_status_message() -> str:
     logger.error(f"build_market_status_message error: {e}")
     return f"❌ حصل خطأ أثناء بناء حالة السوق\n{html.escape(str(e))}"
 
+
+def is_strong_exception(candidate: dict) -> bool:
+    """Allow only very strong / relatively strong coins during BLOCK_LONGS."""
+    try:
+        setup_type = str(candidate.get("setup_type", "") or "")
+        score = float(candidate.get("effective_score", candidate.get("score", 0.0)) or 0.0)
+        vol_ratio = float(candidate.get("vol_ratio", 0.0) or 0.0)
+        mtf = bool(candidate.get("mtf_confirmed", False))
+        relative_strength_short = float(candidate.get("relative_strength_short", 0.0) or 0.0)
+        relative_strength_24 = float(candidate.get("relative_strength_24", 0.0) or 0.0)
+        is_rel = (
+            relative_strength_short >= 1.5
+            or relative_strength_24 >= 2.0
+            or bool(candidate.get("relative_strength_vs_btc", False))
+        )
+        strong_setup = (
+            "vwap_reclaim" in setup_type
+            or "retest_breakout_confirmed" in setup_type
+            or "wave_3" in setup_type
+            or "liquidity_sweep_reclaim" in setup_type
+            or "support_bounce_confirmed" in setup_type
+            or "higher_low_continuation" in setup_type
+            or "breakout|mtf_yes|vol_high" in setup_type
+        )
+        return (
+            strong_setup
+            and score >= 8.3
+            and vol_ratio >= 1.2
+            and (mtf or is_rel)
+        ) or (
+            is_rel
+            and score >= 8.0
+            and vol_ratio >= 1.25
+        )
+    except Exception:
+        return False
+
+
+def is_execution_candidate_trade(trade: dict) -> bool:
+    diagnostics = trade.get("diagnostics", {}) or {}
+    setup_type = str(trade.get("setup_type") or diagnostics.get("setup_type") or "")
+    entry_mode = str(trade.get("entry_mode") or diagnostics.get("entry_mode") or "")
+    return (
+        trade.get("execution_entry") is not None
+        or diagnostics.get("execution_entry") is not None
+        or entry_mode in ("pullback_pending", "pullback_triggered")
+        or bool(trade.get("has_pullback_plan") or diagnostics.get("has_pullback_plan"))
+        or bool(trade.get("block_exception") or diagnostics.get("block_exception"))
+        or "vwap_reclaim" in setup_type
+        or "retest_breakout_confirmed" in setup_type
+        or "wave_3" in setup_type
+        or "liquidity_sweep_reclaim" in setup_type
+        or "support_bounce_confirmed" in setup_type
+        or "higher_low_continuation" in setup_type
+        or "relative_strength_vs_btc" in setup_type
+    )
+
+
+def _trade_field(trade: dict, key: str, default=None):
+    diagnostics = trade.get("diagnostics", {}) or {}
+    return trade.get(key, diagnostics.get(key, default))
+
+
+def build_execution_report_message() -> str:
+    try:
+        trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
+        if not trades:
+            return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
+        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
+        for trade in trades[:12]:
+            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+            status = html.escape(str(trade.get("status", "?") or "?"))
+            result = html.escape(str(trade.get("result", "") or ""))
+            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
+            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
+            score = _trade_field(trade, "score", "N/A")
+            lines.extend([
+                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
+                f"  setup: {setup_type}",
+                f"  score: {score} | entry_mode: {entry_mode}",
+                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
+                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
+                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
+                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
+                "",
+            ])
+        return _limit_telegram_message("\n".join(lines))
+    except Exception as e:
+        logger.error(f"build_execution_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
+
+
+def build_setup_performance_report_message() -> str:
+    try:
+        trades = _load_long_trades_from_redis(limit=1500)
+        if not trades:
+            return "📭 لا توجد صفقات لتحليل أداء الـ setups."
+        buckets = {}
+        for trade in trades:
+            setup = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type") or "unknown")
+            b = buckets.setdefault(setup, {"total":0,"wins":0,"losses":0,"open":0,"pending":0,"tp1":0,"tp2":0,"breakeven":0,"expired":0,"scores":[],"pnls":[]})
+            b["total"] += 1
+            status = str(trade.get("status", "") or "").lower()
+            result = str(trade.get("result", "") or "").lower()
+            if status == "open": b["open"] += 1
+            if status == "pending_pullback": b["pending"] += 1
+            if trade.get("tp1_hit"): b["tp1"] += 1
+            if trade.get("tp2_hit") or result == "tp2_win": b["tp2"] += 1
+            if "breakeven" in result or trade.get("protected_breakeven_exit"): b["breakeven"] += 1
+            if result == "expired": b["expired"] += 1
+            if result in ("tp1_win", "tp2_win", "trailing_win", "win") or trade.get("tp1_hit"):
+                b["wins"] += 1
+            if result == "loss": b["losses"] += 1
+            try: b["scores"].append(float(_trade_field(trade, "score", 0) or 0))
+            except Exception: pass
+            try:
+                pnl = _get_trade_pnl_pct(trade)
+                if pnl != 0: b["pnls"].append(float(pnl))
+            except Exception: pass
+        def enrich(item):
+            setup, b = item
+            total = max(1, b["total"])
+            closed = max(1, b["wins"] + b["losses"] + b["breakeven"] + b["expired"])
+            return {
+                "setup": setup, **b,
+                "winrate": b["wins"] / closed * 100,
+                "tp1_rate": b["tp1"] / total * 100,
+                "tp2_rate": b["tp2"] / total * 100,
+                "avg_score": _avg(b["scores"]),
+                "avg_pnl": _avg(b["pnls"]) if b["pnls"] else None,
+            }
+        rows = [enrich(x) for x in buckets.items()]
+        rows.sort(key=lambda x: (x["winrate"], x["tp2_rate"], x["total"]), reverse=True)
+        def fmt_row(x):
+            pnl = f"{x['avg_pnl']:+.2f}%" if x["avg_pnl"] is not None else "N/A"
+            name = html.escape(x["setup"][:55])
+            return (f"• {name}\n  total={x['total']} | W/L={x['wins']}/{x['losses']} | open={x['open']} | pending={x['pending']}\n"
+                    f"  WR={x['winrate']:.1f}% | TP1={x['tp1_rate']:.1f}% | TP2={x['tp2_rate']:.1f}% | BE={x['breakeven']} | Exp={x['expired']}\n"
+                    f"  avg_score={x['avg_score']:.2f} | avg_pnl={pnl}")
+        lines = ["🧠 <b>Setup Performance</b>", f"إجمالي الصفقات: {len(trades)}", "", "✅ <b>أفضل 8 Setups</b>"]
+        lines += [fmt_row(x) for x in rows[:8]]
+        lines += ["", "⚠️ <b>أضعف 8 Setups</b>"]
+        weak = sorted(rows, key=lambda x: (x["winrate"], x["tp2_rate"], -x["losses"]))[:8]
+        lines += [fmt_row(x) for x in weak]
+        return _limit_telegram_message("\n\n".join(lines))
+    except Exception as e:
+        logger.error(f"build_setup_performance_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير setups: {html.escape(str(e))}"
+
 # =========================
 # COMMAND HANDLERS
 # =========================
@@ -2534,7 +2723,8 @@ COMMAND_HANDLERS = {
  "/report_30d": lambda chat_id: send_telegram_reply(chat_id, build_report_message("month")),
  "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
- "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setups_report(r, market_type="futures", side="long", period="all")),
+ "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
+ "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message()),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -5442,174 +5632,197 @@ def is_major_round_level(price: float) -> bool:
     return False
 
 def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50) -> bool:
+    """Accept round numbers as resistance only when recent price action rejected them."""
     try:
-        if level <= entry:
+        if df is None or getattr(df, "empty", True) or level <= entry:
             return False
-        signal_row = get_signal_row(df)
-        if signal_row is None:
-            return False
-        idx = signal_row.name
-        start = max(0, idx - lookback)
-        work = df.iloc[start:idx].copy()
-        if work.empty:
-            return False
-        tolerance = 0.002
-        touches_rejected = 0
-        close_above_count = 0
-        for _, row in work.iterrows():
-            high = float(row["high"])
-            close = float(row["close"])
-            low = float(row["low"])
-            open_c = float(row["open"])
-            if abs(high - level) / level <= tolerance:
-                if close < level:
-                    touches_rejected += 1
-                else:
-                    close_above_count += 1
-            if high >= level and max(open_c, close) < level:
-                touches_rejected += 1
-        if close_above_count >= 2:
-            return False
-        return touches_rejected >= 1
+
+        recent = df.tail(lookback)
+        touches = 0
+        rejections = 0
+
+        for _, row in recent.iterrows():
+            high = float(row.get("high", 0) or 0)
+            close = float(row.get("close", 0) or 0)
+            open_ = float(row.get("open", 0) or 0)
+
+            if high <= 0 or close <= 0 or level <= 0:
+                continue
+
+            near_level = abs(high - level) / level <= 0.003
+            rejected = near_level and close < level and close <= open_
+
+            if near_level:
+                touches += 1
+            if rejected:
+                rejections += 1
+
+        return touches >= 1 and rejections >= 1
     except Exception as e:
         logger.warning(f"is_valid_round_resistance error: {e}")
         return False
 
-def _collect_resistance_candidates_long(df, entry: float) -> list:
+
+def collect_resistance_candidates_long(df, entry: float, lookback: int = 50) -> list:
+    """Collect real resistance candidates above entry from structure, bands and confirmed round levels."""
     candidates = []
     try:
-        if df is None or df.empty or entry <= 0:
+        if df is None or getattr(df, "empty", True) or entry <= 0:
             return candidates
 
-        signal_row = get_signal_row(df)
-        if signal_row is None:
+        recent = df.tail(lookback).copy()
+        if recent.empty:
             return candidates
 
-        idx = signal_row.name
-        if idx is None:
-            return candidates
+        # 1) Real swing highs: local pivot high, not any previous high.
+        highs = recent["high"].astype(float).tolist()
+        for i in range(2, len(highs) - 2):
+            level = highs[i]
+            if (
+                level > entry
+                and level > highs[i - 1]
+                and level > highs[i - 2]
+                and level > highs[i + 1]
+                and level > highs[i + 2]
+            ):
+                candidates.append({"price": level, "level": level, "source": "swing_high", "strength": 3})
 
-        start = max(0, idx - SMART_TP1_LOOKBACK_SWING)
-        work = df.iloc[start:idx].copy()
-        if work.empty:
-            return candidates
+        # 2) Recent high from the last 20 candles.
+        try:
+            recent20 = df.tail(20)
+            level = float(recent20["high"].astype(float).max())
+            if level > entry:
+                candidates.append({"price": level, "level": level, "source": "recent_20_high", "strength": 2})
+        except Exception:
+            pass
 
-        highs = work["high"].astype(float)
-        closes = work["close"].astype(float)
-
-        for h in highs.tail(30).tolist():
-            h = _safe_float(h, 0.0)
-            if h > entry:
-                candidates.append({
-                    "price": h,
-                    "source": "swing_high"
-                })
-
-        for c in closes.tail(30).tolist():
-            c = _safe_float(c, 0.0)
-            if c > entry:
-                candidates.append({
-                    "price": c,
-                    "source": "recent_close_high"
-                })
-
-        bb_upper = _safe_float(signal_row.get("bb_upper"), 0.0)
-        if bb_upper > entry:
-            candidates.append({
-                "price": bb_upper,
-                "source": "bb_upper"
-            })
-
-        if len(work) >= 20:
-            prev_high = _safe_float(work["high"].tail(20).max(), 0.0)
-            if prev_high > entry:
-                candidates.append({
-                    "price": prev_high,
-                    "source": "prev_20_high"
-                })
-
-        if SMART_TP1_ROUND_LEVELS_ENABLED:
-            round_levels = []
-            if entry >= 100:
-                step = 5.0
-            elif entry >= 10:
-                step = 0.5
-            elif entry >= 1:
-                step = 0.05
-            elif entry >= 0.1:
-                step = 0.005
-            elif entry >= 0.01:
-                step = 0.0005
-            else:
-                step = 0.00005
-
-            try:
-                base = int(entry / step) * step
-                for i in range(1, 8):
-                    level = base + step * i
+        # 3) Bollinger upper band if available.
+        for col in ("bb_upper", "bollinger_upper", "upper_band"):
+            if col in df.columns:
+                try:
+                    level = float(df.iloc[-1].get(col, 0) or 0)
                     if level > entry:
-                        round_levels.append(level)
+                        candidates.append({"price": level, "level": level, "source": "bb_upper", "strength": 2})
+                    break
+                except Exception:
+                    pass
+
+        # 4) Previous rejection levels: upper wick rejection above entry.
+        for _, row in recent.iterrows():
+            try:
+                high = float(row.get("high", 0) or 0)
+                close = float(row.get("close", 0) or 0)
+                open_ = float(row.get("open", 0) or 0)
+                low = float(row.get("low", 0) or 0)
+                if high <= entry or high <= 0:
+                    continue
+                candle_range = high - low
+                if candle_range <= 0:
+                    continue
+                upper_wick = high - max(open_, close)
+                rejected = (upper_wick / candle_range) >= 0.35 and close < high
+                if rejected:
+                    candidates.append({"price": high, "level": high, "source": "previous_rejection", "strength": 3})
             except Exception:
-                round_levels = []
+                continue
 
-            for level in round_levels:
-                if is_major_round_level(level):
-                    candidates.append({
-                        "price": level,
-                        "source": "major_round_level"
-                    })
-                elif is_valid_round_resistance(df, level, entry):
-                    candidates.append({
-                        "price": level,
-                        "source": "round_level_confirmed"
-                    })
+        # 5) Confirmed round levels only.
+        if SMART_TP1_ROUND_LEVELS_ENABLED:
+            try:
+                if entry >= 100:
+                    steps = [1, 5, 10]
+                elif entry >= 10:
+                    steps = [0.1, 0.5, 1]
+                elif entry >= 1:
+                    steps = [0.01, 0.05, 0.1]
+                elif entry >= 0.1:
+                    steps = [0.001, 0.005, 0.01]
+                elif entry >= 0.01:
+                    steps = [0.0001, 0.0005, 0.001]
+                else:
+                    steps = [entry * 0.01, entry * 0.05, entry * 0.1]
 
+                for step in steps:
+                    if step <= 0:
+                        continue
+                    next_level = round(((entry // step) + 1) * step, 12)
+                    if next_level > entry and is_valid_round_resistance(df, next_level, entry, lookback=lookback):
+                        candidates.append({
+                            "price": next_level,
+                            "level": next_level,
+                            "source": "round_level_confirmed",
+                            "strength": 1,
+                        })
+            except Exception:
+                pass
+
+        # Merge duplicates/near-duplicates, keeping the stronger source.
         cleaned = []
-        seen = set()
-        for item in candidates:
-            price = _safe_float(item.get("price"), 0.0)
-            if price <= entry:
+        for c in candidates:
+            try:
+                level = float(c.get("price", c.get("level", 0)) or 0)
+                if level <= entry:
+                    continue
+                duplicate = False
+                for old in cleaned:
+                    old_level = float(old.get("price", old.get("level", 0)) or 0)
+                    if old_level > 0 and abs(level - old_level) / old_level <= 0.002:
+                        duplicate = True
+                        if c.get("strength", 0) > old.get("strength", 0):
+                            old.update(c)
+                            old["price"] = level
+                            old["level"] = level
+                        break
+                if not duplicate:
+                    c["price"] = level
+                    c["level"] = level
+                    cleaned.append(c)
+            except Exception:
                 continue
-            key = round(price, 10)
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append({
-                "price": price,
-                "source": item.get("source", "unknown")
-            })
 
-        cleaned.sort(key=lambda x: x["price"])
+        cleaned.sort(key=lambda x: float(x.get("price", 0) or 0))
         return cleaned
-
     except Exception as e:
-        logger.warning(f"_collect_resistance_candidates_long error: {e}")
+        logger.warning(f"collect_resistance_candidates_long error: {e}")
         return candidates
 
 
-def find_nearest_resistance_long(df, entry: float):
+# Backward-compatible alias for older calls in this file.
+def _collect_resistance_candidates_long(df, entry: float) -> list:
+    return collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
+
+
+def find_nearest_resistance_long(df, entry: float) -> dict:
     try:
-        candidates = _collect_resistance_candidates_long(df, entry)
-        if not candidates:
-            return None
-        source_order = {
-            "swing_high": 0,
-            "recent_close_high": 1,
-            "prev_20_high": 2,
-            "bb_upper": 3,
-            "round_level_confirmed": 4,
-            "major_round_level": 5,
-        }
+        candidates = collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
         valid = []
         for c in candidates:
-            source = c.get("source", "unknown")
-            order = source_order.get(source, 99)
-            valid.append((order, c["price"], c))
+            try:
+                level = float(c.get("price", c.get("level", 0)) or 0)
+                if level > entry:
+                    valid.append(c)
+            except Exception:
+                pass
+
         if not valid:
             return None
-        valid.sort(key=lambda x: (x[0], x[1]))
-        return valid[0][2]
-    except Exception:
+
+        source_priority = {
+            "swing_high": 1,
+            "previous_rejection": 2,
+            "recent_20_high": 3,
+            "bb_upper": 4,
+            "round_level_confirmed": 5,
+        }
+        valid.sort(
+            key=lambda c: (
+                float(c.get("price", c.get("level", 0)) or 0),
+                source_priority.get(c.get("source", ""), 99),
+            )
+        )
+        return valid[0]
+    except Exception as e:
+        logger.warning(f"find_nearest_resistance_long error: {e}")
         return None
 
 
@@ -5671,6 +5884,7 @@ def build_smart_tp1_long(
         "tp1": calc_tp_long(entry, sl, rr=rr1),
         "tp2": calc_tp_long(entry, sl, rr=rr2),
         "nearest_resistance": None,
+        "nearest_resistance_source": None,
         "nearest_support": None,
         "target_method": "rr",
         "target_notes": [],
@@ -5702,6 +5916,7 @@ def build_smart_tp1_long(
         if nearest_resistance_data:
             nearest_resistance = _safe_float(nearest_resistance_data.get("price"), 0.0)
             result["nearest_resistance"] = _round_price_dynamic(nearest_resistance)
+            result["nearest_resistance_source"] = nearest_resistance_data.get("source", "unknown")
         else:
             nearest_resistance = 0.0
 
@@ -6941,9 +7156,7 @@ def run_scanner_loop():
                 time.sleep(60)
                 continue
             if current_mode == MODE_BLOCK_LONGS:
-                logger.warning("MODE BLOCK LONGS - blocking new long signals before candidate scan")
-                time.sleep(60)
-                continue
+                logger.warning("MODE BLOCK LONGS - scanning candidates for strict exceptions only")
 
             upcoming_events = get_upcoming_high_impact_events()
             has_high_impact_news = len(upcoming_events) > 0
@@ -8352,14 +8565,30 @@ def run_scanner_loop():
                         "opportunity_type": temp_opportunity_type,
                         "entry_timing": entry_timing_temp,
                         "resistance_warning": early_resistance_warning,
+                        "setup_type": "|".join([str(primary_extra_setup or ""), " ".join(extra_setup_names or []), " ".join(context_setups or [])]),
+                        "vol_ratio": vol_ratio,
                     }
                     wait_pullback = should_wait_for_pullback_entry(temp_cand_dec)
 
+                final_pullback_entry = None
                 if wait_pullback:
-                    entry_price_for_trade = price   # نبقي الدخول الأصلي على السوق
+                    try:
+                        final_pullback_entry = (float(pullback_low) + float(pullback_high)) / 2.0
+                    except Exception:
+                        try:
+                            final_pullback_entry = float(pullback_entry)
+                        except Exception:
+                            final_pullback_entry = None
+                    if not final_pullback_entry or final_pullback_entry <= 0:
+                        try:
+                            final_pullback_entry = float(pullback_entry)
+                        except Exception:
+                            final_pullback_entry = None
+                    entry_price_for_trade = final_pullback_entry if final_pullback_entry and final_pullback_entry > 0 else price
+                    pullback_entry = entry_price_for_trade
                     entry_mode = "pullback_pending"
                     pullback_triggered = False
-                    recommended = pullback_entry
+                    recommended = entry_price_for_trade
                 else:
                     entry_price_for_trade = price
                     entry_mode = "market"
@@ -8377,7 +8606,7 @@ def run_scanner_loop():
                 rr1, rr2 = get_rr_targets_long(signal_type=sl_type, entry_timing=entry_timing_temp)
                 smart_sl = build_smart_sl_long(
                     df=df,
-                    entry=price,  # نبني SL على سعر السوق الأصلي
+                    entry=entry_price_for_trade,
                     atr_value=atr_value,
                     signal_type=sl_type,
                     market_state=market_state,
@@ -8392,7 +8621,7 @@ def run_scanner_loop():
 
                 smart_targets_early = build_smart_tp1_long(
                     df=df,
-                    entry=price,      # أيضاً مبني على السوق الأصلي
+                    entry=entry_price_for_trade,
                     sl=stop_loss,
                     rr1=rr1,
                     rr2=rr2,
@@ -8405,6 +8634,75 @@ def run_scanner_loop():
                 early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
                 resistance_rejected = False
                 resistance_dynamic_penalty = 0.0
+
+                try:
+                    _risk_for_quality = float(entry_price_for_trade) - float(stop_loss)
+                    _nearest_res = float(early_nearest_resistance or 0.0)
+                    if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
+                        _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
+                        _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
+                        _tp1_structure = _nearest_res * 0.995
+                        _min_tp1 = float(entry_price_for_trade) + (_risk_for_quality * 1.2)
+                        if _res_dist_pct < 1.0 or _res_r < 1.2:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="near_resistance_before_tp1",
+                                candle_time=candle_time,
+                                score=score_result.get("score"),
+                                raw_score=raw_score,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                entry_timing=entry_timing_temp,
+                                opportunity_type=temp_opportunity_type,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={
+                                    "nearest_resistance": _nearest_res,
+                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
+                                    "resistance_distance_pct": _res_dist_pct,
+                                    "resistance_r": _res_r,
+                                    "category": "trade_quality",
+                                },
+                            )
+                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
+                            continue
+                        if _tp1_structure < _min_tp1:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="tp1_not_rewarding_before_resistance",
+                                candle_time=candle_time,
+                                score=score_result.get("score"),
+                                raw_score=raw_score,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                entry_timing=entry_timing_temp,
+                                opportunity_type=temp_opportunity_type,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={
+                                    "nearest_resistance": _nearest_res,
+                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
+                                    "tp1_structure": _tp1_structure,
+                                    "min_tp1": _min_tp1,
+                                    "category": "trade_quality",
+                                },
+                            )
+                            logger.info(f"⛔ {symbol} rejected: tp1_not_rewarding_before_resistance | res={_nearest_res} | tp1_structure={_tp1_structure} | min_tp1={_min_tp1}")
+                            continue
+                except Exception as _smart_reject_error:
+                    logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
                 explicit_warnings = score_result.get("warning_reasons") or []
                 _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -8889,8 +9187,8 @@ def run_scanner_loop():
                     )
                     continue
 
-                tp1 = smart_targets_early.get("tp1", calc_tp_long(price, stop_loss, rr=rr1))
-                tp2 = smart_targets_early.get("tp2", calc_tp_long(price, stop_loss, rr=rr2))
+                tp1 = smart_targets_early.get("tp1", calc_tp_long(entry_price_for_trade, stop_loss, rr=rr1))
+                tp2 = smart_targets_early.get("tp2", calc_tp_long(entry_price_for_trade, stop_loss, rr=rr2))
                 target_method = smart_targets_early.get("target_method", "rr")
                 nearest_resistance = smart_targets_early.get("nearest_resistance")
                 resistance_warning = early_resistance_warning
@@ -8899,12 +9197,9 @@ def run_scanner_loop():
                 rr1 = smart_targets_early.get("rr1_effective", rr1)
                 rr2 = smart_targets_early.get("rr2_effective", rr2)
 
-                # حساب execution إذا كان هناك خطة بول باك
-                if has_pullback_plan:
-                    try:
-                        execution_entry = (float(pullback_low) + float(pullback_high)) / 2.0
-                    except Exception:
-                        execution_entry = float(pullback_entry) if pullback_entry else None
+                # حساب execution إذا كان هناك خطة بول باك مفعلة فعلاً
+                if wait_pullback:
+                    execution_entry = entry_price_for_trade
 
                     if execution_entry and execution_entry > 0:
                         support_candidates = []
@@ -9047,7 +9342,7 @@ def run_scanner_loop():
                 candidate = {
                     "symbol": symbol,
                     "candle_time": candle_time,
-                    "entry": price,                # سعر السوق الأصلي
+                    "entry": entry_price_for_trade,
                     "sl": stop_loss,
                     "tp1": tp1,
                     "tp2": tp2,
@@ -9139,6 +9434,10 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     "momentum_priority": momentum_priority,
                     "now": now,
+                    "relative_strength_short": round(get_change_8(df) - get_change_8(btc_df), 4),
+                    "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4),
+                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_df), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
+                    "block_exception": False,
                     "current_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
                     "setup_stats": get_setup_type_stats(
@@ -9170,6 +9469,38 @@ def run_scanner_loop():
                     "execution_tp1": execution_tp1,
                     "execution_tp2": execution_tp2,
                 }
+                if current_mode == MODE_BLOCK_LONGS:
+                    if not is_strong_exception(candidate):
+                        log_long_rejection(
+                            symbol=symbol,
+                            reason="market_mode_block_longs",
+                            candle_time=candle_time,
+                            score=candidate.get("score"),
+                            raw_score=candidate.get("raw_score"),
+                            final_threshold=candidate.get("final_threshold"),
+                            market_state=candidate.get("market_state", ""),
+                            current_mode=current_mode,
+                            setup_type=candidate.get("setup_type", ""),
+                            entry_timing=candidate.get("entry_timing", ""),
+                            opportunity_type=candidate.get("opportunity_type", ""),
+                            dist_ma=candidate.get("dist_ma"),
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            extra={
+                                "blocked_by": "market_mode",
+                                "mode": "BLOCK_LONGS",
+                                "relative_strength_short": candidate.get("relative_strength_short"),
+                                "relative_strength_24": candidate.get("relative_strength_24"),
+                            },
+                        )
+                        logger.info(f"⛔ BLOCK_LONGS | skipped {symbol}")
+                        continue
+                    candidate["block_exception"] = True
+                    logger.info(f"🔥 BLOCK_LONGS EXCEPTION | allowed {symbol}")
+
                 candidate["bucket"] = get_candidate_bucket(candidate)
                 candidates.append(candidate)
                 candidates_symbols.add(symbol)
@@ -9261,6 +9592,9 @@ def run_scanner_loop():
                     execution_tp2=candidate.get("execution_tp2"),
                 )
                 reply_markup = build_track_reply_markup(candidate["alert_id"])
+
+                if candidate.get("block_exception"):
+                    message = "🔥 <b>استثناء BLOCK_LONGS:</b> العملة أقوى من BTC أو Setup قوي جدًا\n\n" + message
 
                 badge = build_execution_badge_line(candidate)
                 if badge:
@@ -9375,6 +9709,10 @@ def run_scanner_loop():
                         "execution_sl": candidate.get("execution_sl"),
                         "execution_tp1": candidate.get("execution_tp1"),
                         "execution_tp2": candidate.get("execution_tp2"),
+                        "block_exception": candidate.get("block_exception", False),
+                        "relative_strength_short": candidate.get("relative_strength_short"),
+                        "relative_strength_24": candidate.get("relative_strength_24"),
+                        "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
                     candidate_alert_id = candidate["alert_id"]
