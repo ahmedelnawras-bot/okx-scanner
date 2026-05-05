@@ -1372,6 +1372,20 @@ def send_telegram_message(message: str, reply_markup=None) -> dict:
     payload["reply_markup"] = reply_markup
  return telegram_api_call("sendMessage", payload)
 
+
+def send_telegram_message_plain(message: str, reply_markup=None) -> dict:
+ if not BOT_TOKEN or not CHAT_ID:
+    logger.error("❌ Telegram config missing")
+    return {"ok": False}
+ payload = {
+    "chat_id": CHAT_ID,
+    "text": message,
+    "disable_web_page_preview": True,
+ }
+ if reply_markup:
+    payload["reply_markup"] = reply_markup
+ return telegram_api_call("sendMessage", payload)
+
 def send_telegram_reply(chat_id: str, message: str) -> bool:
  if not BOT_TOKEN or not chat_id:
     logger.error("❌ Telegram reply config missing")
@@ -2451,135 +2465,29 @@ def _trade_field(trade: dict, key: str, default=None):
     return trade.get(key, diagnostics.get(key, default))
 
 
-def _execution_status_label(trade: dict) -> str:
-    status = str(trade.get("status", "") or "").lower()
-    result = str(trade.get("result", "") or "").lower()
-    if status == "pending_pullback":
-        return "⏳ معلقة Pullback"
-    if result == "loss":
-        return "🔴 SL خسارة"
-    if result == "tp2_win":
-        return "🟢 TP2 ربح"
-    if result == "tp1_win":
-        return "🟡 TP1 فقط"
-    if result == "trailing_win":
-        return "🟢 Trailing ربح"
-    if result in ("breakeven", "protected_breakeven") or bool(trade.get("protected_breakeven_exit")):
-        return "⚪ Breakeven"
-    if result in ("expired", "pending_expired"):
-        return "⚫ منتهية"
-    if status in ("partial", "tp2_partial") or bool(trade.get("tp1_hit")):
-        return "🟡 مفتوحة بعد TP1"
-    if status in ("trailing", "trailing_open"):
-        return "🔁 Trailing مفتوح"
-    if status == "open":
-        return "🟢 مفتوحة"
-    return "⚪ غير محددة"
-
-
-def _execution_trade_pnl_pair(trade: dict):
-    """Return (raw_pct, leveraged_pct, is_final). Open trades use current_price when available."""
-    try:
-        from tracking.summary_helpers import calc_trade_result_pct, get_effective_entry
-        raw = calc_trade_result_pct(trade)
-        if raw is not None:
-            return round(float(raw), 4), round(float(raw) * TRACK_LEVERAGE, 4), True
-
-        status = str(trade.get("status", "") or "").lower()
-        if status == "pending_pullback":
-            return None, None, False
-
-        entry = float(get_effective_entry(trade) or 0.0)
-        current_price = float(trade.get("current_price") or _trade_field(trade, "current_price", 0.0) or 0.0)
-        side = str(trade.get("side") or trade.get("direction") or "long").lower()
-        if entry > 0 and current_price > 0:
-            raw_open = ((current_price - entry) / entry) * 100.0
-            if side == "short":
-                raw_open = -raw_open
-            return round(raw_open, 4), round(raw_open * TRACK_LEVERAGE, 4), False
-    except Exception:
-        pass
-    return None, None, False
-
-
-def _execution_entry_label(trade: dict) -> str:
-    entry_mode = str(_trade_field(trade, "entry_mode", "") or "").lower()
-    if entry_mode == "pullback_pending" or bool(_trade_field(trade, "has_pullback_plan", False)):
-        return "Pullback"
-    return "Market"
-
-
 def build_execution_report_message() -> str:
     try:
         trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
         if not trades:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
-
-        closed = []
-        open_count = 0
-        pending_count = 0
-        wins = losses = breakeven = 0
-        pnl_raw_values = []
-        pnl_lev_values = []
-
-        for t in trades:
-            status = str(t.get("status", "") or "").lower()
-            result = str(t.get("result", "") or "").lower()
-            raw, lev, is_final = _execution_trade_pnl_pair(t)
-            if status == "pending_pullback":
-                pending_count += 1
-            elif status in ("open", "partial", "tp2_partial", "trailing", "trailing_open"):
-                open_count += 1
-            if is_final:
-                closed.append(t)
-                if raw is not None:
-                    pnl_raw_values.append(raw)
-                    pnl_lev_values.append(lev)
-                if result in ("tp1_win", "tp2_win", "trailing_win") or raw and raw > 0:
-                    wins += 1
-                elif result == "loss" or (raw is not None and raw < 0):
-                    losses += 1
-                elif result in ("breakeven", "protected_breakeven") or raw == 0:
-                    breakeven += 1
-
-        closed_count = len(closed)
-        winrate = (wins / closed_count * 100.0) if closed_count else 0.0
-        net_raw = sum(pnl_raw_values) if pnl_raw_values else 0.0
-        net_lev = sum(pnl_lev_values) if pnl_lev_values else 0.0
-        avg_raw = _avg(pnl_raw_values) if pnl_raw_values else 0.0
-        avg_lev = _avg(pnl_lev_values) if pnl_lev_values else 0.0
-
-        lines = [
-            "🚀 <b>Execution Report</b>",
-            f"إجمالي المرشحين: <b>{len(trades)}</b>",
-            f"مغلقة: {closed_count} | مفتوحة: {open_count} | معلقة Pullback: {pending_count}",
-            f"النتائج المغلقة: 🟢 {wins} | 🔴 {losses} | ⚪ {breakeven}",
-            f"Winrate: <b>{winrate:.1f}%</b>",
-            f"Net PnL: <b>{net_raw:+.2f}%</b> | بعد الرافعة {TRACK_LEVERAGE:.0f}x: <b>{net_lev:+.2f}%</b>",
-            f"Avg PnL: {avg_raw:+.2f}% | بعد الرافعة: {avg_lev:+.2f}%",
-            "",
-            "📌 <b>آخر الصفقات</b>",
-        ]
-
-        for i, trade in enumerate(trades[:10], 1):
+        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
+        for trade in trades[:12]:
             symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-            label = html.escape(_execution_status_label(trade))
-            entry_label = _execution_entry_label(trade)
-            raw, lev, is_final = _execution_trade_pnl_pair(trade)
-            pnl_text = "لا توجد نتيجة بعد"
-            if raw is not None and lev is not None:
-                prefix = "نهائي" if is_final else "حالي"
-                pnl_text = f"{prefix}: {raw:+.2f}% | بعد الرافعة: {lev:+.2f}%"
-            entry = _trade_field(trade, "execution_entry", None) or _trade_field(trade, "recommended_entry", None) or trade.get("entry", "N/A")
-            setup = str(_trade_field(trade, "primary_extra_setup", "") or _trade_field(trade, "setup_type", "") or "")
-            setup = setup.replace("|", " / ")[:46]
+            status = html.escape(str(trade.get("status", "?") or "?"))
+            result = html.escape(str(trade.get("result", "") or ""))
+            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
+            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
+            score = _trade_field(trade, "score", "N/A")
             lines.extend([
-                f"{i}) <b>{symbol}</b> — {label}",
-                f"   💰 PnL: <b>{html.escape(pnl_text)}</b>",
-                f"   📌 الدخول: {entry_label} | {entry}",
-                f"   🧠 Setup: {html.escape(setup) if setup else 'N/A'}",
+                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
+                f"  setup: {setup_type}",
+                f"  score: {score} | entry_mode: {entry_mode}",
+                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
+                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
+                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
+                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
+                "",
             ])
-
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
@@ -3268,237 +3176,140 @@ def format_trade_status_line(trade: dict) -> str:
 
     return "📌 حالة الصفقة: ⚪ غير معروفة"
 
-
-def _calc_track_effective_entry(alert: dict, trade: dict = None) -> float:
-    """Return the user-facing entry used for PnL/tracking."""
-    trade = trade or {}
-    mode = alert.get("mode") or alert.get("market_mode", "")
-    avg_planned = _safe_float(alert.get("average_planned_entry") or trade.get("average_planned_entry"), 0.0)
-    if mode == MODE_RECOVERY_LONG and avg_planned > 0:
-        return avg_planned
-
-    for key in ("effective_entry", "execution_entry", "recommended_entry", "pullback_entry", "entry"):
-        v = _safe_float(trade.get(key), 0.0)
-        if v > 0:
-            return v
-
-    entry_mode = str(alert.get("entry_mode") or trade.get("entry_mode") or "market")
-    pullback_triggered = bool(alert.get("pullback_triggered") or trade.get("pullback_triggered"))
-    if entry_mode == "pullback_pending":
-        if pullback_triggered:
-            for key in ("pullback_entry", "execution_entry", "recommended_entry", "entry"):
-                v = _safe_float(alert.get(key), 0.0)
-                if v > 0:
-                    return v
-        for key in ("pullback_entry", "execution_entry", "recommended_entry", "entry"):
-            v = _safe_float(alert.get(key), 0.0)
-            if v > 0:
-                return v
-
-    for key in ("market_entry", "entry"):
-        v = _safe_float(alert.get(key), 0.0)
-        if v > 0:
-            return v
-    return 0.0
-
-
-def _calc_long_pct(entry: float, price: float) -> float:
-    if entry <= 0 or price <= 0:
-        return 0.0
-    return ((price - entry) / entry) * 100.0
-
-
-def _build_track_pnl_lines(trade: dict, entry: float, current_price: float, tp1: float, tp2: float, sl: float) -> list:
-    """Build clear PnL lines. Percentages are unleveraged unless explicitly marked."""
-    lines = []
-    status = str((trade or {}).get("status", "") or "").lower()
-    result = str((trade or {}).get("result", "") or "").lower()
-    tp1_hit = bool((trade or {}).get("tp1_hit", False))
-    tp2_hit = bool((trade or {}).get("tp2_hit", False))
-    trailing_exit = _safe_float((trade or {}).get("trailing_exit_price"), 0.0)
-    exit_price = _safe_float((trade or {}).get("exit_price") or (trade or {}).get("closed_price"), 0.0)
-
-    current_pct = _calc_long_pct(entry, current_price)
-
-    if status == "pending_pullback":
-        lines.append("💰 الربح/الخسارة: غير محسوب حتى يتفعل Pullback")
-        return lines
-
-    if result == "loss":
-        loss_pct = _calc_long_pct(entry, exit_price if exit_price > 0 else sl)
-        lines.append(f"💰 النتيجة: 🔴 خسارة {loss_pct:.2f}% | بعد الرافعة: {loss_pct * TRACK_LEVERAGE:.2f}%")
-        return lines
-
-    if result == "breakeven":
-        lines.append("💰 النتيجة: ⚪ Breakeven تقريبًا 0.00%")
-        return lines
-
-    if result in ("tp1_win", "tp2_win", "trailing_win") or status == "closed":
-        tp1_pct = _calc_long_pct(entry, tp1)
-        tp2_pct = _calc_long_pct(entry, tp2)
-        realized = 0.0
-        detail = []
-        if tp1_hit or result in ("tp1_win", "tp2_win", "trailing_win"):
-            realized += tp1_pct * 0.40
-            detail.append(f"TP1 40%={tp1_pct:.2f}%")
-        if tp2_hit or result in ("tp2_win", "trailing_win"):
-            realized += tp2_pct * 0.40
-            detail.append(f"TP2 40%={tp2_pct:.2f}%")
-        if result == "trailing_win" and trailing_exit > 0:
-            tr_pct = _calc_long_pct(entry, trailing_exit)
-            realized += tr_pct * 0.20
-            detail.append(f"Trailing 20%={tr_pct:.2f}%")
-        elif result == "tp2_win":
-            realized += tp2_pct * 0.20
-            detail.append(f"Trailing 20%≈{tp2_pct:.2f}%")
-        elif result == "tp1_win":
-            detail.append("الباقي خرج Entry")
-        if detail:
-            lines.append(f"💰 الربح المحقق: {realized:+.2f}% إجمالي موزون | بعد الرافعة: {realized * TRACK_LEVERAGE:+.2f}%")
-            lines.append("   " + " | ".join(detail))
-        else:
-            lines.append(f"💰 النتيجة: {current_pct:+.2f}% | بعد الرافعة: {current_pct * TRACK_LEVERAGE:+.2f}%")
-        return lines
-
-    if status == "partial" or tp1_hit:
-        tp1_pct = _calc_long_pct(entry, tp1)
-        realized_weighted = tp1_pct * 0.40
-        lines.append(f"💰 الربح المحقق TP1: {tp1_pct:+.2f}% على 40% | صافي جزئي: {realized_weighted:+.2f}%")
-        lines.append(f"📊 ربح/خسارة المتبقي حاليًا: {current_pct:+.2f}% | بعد الرافعة: {current_pct * TRACK_LEVERAGE:+.2f}%")
-        return lines
-
-    lines.append(f"💰 الربح/الخسارة الحالية: {current_pct:+.2f}% | بعد الرافعة: {current_pct * TRACK_LEVERAGE:+.2f}%")
-    return lines
-
-
 def build_track_message(alert: dict) -> str:
-    try:
-        raw_symbol = alert.get("symbol", "Unknown")
-        symbol = clean_symbol_for_message(raw_symbol)
-        timeframe = str(alert.get("timeframe", TIMEFRAME))
-        mode = alert.get("mode") or alert.get("market_mode", "")
-        entry_mode = str(alert.get("entry_mode", "market") or "market")
-        pullback_triggered = bool(alert.get("pullback_triggered", False))
-        market_entry = _safe_float(alert.get("market_entry"), 0.0)
-        entry = _safe_float(alert.get("entry"), 0.0)
-        recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
-        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
-        pullback_low = _safe_float(alert.get("pullback_low"), 0.0)
-        pullback_high = _safe_float(alert.get("pullback_high"), 0.0)
-        sl = _safe_float(alert.get("sl"), 0.0)
-        tp1 = _safe_float(alert.get("tp1"), 0.0)
-        tp2 = _safe_float(alert.get("tp2"), 0.0)
-        candle_time = int(_safe_float(alert.get("candle_time"), 0))
-        created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
-        current_price = get_last_price(raw_symbol)
-        trade = load_registered_trade_for_alert(alert)
+ try:
+    symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
+    mode = alert.get("mode") or alert.get("market_mode", "")
+    avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
+    entry = _safe_float(alert.get("entry"), 0.0)
+    recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
+    pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+    market_entry = _safe_float(alert.get("market_entry"), 0.0)
+    entry_mode = alert.get("entry_mode", "market")
+    pullback_triggered = bool(alert.get("pullback_triggered", False))
+    sl = _safe_float(alert.get("sl"), 0.0)
+    tp1 = _safe_float(alert.get("tp1"), 0.0)
+    tp2 = _safe_float(alert.get("tp2"), 0.0)
+    candle_time = int(_safe_float(alert.get("candle_time"), 0))
+    created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
+    current_price = get_last_price(alert.get("symbol", ""))
 
-        if trade:
-            entry_mode = str(trade.get("entry_mode") or entry_mode or "market")
-            pullback_triggered = bool(trade.get("pullback_triggered", pullback_triggered))
-            sl = _safe_float(trade.get("sl"), sl)
-            tp1 = _safe_float(trade.get("tp1"), tp1)
-            tp2 = _safe_float(trade.get("tp2"), tp2)
-            market_entry = _safe_float(trade.get("market_entry"), market_entry)
-            recommended_entry = _safe_float(trade.get("recommended_entry"), recommended_entry)
-            pullback_entry = _safe_float(trade.get("pullback_entry"), pullback_entry)
-
-        effective_entry = _calc_track_effective_entry(alert, trade)
-        if effective_entry <= 0:
-            effective_entry = entry if entry > 0 else market_entry
-
-        is_pending_pullback = entry_mode == "pullback_pending" and not pullback_triggered and (not trade or str(trade.get("status", "")).lower() == "pending_pullback")
-
-        status_line = format_trade_status_line(trade) if trade else format_trade_status_line(None)
-        if is_pending_pullback:
-            status_line = "📌 حالة الصفقة: ⏳ معلّقة | انتظار Pullback"
-
-        status_info = resolve_alert_official_or_estimated_status(alert)
-        display_status = status_info.get("display_status") or ""
-        if is_pending_pullback:
-            display_status = "⏳ Pending Pullback"
-
-        duration_seconds = max(0, int(time.time()) - created_ts)
-        duration_h = duration_seconds // 3600
-        duration_m = (duration_seconds % 3600) // 60
-        tv_link = build_track_tradingview_link(raw_symbol)
-
-        msg = (
-            f"📌 <b>Alert Track</b>\n\n"
-            f"🪙 <b>{html.escape(symbol)}</b>\n"
-            f"📈 Long | ⏱ {html.escape(timeframe)}\n"
-            f"{status_line}\n\n"
-        )
-
-        current_display = current_price if current_price > 0 else market_entry if market_entry > 0 else entry
-        msg += f"💵 <b>سعر السوق الحالي:</b> {_fmt_price(current_display)}\n"
-
-        if is_pending_pullback:
-            msg += "📌 <b>قرار الدخول:</b> انتظار Pullback — لا تدخل Market الآن\n"
-            if pullback_low > 0 and pullback_high > 0:
-                msg += f"🎯 <b>منطقة الدخول:</b> {_fmt_price(pullback_low)} → {_fmt_price(pullback_high)}\n"
-            msg += f"⚡ <b>سعر الدخول المعتمد:</b> {_fmt_price(effective_entry)}\n"
+    if mode == MODE_RECOVERY_LONG and avg_planned > 0:
+        effective_entry = avg_planned
+    elif entry_mode == "pullback_pending":
+        if pullback_triggered:
+            effective_entry = pullback_entry if pullback_entry > 0 else entry
         else:
-            decision = "Market Entry" if entry_mode != "pullback_pending" else "Pullback تم تفعيله"
-            msg += f"📌 <b>قرار الدخول:</b> {html.escape(decision)}\n"
-            msg += f"🎯 <b>سعر الدخول المعتمد:</b> {_fmt_price(effective_entry)}\n"
+            effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
+    else:
+        effective_entry = market_entry if market_entry > 0 else entry
 
-        msg += (
-            f"\n🛑 <b>SL:</b> {_fmt_price(sl)}\n"
-            f"🎯 <b>TP1:</b> {_fmt_price(tp1)} | إغلاق 40%\n"
-            f"🏁 <b>TP2:</b> {_fmt_price(tp2)} | إغلاق 40%\n"
-            f"🔄 <b>آخر 20%:</b> Trailing بعد TP2 ({TRAILING_PCT}% تحت الـ High)\n"
-            f"🛡 <b>بعد TP1:</b> نقل SL إلى Entry\n"
+    favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
+        symbol=alert.get("symbol", ""),
+        since_ts=candle_time,
+        entry=effective_entry,
+        side="long",
+    )
+
+    trade = load_registered_trade_for_alert(alert)
+    status_line = format_trade_status_line(trade) if trade else format_trade_status_line(None)
+
+    status_info = resolve_alert_official_or_estimated_status(alert)
+    display_status = status_info["display_status"]
+    is_official = status_info["is_official"]
+
+    if entry_mode == "pullback_pending" and not pullback_triggered:
+        display_status = "⏳ Pending Pullback"
+        is_official = False
+
+    if is_official:
+        logger.info(f"Track using official status for {alert.get('alert_id')}: {display_status}")
+    else:
+        logger.info(f"Track using estimated status for {alert.get('alert_id')}: {display_status}")
+
+    duration_seconds = max(0, int(time.time()) - created_ts)
+    duration_h = duration_seconds // 3600
+    duration_m = (duration_seconds % 3600) // 60
+    current_move = 0.0
+    if effective_entry > 0 and current_price > 0:
+        current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
+    state_badge = get_track_state_badge(display_status, current_move)
+    tv_link = build_track_tradingview_link(alert.get("symbol", ""))
+    leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
+    leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
+    leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
+    recovery_extra = ""
+    if mode == MODE_RECOVERY_LONG:
+        entry1 = _safe_float(alert.get("entry1"), entry)
+        entry2 = _safe_float(alert.get("entry2"), 0.0)
+        recovery_extra = (
+            f"\n🔄 Mode: Recovery Long\n"
+            f"• Entry 1: {entry1:.6f}\n"
+            f"• Entry 2: {entry2:.6f}\n"
+            f"• Avg Planned Entry: {avg_planned:.6f}"
         )
+    msg = (
+        f"📌 <b>Alert Track</b>\n\n"
+        f"🪙 {html.escape(symbol)}\n"
+        f"📈 Long\n"
+        f"⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
+        f"{status_line}\n"
+        f"{recovery_extra}\n"
+        f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
+    )
+    if entry_mode == "pullback_pending" and not pullback_triggered:
+        msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
+    msg += (
+        f"💰 Signal Entry: {entry:.6f}\n"
+    )
+    if entry_mode == "pullback_pending" and market_entry > 0:
+        msg += f"💵 سعر السوق عند الإرسال: {market_entry:.6f}\n"
+    if recommended_entry > 0 and recommended_entry != entry:
+        msg += f"📌 Recommended Entry: {recommended_entry:.6f}\n"
+    if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
+        msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
+    msg += (
+        f"🛑 SL: {sl:.6f}\n"
+        f"🎯 TP1: {tp1:.6f} | إغلاق 40%\n"
+        f"🏁 TP2: {tp2:.6f} | إغلاق 40%\n"
+        f"🔄 بعد TP2: Trailing Stop 20% ({TRAILING_PCT}% تحت الـ High)\n"
+        f"🛡 بعد TP1: نقل SL إلى Entry\n\n"
+        f"{state_badge}\n"
+        f"📊 {html.escape(display_status)}"
+    )
+    if is_official:
+        msg += "\n🏛️ <b>حالة رسمية</b> (مستندة إلى سجل الصفقة)"
+    else:
+        msg += "\n⚠️ <b>حالة تقديرية</b> لعدم توفر صفقة مسجلة"
 
-        pnl_lines = _build_track_pnl_lines(trade or ({"status": "pending_pullback"} if is_pending_pullback else {}), effective_entry, current_display, tp1, tp2, sl)
-        msg += "\n" + "\n".join(pnl_lines) + "\n"
-
-        if trade:
-            trailing_active = bool(trade.get("trailing_active", False))
-            tp2_hit_flag = bool(trade.get("tp2_hit", False))
-            t_high = _safe_float(trade.get("trailing_high"), 0.0)
-            t_sl = _safe_float(trade.get("trailing_sl"), 0.0)
-            t_pct = _safe_float(trade.get("trailing_pct"), TRAILING_PCT)
-            if trailing_active and tp2_hit_flag:
-                gain_from_entry = _calc_long_pct(effective_entry, t_high)
-                msg += (
-                    f"\n🔄 <b>Trailing شغال</b>\n"
-                    f"🚀 أعلى سعر بعد TP2: {_fmt_price(t_high)} | {gain_from_entry:+.2f}%\n"
-                    f"🛑 Trailing SL الحالي: {_fmt_price(t_sl)} | {t_pct:.1f}% تحت الـ High\n"
-                )
-
-        if not is_pending_pullback and effective_entry > 0 and candle_time > 0:
-            favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
-                symbol=raw_symbol,
-                since_ts=candle_time,
-                entry=effective_entry,
-                side="long",
-            )
+    if trade:
+        trailing_active = bool(trade.get("trailing_active", False))
+        tp2_hit_flag = bool(trade.get("tp2_hit", False))
+        t_high = _safe_float(trade.get("trailing_high"), 0.0)
+        t_sl   = _safe_float(trade.get("trailing_sl"), 0.0)
+        t_pct  = _safe_float(trade.get("trailing_pct"), TRAILING_PCT)
+        if trailing_active and tp2_hit_flag:
+            gain_from_entry = 0.0
+            if effective_entry > 0 and t_high > 0:
+                gain_from_entry = ((t_high - effective_entry) / effective_entry) * 100
             msg += (
-                f"\n🚀 <b>أقصى صعود:</b> {_fmt_price(favorable_price)} | {favorable_pct:+.2f}% | بعد الرافعة: {favorable_pct * TRACK_LEVERAGE:+.2f}%\n"
-                f"📉 <b>أقصى هبوط ضدك:</b> {_fmt_price(adverse_price)} | {-abs(adverse_pct):.2f}% | بعد الرافعة: {-abs(adverse_pct) * TRACK_LEVERAGE:.2f}%\n"
+                f"\n\n🔄 <b>Trailing Stop شغال (20%)</b>\n"
+                f"• أعلى سعر وصله: {_fmt_price(t_high)} (+{gain_from_entry:.2f}%)\n"
+                f"• Trailing SL الحالي: {_fmt_price(t_sl)} ({t_pct:.1f}% تحت الـ High)"
             )
-
-        if mode == MODE_RECOVERY_LONG:
-            avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
-            entry1 = _safe_float(alert.get("entry1"), entry)
-            entry2 = _safe_float(alert.get("entry2"), 0.0)
-            msg += (
-                f"\n🔄 <b>Recovery Long</b>\n"
-                f"• Entry 1: {_fmt_price(entry1)}\n"
-                f"• Entry 2: {_fmt_price(entry2)}\n"
-                f"• Avg Planned: {_fmt_price(avg_planned)}\n"
-            )
-
-        msg += (
-            f"\n⏳ <b>المدة:</b> {duration_h}h {duration_m}m\n\n"
-            f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
-        )
-        return msg
-    except Exception as e:
-        logger.error(f"build_track_message error: {e}")
-        return "❌ حصل خطأ أثناء متابعة الإشارة"
+    msg += (
+        f"\n💵 السعر الحالي: {current_price:.6f}\n"
+        f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
+        f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
+        f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
+        f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
+        f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
+        f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
+    )
+    return msg
+ except Exception as e:
+    logger.error(f"build_track_message error: {e}")
+    return "❌ حصل خطأ أثناء متابعة الإشارة"
 
 def build_track_reply_markup(alert_id: str) -> dict:
  return {
@@ -5780,6 +5591,10 @@ SMART_TP1_MIN_RR = 1.2
 SMART_TP1_DEFAULT_RR_FALLBACK = 2.0
 SMART_TP1_RESISTANCE_BUFFER_ATR = 0.20
 SMART_TP1_NEAR_RESISTANCE_RR = 1.2
+# Ignore micro/noise resistance levels that are too close to entry.
+# These tiny levels were causing excessive near_resistance_before_tp1 rejections.
+SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.004  # 0.40%
+SMART_TP1_IGNORE_NEAR_ROUND_PCT = 0.005       # 0.50%
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
@@ -5946,6 +5761,12 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
                 round_levels = []
 
             for level in round_levels:
+                try:
+                    # Round levels very close to entry are usually noise and should not block a setup.
+                    if ((float(level) - entry) / entry) < SMART_TP1_IGNORE_NEAR_ROUND_PCT:
+                        continue
+                except Exception:
+                    pass
                 if is_valid_round_resistance(df, level, entry):
                     candidates.append({
                         "price": level,
@@ -5956,15 +5777,30 @@ def _collect_resistance_candidates_long(df, entry: float) -> list:
         seen = set()
         for item in candidates:
             price = _safe_float(item.get("price"), 0.0)
+            source = item.get("source", "unknown")
             if price <= entry:
                 continue
+
+            # Smart Resistance Filter v2:
+            # Ignore extremely close resistance candidates because they are usually wick/noise
+            # and were over-filtering otherwise valid trades. Confirmed round levels use
+            # a slightly wider ignore band.
+            try:
+                distance_pct = (price - entry) / entry
+            except Exception:
+                distance_pct = 0.0
+
+            ignore_pct = SMART_TP1_IGNORE_NEAR_ROUND_PCT if source == "round_level_confirmed" else SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT
+            if distance_pct < ignore_pct:
+                continue
+
             key = round(price, 10)
             if key in seen:
                 continue
             seen.add(key)
             cleaned.append({
                 "price": price,
-                "source": item.get("source", "unknown")
+                "source": source
             })
 
         cleaned.sort(key=lambda x: x["price"])
@@ -8814,7 +8650,7 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-                        if _res_dist_pct < 0.6 or _res_r < 1.0:
+                        if _res_dist_pct < 1.0 or _res_r < 1.2:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="near_resistance_before_tp1",
@@ -9873,11 +9709,36 @@ def run_scanner_loop():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                         elif EXECUTION_AVAILABLE:
                             exec_result = process_trade_candidate(r, symbol, candidate)
-                            if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
+                            status = exec_result.get("status")
+                            if status in ("accepted_preview", "pending_pullback_preview"):
                                 execution_message = exec_result.get("execution_message")
                                 if execution_message:
-                                    send_telegram_message(execution_message)
-                                logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
+                                    send_result = send_telegram_message(execution_message)
+                                    if not send_result.get("ok"):
+                                        logger.warning(
+                                            f"⚠️ Execution message HTML failed | status={status} | symbol={symbol} | "
+                                            f"error={send_result.get('description') or send_result}"
+                                        )
+                                        plain_result = send_telegram_message_plain(execution_message)
+                                        if plain_result.get("ok"):
+                                            logger.info(
+                                                f"✅ Execution message sent as plain text | status={status} | symbol={symbol}"
+                                            )
+                                        else:
+                                            logger.error(
+                                                f"❌ Execution message failed completely | status={status} | symbol={symbol} | "
+                                                f"error={plain_result.get('description') or plain_result}"
+                                            )
+                                    else:
+                                        logger.info(
+                                            f"✅ Execution message sent | status={status} | symbol={symbol}"
+                                        )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ Execution status matched but no execution_message | "
+                                        f"status={status} | symbol={symbol}"
+                                    )
+                                logger.info(f"EXEC {status}: {symbol}")
                             else:
                                 logger.info(
                                     f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
