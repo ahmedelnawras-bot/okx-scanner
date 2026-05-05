@@ -402,11 +402,42 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
  except Exception as e:
     logger.error(f"Redis release error: {e}")
 
+def clear_stale_scan_locks_on_startup() -> None:
+ if not r:
+    return
+ try:
+    # Clean legacy lock name from older versions if it exists.
+    try:
+        if r.delete("scan:running"):
+            logger.info("🧹 Cleared legacy stale scan lock: scan:running")
+    except Exception:
+        pass
+
+    # Current lock should always have TTL. If it has no expiry, it is stale/dead.
+    ttl = r.ttl(SCAN_LOCK_KEY)
+    if ttl == -1:
+        r.delete(SCAN_LOCK_KEY)
+        logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
+    elif ttl and ttl > 0:
+        logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
+ except Exception as e:
+    logger.warning(f"Failed to clear stale scan locks on startup: {e}")
+
+def get_scan_lock_ttl() -> int:
+ if not r:
+    return 0
+ try:
+    ttl = r.ttl(SCAN_LOCK_KEY)
+    return int(ttl or 0)
+ except Exception:
+    return 0
+
 def acquire_scan_lock() -> bool:
  if not r:
     return True
  try:
-    locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
+    # Always set an expiry so a crash/redeploy cannot leave a permanent dead lock.
+    locked = r.set(SCAN_LOCK_KEY, str(os.getpid()), ex=SCAN_LOCK_TTL, nx=True)
     return bool(locked)
  except Exception as e:
     logger.error(f"Scan lock acquire error: {e}")
@@ -7067,7 +7098,8 @@ def run_scanner_loop():
             if not scan_locked:
                 _now_ts = time.time()
                 if _now_ts - _last_scan_skip_log_ts >= 60:
-                    logger.info("⏳ Scan lock active, waiting...")
+                    _lock_ttl = get_scan_lock_ttl()
+                    logger.info(f"⏳ Scan lock active, waiting... (ttl={_lock_ttl}s)")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
                 continue
@@ -9936,6 +9968,7 @@ def run():
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
     )
     clear_webhook()
+    clear_stale_scan_locks_on_startup()
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
     run_scanner_loop()
