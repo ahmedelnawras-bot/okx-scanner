@@ -1,5 +1,4 @@
-[file name]: main.py (full content with modifications)
-[file content]
+
 import os 
 import sys 
 import time 
