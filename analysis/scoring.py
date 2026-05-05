@@ -429,4 +429,20 @@ def calculate_long_score(
         "signal": score >= 5.5,
         "funding_label": funding_label,
         "signal_rating": classify_signal(score),
+
+        # Diagnostic fields only.
+        # These do not change the trading decision, but make main.py/reports safer
+        # because they can read the same values calculated by scoring.py instead
+        # of recalculating or guessing them.
+        "validated_breakout": bool(validated_breakout),
+        "strong_breakout": bool(strong_breakout),
+        "late_breakout": bool(late_breakout),
+        "exhaustion_wick": bool(exhaustion_wick),
+        "consolidation_ok": bool(consolidation_ok),
+        "candle_strength": round(float(candle_strength or 0.0), 4),
+        "dist_ma": round(float(dist_ma or 0.0), 4),
+        "vol_ratio": round(float(vol_ratio or 0.0), 4),
+        "rsi_now": round(float(rsi or 0.0), 4),
+        "rsi_momentum": round(float(rsi_momentum or 0.0), 4),
+        "breakout_extension": round(float(breakout_extension or 0.0), 4),
     }
