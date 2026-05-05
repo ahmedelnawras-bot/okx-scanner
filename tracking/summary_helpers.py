@@ -125,19 +125,32 @@ def calc_side_pct(side: str, entry: float, exit_price: float) -> float:
 
 def get_effective_entry(trade: dict) -> float:
     """
-    سعر الدخول الفعلي — أولوية:
-    1. trade["effective_entry"]
-    2. diagnostics["effective_entry"]
-    3. trade["entry"]
+    سعر الدخول الفعلي — أولوية محسّنة بعد توحيد Pullback/Execution:
+    1. effective_entry من الصفقة أو diagnostics
+    2. execution_entry لو موجودة وتمثل دخول التنفيذ الحقيقي
+    3. recommended_entry / pullback_entry عند خطط Pullback القديمة
+    4. entry كاحتياطي أخير
     """
+    if not isinstance(trade, dict):
+        return 0.0
+
     diagnostics = trade.get("diagnostics", {}) or {}
-    eff = safe_float(trade.get("effective_entry"), 0.0)
-    if eff > 0:
-        return eff
-    eff = safe_float(diagnostics.get("effective_entry"), 0.0)
-    if eff > 0:
-        return eff
-    return safe_float(trade.get("entry"), 0.0)
+
+    for key in (
+        "effective_entry",
+        "execution_entry",
+        "recommended_entry",
+        "pullback_entry",
+        "entry",
+    ):
+        eff = safe_float(trade.get(key), 0.0)
+        if eff > 0:
+            return eff
+        eff = safe_float(diagnostics.get(key), 0.0)
+        if eff > 0:
+            return eff
+
+    return 0.0
 
 
 def is_pullback_not_triggered(trade: dict) -> bool:
@@ -169,8 +182,9 @@ def _get_close_pcts(trade: dict) -> tuple:
             v = diagnostics.get(key)
         return safe_float(v, default)
 
-    tp1_pct   = _get("tp1_close_pct", DEFAULT_TP1_CLOSE_PCT) / 100.0
-    tp2_pct   = _get("tp2_close_pct", DEFAULT_TP2_CLOSE_PCT) / 100.0
+    # ندعم الاسمين: close_pct القديم، و plan_pct المضاف مع Smart TP 40/40/20
+    tp1_pct   = _get("tp1_close_pct", _get("tp1_plan_pct", DEFAULT_TP1_CLOSE_PCT)) / 100.0
+    tp2_pct   = _get("tp2_close_pct", _get("tp2_plan_pct", DEFAULT_TP2_CLOSE_PCT)) / 100.0
     trail_pct = _get("trailing_position_pct", DEFAULT_TRAILING_POSITION_PCT) / 100.0
 
     # normalize لو المجموع مش 100%
