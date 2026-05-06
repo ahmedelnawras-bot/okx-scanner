@@ -2636,6 +2636,108 @@ def _partial_lifecycle_realized_pnl_for_report(trade: dict) -> float:
     except Exception:
         return 0.0
 
+def build_trade_summary_from_trades(
+    trades: list,
+    market_type: Optional[str] = "futures",
+    side: Optional[str] = "long",
+) -> dict:
+    """Build the same financial/TP report summary from an already-filtered trade list.
+
+    Used for specialized reports such as execution-candidate trades without changing
+    the normal all-trades report logic.
+    """
+    side_norm = normalize_side(side or "long")
+    filtered_trades = [
+        t for t in (trades or [])
+        if isinstance(t, dict) and t.get("status") != "pending_pullback"
+    ]
+
+    summary = summarize_trades(filtered_trades)
+    summary["market_type"] = market_type or "futures"
+    summary["side"] = side_norm
+
+    closed_trades = [
+        t for t in filtered_trades
+        if str(t.get("result", "")).lower() in (
+            "tp1_win", "tp2_win", "trailing_win", "loss", "breakeven"
+        )
+    ]
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    total_pnl = 0.0
+    win_pnls = []
+    loss_pnls = []
+    all_pnls = []
+
+    tp1_hits = sum(1 for t in filtered_trades if _is_tp1_hit(t))
+    tp2_hits = sum(1 for t in filtered_trades if _is_tp2_hit(t))
+    tp2_wins = sum(1 for t in closed_trades if t.get("result") in ("tp2_win", "trailing_win"))
+    trailing_wins = sum(1 for t in closed_trades if t.get("result") == "trailing_win")
+
+    partial_lifecycle_pnl = 0.0
+    partial_lifecycle_count = 0
+    for _trade in filtered_trades:
+        _p = _partial_lifecycle_realized_pnl_for_report(_trade)
+        if abs(_p) > 0:
+            partial_lifecycle_pnl += _p
+            partial_lifecycle_count += 1
+
+    for trade in closed_trades:
+        pnl_data = calculate_trade_pnl(trade)
+        if pnl_data["skipped"] or pnl_data["is_pending"]:
+            continue
+        pnl = pnl_data["pnl_leveraged"]
+        all_pnls.append(pnl)
+        total_pnl += pnl
+        if pnl > 0:
+            gross_profit += pnl
+            win_pnls.append(pnl)
+        elif pnl < 0:
+            gross_loss += abs(pnl)
+            loss_pnls.append(pnl)
+
+    summary["realized_leveraged_pnl_pct"] = round(total_pnl, 4)
+    summary["realized_pnl_pct"] = round(total_pnl, 4)
+    summary["gross_profit_pct"] = round(gross_profit, 4)
+    summary["gross_loss_pct"] = round(-gross_loss, 4)
+    summary["net_profit_pct"] = round(total_pnl, 4)
+    summary["avg_win_pct"] = round(sum(win_pnls) / len(win_pnls), 4) if win_pnls else 0.0
+    summary["avg_loss_pct"] = round(sum(loss_pnls) / len(loss_pnls), 4) if loss_pnls else 0.0
+    summary["best_trade_pct"] = round(max(all_pnls), 4) if all_pnls else 0.0
+    summary["worst_trade_pct"] = round(min(all_pnls), 4) if all_pnls else 0.0
+
+    leverage = SHORT_REPORT_LEVERAGE if side_norm == "short" else REPORT_LEVERAGE
+    summary["realized_raw_pnl_pct"] = round(total_pnl / leverage, 4) if leverage else 0.0
+    summary["partial_lifecycle_leveraged_pnl_pct"] = round(partial_lifecycle_pnl, 4)
+    summary["partial_lifecycle_raw_pnl_pct"] = round(partial_lifecycle_pnl / leverage, 4) if leverage else 0.0
+    summary["partial_lifecycle_count"] = partial_lifecycle_count
+    summary["total_lifecycle_leveraged_pnl_pct"] = round(total_pnl + partial_lifecycle_pnl, 4)
+
+    summary["tp1_hits"] = tp1_hits
+    summary["tp2_hits"] = tp2_hits
+    summary["tp2_wins"] = tp2_wins
+    summary["trailing_wins"] = trailing_wins
+
+    signals = safe_int(summary.get("signals", 0))
+    summary["tp1_rate"] = round((tp1_hits / signals) * 100, 2) if signals > 0 else 0.0
+    summary["tp2_rate"] = round((tp2_hits / signals) * 100, 2) if signals > 0 else 0.0
+    summary["tp1_to_tp2_rate"] = round((tp2_hits / tp1_hits) * 100, 2) if tp1_hits > 0 else 0.0
+
+    plan = get_report_sizing_plan(side_norm)
+    for key in [
+        "leverage",
+        "margin_per_trade_usd",
+        "active_trade_slots",
+        "total_margin_used_usd",
+        "notional_per_trade_usd",
+        "total_notional_exposure_usd",
+    ]:
+        summary[key] = plan[key]
+
+    return summary
+
+
 def get_trade_summary(
     redis_client,
     market_type: Optional[str] = None,
