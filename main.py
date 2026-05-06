@@ -139,7 +139,7 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:long:running"
-SCAN_LOCK_TTL = 600
+SCAN_LOCK_TTL = 180
 
 SCAN_LOOP_SLEEP_SECONDS = 5
 SCAN_IDLE_SLEEP_SECONDS = 8
@@ -388,11 +388,43 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
  except Exception as e:
     logger.error(f"Redis release error: {e}")
 
+def get_scan_lock_ttl() -> int:
+ if not r:
+    return 0
+ try:
+    ttl = r.ttl(SCAN_LOCK_KEY)
+    return int(ttl or 0)
+ except Exception:
+    return 0
+
+def clear_stale_scan_locks_on_startup() -> None:
+ if not r:
+    return
+ try:
+    # Clean legacy lock name from older versions if it exists.
+    try:
+        if r.delete("scan:running"):
+            logger.info("🧹 Cleared legacy stale scan lock: scan:running")
+    except Exception:
+        pass
+
+    ttl = r.ttl(SCAN_LOCK_KEY)
+    if ttl == -1:
+        r.delete(SCAN_LOCK_KEY)
+        logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
+    elif ttl and ttl > 300:
+        r.delete(SCAN_LOCK_KEY)
+        logger.warning(f"🧹 Cleared stale scan lock with too-long TTL: {SCAN_LOCK_KEY} ttl={ttl}s")
+    elif ttl and ttl > 0:
+        logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
+ except Exception as e:
+    logger.warning(f"Failed to clear stale scan locks on startup: {e}")
+
 def acquire_scan_lock() -> bool:
  if not r:
     return True
  try:
-    locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
+    locked = r.set(SCAN_LOCK_KEY, str(os.getpid()), ex=SCAN_LOCK_TTL, nx=True)
     return bool(locked)
  except Exception as e:
     logger.error(f"Scan lock acquire error: {e}")
@@ -7129,6 +7161,7 @@ def run_command_poller():
 
 def run_scanner_loop():
     global last_global_send_ts, _last_scan_skip_log_ts
+    logger.info("🚀 run_scanner_loop entered")
     while True:
         try:
             cleanup_local_caches()
@@ -7139,8 +7172,17 @@ def run_scanner_loop():
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 _now_ts = time.time()
-                if _now_ts - _last_scan_skip_log_ts >= 60:
-                    logger.debug("Another long scan is running --- skipping")
+                ttl = get_scan_lock_ttl()
+                if ttl > 300:
+                    try:
+                        r.delete(SCAN_LOCK_KEY)
+                        logger.warning(f"🧹 Stale scan lock detected during loop, clearing... (ttl={ttl}s)")
+                    except Exception as _lock_e:
+                        logger.warning(f"Failed clearing stale scan lock: {_lock_e}")
+                    time.sleep(1)
+                    continue
+                if _now_ts - _last_scan_skip_log_ts >= 15:
+                    logger.info(f"⏳ Scan lock active, waiting... (ttl={ttl}s)")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
                 continue
@@ -8799,7 +8841,31 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-                        if _res_dist_pct < 1.0 or _res_r < 1.2:
+
+                        # Smart Resistance Balance v2:
+                        # normal setups stay protected, but relaxed/execution-quality setups should not be killed
+                        # by moderate resistance. Borderline cases continue as warnings/score penalty below.
+                        _relaxed_resistance_setup = is_relaxed_execution_setup(
+                            setup_type="|".join([
+                                str(primary_extra_setup or ""),
+                                " ".join(extra_setup_names or []),
+                                " ".join(context_setups or []),
+                            ]),
+                            extra_setup_names=extra_setup_names,
+                            primary_extra_setup=primary_extra_setup,
+                            mtf_confirmed=mtf_confirmed,
+                            vol_ratio=vol_ratio,
+                            score=score_result.get("score", 0.0),
+                        )
+
+                        if _relaxed_resistance_setup:
+                            _reject_by_resistance = (_res_dist_pct < 0.40 or _res_r < 0.35)
+                            _limits_label = "dist<0.40_or_R<0.35"
+                        else:
+                            _reject_by_resistance = (_res_dist_pct < 0.80 or _res_r < 0.70)
+                            _limits_label = "dist<0.80_or_R<0.70"
+
+                        if _reject_by_resistance:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="near_resistance_before_tp1",
@@ -8822,11 +8888,22 @@ def run_scanner_loop():
                                     "nearest_resistance": _nearest_res,
                                     "resistance_distance_pct": _res_dist_pct,
                                     "resistance_r": _res_r,
+                                    "relaxed": _relaxed_resistance_setup,
+                                    "limits": _limits_label,
                                     "category": "trade_quality",
                                 },
                             )
-                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
+                            logger.info(
+                                f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | "
+                                f"dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                f"relaxed={_relaxed_resistance_setup} | limits={_limits_label}"
+                            )
                             continue
+                        else:
+                            logger.info(
+                                f"⚠️ {symbol} near resistance warning only | dist={_res_dist_pct:.2f}% | "
+                                f"R={_res_r:.2f} | relaxed={_relaxed_resistance_setup}"
+                            )
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
@@ -9917,6 +9994,7 @@ def run():
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
     )
     clear_webhook()
+    clear_stale_scan_locks_on_startup()
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
     run_scanner_loop()
