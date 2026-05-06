@@ -8982,11 +8982,17 @@ def run_scanner_loop():
                 early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
                 resistance_rejected = False
                 resistance_dynamic_penalty = 0.0
+                # Prevent the older near_resistance_guard_long from re-rejecting
+                # a signal after the new Smart Resistance Balance block already
+                # classified it as noise / warning-only.
+                smart_resistance_balance_checked = False
+                smart_resistance_warning_only = False
 
                 try:
                     _risk_for_quality = float(entry_price_for_trade) - float(stop_loss)
                     _nearest_res = float(early_nearest_resistance or 0.0)
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
+                        smart_resistance_balance_checked = True
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
                         _tp1_structure = _nearest_res * 0.995
@@ -9019,6 +9025,8 @@ def run_scanner_loop():
                         )
 
                         if _res_is_micro_noise:
+                            smart_resistance_warning_only = True
+                            early_resistance_warning = ""
                             logger.info(
                                 f"⚪ {symbol} tiny/micro resistance ignored | "
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
@@ -9037,6 +9045,7 @@ def run_scanner_loop():
                             )
 
                             if _should_hard_reject_resistance:
+                                resistance_rejected = True
                                 log_long_rejection(
                                     symbol=symbol,
                                     reason="near_resistance_before_tp1",
@@ -9083,6 +9092,7 @@ def run_scanner_loop():
                         )
 
                         if _tp1_unrewarding_structural:
+                            resistance_rejected = True
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="tp1_not_rewarding_before_resistance",
@@ -9119,6 +9129,8 @@ def run_scanner_loop():
                             )
                             continue
                         elif _tp1_structure < _min_tp1:
+                            smart_resistance_warning_only = True
+                            early_resistance_warning = ""
                             logger.info(
                                 f"⚠️ {symbol} resistance warning only | "
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
@@ -9126,6 +9138,12 @@ def run_scanner_loop():
                             )
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
+
+                # If Smart Resistance Balance evaluated the level and did not hard-reject,
+                # do not let the older dynamic guard kill the same signal again.
+                # This keeps near-resistance as warning/penalty only for balanced cases.
+                if smart_resistance_balance_checked and not resistance_rejected:
+                    early_resistance_warning = ""
                 
                 explicit_warnings = score_result.get("warning_reasons") or []
                 _, inferred_warnings = classify_reasons(score_result.get("reasons", []))
