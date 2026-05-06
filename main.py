@@ -2645,6 +2645,15 @@ def _trade_live_pnl_for_report(trade: dict) -> dict:
         else:
             weighted = pnl
 
+    leverage = safe_float(
+        trade.get("leverage")
+        or trade.get("default_leverage")
+        or trade.get("diagnostics", {}).get("leverage")
+        or trade.get("diagnostics", {}).get("default_leverage")
+        or 15,
+        15,
+    )
+
     return {
         "phase": phase,
         "phase_label": phase_label,
@@ -2652,8 +2661,9 @@ def _trade_live_pnl_for_report(trade: dict) -> dict:
         "current_price": current,
         "pnl_pct": pnl,
         "weighted_pnl_pct": weighted,
-        "leveraged_pnl_pct": (pnl * DEFAULT_LEVERAGE) if pnl is not None else None,
-        "weighted_leveraged_pnl_pct": (weighted * DEFAULT_LEVERAGE) if weighted is not None else None,
+        "leveraged_pnl_pct": (pnl * leverage) if pnl is not None else None,
+        "weighted_leveraged_pnl_pct": (weighted * leverage) if weighted is not None else None,
+        "leverage": leverage,
     }
 
 
