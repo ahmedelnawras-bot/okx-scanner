@@ -3378,6 +3378,105 @@ def format_trade_status_line(trade: dict) -> str:
 
     return "📌 حالة الصفقة: ⚪ غير معروفة"
 
+
+def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = None) -> dict:
+    """Display-only weighted PnL using the 40/40/20 exit plan.
+
+    This does not change tracking decisions. It only reports the effective PnL:
+    - before TP1: 100% of position moves with current price
+    - after TP1: 40% locked at TP1 + 60% live
+    - after TP2/trailing: 40% TP1 + 40% TP2 + 20% live/trailing exit
+    """
+    try:
+        if not isinstance(trade, dict):
+            return {"available": False}
+
+        side = str(trade.get("side", "long") or "long").lower()
+        entry = _safe_float(
+            trade.get("effective_entry")
+            or trade.get("execution_entry")
+            or trade.get("recommended_entry")
+            or trade.get("pullback_entry")
+            or trade.get("entry"),
+            0.0,
+        )
+        tp1 = _safe_float(trade.get("tp1"), 0.0)
+        tp2 = _safe_float(trade.get("tp2"), 0.0)
+        price = _safe_float(current_price, 0.0)
+        if price <= 0:
+            price = _safe_float(
+                trade.get("current_price")
+                or trade.get("last_price")
+                or trade.get("trailing_exit_price")
+                or trade.get("exit_price"),
+                0.0,
+            )
+
+        leverage = _safe_float(trade.get("leverage"), TRACK_LEVERAGE) or TRACK_LEVERAGE
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+        tp1_hit = bool(trade.get("tp1_hit", False)) or result in ("tp1_win", "tp2_win", "trailing_win")
+        tp2_hit = (
+            bool(trade.get("tp2_hit", False))
+            or result in ("tp2_win", "trailing_win")
+            or status in ("tp2_partial", "trailing_open", "trailing")
+        )
+        trailing_active = bool(trade.get("trailing_active", False)) or status in ("trailing_open", "trailing")
+
+        if status == "pending_pullback" or entry <= 0:
+            return {"available": False, "phase": "pending_pullback"}
+
+        def pct_to(target):
+            target = _safe_float(target, 0.0)
+            if target <= 0 or entry <= 0:
+                return 0.0
+            if side == "short":
+                return ((entry - target) / entry) * 100.0
+            return ((target - entry) / entry) * 100.0
+
+        current_raw = pct_to(price) if price > 0 else 0.0
+        tp1_raw = pct_to(tp1)
+        tp2_raw = pct_to(tp2)
+
+        if result == "loss":
+            raw = pct_to(trade.get("sl") or trade.get("exit_price"))
+            phase = "loss"
+        elif result == "breakeven":
+            raw = 0.0
+            phase = "breakeven"
+        elif result == "tp1_win":
+            raw = tp1_raw * 0.40
+            phase = "tp1_closed"
+        elif result == "tp2_win":
+            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (tp2_raw * 0.20)
+            phase = "tp2_closed"
+        elif result == "trailing_win":
+            trailing_exit = _safe_float(trade.get("trailing_exit_price") or trade.get("exit_price"), price)
+            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (pct_to(trailing_exit) * 0.20)
+            phase = "trailing_closed"
+        elif tp2_hit or trailing_active:
+            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (current_raw * 0.20)
+            phase = "trailing_live"
+        elif tp1_hit or status == "partial":
+            raw = (tp1_raw * 0.40) + (current_raw * 0.60)
+            phase = "tp1_live"
+        else:
+            raw = current_raw
+            phase = "open_before_tp1"
+
+        return {
+            "available": True,
+            "phase": phase,
+            "raw_pct": round(raw, 4),
+            "leveraged_pct": round(raw * leverage, 4),
+            "current_raw_pct": round(current_raw, 4),
+            "current_leveraged_pct": round(current_raw * leverage, 4),
+            "leverage": leverage,
+        }
+    except Exception as e:
+        logger.warning(f"calculate_trade_lifecycle_pnl_for_track error: {e}")
+        return {"available": False}
+
 def build_track_message(alert: dict) -> str:
  try:
     symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
@@ -3438,6 +3537,7 @@ def build_track_message(alert: dict) -> str:
     state_badge = get_track_state_badge(display_status, current_move)
     tv_link = build_track_tradingview_link(alert.get("symbol", ""))
     leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
+    lifecycle_pnl = calculate_trade_lifecycle_pnl_for_track(trade, current_price) if trade else {"available": False}
     leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
     leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
     recovery_extra = ""
@@ -3503,6 +3603,13 @@ def build_track_message(alert: dict) -> str:
         f"\n💵 السعر الحالي: {current_price:.6f}\n"
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
         f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
+    )
+    if lifecycle_pnl.get("available"):
+        msg += (
+            f"⚖️ الربح الفعلي 40/40/20: {lifecycle_pnl.get('raw_pct', 0):+.2f}% "
+            f"| بعد الرافعة: {lifecycle_pnl.get('leveraged_pct', 0):+.2f}%\n"
+        )
+    msg += (
         f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
         f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
         f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
