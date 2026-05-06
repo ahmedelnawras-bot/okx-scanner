@@ -139,7 +139,7 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:long:running"
-SCAN_LOCK_TTL = 180
+SCAN_LOCK_TTL = 600
 
 SCAN_LOOP_SLEEP_SECONDS = 5
 SCAN_IDLE_SLEEP_SECONDS = 8
@@ -218,15 +218,16 @@ STRONG_ONLY_ALLOWED_SETUPS = {
     "support_bounce_confirmed",
     "higher_low_continuation",
     "relative_strength_vs_btc",
+    "failed_breakdown_trap",
 }
 STRONG_ONLY_MIN_SCORE = 8.0
 STRONG_ONLY_MIN_VOL_RATIO = 1.2
 
-MODE_TRANSITION_MIN_INTERVAL = 240
+MODE_TRANSITION_MIN_INTERVAL = 480
 RECOVERY_CHECK_INTERVAL = 120
-NORMAL_CANDIDATE_DURATION = 180
+NORMAL_CANDIDATE_DURATION = 480
 BLOCK_EXIT_CONFIRM_DURATION = 240
-STRONG_TO_NORMAL_CONFIRM_DURATION = 180
+STRONG_TO_NORMAL_CONFIRM_DURATION = 480
 
 # Market Crash Guard
 MARKET_GUARD_ENABLED = True
@@ -294,27 +295,6 @@ last_candle_cache_meta = {}
 last_global_send_ts = 0.0
 _local_news_cache = {"created_ts": 0, "events": []}
 _last_scan_skip_log_ts = 0.0
-
-# Telegram command responsiveness: run heavy command handlers away from the polling loop.
-COMMAND_EXECUTOR = ThreadPoolExecutor(max_workers=3)
-ASYNC_TELEGRAM_COMMANDS = {
-    "/open_trades",
-    "/report_1h",
-    "/report_today",
-    "/report_7d",
-    "/report_30d",
-    "/report_month",
-    "/report_all",
-    "/report_deep",
-    "/report_exits",
-    "/report_execution",
-    "/report_rejections",
-    "/report_setups",
-    "/report_scores",
-    "/report_market",
-    "/report_losses",
-    "/report_diagnostics",
-}
 
 
 def clean_symbol_for_message(symbol: str) -> str:
@@ -388,43 +368,11 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
  except Exception as e:
     logger.error(f"Redis release error: {e}")
 
-def get_scan_lock_ttl() -> int:
- if not r:
-    return 0
- try:
-    ttl = r.ttl(SCAN_LOCK_KEY)
-    return int(ttl or 0)
- except Exception:
-    return 0
-
-def clear_stale_scan_locks_on_startup() -> None:
- if not r:
-    return
- try:
-    # Clean legacy lock name from older versions if it exists.
-    try:
-        if r.delete("scan:running"):
-            logger.info("🧹 Cleared legacy stale scan lock: scan:running")
-    except Exception:
-        pass
-
-    ttl = r.ttl(SCAN_LOCK_KEY)
-    if ttl == -1:
-        r.delete(SCAN_LOCK_KEY)
-        logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
-    elif ttl and ttl > 300:
-        r.delete(SCAN_LOCK_KEY)
-        logger.warning(f"🧹 Cleared stale scan lock with too-long TTL: {SCAN_LOCK_KEY} ttl={ttl}s")
-    elif ttl and ttl > 0:
-        logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
- except Exception as e:
-    logger.warning(f"Failed to clear stale scan locks on startup: {e}")
-
 def acquire_scan_lock() -> bool:
  if not r:
     return True
  try:
-    locked = r.set(SCAN_LOCK_KEY, str(os.getpid()), ex=SCAN_LOCK_TTL, nx=True)
+    locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
     return bool(locked)
  except Exception as e:
     logger.error(f"Scan lock acquire error: {e}")
@@ -513,6 +461,54 @@ def should_wait_for_pullback_entry(candidate: dict) -> bool:
     if distance_pct > PULLBACK_ENTRY_MAX_DISTANCE_PCT:
         return False
     return True
+
+
+# =========================
+# CANDLE DATA QUALITY GUARD
+# =========================
+NO_CANDLES_FAIL_PREFIX = "data:no_candles_fail:long"
+NO_CANDLES_BLOCK_PREFIX = "data:no_candles_block:long"
+NO_CANDLES_FAIL_LIMIT = 3
+NO_CANDLES_FAIL_TTL_SECONDS = 60 * 60
+NO_CANDLES_BLOCK_TTL_SECONDS = 60 * 60
+NO_CANDLES_LOG_SAMPLE_LIMIT = 10
+
+def _candle_data_key(prefix: str, symbol: str, timeframe: str = TIMEFRAME) -> str:
+    return f"{prefix}:{str(timeframe).lower()}:{symbol}"
+
+def is_candle_temporarily_blocked(symbol: str, timeframe: str = TIMEFRAME) -> bool:
+    try:
+        return bool(r and r.exists(_candle_data_key(NO_CANDLES_BLOCK_PREFIX, symbol, timeframe)))
+    except Exception:
+        return False
+
+def record_candle_fetch_success(symbol: str, timeframe: str = TIMEFRAME) -> None:
+    try:
+        if not r:
+            return
+        r.delete(_candle_data_key(NO_CANDLES_FAIL_PREFIX, symbol, timeframe))
+        r.delete(_candle_data_key(NO_CANDLES_BLOCK_PREFIX, symbol, timeframe))
+    except Exception as e:
+        logger.warning(f"record_candle_fetch_success failed for {symbol}: {e}")
+
+def record_candle_fetch_failure(symbol: str, timeframe: str = TIMEFRAME) -> int:
+    try:
+        if not r:
+            return 1
+        fail_key = _candle_data_key(NO_CANDLES_FAIL_PREFIX, symbol, timeframe)
+        fail_count = int(r.incr(fail_key))
+        r.expire(fail_key, NO_CANDLES_FAIL_TTL_SECONDS)
+        if fail_count >= NO_CANDLES_FAIL_LIMIT:
+            block_key = _candle_data_key(NO_CANDLES_BLOCK_PREFIX, symbol, timeframe)
+            r.set(block_key, str(fail_count), ex=NO_CANDLES_BLOCK_TTL_SECONDS)
+            logger.warning(
+                f"DATA ERROR | {symbol} | no_candles blocked for {NO_CANDLES_BLOCK_TTL_SECONDS}s "
+                f"after {fail_count} consecutive failures"
+            )
+        return fail_count
+    except Exception as e:
+        logger.warning(f"record_candle_fetch_failure failed for {symbol}: {e}")
+        return 1
 
 # =========================
 # NEW HELPER: consolidated rejection logging
@@ -1202,6 +1198,63 @@ def detect_extra_strong_long_setups(
         "context_setups": context_setups,    
     }
 
+
+
+def is_relaxed_execution_setup(
+    setup_type: str = "",
+    extra_setup_names=None,
+    primary_extra_setup: str = "",
+    mtf_confirmed: bool = False,
+    vol_ratio: float = 0.0,
+    score: float = 0.0,
+) -> bool:
+    """
+    Safe helper used by softening / resistance guards.
+    Returns True only for strong/known setups in a supportive context.
+    This prevents NameError and keeps weak setups strict.
+    """
+    try:
+        names = []
+        if setup_type:
+            names.append(str(setup_type))
+        if primary_extra_setup:
+            names.append(str(primary_extra_setup))
+        if isinstance(extra_setup_names, (list, tuple, set)):
+            names.extend([str(x) for x in extra_setup_names if x])
+        elif extra_setup_names:
+            names.append(str(extra_setup_names))
+
+        blob = "|".join(names).lower()
+        strong_tokens = {
+            "vwap_reclaim",
+            "retest_breakout_confirmed",
+            "wave_3",
+            "liquidity_sweep_reclaim",
+            "support_bounce_confirmed",
+            "higher_low_continuation",
+            "relative_strength_vs_btc",
+            "failed_breakdown_trap",
+        }
+        has_strong_token = any(token in blob for token in strong_tokens)
+        if not has_strong_token:
+            return False
+
+        try:
+            v = float(vol_ratio or 0.0)
+        except Exception:
+            v = 0.0
+        try:
+            sc = float(score or 0.0)
+        except Exception:
+            sc = 0.0
+
+        # Before final scoring, score may be 0; allow only if MTF or volume supports it.
+        if sc <= 0:
+            return bool(mtf_confirmed or v >= 1.15)
+        return bool(sc >= 7.0 and (mtf_confirmed or v >= 1.15))
+    except Exception:
+        return False
+
 # =========================
 # ECONOMIC CALENDAR
 # =========================
@@ -1419,20 +1472,6 @@ def send_telegram_message(message: str, reply_markup=None) -> dict:
     "chat_id": CHAT_ID,
     "text": message,
     "parse_mode": "HTML",
-    "disable_web_page_preview": True,
- }
- if reply_markup:
-    payload["reply_markup"] = reply_markup
- return telegram_api_call("sendMessage", payload)
-
-
-def send_telegram_message_plain(message: str, reply_markup=None) -> dict:
- if not BOT_TOKEN or not CHAT_ID:
-    logger.error("❌ Telegram config missing")
-    return {"ok": False}
- payload = {
-    "chat_id": CHAT_ID,
-    "text": message,
     "disable_web_page_preview": True,
  }
  if reply_markup:
@@ -2518,250 +2557,34 @@ def _trade_field(trade: dict, key: str, default=None):
     return trade.get(key, diagnostics.get(key, default))
 
 
-def _execution_trade_status_label(trade: dict) -> str:
-    status = str(trade.get("status", "") or "").lower()
-    result = str(trade.get("result", "") or "").lower()
-    if status == "pending_pullback":
-        return "⏳ Pending"
-    if status in ("open", "partial", "trailing", "trailing_open", "tp2_partial"):
-        if status == "partial":
-            return "🟡 TP1/Open"
-        if status in ("trailing", "trailing_open", "tp2_partial"):
-            return "🔄 Trailing"
-        return "🟢 Open"
-    if result == "tp2_win":
-        return "🏁 TP2 Win"
-    if result == "trailing_win":
-        return "🔄 Trail Win"
-    if result == "tp1_win":
-        return "✅ TP1 Win"
-    if result == "loss":
-        return "🔴 SL"
-    if result in ("breakeven", "pending_expired"):
-        return "⚪ BE/Expired"
-    if result == "expired":
-        return "⚫ Expired"
-    if trade.get("tp1_hit"):
-        return "🟡 TP1"
-    return status or result or "unknown"
-
-
-def _execution_trade_is_closed(trade: dict) -> bool:
-    status = str(trade.get("status", "") or "").lower()
-    result = str(trade.get("result", "") or "").lower()
-    return status == "closed" or result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven", "expired", "pending_expired")
-
-
-def _execution_trade_is_win(trade: dict) -> bool:
-    result = str(trade.get("result", "") or "").lower()
-    return result in ("tp1_win", "tp2_win", "trailing_win") or bool(trade.get("tp1_hit") and result != "loss")
-
-
-def _execution_trade_is_loss(trade: dict) -> bool:
-    return str(trade.get("result", "") or "").lower() == "loss"
-
-
-# =========================
-# OPEN TRADE LIVE PHASE / PNL HELPERS
-# =========================
-def _trade_effective_entry_for_report(trade: dict) -> float:
-    """أفضل سعر دخول فعلي للتقارير: Pullback يستخدم recommended/effective، والـ Market يستخدم entry."""
-    for key in ("effective_entry", "recommended_entry", "execution_entry", "pullback_entry", "entry"):
-        v = _safe_float(_trade_field(trade, key, 0.0), 0.0)
-        if v > 0:
-            return v
-    return 0.0
-
-
-def _trade_current_price_for_report(trade: dict) -> float:
-    """سعر حالي سريع من آخر شمعة 1m، مع fallback لأي قيمة محفوظة داخل الصفقة."""
-    for key in ("current_price", "last_price", "market_price"):
-        v = _safe_float(trade.get(key, 0.0), 0.0)
-        if v > 0:
-            return v
-    symbol = str(trade.get("symbol", "") or "")
-    if not symbol:
-        return 0.0
-    try:
-        candles = get_candles(symbol, timeframe="1m", limit=1)
-        if candles:
-            row = candles[0]
-            if isinstance(row, (list, tuple)) and len(row) >= 5:
-                return _safe_float(row[4], 0.0)
-            if isinstance(row, dict):
-                return _safe_float(row.get("close", 0.0), 0.0)
-    except Exception as e:
-        logger.warning(f"current price fetch failed for {symbol}: {e}")
-    return 0.0
-
-
-def _trade_phase_for_report(trade: dict) -> tuple:
-    """يرجع (phase_key, Arabic label) للمرحلة الحالية للصفقة المفتوحة."""
-    status = str(trade.get("status", "") or "").lower()
-    result = str(trade.get("result", "") or "").lower()
-    tp1_hit = bool(trade.get("tp1_hit") or _trade_field(trade, "tp1_hit", False))
-    tp2_hit = bool(trade.get("tp2_hit") or _trade_field(trade, "tp2_hit", False))
-    trailing_active = bool(trade.get("trailing_active") or _trade_field(trade, "trailing_active", False))
-    sl_moved = bool(trade.get("sl_moved_to_entry") or _trade_field(trade, "sl_moved_to_entry", False))
-    entry_mode = str(_trade_field(trade, "entry_mode", "") or "").lower()
-
-    if status == "pending_pullback" or entry_mode == "pullback_pending":
-        return "pending", "⏳ انتظار Pullback"
-    if status == "closed" or result:
-        return "closed", _execution_trade_status_label(trade)
-    if trailing_active or status in ("trailing", "trailing_open", "tp2_partial") or tp2_hit:
-        return "trailing", "🔄 بعد TP2 | آخر 20% Trailing"
-    if tp1_hit or status == "partial":
-        suffix = " | 🔒 SL Entry" if sl_moved else ""
-        return "tp1", f"🟡 بعد TP1 | 40% مغلق{suffix}"
-    return "open", "🟢 قبل TP1"
-
-
-def _trade_live_pnl_for_report(trade: dict) -> dict:
-    """حساب الربح/الخسارة الحالي والمرجّح للصفقات المفتوحة حسب 40/40/20."""
-    phase, phase_label = _trade_phase_for_report(trade)
-    entry = _trade_effective_entry_for_report(trade)
-    current = _trade_current_price_for_report(trade)
-    side = str(trade.get("side", "long") or "long").lower()
-    tp1 = _safe_float(_trade_field(trade, "tp1", 0.0), 0.0)
-    tp2 = _safe_float(_trade_field(trade, "tp2", 0.0), 0.0)
-
-    pnl = None
-    weighted = None
-    if phase != "pending" and entry > 0 and current > 0:
-        if side == "short":
-            pnl = ((entry - current) / entry) * 100.0
-            tp1_move = ((entry - tp1) / entry) * 100.0 if tp1 > 0 else 0.0
-            tp2_move = ((entry - tp2) / entry) * 100.0 if tp2 > 0 else 0.0
-        else:
-            pnl = ((current - entry) / entry) * 100.0
-            tp1_move = ((tp1 - entry) / entry) * 100.0 if tp1 > 0 else 0.0
-            tp2_move = ((tp2 - entry) / entry) * 100.0 if tp2 > 0 else 0.0
-
-        if phase == "trailing":
-            weighted = (tp1_move * 0.40) + (tp2_move * 0.40) + (pnl * 0.20)
-        elif phase == "tp1":
-            weighted = (tp1_move * 0.40) + (pnl * 0.60)
-        else:
-            weighted = pnl
-
-    leverage = safe_float(
-        trade.get("leverage")
-        or trade.get("default_leverage")
-        or trade.get("diagnostics", {}).get("leverage")
-        or trade.get("diagnostics", {}).get("default_leverage")
-        or 15,
-        15,
-    )
-
-    return {
-        "phase": phase,
-        "phase_label": phase_label,
-        "entry": entry,
-        "current_price": current,
-        "pnl_pct": pnl,
-        "weighted_pnl_pct": weighted,
-        "leveraged_pnl_pct": (pnl * leverage) if pnl is not None else None,
-        "weighted_leveraged_pnl_pct": (weighted * leverage) if weighted is not None else None,
-        "leverage": leverage,
-    }
-
-
-def _format_live_pnl_line(trade: dict) -> str:
-    live = _trade_live_pnl_for_report(trade)
-    if live["phase"] == "pending":
-        return f"{live['phase_label']} | الربح الحالي: N/A"
-    if live["pnl_pct"] is None:
-        return f"{live['phase_label']} | الربح الحالي: N/A"
-    emoji = "🟢" if live["pnl_pct"] > 0 else ("🔴" if live["pnl_pct"] < 0 else "⚪")
-    line = f"{live['phase_label']} | {emoji} الحالي: {_pct_safe(live['pnl_pct'])}"
-    if live["phase"] in ("tp1", "trailing") and live["weighted_pnl_pct"] is not None:
-        line += f" | فعلي 40/40/20: {_pct_safe(live['weighted_pnl_pct'])}"
-    return line
-
-
 def build_execution_report_message() -> str:
-    """Compact execution report focused on what matters: result and PnL."""
     try:
         trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
         if not trades:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
-
-        closed = [t for t in trades if _execution_trade_is_closed(t)]
-        open_trades = [t for t in trades if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")]
-        pending = [t for t in trades if str(t.get("status", "") or "").lower() == "pending_pullback"]
-        wins = [t for t in closed if _execution_trade_is_win(t)]
-        losses = [t for t in closed if _execution_trade_is_loss(t)]
-        breakeven = [t for t in closed if str(t.get("result", "") or "").lower() in ("breakeven", "pending_expired")]
-
-        pnls = []
-        for t in closed:
-            try:
-                pnls.append(float(_get_trade_pnl_pct(t)))
-            except Exception:
-                pass
-        net_pnl = sum(pnls) if pnls else 0.0
-        avg_pnl = _avg(pnls) if pnls else 0.0
-        winrate = (len(wins) / len(closed) * 100.0) if closed else 0.0
-
-        best_trade = None
-        worst_trade = None
-        if closed:
-            scored = []
-            for t in closed:
-                try:
-                    scored.append((float(_get_trade_pnl_pct(t)), t))
-                except Exception:
-                    pass
-            if scored:
-                best_trade = max(scored, key=lambda x: x[0])
-                worst_trade = min(scored, key=lambda x: x[0])
-
-        lines = [
-            "🚀 <b>Execution Report - LONG</b>",
-            "",
-            f"📊 الإجمالي: {len(trades)} | مغلقة: {len(closed)} | مفتوحة: {len(open_trades)} | Pending: {len(pending)}",
-            f"✅ Wins: {len(wins)} | 🔴 Losses: {len(losses)} | ⚪ BE/Expired: {len(breakeven)}",
-            f"📈 Winrate: {winrate:.1f}%",
-            f"💰 Net PnL: {_pct_safe(net_pnl)} | Avg: {_pct_safe(avg_pnl)}",
-        ]
-
-        if best_trade:
-            lines.append(f"🏆 Best: {html.escape(clean_symbol_for_message(best_trade[1].get('symbol', '?')))} {_pct_safe(best_trade[0])}")
-        if worst_trade:
-            lines.append(f"💀 Worst: {html.escape(clean_symbol_for_message(worst_trade[1].get('symbol', '?')))} {_pct_safe(worst_trade[0])}")
-
-        lines.append("")
-        lines.append("<b>آخر 12 صفقة:</b>")
-
-        for idx, trade in enumerate(trades[:12], 1):
-            symbol = html.escape(clean_symbol_for_message(str(trade.get("symbol", "?") or "?")))
-            label = _execution_trade_status_label(trade)
-            if _execution_trade_is_closed(trade):
-                pnl = _get_trade_pnl_pct(trade)
-                pnl_txt = _pct_safe(pnl) if pnl is not None else "N/A"
-                live_line = ""
-            else:
-                live = _trade_live_pnl_for_report(trade)
-                pnl_txt = _pct_safe(live["pnl_pct"]) if live.get("pnl_pct") is not None else "N/A"
-                live_line = f"\n   المرحلة: {html.escape(live['phase_label'])} | الحالي: {pnl_txt}"
-                if live.get("weighted_pnl_pct") is not None and live.get("phase") in ("tp1", "trailing"):
-                    live_line += f" | فعلي: {_pct_safe(live['weighted_pnl_pct'])}"
-            setup_type = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or "")
-            setup_short = html.escape(setup_type[:42])
-            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or "market"))
-            score = _safe_float(_trade_field(trade, "score", 0.0), 0.0)
-
-            lines.append(
-                f"{idx}) <b>{symbol}</b> | {label} | {pnl_txt}\n"
-                f"   score={score:.2f} | {entry_mode} | {setup_short}"
-                f"{live_line}"
-            )
-
+        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
+        for trade in trades[:12]:
+            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+            status = html.escape(str(trade.get("status", "?") or "?"))
+            result = html.escape(str(trade.get("result", "") or ""))
+            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
+            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
+            score = _trade_field(trade, "score", "N/A")
+            lines.extend([
+                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
+                f"  setup: {setup_type}",
+                f"  score: {score} | entry_mode: {entry_mode}",
+                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
+                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
+                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
+                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
+                "",
+            ])
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
+
 
 def build_setup_performance_report_message() -> str:
     try:
@@ -2977,74 +2800,14 @@ def _send_open_trades(chat_id: str):
 
 
 def build_open_trades_message() -> str:
-    """تقرير صفقات مفتوحة واضح: المرحلة + الربح الحالي + الربح الفعلي حسب 40/40/20."""
-    try:
-        if not r:
-            return "❌ لا يوجد اتصال بقاعدة البيانات"
-
-        trades = [
-            t for t in _load_long_trades_from_redis(limit=800)
-            if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial", "pending_pullback")
-        ]
-        if not trades:
-            return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
-
-        lines = [
-            f"📋 <b>الصفقات المفتوحة - LONG</b>",
-            f"📊 العدد: {len(trades)}",
-            "",
-        ]
-        winning = losing = pending = tp1_count = trailing_count = 0
-        weighted_values = []
-
-        for idx, trade in enumerate(trades[:12], 1):
-            symbol = html.escape(clean_symbol_for_message(str(trade.get("symbol", "?") or "?")))
-            live = _trade_live_pnl_for_report(trade)
-            phase = live["phase"]
-            if phase == "pending": pending += 1
-            if phase == "tp1": tp1_count += 1
-            if phase == "trailing": trailing_count += 1
-            if live.get("pnl_pct") is not None:
-                if live["pnl_pct"] > 0: winning += 1
-                elif live["pnl_pct"] < 0: losing += 1
-            if live.get("weighted_pnl_pct") is not None:
-                weighted_values.append(live["weighted_pnl_pct"])
-
-            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "market") or "market"))
-            setup_type = html.escape(str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or "")[:48])
-            score = _safe_float(_trade_field(trade, "score", 0.0), 0.0)
-            entry = live.get("entry") or _trade_effective_entry_for_report(trade)
-            current = live.get("current_price") or 0.0
-            sl = _safe_float(_trade_field(trade, "sl", 0.0), 0.0)
-            tp1 = _safe_float(_trade_field(trade, "tp1", 0.0), 0.0)
-            tp2 = _safe_float(_trade_field(trade, "tp2", 0.0), 0.0)
-
-            pnl_txt = _pct_safe(live["pnl_pct"]) if live.get("pnl_pct") is not None else "N/A"
-            lev_txt = _pct_safe(live["leveraged_pnl_pct"], 1) if live.get("leveraged_pnl_pct") is not None else "N/A"
-            actual_txt = ""
-            if live.get("weighted_pnl_pct") is not None and phase in ("tp1", "trailing"):
-                actual_txt = f"\n   ⚖️ فعلي 40/40/20: <b>{_pct_safe(live['weighted_pnl_pct'])}</b> | بعد الرافعة: {_pct_safe(live['weighted_leveraged_pnl_pct'], 1)}"
-
-            lines.append(
-                f"{idx}) <b>{symbol}</b> | score={score:.2f}\n"
-                f"   📌 المرحلة: {html.escape(live['phase_label'])}\n"
-                f"   💰 الربح الحالي: <b>{pnl_txt}</b> | بعد الرافعة: {lev_txt}{actual_txt}\n"
-                f"   💵 الحالي: {_fmt_price(current)} | 🎯 الدخول: {_fmt_price(entry)} | {entry_mode}\n"
-                f"   🛑 SL: {_fmt_price(sl)} | 🎯 TP1: {_fmt_price(tp1)} | 🏁 TP2: {_fmt_price(tp2)}\n"
-                f"   🧩 {setup_type}"
-            )
-
-        lines.append("")
-        lines.append("📊 <b>ملخص المفتوحة:</b>")
-        lines.append(f"🟢 رابحة الآن: {winning} | 🔴 خاسرة الآن: {losing} | ⏳ Pending: {pending}")
-        lines.append(f"🟡 بعد TP1: {tp1_count} | 🔄 Trailing: {trailing_count}")
-        if weighted_values:
-            lines.append(f"⚖️ متوسط الربح الفعلي: {_pct_safe(_avg(weighted_values))}")
-
-        return _limit_telegram_message("\n".join(lines))
-    except Exception as e:
-        logger.error(f"build_open_trades_message error: {e}", exc_info=True)
-        return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
+ try:
+    if not r:
+        return "❌ لا يوجد اتصال بقاعدة البيانات"
+    trades = get_open_trades_summary(r, market_type="futures", side="long")
+    return format_open_trades_message(trades, side="long")
+ except Exception as e:
+    logger.error(f"build_open_trades_message error: {e}", exc_info=True)
+    return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
 
 
 COMMAND_HANDLERS = {
@@ -3748,6 +3511,8 @@ def _safe_float(value, default=0.0):
     return value
  except Exception:
     return default
+
+safe_float = _safe_float  # compatibility alias for older report helpers
 
 def get_signal_row(df):
  try:
@@ -5920,10 +5685,6 @@ SMART_TP1_MIN_RR = 1.2
 SMART_TP1_DEFAULT_RR_FALLBACK = 2.0
 SMART_TP1_RESISTANCE_BUFFER_ATR = 0.20
 SMART_TP1_NEAR_RESISTANCE_RR = 1.2
-# Ignore micro/noise resistance levels that are too close to entry.
-# These tiny levels were causing excessive near_resistance_before_tp1 rejections.
-SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.004  # 0.40%
-SMART_TP1_IGNORE_NEAR_ROUND_PCT = 0.005       # 0.50%
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
@@ -5979,190 +5740,197 @@ def is_major_round_level(price: float) -> bool:
     return False
 
 def is_valid_round_resistance(df, level: float, entry: float, lookback: int = 50) -> bool:
+    """Accept round numbers as resistance only when recent price action rejected them."""
     try:
-        if level <= entry:
+        if df is None or getattr(df, "empty", True) or level <= entry:
             return False
-        signal_row = get_signal_row(df)
-        if signal_row is None:
-            return False
-        idx = signal_row.name
-        start = max(0, idx - lookback)
-        work = df.iloc[start:idx].copy()
-        if work.empty:
-            return False
-        tolerance = 0.002
-        touches_rejected = 0
-        close_above_count = 0
-        for _, row in work.iterrows():
-            high = float(row["high"])
-            close = float(row["close"])
-            low = float(row["low"])
-            open_c = float(row["open"])
-            if abs(high - level) / level <= tolerance:
-                if close < level:
-                    touches_rejected += 1
-                else:
-                    close_above_count += 1
-            if high >= level and max(open_c, close) < level:
-                touches_rejected += 1
-        if close_above_count >= 2:
-            return False
-        return touches_rejected >= 1
+
+        recent = df.tail(lookback)
+        touches = 0
+        rejections = 0
+
+        for _, row in recent.iterrows():
+            high = float(row.get("high", 0) or 0)
+            close = float(row.get("close", 0) or 0)
+            open_ = float(row.get("open", 0) or 0)
+
+            if high <= 0 or close <= 0 or level <= 0:
+                continue
+
+            near_level = abs(high - level) / level <= 0.003
+            rejected = near_level and close < level and close <= open_
+
+            if near_level:
+                touches += 1
+            if rejected:
+                rejections += 1
+
+        return touches >= 1 and rejections >= 1
     except Exception as e:
         logger.warning(f"is_valid_round_resistance error: {e}")
         return False
 
-def _collect_resistance_candidates_long(df, entry: float) -> list:
+
+def collect_resistance_candidates_long(df, entry: float, lookback: int = 50) -> list:
+    """Collect real resistance candidates above entry from structure, bands and confirmed round levels."""
     candidates = []
     try:
-        if df is None or df.empty or entry <= 0:
+        if df is None or getattr(df, "empty", True) or entry <= 0:
             return candidates
 
-        signal_row = get_signal_row(df)
-        if signal_row is None:
+        recent = df.tail(lookback).copy()
+        if recent.empty:
             return candidates
 
-        idx = signal_row.name
-        if idx is None:
-            return candidates
+        # 1) Real swing highs: local pivot high, not any previous high.
+        highs = recent["high"].astype(float).tolist()
+        for i in range(2, len(highs) - 2):
+            level = highs[i]
+            if (
+                level > entry
+                and level > highs[i - 1]
+                and level > highs[i - 2]
+                and level > highs[i + 1]
+                and level > highs[i + 2]
+            ):
+                candidates.append({"price": level, "level": level, "source": "swing_high", "strength": 3})
 
-        start = max(0, idx - SMART_TP1_LOOKBACK_SWING)
-        work = df.iloc[start:idx].copy()
-        if work.empty:
-            return candidates
+        # 2) Recent high from the last 20 candles.
+        try:
+            recent20 = df.tail(20)
+            level = float(recent20["high"].astype(float).max())
+            if level > entry:
+                candidates.append({"price": level, "level": level, "source": "recent_20_high", "strength": 2})
+        except Exception:
+            pass
 
-        highs = work["high"].astype(float)
-        closes = work["close"].astype(float)
-
-        for h in highs.tail(30).tolist():
-            h = _safe_float(h, 0.0)
-            if h > entry:
-                candidates.append({
-                    "price": h,
-                    "source": "swing_high"
-                })
-
-        for c in closes.tail(30).tolist():
-            c = _safe_float(c, 0.0)
-            if c > entry:
-                candidates.append({
-                    "price": c,
-                    "source": "recent_close_high"
-                })
-
-        bb_upper = _safe_float(signal_row.get("bb_upper"), 0.0)
-        if bb_upper > entry:
-            candidates.append({
-                "price": bb_upper,
-                "source": "bb_upper"
-            })
-
-        if len(work) >= 20:
-            prev_high = _safe_float(work["high"].tail(20).max(), 0.0)
-            if prev_high > entry:
-                candidates.append({
-                    "price": prev_high,
-                    "source": "prev_20_high"
-                })
-
-        if SMART_TP1_ROUND_LEVELS_ENABLED:
-            round_levels = []
-            if entry >= 100:
-                step = 5.0
-            elif entry >= 10:
-                step = 0.5
-            elif entry >= 1:
-                step = 0.05
-            elif entry >= 0.1:
-                step = 0.005
-            elif entry >= 0.01:
-                step = 0.0005
-            else:
-                step = 0.00005
-
-            try:
-                base = int(entry / step) * step
-                for i in range(1, 8):
-                    level = base + step * i
-                    if level > entry:
-                        round_levels.append(level)
-            except Exception:
-                round_levels = []
-
-            for level in round_levels:
+        # 3) Bollinger upper band if available.
+        for col in ("bb_upper", "bollinger_upper", "upper_band"):
+            if col in df.columns:
                 try:
-                    # Round levels very close to entry are usually noise and should not block a setup.
-                    if ((float(level) - entry) / entry) < SMART_TP1_IGNORE_NEAR_ROUND_PCT:
-                        continue
+                    level = float(df.iloc[-1].get(col, 0) or 0)
+                    if level > entry:
+                        candidates.append({"price": level, "level": level, "source": "bb_upper", "strength": 2})
+                    break
                 except Exception:
                     pass
-                if is_valid_round_resistance(df, level, entry):
-                    candidates.append({
-                        "price": level,
-                        "source": "round_level_confirmed"
-                    })
 
-        cleaned = []
-        seen = set()
-        for item in candidates:
-            price = _safe_float(item.get("price"), 0.0)
-            source = item.get("source", "unknown")
-            if price <= entry:
-                continue
-
-            # Smart Resistance Filter v2:
-            # Ignore extremely close resistance candidates because they are usually wick/noise
-            # and were over-filtering otherwise valid trades. Confirmed round levels use
-            # a slightly wider ignore band.
+        # 4) Previous rejection levels: upper wick rejection above entry.
+        for _, row in recent.iterrows():
             try:
-                distance_pct = (price - entry) / entry
+                high = float(row.get("high", 0) or 0)
+                close = float(row.get("close", 0) or 0)
+                open_ = float(row.get("open", 0) or 0)
+                low = float(row.get("low", 0) or 0)
+                if high <= entry or high <= 0:
+                    continue
+                candle_range = high - low
+                if candle_range <= 0:
+                    continue
+                upper_wick = high - max(open_, close)
+                rejected = (upper_wick / candle_range) >= 0.35 and close < high
+                if rejected:
+                    candidates.append({"price": high, "level": high, "source": "previous_rejection", "strength": 3})
             except Exception:
-                distance_pct = 0.0
-
-            ignore_pct = SMART_TP1_IGNORE_NEAR_ROUND_PCT if source == "round_level_confirmed" else SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT
-            if distance_pct < ignore_pct:
                 continue
 
-            key = round(price, 10)
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append({
-                "price": price,
-                "source": source
-            })
+        # 5) Confirmed round levels only.
+        if SMART_TP1_ROUND_LEVELS_ENABLED:
+            try:
+                if entry >= 100:
+                    steps = [1, 5, 10]
+                elif entry >= 10:
+                    steps = [0.1, 0.5, 1]
+                elif entry >= 1:
+                    steps = [0.01, 0.05, 0.1]
+                elif entry >= 0.1:
+                    steps = [0.001, 0.005, 0.01]
+                elif entry >= 0.01:
+                    steps = [0.0001, 0.0005, 0.001]
+                else:
+                    steps = [entry * 0.01, entry * 0.05, entry * 0.1]
 
-        cleaned.sort(key=lambda x: x["price"])
+                for step in steps:
+                    if step <= 0:
+                        continue
+                    next_level = round(((entry // step) + 1) * step, 12)
+                    if next_level > entry and is_valid_round_resistance(df, next_level, entry, lookback=lookback):
+                        candidates.append({
+                            "price": next_level,
+                            "level": next_level,
+                            "source": "round_level_confirmed",
+                            "strength": 1,
+                        })
+            except Exception:
+                pass
+
+        # Merge duplicates/near-duplicates, keeping the stronger source.
+        cleaned = []
+        for c in candidates:
+            try:
+                level = float(c.get("price", c.get("level", 0)) or 0)
+                if level <= entry:
+                    continue
+                duplicate = False
+                for old in cleaned:
+                    old_level = float(old.get("price", old.get("level", 0)) or 0)
+                    if old_level > 0 and abs(level - old_level) / old_level <= 0.002:
+                        duplicate = True
+                        if c.get("strength", 0) > old.get("strength", 0):
+                            old.update(c)
+                            old["price"] = level
+                            old["level"] = level
+                        break
+                if not duplicate:
+                    c["price"] = level
+                    c["level"] = level
+                    cleaned.append(c)
+            except Exception:
+                continue
+
+        cleaned.sort(key=lambda x: float(x.get("price", 0) or 0))
         return cleaned
-
     except Exception as e:
-        logger.warning(f"_collect_resistance_candidates_long error: {e}")
+        logger.warning(f"collect_resistance_candidates_long error: {e}")
         return candidates
 
 
-def find_nearest_resistance_long(df, entry: float):
+# Backward-compatible alias for older calls in this file.
+def _collect_resistance_candidates_long(df, entry: float) -> list:
+    return collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
+
+
+def find_nearest_resistance_long(df, entry: float) -> dict:
     try:
-        candidates = _collect_resistance_candidates_long(df, entry)
-        if not candidates:
-            return None
-        source_order = {
-            "swing_high": 0,
-            "recent_close_high": 1,
-            "prev_20_high": 2,
-            "bb_upper": 3,
-            "round_level_confirmed": 4,
-            "major_round_level": 5,
-        }
+        candidates = collect_resistance_candidates_long(df, entry, lookback=SMART_TP1_LOOKBACK_SWING)
         valid = []
         for c in candidates:
-            source = c.get("source", "unknown")
-            order = source_order.get(source, 99)
-            valid.append((order, c["price"], c))
+            try:
+                level = float(c.get("price", c.get("level", 0)) or 0)
+                if level > entry:
+                    valid.append(c)
+            except Exception:
+                pass
+
         if not valid:
             return None
-        valid.sort(key=lambda x: (x[1], x[0]))
-        return valid[0][2]
-    except Exception:
+
+        source_priority = {
+            "swing_high": 1,
+            "previous_rejection": 2,
+            "recent_20_high": 3,
+            "bb_upper": 4,
+            "round_level_confirmed": 5,
+        }
+        valid.sort(
+            key=lambda c: (
+                float(c.get("price", c.get("level", 0)) or 0),
+                source_priority.get(c.get("source", ""), 99),
+            )
+        )
+        return valid[0]
+    except Exception as e:
+        logger.warning(f"find_nearest_resistance_long error: {e}")
         return None
 
 
@@ -6224,6 +5992,7 @@ def build_smart_tp1_long(
         "tp1": calc_tp_long(entry, sl, rr=rr1),
         "tp2": calc_tp_long(entry, sl, rr=rr2),
         "nearest_resistance": None,
+        "nearest_resistance_source": None,
         "nearest_support": None,
         "target_method": "rr",
         "target_notes": [],
@@ -6255,6 +6024,7 @@ def build_smart_tp1_long(
         if nearest_resistance_data:
             nearest_resistance = _safe_float(nearest_resistance_data.get("price"), 0.0)
             result["nearest_resistance"] = _round_price_dynamic(nearest_resistance)
+            result["nearest_resistance_source"] = nearest_resistance_data.get("source", "unknown")
         else:
             nearest_resistance = 0.0
 
@@ -6587,45 +6357,22 @@ def build_message(
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
 
- # Unified entry / execution decision block so normal alerts and execution-candidate alerts look consistent.
- current_market_price = market_price if market_price is not None else price
- price_line = f"💰 <b>سعر السوق الحالي:</b> {fmt_num(current_market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
-
- if has_pullback_plan and pullback_low is not None and pullback_high is not None:
-    entry_decision_block = (
-        f"🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}\n"
-        f"📌 <b>قرار الدخول:</b> انتظار Pullback\n"
-        f"📥 <b>منطقة الدخول:</b> {fmt_num(pullback_low, 6)} → {fmt_num(pullback_high, 6)}\n"
-        f"🎯 <b>دخول التنفيذ المخطط:</b> {fmt_num(execution_entry if execution_entry is not None else price, 6)}\n"
-    )
+ if has_pullback_plan and market_price is not None:
+    price_line = f"🎯 <b>الدخول المخطط:</b> {fmt_num(price, 6)} | 💰 <b>السوق:</b> {fmt_num(market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
  else:
-    entry_decision_block = (
-        f"🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}\n"
-        f"📌 <b>قرار الدخول:</b> Market Entry\n"
-        f"🎯 <b>سعر الدخول المعتمد:</b> {fmt_num(price, 6)}\n"
-    )
-
- execution_targets_block = ""
- if has_pullback_plan:
-    if execution_sl is not None:
-        execution_targets_block += f"🛑 <b>Execution SL:</b> {fmt_num(execution_sl, 6)}\n"
-    if execution_tp1 is not None:
-        execution_targets_block += f"🎯 <b>Execution TP1:</b> {fmt_num(execution_tp1, 6)}\n"
-    if execution_tp2 is not None:
-        execution_targets_block += f"🏁 <b>Execution TP2:</b> {fmt_num(execution_tp2, 6)}\n"
-
- setup_details_block = f"{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}"
+    price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
 
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 {price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
-{entry_decision_block}{execution_targets_block}{setup_details_block}
+{pullback_text}
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
 🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
+🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
@@ -7015,7 +6762,7 @@ def determine_long_market_mode(
                     pass
             if time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
                 return {"mode": MODE_STRONG_LONG_ONLY, "reason": "تأكيد طبيعي لكن أقل مدة انتقال لم تمر"}
-            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 3 دقائق، رجوع للوضع الطبيعي"}
+            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 8 دقائق، رجوع للوضع الطبيعي"}
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{STRONG_TO_NORMAL_CONFIRM_DURATION}s)"}
     if allow_state_writes and r:
         try:
@@ -7097,7 +6844,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
     lines = [
         "🟡 <b>Mode Changed: STRONG LONG ONLY (وضع حذر)</b>",
         "• السوق غير مثالي، يسمح فقط بأقوى فرص اللونج وفق معايير صارمة",
-        "• مسموح فقط setups: vwap_reclaim, retest_breakout_confirmed, wave_3",
+        "• مسموح setups قوية: vwap_reclaim, retest_breakout_confirmed, wave_3, higher_low, relative_strength, support_bounce",
         f"• Score ≥ {STRONG_ONLY_MIN_SCORE} & Vol ratio ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
         f"• الانتقال: {transition}",
     ]
@@ -7177,18 +6924,6 @@ def bootstrap_telegram_offset_once():
  finally:
     release_telegram_poll_lock()
 
-def _run_telegram_command_handler(command: str, chat_id: str, handler):
-    """Run one Telegram command safely outside the polling loop."""
-    try:
-        handler(chat_id)
-    except Exception as e:
-        logger.error(f"telegram command handler error | command={command} | chat_id={chat_id} | error={e}", exc_info=True)
-        try:
-            send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء تنفيذ الأمر {html.escape(command)}\n{html.escape(str(e))}")
-        except Exception:
-            pass
-
-
 def handle_telegram_commands():
  if not acquire_telegram_poll_lock():
     return
@@ -7200,8 +6935,7 @@ def handle_telegram_commands():
         try:
             latest_offset = update["update_id"] + 1
             if update.get("callback_query"):
-                # Callback tracking can fetch candles, so do not block polling.
-                COMMAND_EXECUTOR.submit(handle_callback_query, update["callback_query"])
+                handle_callback_query(update["callback_query"])
                 continue
             message = update.get("message") or {}
             text = (message.get("text") or "").strip()
@@ -7212,13 +6946,9 @@ def handle_telegram_commands():
             command = text.split()[0].split("@")[0]
             handler = COMMAND_HANDLERS.get(command)
             if handler:
-                if command in ASYNC_TELEGRAM_COMMANDS:
-                    send_telegram_reply(chat_id, f"⏳ جاري تجهيز {html.escape(command)}...")
-                    COMMAND_EXECUTOR.submit(_run_telegram_command_handler, command, chat_id, handler)
-                else:
-                    _run_telegram_command_handler(command, chat_id, handler)
+                handler(chat_id)
         except Exception as e:
-            logger.error(f"handle_telegram_commands error: {e}", exc_info=True)
+            logger.error(f"handle_telegram_commands error: {e}")
     if latest_offset != offset:
         save_telegram_offset(latest_offset)
  finally:
@@ -7349,7 +7079,6 @@ def run_command_poller():
 
 def run_scanner_loop():
     global last_global_send_ts, _last_scan_skip_log_ts
-    logger.info("🚀 run_scanner_loop entered")
     while True:
         try:
             cleanup_local_caches()
@@ -7360,17 +7089,8 @@ def run_scanner_loop():
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 _now_ts = time.time()
-                ttl = get_scan_lock_ttl()
-                if ttl > 300:
-                    try:
-                        r.delete(SCAN_LOCK_KEY)
-                        logger.warning(f"🧹 Stale scan lock detected during loop, clearing... (ttl={ttl}s)")
-                    except Exception as _lock_e:
-                        logger.warning(f"Failed clearing stale scan lock: {_lock_e}")
-                    time.sleep(1)
-                    continue
-                if _now_ts - _last_scan_skip_log_ts >= 15:
-                    logger.info(f"⏳ Scan lock active, waiting... (ttl={ttl}s)")
+                if _now_ts - _last_scan_skip_log_ts >= 60:
+                    logger.debug("Another long scan is running --- skipping")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
                 continue
@@ -7852,25 +7572,44 @@ def run_scanner_loop():
             sent_symbols_this_run = set()
             candidates = []
             candidates_symbols = set()
+            no_candles_symbols_this_run = set()
+            no_candles_cooldown_symbols_this_run = set()
             for pair_data in filtered_scan_pairs:
                 final_threshold_min = None
                 tested += 1
                 symbol = pair_data["instId"]
                 change_24h = extract_24h_change_percent(pair_data)
+                if is_candle_temporarily_blocked(symbol, TIMEFRAME):
+                    no_candles_cooldown_symbols_this_run.add(symbol)
+                    if len(no_candles_cooldown_symbols_this_run) <= NO_CANDLES_LOG_SAMPLE_LIMIT:
+                        logger.info(f"DATA ERROR | {symbol} | no_candles cooldown | main scan")
+                    log_long_rejection(symbol=symbol, reason="data_error_no_candles_cooldown", candle_time=None, market_state=market_state, current_mode=current_mode,
+                        extra={
+                            "category": "data_error",
+                            "original_reason": "no_candles",
+                            "data_error_type": "temporary_cooldown",
+                            "details": "Symbol temporarily skipped after repeated candle fetch failures"
+                        })
+                    continue
                 candles = candles_map.get(symbol, [])
                 if not candles:
                     time.sleep(0.4)
                     candles = get_candles(symbol, TIMEFRAME, 100)
                 if not candles:
+                    no_candles_symbols_this_run.add(symbol)
+                    fail_count = record_candle_fetch_failure(symbol, TIMEFRAME)
                     log_long_rejection(symbol=symbol, reason="data_error_no_candles", candle_time=None, market_state=market_state, current_mode=current_mode,
                         extra={
                             "category": "data_error",
                             "original_reason": "no_candles",
                             "data_error_type": "empty_response_or_too_few",
+                            "fail_count": fail_count,
                             "details": "Retry failed for main scan"
                         })
-                    logger.warning(f"DATA ERROR | {symbol} | no_candles | main scan")
+                    if len(no_candles_symbols_this_run) <= NO_CANDLES_LOG_SAMPLE_LIMIT:
+                        logger.warning(f"DATA ERROR | {symbol} | no_candles | main scan | fail_count={fail_count}")
                     continue
+                record_candle_fetch_success(symbol, TIMEFRAME)
                 df = to_dataframe(candles)
                 if df is None or df.empty:
                     log_long_rejection(symbol=symbol, reason="dataframe_empty", candle_time=None, market_state=market_state, current_mode=current_mode)
@@ -7957,6 +7696,9 @@ def run_scanner_loop():
                     dist_ma=dist_ma,
                     mtf_confirmed=mtf_confirmed,
                 )
+                # Default setup_type before final setup construction.
+                # STRONG_LONG_ONLY guards run before final build_setup_type(), so keep this safe.
+                setup_type = str(temp_opportunity_type or "unknown")
                 extra_setups = detect_extra_strong_long_setups(
                     symbol=symbol,
                     df=df,
@@ -7972,6 +7714,26 @@ def run_scanner_loop():
                 extra_setup_bonus = float(extra_setups.get("score_bonus", 0.0) or 0.0)
                 primary_extra_setup = extra_setups.get("primary_setup", "")
                 context_setups = extra_setups.get("context_setups", [])
+
+                # SAFE DEFAULTS for softening / warning blocks.
+                # These variables are used only as local flags before score_result exists.
+                # Always initialize them before any guard can append/read them.
+                entry_warning = False
+                warning_reasons = []
+                softening_applied = False
+                soft_warning = False
+                late_warning = False
+
+                # Conservative pre-score strong setup flag used only to soften RSI/MACD guards
+                # in bull/alt-season + MTF/volume contexts. It does not open weak setups.
+                relaxed_pre_score_setup = is_relaxed_execution_setup(
+                    setup_type=temp_opportunity_type,
+                    extra_setup_names=extra_setup_names,
+                    primary_extra_setup=primary_extra_setup,
+                    mtf_confirmed=mtf_confirmed,
+                    vol_ratio=vol_ratio,
+                    score=0.0,
+                ) or bool(has_extra_strong_setup)
 
                 _preliminary_entry_timing = classify_entry_timing_long(
                     dist_ma=dist_ma,
@@ -8126,6 +7888,13 @@ def run_scanner_loop():
                         )
                         continue
                 if not is_reverse:
+                    bull_mtf_strong_soften = (
+                        market_state in ("bull_market", "alt_season")
+                        and mtf_confirmed
+                        and relaxed_pre_score_setup
+                        and vol_ratio >= 1.15
+                    )
+
                     if (
                         rsi_now >= 67
                         and rsi_slope <= 0
@@ -8133,72 +7902,110 @@ def run_scanner_loop():
                         and not pre_breakout
                         and breakout_quality != "strong"
                     ):
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="rsi_momentum_weak",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"rsi_slope": rsi_slope, "breakout_quality": breakout_quality,
-                                   "has_extra_strong_setup": has_extra_strong_setup,
-                                   "extra_setup_names": extra_setup_names,
-                                   "primary_extra_setup": primary_extra_setup,
-                                   "extra_setup_bonus": extra_setup_bonus},
-                        )
-                        continue
+                        if bull_mtf_strong_soften:
+                            logger.info(
+                                f"{symbol} --> RSI momentum weak softened to warning "
+                                f"(bull/MTF/strong setup, rsi={rsi_now:.1f}, slope={rsi_slope:.2f})"
+                            )
+                            entry_warning = True
+                            softening_applied = True
+                            soft_warning = True
+                            warning_reasons.append("RSI momentum weak لكن Bull+MTF+setup قوي؛ تم السماح مع تحذير")
+                        else:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="rsi_momentum_weak",
+                                candle_time=candle_time,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={"rsi_slope": rsi_slope, "breakout_quality": breakout_quality,
+                                       "has_extra_strong_setup": has_extra_strong_setup,
+                                       "extra_setup_names": extra_setup_names,
+                                       "primary_extra_setup": primary_extra_setup,
+                                       "extra_setup_bonus": extra_setup_bonus,
+                                       "soften_allowed": False},
+                            )
+                            continue
                     if rsi_slope < -2.5 and not breakout and not pre_breakout:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="rsi_momentum_weak",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"rsi_slope": rsi_slope,
-                                   "has_extra_strong_setup": has_extra_strong_setup,
-                                   "extra_setup_names": extra_setup_names,
-                                   "primary_extra_setup": primary_extra_setup,
-                                   "extra_setup_bonus": extra_setup_bonus},
-                        )
-                        continue
+                        if bull_mtf_strong_soften:
+                            logger.info(
+                                f"{symbol} --> RSI slope weak softened to warning "
+                                f"(bull/MTF/strong setup, slope={rsi_slope:.2f})"
+                            )
+                            entry_warning = True
+                            softening_applied = True
+                            soft_warning = True
+                            warning_reasons.append("RSI slope ضعيف لكن Bull+MTF+setup قوي؛ تم السماح مع تحذير")
+                        else:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="rsi_momentum_weak",
+                                candle_time=candle_time,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={"rsi_slope": rsi_slope,
+                                       "has_extra_strong_setup": has_extra_strong_setup,
+                                       "extra_setup_names": extra_setup_names,
+                                       "primary_extra_setup": primary_extra_setup,
+                                       "extra_setup_bonus": extra_setup_bonus,
+                                       "soften_allowed": False},
+                            )
+                            continue
                 if not is_reverse:
                     if macd_hist < 0 and not breakout and not pre_breakout:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="macd_negative",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"macd_hist": macd_hist,
-                                   "has_extra_strong_setup": has_extra_strong_setup,
-                                   "extra_setup_names": extra_setup_names,
-                                   "primary_extra_setup": primary_extra_setup,
-                                   "extra_setup_bonus": extra_setup_bonus},
-                        )
-                        continue
+                        if (
+                            market_state in ("bull_market", "alt_season")
+                            and mtf_confirmed
+                            and relaxed_pre_score_setup
+                            and vol_ratio >= 1.15
+                        ):
+                            logger.info(
+                                f"{symbol} --> MACD negative softened to warning "
+                                f"(bull/MTF/strong setup, macd_hist={macd_hist:.6f})"
+                            )
+                            entry_warning = True
+                            softening_applied = True
+                            soft_warning = True
+                            warning_reasons.append("MACD سلبي بسيط لكن Bull+MTF+setup قوي؛ تم السماح مع تحذير")
+                        else:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="macd_negative",
+                                candle_time=candle_time,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={"macd_hist": macd_hist,
+                                       "has_extra_strong_setup": has_extra_strong_setup,
+                                       "extra_setup_names": extra_setup_names,
+                                       "primary_extra_setup": primary_extra_setup,
+                                       "extra_setup_bonus": extra_setup_bonus,
+                                       "soften_allowed": False},
+                            )
+                            continue
                     if (
                         macd_hist_slope < 0
                         and rsi_now >= 66
@@ -8898,6 +8705,14 @@ def run_scanner_loop():
                             "value": maturity_bonus,
                             "reason": "entry_maturity"
                         })
+                # Merge warnings created by early softening guards before scoring penalties/reports.
+                if warning_reasons:
+                    if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
+                        score_result["warning_reasons"] = []
+                    for _soft_reason in warning_reasons:
+                        if _soft_reason not in score_result["warning_reasons"]:
+                            score_result["warning_reasons"].append(_soft_reason)
+
                 for reason in entry_maturity_data.get("warning_reasons", []):
                     if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
                         score_result["warning_reasons"] = []
@@ -9029,31 +8844,9 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-
-                        # Smart Resistance Balance v2:
-                        # normal setups stay protected, but relaxed/execution-quality setups should not be killed
-                        # by moderate resistance. Borderline cases continue as warnings/score penalty below.
-                        _relaxed_resistance_setup = is_relaxed_execution_setup(
-                            setup_type="|".join([
-                                str(primary_extra_setup or ""),
-                                " ".join(extra_setup_names or []),
-                                " ".join(context_setups or []),
-                            ]),
-                            extra_setup_names=extra_setup_names,
-                            primary_extra_setup=primary_extra_setup,
-                            mtf_confirmed=mtf_confirmed,
-                            vol_ratio=vol_ratio,
-                            score=score_result.get("score", 0.0),
-                        )
-
-                        if _relaxed_resistance_setup:
-                            _reject_by_resistance = (_res_dist_pct < 0.40 or _res_r < 0.35)
-                            _limits_label = "dist<0.40_or_R<0.35"
-                        else:
-                            _reject_by_resistance = (_res_dist_pct < 0.80 or _res_r < 0.70)
-                            _limits_label = "dist<0.80_or_R<0.70"
-
-                        if _reject_by_resistance:
+                        _tp1_structure = _nearest_res * 0.995
+                        _min_tp1 = float(entry_price_for_trade) + (_risk_for_quality * 1.2)
+                        if _res_dist_pct < 1.0 or _res_r < 1.2:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="near_resistance_before_tp1",
@@ -9074,24 +8867,43 @@ def run_scanner_loop():
                                 is_reverse=is_reverse,
                                 extra={
                                     "nearest_resistance": _nearest_res,
+                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
                                     "resistance_distance_pct": _res_dist_pct,
                                     "resistance_r": _res_r,
-                                    "relaxed": _relaxed_resistance_setup,
-                                    "limits": _limits_label,
                                     "category": "trade_quality",
                                 },
                             )
-                            logger.info(
-                                f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | "
-                                f"dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
-                                f"relaxed={_relaxed_resistance_setup} | limits={_limits_label}"
-                            )
+                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
                             continue
-                        else:
-                            logger.info(
-                                f"⚠️ {symbol} near resistance warning only | dist={_res_dist_pct:.2f}% | "
-                                f"R={_res_r:.2f} | relaxed={_relaxed_resistance_setup}"
+                        if _tp1_structure < _min_tp1:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="tp1_not_rewarding_before_resistance",
+                                candle_time=candle_time,
+                                score=score_result.get("score"),
+                                raw_score=raw_score,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                entry_timing=entry_timing_temp,
+                                opportunity_type=temp_opportunity_type,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={
+                                    "nearest_resistance": _nearest_res,
+                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
+                                    "tp1_structure": _tp1_structure,
+                                    "min_tp1": _min_tp1,
+                                    "category": "trade_quality",
+                                },
                             )
+                            logger.info(f"⛔ {symbol} rejected: tp1_not_rewarding_before_resistance | res={_nearest_res} | tp1_structure={_tp1_structure} | min_tp1={_min_tp1}")
+                            continue
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
@@ -9895,6 +9707,18 @@ def run_scanner_loop():
                 candidate["bucket"] = get_candidate_bucket(candidate)
                 candidates.append(candidate)
                 candidates_symbols.add(symbol)
+            if no_candles_symbols_this_run:
+                sample = ", ".join(sorted(list(no_candles_symbols_this_run))[:NO_CANDLES_LOG_SAMPLE_LIMIT])
+                logger.warning(
+                    f"DATA ERROR SUMMARY | no_candles unique={len(no_candles_symbols_this_run)} "
+                    f"sample=[{sample}]"
+                )
+            if no_candles_cooldown_symbols_this_run:
+                sample = ", ".join(sorted(list(no_candles_cooldown_symbols_this_run))[:NO_CANDLES_LOG_SAMPLE_LIMIT])
+                logger.info(
+                    f"DATA ERROR SUMMARY | no_candles cooldown unique={len(no_candles_cooldown_symbols_this_run)} "
+                    f"sample=[{sample}]"
+                )
             logger.info(f"Long candidates found before momentum filter: {len(candidates)}")
             candidates = apply_top_momentum_filter(candidates)
             logger.info(f"Long candidates found after momentum filter: {len(candidates)}")
@@ -10123,36 +9947,11 @@ def run_scanner_loop():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                         elif EXECUTION_AVAILABLE:
                             exec_result = process_trade_candidate(r, symbol, candidate)
-                            status = exec_result.get("status")
-                            if status in ("accepted_preview", "pending_pullback_preview"):
+                            if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
                                 execution_message = exec_result.get("execution_message")
                                 if execution_message:
-                                    send_result = send_telegram_message(execution_message)
-                                    if not send_result.get("ok"):
-                                        logger.warning(
-                                            f"⚠️ Execution message HTML failed | status={status} | symbol={symbol} | "
-                                            f"error={send_result.get('description') or send_result}"
-                                        )
-                                        plain_result = send_telegram_message_plain(execution_message)
-                                        if plain_result.get("ok"):
-                                            logger.info(
-                                                f"✅ Execution message sent as plain text | status={status} | symbol={symbol}"
-                                            )
-                                        else:
-                                            logger.error(
-                                                f"❌ Execution message failed completely | status={status} | symbol={symbol} | "
-                                                f"error={plain_result.get('description') or plain_result}"
-                                            )
-                                    else:
-                                        logger.info(
-                                            f"✅ Execution message sent | status={status} | symbol={symbol}"
-                                        )
-                                else:
-                                    logger.warning(
-                                        f"⚠️ Execution status matched but no execution_message | "
-                                        f"status={status} | symbol={symbol}"
-                                    )
-                                logger.info(f"EXEC {status}: {symbol}")
+                                    send_telegram_message(execution_message)
+                                logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
                             else:
                                 logger.info(
                                     f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
@@ -10182,7 +9981,6 @@ def run():
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
     )
     clear_webhook()
-    clear_stale_scan_locks_on_startup()
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
     run_scanner_loop()
