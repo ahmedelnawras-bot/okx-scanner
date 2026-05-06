@@ -7954,7 +7954,40 @@ def run_scanner_loop():
                     except Exception as e:
                         logger.warning(f"{symbol} --> entry maturity analysis failed: {e}")
                 if entry_maturity_data.get("block_signal"):
-                    if not is_reverse and not pre_breakout and not (
+                    # Final softening for strong continuation in bullish/MTF context.
+                    # This prevents good continuation setups from being killed early as danger_late,
+                    # while keeping true wave-5/overextended weak setups blocked.
+                    late_strong_continuation_soften = (
+                        not is_reverse
+                        and market_state in ("bull_market", "alt_season")
+                        and mtf_confirmed
+                        and vol_ratio >= 1.8
+                        and dist_ma < 3.5
+                        and (
+                            breakout
+                            or pre_breakout
+                            or breakout_quality == "strong"
+                            or has_extra_strong_setup
+                        )
+                    )
+
+                    if late_strong_continuation_soften:
+                        entry_maturity_data["block_signal"] = False
+                        entry_maturity_data["maturity_penalty"] = min(
+                            float(entry_maturity_data.get("maturity_penalty", 0.0) or 0.0),
+                            -0.35,
+                        )
+                        if not isinstance(entry_maturity_data.get("warning_reasons"), list):
+                            entry_maturity_data["warning_reasons"] = []
+                        entry_maturity_data["warning_reasons"].append(
+                            "دخول متأخر لكن Bull+MTF+Volume قوي؛ تحذير بدل رفض"
+                        )
+                        logger.info(
+                            f"{symbol} --> entry maturity block softened to warning "
+                            f"(bull/MTF/strong continuation, dist_ma={dist_ma:.2f}, "
+                            f"vol={vol_ratio:.2f}, setup={primary_extra_setup or setup_type})"
+                        )
+                    elif not is_reverse and not pre_breakout and not (
                         breakout_quality == "strong"
                         and mtf_confirmed
                         and vol_ratio >= 1.8
@@ -9875,9 +9908,9 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     "momentum_priority": momentum_priority,
                     "now": now,
-                    "relative_strength_short": round(get_change_8(df) - get_change_8(btc_df), 4),
+                    "relative_strength_short": round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4),
                     "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4),
-                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_df), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
+                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
                     "block_exception": False,
                     "current_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
