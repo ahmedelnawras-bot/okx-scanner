@@ -289,34 +289,8 @@ def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> 
     if effective_entry <= 0 or sl <= 0:
         return trade
 
-    # مهم: لو main.py حسب Smart TP مسبقًا بناءً على final_pullback_entry،
-    # لا نعيد كتابة TP1/TP2 هنا عند تفعيل البولباك.
-    # هذه الدالة تظل fallback فقط للصفقات القديمة أو التي لا تحتوي خطة أهداف ذكية.
-    target_method = str(
-        trade.get("target_method")
-        or diagnostics.get("target_method")
-        or ""
-    ).lower()
-    has_existing_targets = safe_float(trade.get("tp1"), 0.0) > 0 and safe_float(trade.get("tp2"), 0.0) > 0
-    smart_or_execution_targets = (
-        "smart" in target_method
-        or safe_float(trade.get("execution_tp1"), 0.0) > 0
-        or safe_float(trade.get("execution_tp2"), 0.0) > 0
-        or safe_float(diagnostics.get("execution_tp1"), 0.0) > 0
-        or safe_float(diagnostics.get("execution_tp2"), 0.0) > 0
-    )
-
-    diagnostics["effective_entry"] = round_price(effective_entry)
-    diagnostics["rr1"] = rr1
-    diagnostics["rr2"] = rr2
-
-    if has_existing_targets and smart_or_execution_targets:
-        trade["diagnostics"] = diagnostics
-        return trade
-
     risk = abs(effective_entry - sl)
     if risk <= 0:
-        trade["diagnostics"] = diagnostics
         return trade
 
     if side == "short":
@@ -326,6 +300,8 @@ def recalc_targets_from_effective_entry(trade: dict, effective_entry: float) -> 
         trade["tp1"] = round_price(effective_entry + (risk * rr1))
         trade["tp2"] = round_price(effective_entry + (risk * rr2))
 
+    diagnostics["rr1"] = rr1
+    diagnostics["rr2"] = rr2
     trade["diagnostics"] = diagnostics
     return trade
 
@@ -2619,6 +2595,47 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
         }
 
 
+
+
+def _partial_lifecycle_realized_pnl_for_report(trade: dict) -> float:
+    """Return leveraged realized/locked PnL for non-closed lifecycle states.
+
+    Reporting only: TP1 contributes 40%, TP2 contributes 40%, trailing 20% is
+    counted only when a trailing/current/exit price exists.
+    """
+    try:
+        if not isinstance(trade, dict):
+            return 0.0
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+        if status == "pending_pullback" or result in ("loss", "breakeven", "tp1_win", "tp2_win", "trailing_win"):
+            return 0.0
+        side = normalize_side(trade.get("side", "long"))
+        leverage = SHORT_REPORT_LEVERAGE if side == "short" else REPORT_LEVERAGE
+        entry = get_trade_effective_entry(trade)
+        tp1 = safe_float(trade.get("tp1"), 0.0)
+        tp2 = safe_float(trade.get("tp2"), 0.0)
+        if entry <= 0:
+            return 0.0
+        def pct_to(target):
+            target = safe_float(target, 0.0)
+            if target <= 0:
+                return 0.0
+            if side == "short":
+                return ((entry - target) / entry) * 100.0
+            return ((target - entry) / entry) * 100.0
+        raw = 0.0
+        if _is_tp1_hit(trade):
+            raw += pct_to(tp1) * 0.40
+        if _is_tp2_hit(trade):
+            raw += pct_to(tp2) * 0.40
+            trailing_price = safe_float(trade.get("current_price") or trade.get("trailing_exit_price") or trade.get("exit_price"), 0.0)
+            if trailing_price > 0:
+                raw += pct_to(trailing_price) * 0.20
+        return round(raw * leverage, 4)
+    except Exception:
+        return 0.0
+
 def get_trade_summary(
     redis_client,
     market_type: Optional[str] = None,
@@ -2668,6 +2685,14 @@ def get_trade_summary(
     tp2_wins = sum(1 for t in closed_trades if t.get("result") in ("tp2_win", "trailing_win"))
     trailing_wins = sum(1 for t in closed_trades if t.get("result") == "trailing_win")
 
+    partial_lifecycle_pnl = 0.0
+    partial_lifecycle_count = 0
+    for _trade in filtered_trades:
+        _p = _partial_lifecycle_realized_pnl_for_report(_trade)
+        if abs(_p) > 0:
+            partial_lifecycle_pnl += _p
+            partial_lifecycle_count += 1
+
     for trade in closed_trades:
         pnl_data = calculate_trade_pnl(trade)
         if pnl_data["skipped"] or pnl_data["is_pending"]:
@@ -2694,6 +2719,10 @@ def get_trade_summary(
 
     leverage = SHORT_REPORT_LEVERAGE if side_norm == "short" else REPORT_LEVERAGE
     summary["realized_raw_pnl_pct"] = round(total_pnl / leverage, 4) if leverage else 0.0
+    summary["partial_lifecycle_leveraged_pnl_pct"] = round(partial_lifecycle_pnl, 4)
+    summary["partial_lifecycle_raw_pnl_pct"] = round(partial_lifecycle_pnl / leverage, 4) if leverage else 0.0
+    summary["partial_lifecycle_count"] = partial_lifecycle_count
+    summary["total_lifecycle_leveraged_pnl_pct"] = round(total_pnl + partial_lifecycle_pnl, 4)
 
     # hits و rates
     summary["tp1_hits"] = tp1_hits
@@ -3279,6 +3308,11 @@ def format_period_summary(title: str, summary: dict) -> str:
     if side == "long":
         risk_lines.insert(0, f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%")
 
+
+    partial_lifecycle_pnl = safe_float(summary.get("partial_lifecycle_leveraged_pnl_pct", 0.0))
+    partial_lifecycle_count = safe_int(summary.get("partial_lifecycle_count", 0))
+    total_lifecycle_pnl = safe_float(summary.get("total_lifecycle_leveraged_pnl_pct", net_pnl))
+
     performance_block = (
         f"\n\n🎯 <b>أداء الأهداف:</b>\n"
         f"• TP1 Hits: {tp1_hits} | TP2 Reached: {tp2_reached}\n"
@@ -3288,6 +3322,12 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
         f"• TP1 → TP2 Conversion: {tp1_to_tp2_rate:.1f}%"
     )
+    if partial_lifecycle_count > 0:
+        performance_block += (
+            f"\n• ⚖️ ربح جزئي مفتوح 40/40/20: {partial_lifecycle_pnl:+.2f}% "
+            f"({partial_lifecycle_count} صفقة)"
+            f"\n• 📊 إجمالي مغلق + جزئي: {total_lifecycle_pnl:+.2f}%"
+        )
     if breakeven_exits > 0:
         performance_block += f"\n• Breakeven Protected Exits: {breakeven_exits}"
 
