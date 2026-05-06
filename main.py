@@ -29,8 +29,7 @@ from tracking.performance import (
  format_period_summary, 
  get_setup_type_stats, 
  get_open_trades_summary, 
- format_open_trades_message,
- build_trade_summary_from_trades, 
+ format_open_trades_message, 
 ) 
 from analysis.rejection_tracking import (
     log_rejected_candidate,
@@ -1631,24 +1630,23 @@ def build_deep_report_message() -> str:
 def build_help_message() -> str:
  return """<b>😋 OKX Scanner Bot - LONG</b>
 
-<b>⚡ أوامر سريعة وواضحة:</b>
-/mood - حالة السوق الحالية والمود
-/status - نفس /mood
-/open_trades - الصفقات المفتوحة والتراكنج الحالي
+<b>⚡ أوامر سريعة:</b>
+/mood - حالة السوق والمود الحالي
+/status - نفس أمر /mood
+/open_trades - الصفقات المفتوحة وملخص سريع
 
 <b>📊 تقارير كل الصفقات:</b>
-/report_1h - تقرير كل الصفقات آخر ساعة
-/report_today - تقرير كل الصفقات اليوم
-/report_7d - تقرير كل الصفقات آخر 7 أيام
-/report_30d - تقرير كل الصفقات آخر 30 يوم
-/report_all - تقرير كل الصفقات من البداية
+/report_1h - تقرير آخر ساعة
+/report_today - تقرير اليوم
+/report_7d - تقرير آخر 7 أيام
+/report_30d - تقرير آخر 30 يوم
+/report_all - كل الصفقات من البداية
 
-<b>🚀 تقارير الصفقات المرشحة للتنفيذ فقط:</b>
-/report_candidates - تقرير المرشحين من البداية
-/report_candidates_today - تقرير المرشحين اليوم
-/report_candidates_7d - تقرير المرشحين آخر 7 أيام
-/report_candidates_30d - تقرير المرشحين آخر 30 يوم
-/report_execution - نفس /report_candidates
+<b>🚀 تقارير المرشحين للتنفيذ:</b>
+/report_execution - المرشحين من البداية
+/report_execution_today - مرشحين اليوم
+/report_execution_7d - مرشحين آخر 7 أيام
+/report_execution_30d - مرشحين آخر 30 يوم
 
 <b>⚙️ التنفيذ:</b>
 /exec_status - اختبار اتصال OKX API
@@ -1656,24 +1654,49 @@ def build_help_message() -> str:
 /stop_trading - إيقاف الدخول في صفقات جديدة فقط
 /resume_trading - إعادة السماح بالدخول في صفقات جديدة
 
-<b>🧠 تشخيص وتحليل:</b>
+<b>📊 تحليل الأداء:</b>
+/report_deep - تحليل متقدم شامل
 /report_exits - جودة الخروج TP1/TP2/SL
 /report_rejections - تحليل أسباب رفض الفرص
-/report_setups - أداء أنواع الإشارات
+/report_setups - أفضل وأسوأ أنواع الإشارات
 /report_scores - تحليل السكور
 /report_market - الأداء حسب حالة السوق
 /report_losses - تحليل أسباب الخسارة
 /report_diagnostics - تقرير تشخيصي كامل
-/report_deep - تحليل متقدم شامل
 
 <b>🛠 إدارة:</b>
-/reset_stats - تصفير إحصائيات اللونج soft
-/hard_reset - مسح كامل لبيانات اللونج للمدراء فقط
+/reset_stats - تصفير إحصائيات اللونج (soft)
+/hard_reset - مسح كامل لبيانات اللونج فقط (للمدراء فقط)
 /stats_since_reset - الأداء منذ آخر تصفير
 /how_it_work - شرح طريقة عمل البوت
-"""
 
+<b>ℹ️ ملاحظة:</b>
+البوت يستخدم Entry Maturity لتقليل الدخول المتأخر في نهاية الموجة."""
 
+def build_how_it_work_message() -> str:
+ return """📘 <b>كيف يعمل بوت اللونج؟</b>
+
+🧠 <b>فكرة البوت:</b>
+البوت يبحث عن فرص <b>Long Futures</b> على OKX - بفترة متوازنة حتى لا يخنق الإشارات الجيدة.
+
+🔍 <b>منطق العمل:</b>
+1. اختيار العملات الأعلى سيولة وحجم تداول
+2. تحليل فريم 15m
+3. قياس قوة الزخم الصاعد
+4. تقييم:
+• الفوليوم
+• RSI
+• موقع السعر من المتوسط
+• Breakout / Pre-Breakout
+• تأكيد فريم 1H
+• حالة السوق العامة
+• Entry Maturity (موجات وبولباك)
+5. Smart Early Priority للإشارات المبكرة
+6. إعطاء Score من 10
+7. إرسال فقط الفرص المقبولة نهائيًا
+
+📈 <b>Track:</b>
+يعرض الحقًا أداء الصفقة بعد إرسالها"""
 
 def reset_stats(chat_id: str):
  if not r:
@@ -2650,85 +2673,205 @@ def is_execution_candidate_trade(trade: dict) -> bool:
         return False
 
 
-def _candidate_report_period_filter(trades: list, period: str) -> list:
+def _execution_report_since_ts(period: str):
     period = str(period or "all").strip().lower()
     now_ts = int(time.time())
-    if period == "1h":
-        since_ts = now_ts - 3600
-    elif period == "today":
-        since_ts = get_local_day_start_ts()
-    elif period in ("7d", "week"):
-        since_ts = now_ts - 7 * 24 * 3600
-    elif period in ("30d", "month"):
-        since_ts = now_ts - 30 * 24 * 3600
-    else:
-        since_ts = None
-    if since_ts is None:
-        return trades or []
-    out = []
-    for trade in trades or []:
-        try:
-            created_at = int(float(trade.get("created_at") or trade.get("candle_time") or 0))
-            if created_at >= since_ts:
-                out.append(trade)
-        except Exception:
-            continue
-    return out
+    if period == "today":
+        return get_local_day_start_ts()
+    if period == "7d":
+        return now_ts - (7 * 86400)
+    if period in ("30d", "month"):
+        return now_ts - (30 * 86400)
+    return None
 
 
-def _format_execution_candidate_details(trades: list, max_items: int = 8) -> str:
-    if not trades:
-        return ""
-    lines = ["", "🚀 <b>آخر الصفقات المرشحة للتنفيذ</b>"]
-    for trade in sorted(trades, key=lambda t: int(float(t.get("created_at") or 0)), reverse=True)[:max_items]:
-        plan = _execution_plan_for_trade(trade)
-        symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-        status = html.escape(str(trade.get("status", "?") or "?"))
-        result = html.escape(str(trade.get("result", "") or ""))
-        setup_type = html.escape(str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or ""))
-        entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
-        score = _trade_field(trade, "score", "N/A")
-        lines.extend([
-            f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''} | score={score}",
-            f"  setup: {setup_type}",
-            f"  entry_mode: {entry_mode}",
-            f"  exec: entry={plan.get('entry', 'N/A')} | SL={plan.get('sl', 'N/A')} | TP1={plan.get('tp1', 'N/A')} | TP2={plan.get('tp2', 'N/A')}",
-        ])
-    return "\n".join(lines)
+def _execution_report_title(period: str) -> str:
+    period = str(period or "all").strip().lower()
+    if period == "today":
+        return "🚀 <b>Execution Candidates - Today</b>"
+    if period == "7d":
+        return "🚀 <b>Execution Candidates - Last 7 Days</b>"
+    if period in ("30d", "month"):
+        return "🚀 <b>Execution Candidates - Last 30 Days</b>"
+    return "🚀 <b>Execution Candidates - Since Start</b>"
 
 
-def build_execution_candidates_report_message(period: str = "all") -> str:
+def _execution_trade_ts(trade: dict) -> int:
     try:
-        all_candidates = [
-            t for t in _load_long_trades_from_redis(limit=1500)
-            if is_execution_candidate_trade(t)
+        return int(float(trade.get("created_ts") or trade.get("created_at") or trade.get("candle_time") or 0))
+    except Exception:
+        return 0
+
+
+def _execution_trade_closed(trade: dict) -> bool:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    return status == "closed" or result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven", "expired", "pending_expired")
+
+
+def _execution_trade_pnl_404020(trade: dict) -> float:
+    try:
+        side = str(trade.get("side", "long") or "long").lower()
+        leverage = float(trade.get("leverage") or DEFAULT_LEVERAGE or 15)
+        entry = _safe_float(_trade_field(trade, "effective_entry") or _trade_field(trade, "entry") or _trade_field(trade, "execution_entry"), 0.0)
+        if entry <= 0:
+            return 0.0
+        result = str(trade.get("result", "") or "").lower()
+        status = str(trade.get("status", "") or "").lower()
+        tp1_hit = bool(trade.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
+        tp2_hit = bool(trade.get("tp2_hit")) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing_closed")
+        tp1 = _safe_float(trade.get("tp1"), 0.0)
+        tp2 = _safe_float(trade.get("tp2"), 0.0)
+        exit_price = _safe_float(trade.get("exit_price") or trade.get("current_price") or trade.get("last_price") or trade.get("trailing_exit_price"), 0.0)
+
+        def raw_pct(price):
+            price = _safe_float(price, 0.0)
+            if price <= 0:
+                return 0.0
+            if side == "short":
+                return ((entry - price) / entry) * 100.0
+            return ((price - entry) / entry) * 100.0
+
+        if result == "loss":
+            sl_price = _safe_float(trade.get("sl") or trade.get("exit_price"), 0.0)
+            return round(raw_pct(sl_price or exit_price) * leverage, 4)
+        if result == "breakeven":
+            return 0.0
+
+        pnl_raw = 0.0
+        if tp1_hit and tp1 > 0:
+            pnl_raw += raw_pct(tp1) * 0.40
+        if tp2_hit and tp2 > 0:
+            pnl_raw += raw_pct(tp2) * 0.40
+            if exit_price > 0:
+                pnl_raw += raw_pct(exit_price) * 0.20
+        elif exit_price > 0 and status == "open":
+            # للمرشح المفتوح قبل TP1: الوضع الحالي لكل الحجم، وبعد TP1: الجزء المفتوح فقط.
+            if tp1_hit:
+                pnl_raw += raw_pct(exit_price) * 0.60
+            else:
+                pnl_raw += raw_pct(exit_price)
+        elif _execution_trade_closed(trade) and exit_price > 0:
+            pnl_raw += raw_pct(exit_price)
+        return round(pnl_raw * leverage, 4)
+    except Exception:
+        return 0.0
+
+
+def _execution_status_label(trade: dict) -> str:
+    result = str(trade.get("result", "") or "").lower()
+    status = str(trade.get("status", "") or "").lower()
+    if result == "loss":
+        return "🔴 SL"
+    if result == "trailing_win":
+        return "🔄 Trailing Win"
+    if result == "tp2_win" or bool(trade.get("tp2_hit")):
+        return "🏁 TP2"
+    if result == "tp1_win" or bool(trade.get("tp1_hit")):
+        return "🎯 TP1"
+    if status == "pending_pullback":
+        return "⏳ Pending Pullback"
+    if status == "open":
+        return "🟢 مفتوحة"
+    if result == "breakeven":
+        return "⚪ Breakeven"
+    return html.escape(status or result or "غير معروفة")
+
+
+def _execution_primary_setup(trade: dict) -> str:
+    setup = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type") or "unknown")
+    for token in ("vwap_reclaim", "retest_breakout_confirmed", "wave_3", "support_bounce_confirmed", "higher_low_continuation", "relative_strength_vs_btc", "failed_breakdown_trap"):
+        if token in setup:
+            return token
+    return setup[:70]
+
+
+def build_execution_report_message(period: str = "all") -> str:
+    try:
+        since_ts = _execution_report_since_ts(period)
+        trades = []
+        for t in _load_long_trades_from_redis(limit=1500):
+            if since_ts is not None and _execution_trade_ts(t) < since_ts:
+                continue
+            if is_execution_candidate_trade(t):
+                trades.append(t)
+
+        if not trades:
+            return f"{_execution_report_title(period)}\n\n📭 لا توجد صفقات مرشحة للتنفيذ في هذه الفترة."
+
+        total = len(trades)
+        open_count = sum(1 for t in trades if str(t.get("status", "") or "").lower() == "open")
+        pending_count = sum(1 for t in trades if str(t.get("status", "") or "").lower() == "pending_pullback")
+        closed_count = sum(1 for t in trades if _execution_trade_closed(t))
+        tp1_hits = sum(1 for t in trades if bool(t.get("tp1_hit")) or str(t.get("result", "") or "").lower() in ("tp1_win", "tp2_win", "trailing_win"))
+        tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit")) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
+        trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
+        losses = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss")
+        win_rate = (tp1_hits / total) * 100.0 if total else 0.0
+        tp2_rate = (tp2_hits / total) * 100.0 if total else 0.0
+        tp1_to_tp2 = (tp2_hits / tp1_hits) * 100.0 if tp1_hits else 0.0
+
+        pnls = [_execution_trade_pnl_404020(t) for t in trades]
+        gross_profit = sum(p for p in pnls if p > 0)
+        gross_loss = sum(p for p in pnls if p < 0)
+        net_pnl = sum(pnls)
+
+        period_note = {
+            "today": "اليوم فقط",
+            "7d": "آخر 7 أيام",
+            "30d": "آخر 30 يوم",
+            "month": "آخر 30 يوم",
+        }.get(str(period or "all").lower(), "منذ البداية")
+
+        lines = [
+            _execution_report_title(period),
+            f"🗓️ الفترة: <b>{period_note}</b>",
+            "────────────",
+            "📌 <b>ملخص المرشحين</b>",
+            f"• إجمالي المرشحين: <b>{total}</b>",
+            f"• مفتوحة: {open_count} | معلقة Pullback: {pending_count} | مغلقة: {closed_count}",
+            f"• 🎯 TP1 Hits: {tp1_hits}",
+            f"• 🏁 TP2 Hits: {tp2_hits}",
+            f"• 🔄 Trailing Wins: {trailing_wins}",
+            f"• 🔴 SL: {losses}",
+            "",
+            "📊 <b>أداء 40/40/20</b>",
+            f"• 📈 Win Rate TP1+: <b>{win_rate:.2f}%</b>",
+            f"• 🏁 TP2 Rate: <b>{tp2_rate:.2f}%</b>",
+            f"• 🔁 TP1 → TP2: <b>{tp1_to_tp2:.2f}%</b>",
+            "",
+            "💰 <b>النتيجة الفعلية 40/40/20</b>",
+            f"• 🟢 أرباح محققة/مفتوحة: +{gross_profit:.2f}%",
+            f"• 🔴 خسائر SL: {gross_loss:.2f}%",
+            f"• ⚖️ الصافي بعد الرافعة: <b>{net_pnl:+.2f}%</b>",
+            "────────────",
+            "🚀 <b>آخر الصفقات المرشحة</b>",
         ]
-        candidates = _candidate_report_period_filter(all_candidates, period)
-        if not candidates:
-            return "📭 لا توجد صفقات مرشحة للتنفيذ في هذه الفترة."
 
-        title_map = {
-            "1h": "Execution Candidates Report - Last 1H",
-            "today": "Execution Candidates Report - Today",
-            "7d": "Execution Candidates Report - Last 7 Days",
-            "30d": "Execution Candidates Report - Last 30 Days",
-            "month": "Execution Candidates Report - Last 30 Days",
-            "all": "Execution Candidates Report - All Time",
-        }
-        title = title_map.get(str(period or "all").lower(), "Execution Candidates Report")
-        summary = build_trade_summary_from_trades(candidates, market_type="futures", side="long")
-        report = format_period_summary(f"🚀 {title}", summary)
-        details = _format_execution_candidate_details(candidates, max_items=8)
-        return _limit_telegram_message(report + details)
+        for i, trade in enumerate(trades[:10], 1):
+            plan = _execution_plan_for_trade(trade)
+            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+            setup = html.escape(_execution_primary_setup(trade))
+            score = _trade_field(trade, "score", "N/A")
+            entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
+            pnl = _execution_trade_pnl_404020(trade)
+            lines.extend([
+                "",
+                f"{i}️⃣ <b>{symbol}</b>",
+                f"📌 الحالة: {_execution_status_label(trade)}",
+                f"🧠 setup: {setup}",
+                f"⭐ score: {score} | entry: {entry_mode}",
+                f"📍 دخول: {plan.get('entry', 'N/A')}",
+                f"🛑 SL: {plan.get('sl', 'N/A')}",
+                f"🎯 TP1: {plan.get('tp1', 'N/A')} | إغلاق 40%",
+                f"🏁 TP2: {plan.get('tp2', 'N/A')} | إغلاق 40%",
+                "🔄 20%: Trailing بعد TP2",
+                f"💰 PnL 40/40/20: {pnl:+.2f}%",
+            ])
+        return _limit_telegram_message("\n".join(lines))
     except Exception as e:
-        logger.error(f"build_execution_candidates_report_message error: {e}", exc_info=True)
-        return f"❌ خطأ في تقرير الصفقات المرشحة: {html.escape(str(e))}"
-
-
-def build_execution_report_message() -> str:
-    # Backward-compatible alias: full all-time candidate report.
-    return build_execution_candidates_report_message("all")
-
+        logger.error(f"build_execution_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير المرشحين: {html.escape(str(e))}"
 
 def build_setup_performance_report_message() -> str:
     try:
@@ -2974,11 +3117,10 @@ COMMAND_HANDLERS = {
  "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
  "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
- "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("all")),
- "/report_candidates": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("all")),
- "/report_candidates_today": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("today")),
- "/report_candidates_7d": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("7d")),
- "/report_candidates_30d": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("30d")),
+ "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("all")),
+ "/report_execution_today": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("today")),
+ "/report_execution_7d": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("7d")),
+ "/report_execution_30d": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("30d")),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -4950,93 +5092,6 @@ def get_btc_mode():
     logger.error(f"BTC mode error: {e}")
     return "🟡 محايد"
 
-def get_btc_range_context() -> dict:
- try:
-    candles = get_candles("BTC-USDT-SWAP", "1H", 40)
-    df = to_dataframe(candles)
-    if df is None or df.empty or len(df) < 24:
-        return {"zone": "unknown", "note": "BTC range data insufficient", "relax_near_resistance": False}
-
-    signal_row = get_signal_row(df)
-    if signal_row is None:
-        return {"zone": "unknown", "note": "BTC range signal row missing", "relax_near_resistance": False}
-
-    idx = signal_row.name
-    if idx is None:
-        return {"zone": "unknown", "note": "BTC range index missing", "relax_near_resistance": False}
-
-    lookback = min(36, max(24, int(idx) + 1))
-    window = df.iloc[max(0, int(idx) - lookback + 1):int(idx) + 1]
-    if window is None or window.empty or len(window) < 20:
-        return {"zone": "unknown", "note": "BTC range window insufficient", "relax_near_resistance": False}
-
-    range_high = float(window["high"].astype(float).max())
-    range_low = float(window["low"].astype(float).min())
-    close = _safe_float(signal_row.get("close"), 0.0)
-    open_ = _safe_float(signal_row.get("open"), close)
-    high = _safe_float(signal_row.get("high"), close)
-    low = _safe_float(signal_row.get("low"), close)
-    ma_value = _safe_float(signal_row.get("ma"), close)
-
-    if range_high <= range_low or close <= 0:
-        return {"zone": "unknown", "note": "BTC range invalid", "relax_near_resistance": False}
-
-    range_width_pct = ((range_high - range_low) / close) * 100.0
-    position_pct = (close - range_low) / (range_high - range_low)
-
-    if position_pct <= 0.35:
-        zone = "btc_range_low"
-        zone_label = "أسفل نطاق BTC"
-    elif position_pct >= 0.70:
-        zone = "btc_range_high"
-        zone_label = "أعلى نطاق BTC"
-    else:
-        zone = "btc_range_mid"
-        zone_label = "منتصف نطاق BTC"
-
-    prev_close = _safe_float(df.iloc[int(idx) - 1].get("close"), close) if int(idx) > 0 else close
-    candle_range = max(high - low, 0.0)
-    body = abs(close - open_)
-    lower_wick = min(open_, close) - low
-    upper_wick = high - max(open_, close)
-
-    bounce = (
-        zone == "btc_range_low"
-        and close >= open_
-        and close >= prev_close
-        and (ma_value <= 0 or close >= ma_value * 0.985)
-        and (candle_range <= 0 or lower_wick >= body * 0.6 or close >= low + candle_range * 0.55)
-    )
-    rejection = (
-        zone == "btc_range_high"
-        and candle_range > 0
-        and upper_wick >= max(body * 1.2, candle_range * 0.25)
-        and close < high - candle_range * 0.25
-    )
-
-    if bounce:
-        note = "BTC أسفل النطاق مع ارتداد أولي"
-    elif rejection:
-        note = "BTC أعلى النطاق مع رفض سعري"
-    else:
-        note = zone_label
-
-    return {
-        "zone": zone,
-        "zone_label": zone_label,
-        "position_pct": round(position_pct, 4),
-        "range_high": range_high,
-        "range_low": range_low,
-        "range_width_pct": round(range_width_pct, 2),
-        "bounce": bool(bounce),
-        "rejection": bool(rejection),
-        "relax_near_resistance": bool(bounce),
-        "note": note,
-    }
- except Exception as e:
-    logger.warning(f"BTC range context error: {e}")
-    return {"zone": "unknown", "note": "BTC range error", "relax_near_resistance": False}
-
 def is_gaining_intraday_strength(df) -> bool:
  try:
     if df is None or df.empty or len(df) < 5:
@@ -6512,15 +6567,9 @@ def near_resistance_guard_long(
     dist_ma: float,
     vwap_distance: float,
     score_after_penalties: float,
-    btc_range_context: dict = None,
 ) -> tuple:
     if not resistance_warning or resistance_warning != "مقاومة قريبة جدًا قبل TP1":
         return False, 0.0
-
-    btc_range_context = btc_range_context or {}
-    btc_range_zone = str(btc_range_context.get("zone", "unknown"))
-    btc_range_bounce = bool(btc_range_context.get("bounce") or btc_range_context.get("relax_near_resistance"))
-    btc_range_rejection = bool(btc_range_context.get("rejection"))
 
     if market_state in ("risk_off",):
         base_penalty = 0.75
@@ -6530,11 +6579,6 @@ def near_resistance_guard_long(
         base_penalty = 0.45
     else:
         base_penalty = 0.25
-
-    if btc_range_bounce and market_state not in ("risk_off",):
-        base_penalty = min(base_penalty, 0.25)
-    elif btc_range_rejection or btc_range_zone == "btc_range_high":
-        base_penalty = max(base_penalty, 0.50)
 
     weak_market_conditions = (
         market_state in ("risk_off", "btc_leading", "mixed")
@@ -6560,18 +6604,7 @@ def near_resistance_guard_long(
             and score_after_penalties >= 7.8
             and market_state != "risk_off"
         )
-        btc_low_range_exception = (
-            btc_range_bounce
-            and market_state not in ("risk_off",)
-            and mtf_confirmed
-            and score_after_penalties >= 7.0
-            and dist_ma <= 3.5
-            and vwap_distance <= 2.2
-            and upper_wick_ratio < 0.35
-            and not late_guard.get("late_pump_risk", False)
-            and not (vol_ratio >= 1.8 and candle_strength >= 0.60)
-        )
-        if not strong_exception and not btc_low_range_exception:
+        if not strong_exception:
             return True, 0.0
 
     return False, base_penalty
@@ -7010,14 +7043,12 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         block = True
         reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
     elif MARKET_GUARD_ALT_WEAK_BLOCK and "ضعيف" in alt_mode_str:
-        # ضعف الألتات وحده لا يكفي للـ BLOCK إذا لم يكن هناك هبوط جماعي واضح.
-        # السوق المختلط/السيولة الانتقائية يجب أن يتحول إلى STRONG_LONG_ONLY بدل منع كامل.
-        if red_ratio >= 0.70 and avg_change <= -0.80 and btc_change <= -0.25:
-            block = True
-            reason = f"alt_weak_severe & red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f} & btc_change={btc_change:.2f}"
-        else:
+        if "صاعد" in btc_mode:
             alt_weak_cautious = True
-            reason = f"alt_weak/mixed -> STRONG_LONG_ONLY | red_ratio={red_ratio:.2f} | btc_change={btc_change:.2f}"
+            reason = f"alt_weak & btc_up -> STRONG_LONG_ONLY (cautious)"
+        else:
+            block = True
+            reason = f"alt_weak & red_ratio={red_ratio:.2f} and btc not up"
     return {
         "active": True,
         "block_longs": bool(block),
@@ -7148,9 +7179,9 @@ def determine_long_market_mode(
         crash_reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
     elif alt_weak_cautious:
         pass  # will be handled below as STRONG_LONG_ONLY
-    elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.72 and avg_change <= -0.80 and btc_change <= -0.25:
+    elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
         crash_triggered = True
-        crash_reason = f"alt_weak_severe & red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f} & btc_change={btc_change:.2f}"
+        crash_reason = f"alt_weak & red_ratio={red_ratio:.2f}"
  if crash_triggered:
     if allow_state_writes and r:
         try:
@@ -7167,7 +7198,7 @@ def determine_long_market_mode(
             r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
         except Exception:
             pass
-    return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق مختلط/الألتات ضعيفة بدون كراش واضح → إشارات قوية فقط"}
+    return {"mode": MODE_STRONG_LONG_ONLY, "reason": "alt ضعيف + BTC صاعد → وضع حذر (إشارات قوية فقط)"}
 
  if current_mode == MODE_BLOCK_LONGS:
     if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
@@ -7397,10 +7428,9 @@ HEAVY_TELEGRAM_COMMANDS = {
     "/report_deep",
     "/report_setups",
     "/report_execution",
-    "/report_candidates",
-    "/report_candidates_today",
-    "/report_candidates_7d",
-    "/report_candidates_30d",
+    "/report_execution_today",
+    "/report_execution_7d",
+    "/report_execution_30d",
     "/report_scores",
     "/report_market",
     "/report_losses",
@@ -7616,17 +7646,6 @@ def run_scanner_loop():
             ranked_pairs = get_ranked_pairs()
             logger.info(f"SCAN_LIMIT CONFIG = {SCAN_LIMIT} | ranked_pairs_count = {len(ranked_pairs)}")
             btc_mode = get_btc_mode()
-            btc_range_context = get_btc_range_context()
-            try:
-                logger.info(
-                    f"BTC RANGE CONTEXT | zone={btc_range_context.get('zone')} | "
-                    f"pos={btc_range_context.get('position_pct')} | "
-                    f"bounce={btc_range_context.get('bounce')} | "
-                    f"rejection={btc_range_context.get('rejection')} | "
-                    f"note={btc_range_context.get('note')}"
-                )
-            except Exception:
-                pass
             alt_snapshot = None
             if r:
                 try:
@@ -9071,10 +9090,6 @@ def run_scanner_loop():
                             "extra_setup_names": extra_setup_names,
                             "primary_extra_setup": primary_extra_setup,
                             "extra_setup_bonus": extra_setup_bonus,
-                            "btc_range_zone": btc_range_context.get("zone"),
-                            "btc_range_note": btc_range_context.get("note"),
-                            "btc_range_bounce": btc_range_context.get("bounce"),
-                            "btc_range_rejection": btc_range_context.get("rejection"),
                         },
                     )
                     continue
@@ -9582,7 +9597,6 @@ def run_scanner_loop():
                     dist_ma=dist_ma,
                     vwap_distance=vwap_distance,
                     score_after_penalties=score_result["score"],
-                    btc_range_context=btc_range_context,
                 )
                 if should_reject_near_resistance:
                     log_long_rejection(
@@ -9634,9 +9648,7 @@ def run_scanner_loop():
                     adjustments_log.append({
                         "name": "near_resistance_dynamic_penalty",
                         "value": -res_dynamic_penalty,
-                        "reason": early_resistance_warning,
-                        "btc_range_zone": btc_range_context.get("zone"),
-                        "btc_range_note": btc_range_context.get("note"),
+                        "reason": early_resistance_warning
                     })
 
                 wave_context_early = infer_wave_context(
