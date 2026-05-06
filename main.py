@@ -94,7 +94,7 @@ MAX_ALERTS_PER_RUN = 5
 COOLDOWN_SECONDS = 3600
 LOCAL_RECENT_SEND_SECONDS = 2700
 GLOBAL_COOLDOWN_SECONDS = 120
-COMMAND_POLL_INTERVAL = 3
+COMMAND_POLL_INTERVAL = 1
 MIN_24H_QUOTE_VOLUME = 1_000_000
 NEW_LISTING_MAX_CANDLES = 50
 TOP_MOMENTUM_PERCENT = 0.30
@@ -1531,9 +1531,9 @@ def get_telegram_updates(offset: int = 0):
  if not BOT_TOKEN:
     return []
  url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
- params = {"timeout": 1, "offset": offset}
+ params = {"timeout": 0, "offset": offset}
  try:
-    response = requests.get(url, params=params, timeout=5)
+    response = requests.get(url, params=params, timeout=4)
     if response.status_code != 200:
         logger.error(f"❌ getUpdates HTTP Error: {response.text}")
         return []
@@ -3477,6 +3477,73 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
         logger.warning(f"calculate_trade_lifecycle_pnl_for_track error: {e}")
         return {"available": False}
 
+def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, current_price: float) -> str:
+    """Clear display-only 40/40/20 financial status for Track messages."""
+    try:
+        if not isinstance(trade, dict) or not trade:
+            return (
+                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+                "⚠️ لا توجد صفقة مسجلة — الحساب تقديري فقط"
+            )
+
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+        if status == "pending_pullback":
+            return (
+                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+                "⏳ لم يتم تفعيل الدخول بعد — لا يوجد PnL فعلي"
+            )
+
+        tp1_hit = bool(trade.get("tp1_hit", False)) or result in ("tp1_win", "tp2_win", "trailing_win")
+        tp2_hit = bool(trade.get("tp2_hit", False)) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing")
+        trailing_active = bool(trade.get("trailing_active", False)) or status in ("trailing_open", "trailing")
+        sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
+        protected_exit = bool(trade.get("protected_breakeven_exit", False))
+
+        tp1_line = "✅ اتضرب | 40% اتقفل" if tp1_hit else "⏳ لم يضرب"
+        tp2_line = "✅ اتضرب | 40% إضافي اتقفل" if tp2_hit else "⏳ لم يضرب"
+
+        if result == "trailing_win":
+            trailing_line = "✅ مغلق على Trailing"
+        elif trailing_active:
+            trailing_line = "🔄 شغال Trailing"
+        elif tp2_hit:
+            trailing_line = "🔄 بدأ بعد TP2"
+        else:
+            trailing_line = "⏳ لم يبدأ"
+
+        if result == "loss":
+            sl_line = "✅ اتضرب"
+        elif result == "breakeven" or protected_exit:
+            sl_line = "🔒 خرج على Entry بعد TP1"
+        elif sl_moved_to_entry:
+            sl_line = "🔒 على Entry"
+        else:
+            sl_line = "⏳ لم يضرب"
+
+        if lifecycle_pnl.get("available"):
+            raw = _safe_float(lifecycle_pnl.get("raw_pct"), 0.0)
+            leveraged = _safe_float(lifecycle_pnl.get("leveraged_pct"), 0.0)
+            pnl_line = f"{raw:+.2f}%"
+            lev_line = f"{leveraged:+.2f}%"
+        else:
+            pnl_line = "—"
+            lev_line = "—"
+
+        return (
+            "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+            f"• 🎯 TP1: {tp1_line}\n"
+            f"• 🏁 TP2: {tp2_line}\n"
+            f"• 🔄 الجزء المتبقي 20%: {trailing_line}\n"
+            f"• 🛑 SL: {sl_line}\n"
+            f"• 💵 السعر الحالي: {_fmt_price(current_price)}\n"
+            f"• 💰 الربح/الخسارة الفعلي: {pnl_line}\n"
+            f"• ⚡ بعد الرافعة: {lev_line}"
+        )
+    except Exception as e:
+        logger.warning(f"format_lifecycle_pnl_block_for_track error: {e}")
+        return "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n⚠️ تعذر حساب الربح الفعلي"
+
 def build_track_message(alert: dict) -> str:
  try:
     symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
@@ -3558,6 +3625,7 @@ def build_track_message(alert: dict) -> str:
         f"{status_line}\n"
         f"{recovery_extra}\n"
         f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
+        f"{format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
     )
     if entry_mode == "pullback_pending" and not pullback_triggered:
         msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
@@ -3604,11 +3672,6 @@ def build_track_message(alert: dict) -> str:
         f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
         f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
     )
-    if lifecycle_pnl.get("available"):
-        msg += (
-            f"⚖️ الربح الفعلي 40/40/20: {lifecycle_pnl.get('raw_pct', 0):+.2f}% "
-            f"| بعد الرافعة: {lifecycle_pnl.get('leveraged_pct', 0):+.2f}%\n"
-        )
     msg += (
         f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
         f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
@@ -7175,6 +7238,47 @@ def bootstrap_telegram_offset_once():
  finally:
     release_telegram_poll_lock()
 
+HEAVY_TELEGRAM_COMMANDS = {
+    "/open_trades",
+    "/report_1h",
+    "/report_today",
+    "/report_month",
+    "/report_30d",
+    "/report_all",
+    "/report_deep",
+    "/report_setups",
+    "/report_execution",
+    "/report_scores",
+    "/report_market",
+    "/report_losses",
+    "/report_diagnostics",
+    "/report_exits",
+    "/report_rejections",
+    "/report_daily",
+    "/report_7d",
+}
+
+def run_command_handler_async(command: str, chat_id: str, handler) -> None:
+    """Run heavy Telegram commands without blocking the polling loop."""
+    def _runner():
+        try:
+            handler(chat_id)
+        except Exception as e:
+            logger.error(f"Telegram async command failed | {command}: {e}", exc_info=True)
+            try:
+                send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء تنفيذ {html.escape(command)}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_runner, name=f"telegram-{command.strip('/') or 'cmd'}", daemon=True).start()
+
+def dispatch_telegram_command(command: str, chat_id: str, handler) -> None:
+    if command in HEAVY_TELEGRAM_COMMANDS:
+        send_telegram_reply(chat_id, "⏳ جاري تجهيز التقرير...")
+        run_command_handler_async(command, chat_id, handler)
+        return
+    handler(chat_id)
+
 def handle_telegram_commands():
  if not acquire_telegram_poll_lock():
     return
@@ -7197,7 +7301,7 @@ def handle_telegram_commands():
             command = text.split()[0].split("@")[0]
             handler = COMMAND_HANDLERS.get(command)
             if handler:
-                handler(chat_id)
+                dispatch_telegram_command(command, chat_id, handler)
         except Exception as e:
             logger.error(f"handle_telegram_commands error: {e}")
     if latest_offset != offset:
