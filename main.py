@@ -2532,29 +2532,102 @@ def is_strong_exception(candidate: dict) -> bool:
         return False
 
 
-def is_execution_candidate_trade(trade: dict) -> bool:
-    diagnostics = trade.get("diagnostics", {}) or {}
-    setup_type = str(trade.get("setup_type") or diagnostics.get("setup_type") or "")
-    entry_mode = str(trade.get("entry_mode") or diagnostics.get("entry_mode") or "")
-    return (
-        trade.get("execution_entry") is not None
-        or diagnostics.get("execution_entry") is not None
-        or entry_mode in ("pullback_pending", "pullback_triggered")
-        or bool(trade.get("has_pullback_plan") or diagnostics.get("has_pullback_plan"))
-        or bool(trade.get("block_exception") or diagnostics.get("block_exception"))
-        or "vwap_reclaim" in setup_type
-        or "retest_breakout_confirmed" in setup_type
-        or "wave_3" in setup_type
-        or "liquidity_sweep_reclaim" in setup_type
-        or "support_bounce_confirmed" in setup_type
-        or "higher_low_continuation" in setup_type
-        or "relative_strength_vs_btc" in setup_type
-    )
-
-
+# =====================
+# EXECUTION REPORT / PLAN SAFETY
+# =====================
 def _trade_field(trade: dict, key: str, default=None):
     diagnostics = trade.get("diagnostics", {}) or {}
     return trade.get(key, diagnostics.get(key, default))
+
+
+def _safe_trade_float_value(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _is_late_risky_execution_context(data: dict) -> bool:
+    """Return True when a signal is allowed for tracking but should not be an execution candidate."""
+    try:
+        diagnostics = data.get("diagnostics", {}) or {}
+        setup_type = str(data.get("setup_type") or diagnostics.get("setup_type") or "").lower()
+        entry_maturity = str(data.get("entry_maturity") or diagnostics.get("entry_maturity") or "").lower()
+        wave_label = str(data.get("wave_label") or diagnostics.get("wave_label") or "").lower()
+        fib_position = str(data.get("fib_position") or diagnostics.get("fib_position") or "").lower()
+        maturity_label = str(data.get("entry_maturity_label") or diagnostics.get("entry_maturity_label") or "").lower()
+        risky_tokens = (
+            "wave_5_late",
+            "danger_late",
+            "overextended",
+            "late_without_mtf",
+            "hard_late_entry",
+        )
+        joined = "|".join([setup_type, entry_maturity, wave_label, fib_position, maturity_label])
+        return any(token in joined for token in risky_tokens)
+    except Exception:
+        return False
+
+
+def _has_strict_execution_setup(data: dict) -> bool:
+    diagnostics = data.get("diagnostics", {}) or {}
+    setup_type = str(data.get("setup_type") or diagnostics.get("setup_type") or "").lower()
+    if not setup_type:
+        return False
+    execution_keywords = (
+        "vwap_reclaim",
+        "retest_breakout_confirmed",
+        "wave_3",
+        "liquidity_sweep_reclaim",
+        "support_bounce_confirmed",
+        "higher_low_continuation",
+        "relative_strength_vs_btc",
+        "failed_breakdown_trap",
+    )
+    return any(k in setup_type for k in execution_keywords)
+
+
+def _execution_plan_for_trade(trade: dict) -> dict:
+    """Return complete execution plan values. Market entries can fall back to signal values."""
+    entry_mode = str(_trade_field(trade, "entry_mode", "") or "").lower()
+    has_pullback = bool(_trade_field(trade, "has_pullback_plan", False)) or entry_mode in ("pullback_pending", "pullback_triggered")
+
+    execution_entry = _trade_field(trade, "execution_entry")
+    execution_sl = _trade_field(trade, "execution_sl")
+    execution_tp1 = _trade_field(trade, "execution_tp1")
+    execution_tp2 = _trade_field(trade, "execution_tp2")
+
+    # Market entries do not always store execution_* fields; use the signal plan as the execution plan.
+    if not has_pullback and entry_mode in ("", "market", "market_entry"):
+        execution_entry = execution_entry if execution_entry is not None else (_trade_field(trade, "recommended_entry") or _trade_field(trade, "market_entry") or _trade_field(trade, "entry"))
+        execution_sl = execution_sl if execution_sl is not None else trade.get("sl")
+        execution_tp1 = execution_tp1 if execution_tp1 is not None else trade.get("tp1")
+        execution_tp2 = execution_tp2 if execution_tp2 is not None else trade.get("tp2")
+
+    complete = all(_safe_trade_float_value(v) is not None for v in (execution_entry, execution_sl, execution_tp1))
+    return {
+        "entry": execution_entry,
+        "sl": execution_sl,
+        "tp1": execution_tp1,
+        "tp2": execution_tp2,
+        "complete": complete,
+        "has_pullback": has_pullback,
+        "entry_mode": entry_mode or "market",
+    }
+
+
+def is_execution_candidate_trade(trade: dict) -> bool:
+    try:
+        if _is_late_risky_execution_context(trade):
+            return False
+        if not (_has_strict_execution_setup(trade) or bool(_trade_field(trade, "block_exception", False))):
+            return False
+        plan = _execution_plan_for_trade(trade)
+        return bool(plan.get("complete"))
+    except Exception:
+        return False
 
 
 def build_execution_report_message() -> str:
@@ -2564,18 +2637,19 @@ def build_execution_report_message() -> str:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
         lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
         for trade in trades[:12]:
+            plan = _execution_plan_for_trade(trade)
             symbol = html.escape(str(trade.get("symbol", "?") or "?"))
             status = html.escape(str(trade.get("status", "?") or "?"))
             result = html.escape(str(trade.get("result", "") or ""))
             setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
-            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
+            entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
             score = _trade_field(trade, "score", "N/A")
             lines.extend([
                 f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
                 f"  setup: {setup_type}",
                 f"  score: {score} | entry_mode: {entry_mode}",
                 f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
-                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
+                f"  execution: entry={plan.get('entry', 'N/A')} | sl={plan.get('sl', 'N/A')} | tp1={plan.get('tp1', 'N/A')} | tp2={plan.get('tp2', 'N/A')}",
                 f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
                 f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
                 "",
@@ -6171,10 +6245,44 @@ def format_entry_maturity_block(entry_maturity_data: dict) -> str:
 # =====================
 # EXECUTION BADGE
 # =====================
+def _candidate_has_complete_execution_plan(candidate: dict) -> bool:
+    try:
+        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
+        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
+        if has_pullback:
+            required = (candidate.get("execution_entry"), candidate.get("execution_sl"), candidate.get("execution_tp1"))
+            return all(_safe_trade_float_value(v) is not None for v in required)
+        # Market execution can use the normal signal plan.
+        required = (candidate.get("entry"), candidate.get("sl"), candidate.get("tp1"))
+        return all(_safe_trade_float_value(v) is not None for v in required)
+    except Exception:
+        return False
+
+
+def _apply_market_execution_fallback(candidate: dict) -> dict:
+    """Fill execution_* for market entries so preview/report never shows None."""
+    try:
+        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
+        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
+        if not has_pullback:
+            candidate["execution_entry"] = candidate.get("execution_entry") or candidate.get("recommended_entry") or candidate.get("market_entry") or candidate.get("entry")
+            candidate["execution_sl"] = candidate.get("execution_sl") or candidate.get("sl")
+            candidate["execution_tp1"] = candidate.get("execution_tp1") or candidate.get("tp1")
+            candidate["execution_tp2"] = candidate.get("execution_tp2") or candidate.get("tp2")
+        return candidate
+    except Exception:
+        return candidate
+
+
 def is_candidate_for_execution(candidate: dict) -> bool:
-    setup_type = str(candidate.get("setup_type", "") or "")
-    execution_keywords = ("vwap_reclaim", "retest_breakout_confirmed", "wave_3")
-    return any(k in setup_type for k in execution_keywords)
+    try:
+        if _is_late_risky_execution_context(candidate):
+            return False
+        if not _has_strict_execution_setup(candidate):
+            return False
+        return _candidate_has_complete_execution_plan(candidate)
+    except Exception:
+        return False
 
 
 def build_execution_badge_line(candidate: dict) -> str:
@@ -8846,36 +8954,98 @@ def run_scanner_loop():
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
                         _tp1_structure = _nearest_res * 0.995
                         _min_tp1 = float(entry_price_for_trade) + (_risk_for_quality * 1.2)
-                        if _res_dist_pct < 1.0 or _res_r < 1.2:
-                            log_long_rejection(
-                                symbol=symbol,
-                                reason="near_resistance_before_tp1",
-                                candle_time=candle_time,
-                                score=score_result.get("score"),
-                                raw_score=raw_score,
-                                market_state=market_state,
-                                current_mode=current_mode,
-                                entry_timing=entry_timing_temp,
-                                opportunity_type=temp_opportunity_type,
-                                dist_ma=dist_ma,
-                                rsi_now=rsi_now,
-                                vol_ratio=vol_ratio,
-                                vwap_distance=vwap_distance,
-                                mtf_confirmed=mtf_confirmed,
-                                breakout=breakout,
-                                pre_breakout=pre_breakout,
-                                is_reverse=is_reverse,
-                                extra={
-                                    "nearest_resistance": _nearest_res,
-                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
-                                    "resistance_distance_pct": _res_dist_pct,
-                                    "resistance_r": _res_r,
-                                    "category": "trade_quality",
-                                },
+                        # Smart Resistance Balance (final):
+                        # - normal setups remain protected
+                        # - relaxed/strong setups use softer hard-reject limits
+                        # - ultra-tiny non-structural resistance is treated as noise/warning, not a hard reject
+                        _res_source = str(smart_targets_early.get("nearest_resistance_source") or "unknown")
+                        _structural_res_sources = {"swing_high", "previous_rejection", "round_level_confirmed", "bb_upper"}
+                        _weak_micro_res_sources = {"recent_20_high", "unknown", "micro_high", "tiny_wick"}
+                        _res_is_structural = _res_source in _structural_res_sources
+                        _res_is_micro_noise = (_res_source in _weak_micro_res_sources) and (_res_dist_pct < 0.25 or _res_r < 0.20)
+
+                        _res_relaxed_setup = is_relaxed_execution_setup(
+                            setup_type=setup_type,
+                            extra_setup_names=extra_setup_names,
+                            primary_extra_setup=primary_extra_setup,
+                            mtf_confirmed=mtf_confirmed,
+                            vol_ratio=vol_ratio,
+                            score=score_result.get("score", raw_score),
+                        )
+
+                        _bull_mtf_flex = (
+                            market_state in ("bull_market", "alt_season")
+                            and bool(mtf_confirmed)
+                            and float(vol_ratio or 0.0) >= 1.15
+                            and _res_relaxed_setup
+                            and not _res_is_structural
+                        )
+
+                        if _res_is_micro_noise:
+                            logger.info(
+                                f"⚪ {symbol} tiny/micro resistance ignored | "
+                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
                             )
-                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
-                            continue
-                        if _tp1_structure < _min_tp1:
+                        else:
+                            if _res_relaxed_setup:
+                                _hard_dist_limit = 0.40
+                                _hard_r_limit = 0.35
+                            else:
+                                _hard_dist_limit = 0.80
+                                _hard_r_limit = 0.70
+
+                            _should_hard_reject_resistance = (
+                                (_res_dist_pct < _hard_dist_limit or _res_r < _hard_r_limit)
+                                and not _bull_mtf_flex
+                            )
+
+                            if _should_hard_reject_resistance:
+                                log_long_rejection(
+                                    symbol=symbol,
+                                    reason="near_resistance_before_tp1",
+                                    candle_time=candle_time,
+                                    score=score_result.get("score"),
+                                    raw_score=raw_score,
+                                    market_state=market_state,
+                                    current_mode=current_mode,
+                                    entry_timing=entry_timing_temp,
+                                    opportunity_type=temp_opportunity_type,
+                                    dist_ma=dist_ma,
+                                    rsi_now=rsi_now,
+                                    vol_ratio=vol_ratio,
+                                    vwap_distance=vwap_distance,
+                                    mtf_confirmed=mtf_confirmed,
+                                    breakout=breakout,
+                                    pre_breakout=pre_breakout,
+                                    is_reverse=is_reverse,
+                                    extra={
+                                        "nearest_resistance": _nearest_res,
+                                        "resistance_source": _res_source,
+                                        "resistance_distance_pct": _res_dist_pct,
+                                        "resistance_r": _res_r,
+                                        "relaxed": _res_relaxed_setup,
+                                        "structural": _res_is_structural,
+                                        "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
+                                        "category": "trade_quality",
+                                    },
+                                )
+                                logger.info(
+                                    f"⛔ {symbol} rejected: near_resistance_before_tp1 | "
+                                    f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                    f"relaxed={_res_relaxed_setup} | limits=dist<{_hard_dist_limit}/R<{_hard_r_limit}"
+                                )
+                                continue
+
+                        # Do not let the old 1.2R structure rule kill relaxed/bull-market warnings.
+                        # Hard reject only if the resistance is real structural and still makes TP1 unrewarding.
+                        _tp1_unrewarding_structural = (
+                            _tp1_structure < _min_tp1
+                            and _res_is_structural
+                            and not (_res_relaxed_setup and _res_r >= 0.35 and _res_dist_pct >= 0.40)
+                            and not _bull_mtf_flex
+                        )
+
+                        if _tp1_unrewarding_structural:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="tp1_not_rewarding_before_resistance",
@@ -8896,14 +9066,27 @@ def run_scanner_loop():
                                 is_reverse=is_reverse,
                                 extra={
                                     "nearest_resistance": _nearest_res,
-                                    "resistance_source": smart_targets_early.get("nearest_resistance_source"),
+                                    "resistance_source": _res_source,
                                     "tp1_structure": _tp1_structure,
                                     "min_tp1": _min_tp1,
+                                    "resistance_distance_pct": _res_dist_pct,
+                                    "resistance_r": _res_r,
+                                    "relaxed": _res_relaxed_setup,
+                                    "structural": _res_is_structural,
                                     "category": "trade_quality",
                                 },
                             )
-                            logger.info(f"⛔ {symbol} rejected: tp1_not_rewarding_before_resistance | res={_nearest_res} | tp1_structure={_tp1_structure} | min_tp1={_min_tp1}")
+                            logger.info(
+                                f"⛔ {symbol} rejected: tp1_not_rewarding_before_resistance | "
+                                f"source={_res_source} | R={_res_r:.2f} | structural={_res_is_structural}"
+                            )
                             continue
+                        elif _tp1_structure < _min_tp1:
+                            logger.info(
+                                f"⚠️ {symbol} resistance warning only | "
+                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                f"relaxed={_res_relaxed_setup} | bull_flex={_bull_mtf_flex}"
+                            )
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
@@ -9946,16 +10129,23 @@ def run_scanner_loop():
                         if is_execution_paused():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                         elif EXECUTION_AVAILABLE:
-                            exec_result = process_trade_candidate(r, symbol, candidate)
-                            if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
-                                execution_message = exec_result.get("execution_message")
-                                if execution_message:
-                                    send_telegram_message(execution_message)
-                                logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
-                            else:
+                            if not is_candidate_for_execution(candidate):
                                 logger.info(
-                                    f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
+                                    f"EXEC SKIPPED: {symbol} | reason=not_strict_execution_candidate "
+                                    f"| setup={candidate.get('setup_type', '')} | entry_maturity={candidate.get('entry_maturity', '')}"
                                 )
+                            else:
+                                candidate = _apply_market_execution_fallback(candidate)
+                                exec_result = process_trade_candidate(r, symbol, candidate)
+                                if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
+                                    execution_message = exec_result.get("execution_message")
+                                    if execution_message:
+                                        send_telegram_message(execution_message)
+                                    logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
+                                else:
+                                    logger.info(
+                                        f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
+                                    )
                     except Exception as _exec_e:
                         logger.error(f"Execution preview error for {symbol}: {_exec_e}")
                     logger.info(f"✅ SENT LONG ---> {symbol}")
