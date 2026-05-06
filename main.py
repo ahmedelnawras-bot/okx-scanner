@@ -30,11 +30,14 @@ from tracking.performance import (
  get_setup_type_stats, 
  get_open_trades_summary, 
  format_open_trades_message, 
+ load_all_trades_for_report,
 ) 
 from analysis.rejection_tracking import (
     log_rejected_candidate,
     build_rejections_report_message,
 )
+
+from tracking.summary_helpers import calc_trade_result_pct
 
 # Execution folder integration (safe preview only)
 try:
@@ -88,6 +91,7 @@ OKX_TICKER_SINGLE_URL = "https://www.okx.com/api/v5/market/ticker"
 SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
+DEFAULT_LEVERAGE = 15
 FINAL_MIN_SCORE = 6.2
 PRE_BREAKOUT_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 5
@@ -1944,60 +1948,29 @@ def interpret_register_trade_result(result, candidate: dict) -> bool:
 
 # ----------- Helper functions for exits report -----------
 def _load_long_trades_from_redis(limit: int = 700) -> list:
-    trades = []
+    """
+    تحميل موحد لصفقات اللونج من Redis باستخدام مصدر performance.py الرسمي.
+    الهدف: منع اختلاف الأعداد بين /report_all و /report_exits و /report_setups و /report_execution.
+    """
     if not r:
-        return trades
+        return []
     try:
-        trade_count = 0
-        history_count = 0
-        seen_ids = set()
-
-        for key in r.scan_iter("trade:futures:long:*"):
-            try:
-                raw = r.get(key)
-                if not raw:
-                    continue
-                data = json.loads(raw)
-                if not isinstance(data, dict):
-                    continue
-                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                data["_redis_key"] = key
-                trades.append(data)
-                trade_count += 1
-            except Exception:
-                continue
-
-        for key in r.scan_iter("trade_history:futures:long:*"):
-            try:
-                raw = r.get(key)
-                if not raw:
-                    continue
-                data = json.loads(raw)
-                if not isinstance(data, dict):
-                    continue
-                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                data["_redis_key"] = key
-                trades.append(data)
-                history_count += 1
-            except Exception:
-                continue
-
-        logger.info(f"Loaded trades: trade={trade_count} history={history_count} after dedupe={len(trades)}")
+        trades = load_all_trades_for_report(
+            redis_client=r,
+            market_type="futures",
+            side="long",
+            since_ts=None,
+            include_open=True,
+        )
+        trades.sort(
+            key=lambda x: int(float(x.get("created_ts") or x.get("created_at") or x.get("candle_time") or 0)),
+            reverse=True,
+        )
+        logger.info(f"Loaded long trades via unified loader: {len(trades)}")
+        return trades[:limit]
     except Exception as e:
-        logger.error(f"_load_long_trades_from_redis error: {e}")
-        return trades
-
-    trades.sort(
-        key=lambda x: int(float(x.get("created_ts") or x.get("candle_time") or 0)),
-        reverse=True
-    )
-    return trades[:limit]
+        logger.error(f"_load_long_trades_from_redis unified loader error: {e}", exc_info=True)
+        return []
 
 
 def _pct_safe(value, decimals=2):
@@ -2710,19 +2683,62 @@ def _execution_trade_closed(trade: dict) -> bool:
 
 
 def _execution_trade_pnl_404020(trade: dict) -> float:
+    """Return leveraged 40/40/20 PnL for execution-candidate reports.
+
+    Closed trades use the unified calc_trade_result_pct() from summary_helpers so
+    /report_execution stays consistent with the rest of the performance reports.
+    Open/partial trades use the current/latest price as a live estimate only.
+    """
     try:
-        side = str(trade.get("side", "long") or "long").lower()
-        leverage = float(trade.get("leverage") or DEFAULT_LEVERAGE or 15)
-        entry = _safe_float(_trade_field(trade, "effective_entry") or _trade_field(trade, "entry") or _trade_field(trade, "execution_entry"), 0.0)
+        leverage = _safe_float(trade.get("leverage"), DEFAULT_LEVERAGE)
+        if leverage <= 0:
+            leverage = DEFAULT_LEVERAGE
+
+        plan = _execution_plan_for_trade(trade)
+        trade_for_calc = dict(trade)
+        if _safe_float(trade_for_calc.get("entry"), 0.0) <= 0 and _safe_float(plan.get("entry"), 0.0) > 0:
+            trade_for_calc["entry"] = plan.get("entry")
+        if _safe_float(trade_for_calc.get("effective_entry"), 0.0) <= 0 and _safe_float(plan.get("entry"), 0.0) > 0:
+            trade_for_calc["effective_entry"] = plan.get("entry")
+        if _safe_float(trade_for_calc.get("sl"), 0.0) <= 0 and _safe_float(plan.get("sl"), 0.0) > 0:
+            trade_for_calc["sl"] = plan.get("sl")
+        if _safe_float(trade_for_calc.get("initial_sl"), 0.0) <= 0 and _safe_float(plan.get("sl"), 0.0) > 0:
+            trade_for_calc["initial_sl"] = plan.get("sl")
+        if _safe_float(trade_for_calc.get("tp1"), 0.0) <= 0 and _safe_float(plan.get("tp1"), 0.0) > 0:
+            trade_for_calc["tp1"] = plan.get("tp1")
+        if _safe_float(trade_for_calc.get("tp2"), 0.0) <= 0 and _safe_float(plan.get("tp2"), 0.0) > 0:
+            trade_for_calc["tp2"] = plan.get("tp2")
+
+        # Closed trades: use the same raw PnL function used by normal reports.
+        raw_unified = calc_trade_result_pct(trade_for_calc)
+        if raw_unified is not None:
+            return round(raw_unified * leverage, 4)
+
+        # Live/open fallback only.
+        side = str(trade_for_calc.get("side", "long") or "long").lower()
+        entry = _safe_float(trade_for_calc.get("effective_entry") or trade_for_calc.get("entry") or plan.get("entry"), 0.0)
         if entry <= 0:
             return 0.0
-        result = str(trade.get("result", "") or "").lower()
-        status = str(trade.get("status", "") or "").lower()
-        tp1_hit = bool(trade.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
-        tp2_hit = bool(trade.get("tp2_hit")) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing_closed")
-        tp1 = _safe_float(trade.get("tp1"), 0.0)
-        tp2 = _safe_float(trade.get("tp2"), 0.0)
-        exit_price = _safe_float(trade.get("exit_price") or trade.get("current_price") or trade.get("last_price") or trade.get("trailing_exit_price"), 0.0)
+
+        def _bool_value(value):
+            if isinstance(value, bool):
+                return value
+            return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+        result = str(trade_for_calc.get("result", "") or "").lower()
+        status = str(trade_for_calc.get("status", "") or "").lower()
+        tp1_hit = _bool_value(trade_for_calc.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
+        tp2_hit = _bool_value(trade_for_calc.get("tp2_hit")) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing_closed")
+        tp1 = _safe_float(trade_for_calc.get("tp1") or plan.get("tp1"), 0.0)
+        tp2 = _safe_float(trade_for_calc.get("tp2") or plan.get("tp2"), 0.0)
+        current_price = _safe_float(
+            trade_for_calc.get("current_price")
+            or trade_for_calc.get("last_price")
+            or trade_for_calc.get("exit_price")
+            or trade_for_calc.get("trailing_exit_price")
+            or trade_for_calc.get("trailing_sl"),
+            0.0,
+        )
 
         def raw_pct(price):
             price = _safe_float(price, 0.0)
@@ -2733,8 +2749,8 @@ def _execution_trade_pnl_404020(trade: dict) -> float:
             return ((price - entry) / entry) * 100.0
 
         if result == "loss":
-            sl_price = _safe_float(trade.get("sl") or trade.get("exit_price"), 0.0)
-            return round(raw_pct(sl_price or exit_price) * leverage, 4)
+            sl_price = _safe_float(trade_for_calc.get("initial_sl") or trade_for_calc.get("sl") or trade_for_calc.get("exit_price"), 0.0)
+            return round(raw_pct(sl_price or current_price) * leverage, 4)
         if result == "breakeven":
             return 0.0
 
@@ -2743,16 +2759,15 @@ def _execution_trade_pnl_404020(trade: dict) -> float:
             pnl_raw += raw_pct(tp1) * 0.40
         if tp2_hit and tp2 > 0:
             pnl_raw += raw_pct(tp2) * 0.40
-            if exit_price > 0:
-                pnl_raw += raw_pct(exit_price) * 0.20
-        elif exit_price > 0 and status == "open":
-            # للمرشح المفتوح قبل TP1: الوضع الحالي لكل الحجم، وبعد TP1: الجزء المفتوح فقط.
-            if tp1_hit:
-                pnl_raw += raw_pct(exit_price) * 0.60
+            if current_price > 0:
+                pnl_raw += raw_pct(current_price) * 0.20
             else:
-                pnl_raw += raw_pct(exit_price)
-        elif _execution_trade_closed(trade) and exit_price > 0:
-            pnl_raw += raw_pct(exit_price)
+                pnl_raw += raw_pct(tp2) * 0.20
+        elif current_price > 0:
+            if tp1_hit:
+                pnl_raw += raw_pct(current_price) * 0.60
+            else:
+                pnl_raw += raw_pct(current_price)
         return round(pnl_raw * leverage, 4)
     except Exception:
         return 0.0
@@ -2762,7 +2777,7 @@ def _execution_status_label(trade: dict) -> str:
     result = str(trade.get("result", "") or "").lower()
     status = str(trade.get("status", "") or "").lower()
     if result == "loss":
-        return "🔴 SL"
+        return "🔴 Stopped"
     if result == "trailing_win":
         return "🔄 Trailing Win"
     if result == "tp2_win" or bool(trade.get("tp2_hit")):
@@ -2833,7 +2848,7 @@ def build_execution_report_message(period: str = "all") -> str:
             f"• 🎯 TP1 Hits: {tp1_hits}",
             f"• 🏁 TP2 Hits: {tp2_hits}",
             f"• 🔄 Trailing Wins: {trailing_wins}",
-            f"• 🔴 SL: {losses}",
+            f"• 🔴 Stopped: {losses}",
             "",
             "📊 <b>أداء 40/40/20</b>",
             f"• 📈 Win Rate TP1+: <b>{win_rate:.2f}%</b>",
@@ -2842,7 +2857,7 @@ def build_execution_report_message(period: str = "all") -> str:
             "",
             "💰 <b>النتيجة الفعلية 40/40/20</b>",
             f"• 🟢 أرباح محققة/مفتوحة: +{gross_profit:.2f}%",
-            f"• 🔴 خسائر SL: {gross_loss:.2f}%",
+            f"• 🔴 خسائر Stopped: {gross_loss:.2f}%",
             f"• ⚖️ الصافي بعد الرافعة: <b>{net_pnl:+.2f}%</b>",
             "────────────",
             "🚀 <b>آخر الصفقات المرشحة</b>",
@@ -2865,7 +2880,7 @@ def build_execution_report_message(period: str = "all") -> str:
                 f"🛑 SL: {plan.get('sl', 'N/A')}",
                 f"🎯 TP1: {plan.get('tp1', 'N/A')} | إغلاق 40%",
                 f"🏁 TP2: {plan.get('tp2', 'N/A')} | إغلاق 40%",
-                "🔄 20%: Trailing بعد TP2",
+                "🔄 20%: Trailing",
                 f"💰 PnL 40/40/20: {pnl:+.2f}%",
             ])
         return _limit_telegram_message("\n".join(lines))
