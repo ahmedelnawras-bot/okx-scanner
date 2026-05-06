@@ -2561,6 +2561,115 @@ def _execution_trade_is_loss(trade: dict) -> bool:
     return str(trade.get("result", "") or "").lower() == "loss"
 
 
+# =========================
+# OPEN TRADE LIVE PHASE / PNL HELPERS
+# =========================
+def _trade_effective_entry_for_report(trade: dict) -> float:
+    """أفضل سعر دخول فعلي للتقارير: Pullback يستخدم recommended/effective، والـ Market يستخدم entry."""
+    for key in ("effective_entry", "recommended_entry", "execution_entry", "pullback_entry", "entry"):
+        v = _safe_float(_trade_field(trade, key, 0.0), 0.0)
+        if v > 0:
+            return v
+    return 0.0
+
+
+def _trade_current_price_for_report(trade: dict) -> float:
+    """سعر حالي سريع من آخر شمعة 1m، مع fallback لأي قيمة محفوظة داخل الصفقة."""
+    for key in ("current_price", "last_price", "market_price"):
+        v = _safe_float(trade.get(key, 0.0), 0.0)
+        if v > 0:
+            return v
+    symbol = str(trade.get("symbol", "") or "")
+    if not symbol:
+        return 0.0
+    try:
+        candles = get_candles(symbol, timeframe="1m", limit=1)
+        if candles:
+            row = candles[0]
+            if isinstance(row, (list, tuple)) and len(row) >= 5:
+                return _safe_float(row[4], 0.0)
+            if isinstance(row, dict):
+                return _safe_float(row.get("close", 0.0), 0.0)
+    except Exception as e:
+        logger.warning(f"current price fetch failed for {symbol}: {e}")
+    return 0.0
+
+
+def _trade_phase_for_report(trade: dict) -> tuple:
+    """يرجع (phase_key, Arabic label) للمرحلة الحالية للصفقة المفتوحة."""
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    tp1_hit = bool(trade.get("tp1_hit") or _trade_field(trade, "tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit") or _trade_field(trade, "tp2_hit", False))
+    trailing_active = bool(trade.get("trailing_active") or _trade_field(trade, "trailing_active", False))
+    sl_moved = bool(trade.get("sl_moved_to_entry") or _trade_field(trade, "sl_moved_to_entry", False))
+    entry_mode = str(_trade_field(trade, "entry_mode", "") or "").lower()
+
+    if status == "pending_pullback" or entry_mode == "pullback_pending":
+        return "pending", "⏳ انتظار Pullback"
+    if status == "closed" or result:
+        return "closed", _execution_trade_status_label(trade)
+    if trailing_active or status in ("trailing", "trailing_open", "tp2_partial") or tp2_hit:
+        return "trailing", "🔄 بعد TP2 | آخر 20% Trailing"
+    if tp1_hit or status == "partial":
+        suffix = " | 🔒 SL Entry" if sl_moved else ""
+        return "tp1", f"🟡 بعد TP1 | 40% مغلق{suffix}"
+    return "open", "🟢 قبل TP1"
+
+
+def _trade_live_pnl_for_report(trade: dict) -> dict:
+    """حساب الربح/الخسارة الحالي والمرجّح للصفقات المفتوحة حسب 40/40/20."""
+    phase, phase_label = _trade_phase_for_report(trade)
+    entry = _trade_effective_entry_for_report(trade)
+    current = _trade_current_price_for_report(trade)
+    side = str(trade.get("side", "long") or "long").lower()
+    tp1 = _safe_float(_trade_field(trade, "tp1", 0.0), 0.0)
+    tp2 = _safe_float(_trade_field(trade, "tp2", 0.0), 0.0)
+
+    pnl = None
+    weighted = None
+    if phase != "pending" and entry > 0 and current > 0:
+        if side == "short":
+            pnl = ((entry - current) / entry) * 100.0
+            tp1_move = ((entry - tp1) / entry) * 100.0 if tp1 > 0 else 0.0
+            tp2_move = ((entry - tp2) / entry) * 100.0 if tp2 > 0 else 0.0
+        else:
+            pnl = ((current - entry) / entry) * 100.0
+            tp1_move = ((tp1 - entry) / entry) * 100.0 if tp1 > 0 else 0.0
+            tp2_move = ((tp2 - entry) / entry) * 100.0 if tp2 > 0 else 0.0
+
+        if phase == "trailing":
+            weighted = (tp1_move * 0.40) + (tp2_move * 0.40) + (pnl * 0.20)
+        elif phase == "tp1":
+            weighted = (tp1_move * 0.40) + (pnl * 0.60)
+        else:
+            weighted = pnl
+
+    return {
+        "phase": phase,
+        "phase_label": phase_label,
+        "entry": entry,
+        "current_price": current,
+        "pnl_pct": pnl,
+        "weighted_pnl_pct": weighted,
+        "leveraged_pnl_pct": (pnl * DEFAULT_LEVERAGE) if pnl is not None else None,
+        "weighted_leveraged_pnl_pct": (weighted * DEFAULT_LEVERAGE) if weighted is not None else None,
+    }
+
+
+def _format_live_pnl_line(trade: dict) -> str:
+    live = _trade_live_pnl_for_report(trade)
+    if live["phase"] == "pending":
+        return f"{live['phase_label']} | الربح الحالي: N/A"
+    if live["pnl_pct"] is None:
+        return f"{live['phase_label']} | الربح الحالي: N/A"
+    emoji = "🟢" if live["pnl_pct"] > 0 else ("🔴" if live["pnl_pct"] < 0 else "⚪")
+    line = f"{live['phase_label']} | {emoji} الحالي: {_pct_safe(live['pnl_pct'])}"
+    if live["phase"] in ("tp1", "trailing") and live["weighted_pnl_pct"] is not None:
+        line += f" | فعلي 40/40/20: {_pct_safe(live['weighted_pnl_pct'])}"
+    return line
+
+
 def build_execution_report_message() -> str:
     """Compact execution report focused on what matters: result and PnL."""
     try:
@@ -2618,8 +2727,16 @@ def build_execution_report_message() -> str:
         for idx, trade in enumerate(trades[:12], 1):
             symbol = html.escape(clean_symbol_for_message(str(trade.get("symbol", "?") or "?")))
             label = _execution_trade_status_label(trade)
-            pnl = _get_trade_pnl_pct(trade) if _execution_trade_is_closed(trade) or trade.get("tp1_hit") else None
-            pnl_txt = _pct_safe(pnl) if pnl is not None else "قيد المتابعة"
+            if _execution_trade_is_closed(trade):
+                pnl = _get_trade_pnl_pct(trade)
+                pnl_txt = _pct_safe(pnl) if pnl is not None else "N/A"
+                live_line = ""
+            else:
+                live = _trade_live_pnl_for_report(trade)
+                pnl_txt = _pct_safe(live["pnl_pct"]) if live.get("pnl_pct") is not None else "N/A"
+                live_line = f"\n   المرحلة: {html.escape(live['phase_label'])} | الحالي: {pnl_txt}"
+                if live.get("weighted_pnl_pct") is not None and live.get("phase") in ("tp1", "trailing"):
+                    live_line += f" | فعلي: {_pct_safe(live['weighted_pnl_pct'])}"
             setup_type = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or "")
             setup_short = html.escape(setup_type[:42])
             entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or "market"))
@@ -2628,6 +2745,7 @@ def build_execution_report_message() -> str:
             lines.append(
                 f"{idx}) <b>{symbol}</b> | {label} | {pnl_txt}\n"
                 f"   score={score:.2f} | {entry_mode} | {setup_short}"
+                f"{live_line}"
             )
 
         return _limit_telegram_message("\n".join(lines))
@@ -2849,14 +2967,74 @@ def _send_open_trades(chat_id: str):
 
 
 def build_open_trades_message() -> str:
- try:
-    if not r:
-        return "❌ لا يوجد اتصال بقاعدة البيانات"
-    trades = get_open_trades_summary(r, market_type="futures", side="long")
-    return format_open_trades_message(trades, side="long")
- except Exception as e:
-    logger.error(f"build_open_trades_message error: {e}", exc_info=True)
-    return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
+    """تقرير صفقات مفتوحة واضح: المرحلة + الربح الحالي + الربح الفعلي حسب 40/40/20."""
+    try:
+        if not r:
+            return "❌ لا يوجد اتصال بقاعدة البيانات"
+
+        trades = [
+            t for t in _load_long_trades_from_redis(limit=800)
+            if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial", "pending_pullback")
+        ]
+        if not trades:
+            return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
+
+        lines = [
+            f"📋 <b>الصفقات المفتوحة - LONG</b>",
+            f"📊 العدد: {len(trades)}",
+            "",
+        ]
+        winning = losing = pending = tp1_count = trailing_count = 0
+        weighted_values = []
+
+        for idx, trade in enumerate(trades[:12], 1):
+            symbol = html.escape(clean_symbol_for_message(str(trade.get("symbol", "?") or "?")))
+            live = _trade_live_pnl_for_report(trade)
+            phase = live["phase"]
+            if phase == "pending": pending += 1
+            if phase == "tp1": tp1_count += 1
+            if phase == "trailing": trailing_count += 1
+            if live.get("pnl_pct") is not None:
+                if live["pnl_pct"] > 0: winning += 1
+                elif live["pnl_pct"] < 0: losing += 1
+            if live.get("weighted_pnl_pct") is not None:
+                weighted_values.append(live["weighted_pnl_pct"])
+
+            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "market") or "market"))
+            setup_type = html.escape(str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or "")[:48])
+            score = _safe_float(_trade_field(trade, "score", 0.0), 0.0)
+            entry = live.get("entry") or _trade_effective_entry_for_report(trade)
+            current = live.get("current_price") or 0.0
+            sl = _safe_float(_trade_field(trade, "sl", 0.0), 0.0)
+            tp1 = _safe_float(_trade_field(trade, "tp1", 0.0), 0.0)
+            tp2 = _safe_float(_trade_field(trade, "tp2", 0.0), 0.0)
+
+            pnl_txt = _pct_safe(live["pnl_pct"]) if live.get("pnl_pct") is not None else "N/A"
+            lev_txt = _pct_safe(live["leveraged_pnl_pct"], 1) if live.get("leveraged_pnl_pct") is not None else "N/A"
+            actual_txt = ""
+            if live.get("weighted_pnl_pct") is not None and phase in ("tp1", "trailing"):
+                actual_txt = f"\n   ⚖️ فعلي 40/40/20: <b>{_pct_safe(live['weighted_pnl_pct'])}</b> | بعد الرافعة: {_pct_safe(live['weighted_leveraged_pnl_pct'], 1)}"
+
+            lines.append(
+                f"{idx}) <b>{symbol}</b> | score={score:.2f}\n"
+                f"   📌 المرحلة: {html.escape(live['phase_label'])}\n"
+                f"   💰 الربح الحالي: <b>{pnl_txt}</b> | بعد الرافعة: {lev_txt}{actual_txt}\n"
+                f"   💵 الحالي: {_fmt_price(current)} | 🎯 الدخول: {_fmt_price(entry)} | {entry_mode}\n"
+                f"   🛑 SL: {_fmt_price(sl)} | 🎯 TP1: {_fmt_price(tp1)} | 🏁 TP2: {_fmt_price(tp2)}\n"
+                f"   🧩 {setup_type}"
+            )
+
+        lines.append("")
+        lines.append("📊 <b>ملخص المفتوحة:</b>")
+        lines.append(f"🟢 رابحة الآن: {winning} | 🔴 خاسرة الآن: {losing} | ⏳ Pending: {pending}")
+        lines.append(f"🟡 بعد TP1: {tp1_count} | 🔄 Trailing: {trailing_count}")
+        if weighted_values:
+            lines.append(f"⚖️ متوسط الربح الفعلي: {_pct_safe(_avg(weighted_values))}")
+
+        return _limit_telegram_message("\n".join(lines))
+    except Exception as e:
+        logger.error(f"build_open_trades_message error: {e}", exc_info=True)
+        return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
 
 
 COMMAND_HANDLERS = {
