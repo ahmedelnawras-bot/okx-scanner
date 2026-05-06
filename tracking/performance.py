@@ -3323,11 +3323,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• TP1 → TP2 Conversion: {tp1_to_tp2_rate:.1f}%"
     )
     if partial_lifecycle_count > 0:
-        performance_block += (
-            f"\n• ⚖️ ربح جزئي مفتوح 40/40/20: {partial_lifecycle_pnl:+.2f}% "
-            f"({partial_lifecycle_count} صفقة)"
-            f"\n• 📊 إجمالي مغلق + جزئي: {total_lifecycle_pnl:+.2f}%"
-        )
+        performance_block += f"\n• ⚖️ صفقات جزئية مفتوحة 40/40/20: {partial_lifecycle_count}"
     if breakeven_exits > 0:
         performance_block += f"\n• Breakeven Protected Exits: {breakeven_exits}"
 
@@ -3339,21 +3335,31 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• الإجراء المقترح: {diagnosis['action']}"
     )
 
+    partial_open_block = ""
+    if partial_lifecycle_count > 0:
+        partial_open_block = (
+            f"\n⚖️ <b>الأرباح الجزئية المفتوحة 40/40/20</b>\n"
+            f"• صفقات جزئية مفتوحة: {partial_lifecycle_count}\n"
+            f"• ربح جزئي مفتوح بعد الرافعة: {partial_lifecycle_pnl:+.2f}%\n"
+            f"• إجمالي مغلق + جزئي بعد الرافعة: {total_lifecycle_pnl:+.2f}%\n"
+        )
+
     financial_block = (
-        f"\n\n💰 <b>ملخص الربح والخسارة بعد الرافعة</b>\n"
+        f"\n\n💰 <b>النتيجة المالية الفعلية</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🟢 <b>إجمالي الربح:</b> {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
-        f"🔴 <b>إجمالي الخسارة:</b> {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
-        f"⚖️ <b>صافي الربح/الخسارة:</b> {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
-        f"💼 <b>التأثير الحقيقي على المحفظة:</b> {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
+        f"🟢 إجمالي أرباح الصفقات الرابحة: {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
+        f"🔴 إجمالي خسائر الصفقات الخاسرة: {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
+        f"⚖️ صافي الربح/الخسارة بعد الرافعة: {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
+        f"💼 التأثير الحقيقي على المحفظة: {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
+        f"📊 صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
+        + partial_open_block +
         f"━━━━━━━━━━━━━━\n"
         + settings_block +
         f"\n📊 <b>تفاصيل إضافية:</b>\n"
-        f"• صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
-        f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%\n"
-        f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%\n"
-        f"• أفضل صفقة: {best:+.2f}%\n"
-        f"• أسوأ صفقة: {worst:+.2f}%\n"
+        f"• متوسط الصفقة الرابحة بعد الرافعة: {avg_win:+.2f}%\n"
+        f"• متوسط الصفقة الخاسرة بعد الرافعة: {avg_loss:+.2f}%\n"
+        f"• أفضل صفقة بعد الرافعة: {best:+.2f}%\n"
+        f"• أسوأ صفقة بعد الرافعة: {worst:+.2f}%\n"
         f"\n🧯 <b>إدارة المخاطرة:</b>\n"
         + "\n".join(risk_lines) + "\n"
     )
@@ -3370,9 +3376,9 @@ def format_period_summary(title: str, summary: dict) -> str:
         + (f"Breakeven Exits: {breakeven_exits}\n" if breakeven_exits > 0 else "") +
         f"Open: {summary.get('open', 0)}\n"
         f"Win rate: {summary.get('winrate', 0)}%"
+        + financial_block
         + performance_block
         + diagnosis_block
-        + financial_block
     )
 
 
@@ -3757,6 +3763,51 @@ def get_open_trades_summary(
     return open_trades
 
 
+def _format_open_trade_lifecycle_pnl_block(t: dict) -> List[str]:
+    """بلوك مختصر يوضح المرحلة والربح الفعلي لخطة 40/40/20 في /open_trades."""
+    phase = str(t.get("phase", "open") or "open")
+    current_price = safe_float(t.get("current_price", 0.0), 0.0)
+    w_pnl = safe_float(t.get("weighted_pnl_pct", 0.0), 0.0)
+    w_lev = safe_float(t.get("weighted_pnl_leveraged", 0.0), 0.0)
+    cur_pnl = safe_float(t.get("current_pnl_pct", 0.0), 0.0)
+    cur_lev = safe_float(t.get("current_pnl_leveraged", 0.0), 0.0)
+    tp1_hit = bool(t.get("tp1_hit", False))
+    tp2_hit = bool(t.get("tp2_hit", False))
+    trailing_active = bool(t.get("trailing_active", False)) or phase == "trailing"
+    sl_is_entry = bool(t.get("sl_is_entry", False))
+
+    if phase == "pending_pullback":
+        return [
+            "   📊 <b>الربح الفعلي 40/40/20:</b>",
+            "   • الحالة: ⏳ Pending Pullback — لم يتفعل الدخول",
+            "   • PnL فعلي: —",
+        ]
+
+    if phase == "trailing":
+        state = "🔄 Trailing شغال | الجزء المتبقي 20%"
+    elif tp2_hit or phase == "tp2_hit":
+        state = "🏁 TP2 اتضرب | 40% إضافي اتقفل"
+    elif tp1_hit or phase == "tp1_hit":
+        state = "🎯 TP1 اتضرب | 40% اتقفل | SL Entry"
+    else:
+        state = "🟢 قبل TP1"
+
+    tp1_text = "✅ اتضرب" if tp1_hit or phase in ("tp1_hit", "tp2_hit", "trailing") else "⏳ لم يضرب"
+    tp2_text = "✅ اتضرب" if tp2_hit or phase in ("tp2_hit", "trailing") else "⏳ لم يضرب"
+    trailing_text = "شغال" if trailing_active else ("لم يبدأ" if not tp2_hit else "مغلق/غير نشط")
+    sl_text = "🔒 على Entry" if sl_is_entry else "لم يضرب"
+
+    return [
+        "   📊 <b>الربح الفعلي 40/40/20:</b>",
+        f"   • الحالة: {state}",
+        f"   • TP1: {tp1_text} | TP2: {tp2_text} | 20%: {trailing_text}",
+        f"   • SL: {sl_text}",
+        f"   • السعر الحالي: <code>{_fmt_price_perf(current_price)}</code>",
+        f"   • PnL فعلي: <code>{w_pnl:+.2f}%</code> | بعد الرافعة: <code>{w_lev:+.1f}%</code>",
+        f"   • حركة السعر الحالية: <code>{cur_pnl:+.2f}%</code> | بعد الرافعة: <code>{cur_lev:+.1f}%</code>",
+    ]
+
+
 def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
     """
     تنسيق رسالة /open_trades بالعربي مع ملخص واضح لكل صفقة.
@@ -3813,23 +3864,8 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | ⏱ {age}")
         lines.append(f"   {phase_line}")
 
-        # ── PnL الحالي ──────────────────────────────────────────
-        if phase == "pending_pullback":
-            lines.append(f"   ⏳ في انتظار لمس منطقة الدخول")
-        elif current_price > 0:
-            lines.append(
-                f"   {pnl_emoji} <b>{pnl_label}</b>: "
-                f"<code>{pnl_pct:+.2f}%</code> "
-                f"(<code>{pnl_lev:+.1f}%</code> بعد الرافعة)"
-            )
-            w_pnl = t.get("weighted_pnl_pct", 0.0)
-            w_lev = t.get("weighted_pnl_leveraged", 0.0)
-            if phase in ("tp1_hit", "trailing") and abs(w_pnl - pnl_pct) > 0.01:
-                lines.append(
-                    f"   ⚖️ مرجّح فعلي: <code>{w_pnl:+.2f}%</code> "
-                    f"(<code>{w_lev:+.1f}%</code> بعد الرافعة)"
-                )
-            lines.append(f"   💵 السعر الحالي: <code>{_fmt_price_perf(current_price)}</code>")
+        # ── الربح الفعلي 40/40/20 يظهر مبكرًا وبوضوح ─────────────
+        lines.extend(_format_open_trade_lifecycle_pnl_block(t))
         
         # ── أسعار الدخول والـ SL ────────────────────────────────
         lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
