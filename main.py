@@ -65,12 +65,6 @@ try:
 except Exception: 
  analyze_entry_maturity = None
 
-# استيراد calc_trade_result_pct على مستوى الموديول (تجنب inline import داخل دوال متكررة)
-try:
-    from tracking.summary_helpers import calc_trade_result_pct as _summary_calc_trade_result_pct
-except ImportError:
-    _summary_calc_trade_result_pct = None
-
 # =====================
 # LOGGING
 # =====================
@@ -145,7 +139,7 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:long:running"
-SCAN_LOCK_TTL = 600
+SCAN_LOCK_TTL = 180
 
 SCAN_LOOP_SLEEP_SECONDS = 5
 SCAN_IDLE_SLEEP_SECONDS = 8
@@ -424,6 +418,9 @@ def clear_stale_scan_locks_on_startup() -> None:
     if ttl == -1:
         r.delete(SCAN_LOCK_KEY)
         logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
+    elif ttl and ttl > 300:
+        r.delete(SCAN_LOCK_KEY)
+        logger.info(f"🧹 Cleared long startup scan lock: {SCAN_LOCK_KEY} ttl={ttl}s")
     elif ttl and ttl > 0:
         logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
  except Exception as e:
@@ -2023,9 +2020,8 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    if _summary_calc_trade_result_pct is None:
-        return 0.0
-    raw = _summary_calc_trade_result_pct(trade)
+    from tracking.summary_helpers import calc_trade_result_pct
+    raw = calc_trade_result_pct(trade)
     if raw is None:
         return 0.0
     return round(raw * TRACK_LEVERAGE, 4)
@@ -7104,8 +7100,16 @@ def run_scanner_loop():
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 _now_ts = time.time()
+                _lock_ttl = get_scan_lock_ttl()
+                if _lock_ttl > 300 and r:
+                    try:
+                        r.delete(SCAN_LOCK_KEY)
+                        logger.warning(f"🧹 Stale scan lock detected during loop, cleared automatically (ttl={_lock_ttl}s)")
+                        time.sleep(1)
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Failed to clear stale scan lock during loop: {e}")
                 if _now_ts - _last_scan_skip_log_ts >= 60:
-                    _lock_ttl = get_scan_lock_ttl()
                     logger.info(f"⏳ Scan lock active, waiting... (ttl={_lock_ttl}s)")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
@@ -7602,13 +7606,6 @@ def run_scanner_loop():
                 setup_type_base = "unknown"
                 setup_type_candidate = {}
                 setup_type_candidate_final = {}
-                # score_result و pre_score_adjustments_log يجب تعريفهما هنا
-                # لأن بعض البلوكات المبكرة تستخدمهما قبل calculate_long_score
-                score_result = {
-                    "score": 0.0, "reasons": [], "warning_reasons": [],
-                    "funding_label": "🟡 محايد", "signal_rating": "⚡ عادي", "fake_signal": False,
-                }
-                pre_score_adjustments_log = []
                 relative_strength = 0.0
                 relative_strength_short = 0.0
                 relative_strength_24 = 0.0
@@ -8083,7 +8080,7 @@ def run_scanner_loop():
                         primary_extra_setup=primary_extra_setup,
                         mtf_confirmed=mtf_confirmed,
                         vol_ratio=vol_ratio,
-                        score=0.0,  # Score not yet computed at this stage
+                        score=score_result.get("score", 0.0),
                     )
                     if not relaxed_retest_allowed:
                         log_long_rejection(
@@ -8265,7 +8262,7 @@ def run_scanner_loop():
                             primary_extra_setup=primary_extra_setup,
                             mtf_confirmed=mtf_confirmed,
                             vol_ratio=vol_ratio,
-                            score=0.0,  # Score not yet computed at this stage
+                            score=score_result.get("score", 0.0),
                         ):
                             hard_late_entry = False
                             pre_score_adjustments_log.append({
@@ -9718,7 +9715,6 @@ def run_scanner_loop():
                         since_ts=stats_reset_ts,
                     ),
                     "reversal_4h_result": reversal_4h_result,
-                    "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
                     "above_upper_bb": above_upper_bb,
                     "change_4h": change_4h,
                     "late_guard": late_guard,
@@ -9808,4 +9804,264 @@ def run_scanner_loop():
                     symbol=symbol,
                     price=candidate["entry"],
                     score_result=temp_score_result,
-                    st
+                    stop_loss=candidate["sl"],
+                    tp1=candidate["tp1"],
+                    tp2=candidate["tp2"],
+                    rr1=candidate["rr1"],
+                    rr2=candidate["rr2"],
+                    btc_mode=btc_mode,
+                    btc_dominance_proxy=btc_dominance_proxy,
+                    tv_link=tv_link,
+                    is_new=candidate["is_new"],
+                    change_24h=candidate["change_24h"],
+                    market_state_label=market_state_label,
+                    market_bias_label=market_bias_label,
+                    alt_mode=alt_mode,
+                    news_warning=news_warning_text,
+                    opportunity_type=candidate["opportunity_type"],
+                    entry_timing=candidate["entry_timing"],
+                    display_risk=candidate["risk_level"],
+                    setup_stats=candidate.get("setup_stats"),
+                    is_reverse=candidate["is_reverse"],
+                    reversal_4h_confirmed=candidate["reversal_4h_result"]["confirmed"],
+                    reversal_4h_details=candidate["reversal_4h_result"].get("details", ""),
+                    breakout_quality=candidate["breakout_quality"],
+                    pullback_low=candidate.get("pullback_low"),
+                    pullback_high=candidate.get("pullback_high"),
+                    entry_maturity_data={
+                        "fib_position": candidate.get("fib_position", "unknown"),
+                        "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
+                        "fib_label": candidate.get("fib_label", "غير معروف"),
+                        "had_pullback": candidate.get("had_pullback", False),
+                        "pullback_pct": candidate.get("pullback_pct", 0.0),
+                        "pullback_label": candidate.get("pullback_label", "غير معروف"),
+                        "wave_estimate": candidate.get("wave_estimate", 0),
+                        "wave_peaks": candidate.get("wave_peaks", 0),
+                        "wave_label": candidate.get("wave_label", "غير معروف"),
+                        "entry_maturity": candidate.get("entry_maturity", "unknown"),
+                        "maturity_penalty": candidate.get("maturity_penalty", 0.0),
+                        "maturity_bonus": candidate.get("maturity_bonus", 0.0),
+                    },
+                    warning_penalty=candidate["warning_penalty"] + candidate.get("res_dynamic_penalty", 0.0),
+                    resistance_warning=candidate["resistance_warning"],
+                    target_method=candidate["target_method"],
+                    nearest_resistance=candidate["nearest_resistance"],
+                    wave_context=candidate["wave_context"],
+                    extra_setup_names=candidate["extra_setup_names"],
+                    primary_extra_setup=candidate["primary_extra_setup"],
+                    has_pullback_plan=candidate["has_pullback_plan"],
+                    market_price=candidate.get("market_entry", candidate["entry"]),
+                    sl_method=candidate["sl_method"],
+                    context_setups=candidate.get("context_setups", []),
+                    execution_entry=candidate.get("execution_entry"),
+                    execution_sl=candidate.get("execution_sl"),
+                    execution_tp1=candidate.get("execution_tp1"),
+                    execution_tp2=candidate.get("execution_tp2"),
+                )
+                reply_markup = build_track_reply_markup(candidate["alert_id"])
+
+                if candidate.get("block_exception"):
+                    message = "🔥 <b>استثناء BLOCK_LONGS:</b> العملة أقوى من BTC أو Setup قوي جدًا\n\n" + message
+
+                badge = build_execution_badge_line(candidate)
+                if badge:
+                    message = badge + "\n\n" + message
+
+                sent_data = send_telegram_message(
+                    message,
+                    reply_markup=reply_markup,
+                )
+                if sent_data.get("ok"):
+                    sent_count += 1
+                    sent_symbols_this_run.add(symbol)
+                    sent_cache[symbol] = time.time()
+                    last_candle_cache[symbol] = candidate["candle_time"]
+                    last_candle_cache_meta[symbol] = time.time()
+                    last_global_send_ts = time.time()
+                    message_id = str(((sent_data.get("result") or {}).get("message_id")) or "")
+                    alert_snapshot = {
+                        "alert_id": candidate["alert_id"],
+                        "symbol": symbol,
+                        "mode": current_mode,
+                        "market_mode": current_mode,
+                        "timeframe": TIMEFRAME,
+                        "market_entry": candidate.get("market_entry", candidate["entry"]),
+                        "entry": candidate["entry"],
+                        "recommended_entry": candidate.get("recommended_entry", candidate["entry"]),
+                        "pullback_entry": candidate.get("pullback_entry"),
+                        "entry_mode": candidate.get("entry_mode", "market"),
+                        "pullback_triggered": candidate.get("pullback_triggered", candidate.get("entry_mode") == "market"),
+                        "sl": candidate["sl"],
+                        "tp1": candidate["tp1"],
+                        "tp2": candidate["tp2"],
+                        "rr1": candidate["rr1"],
+                        "rr2": candidate["rr2"],
+                        "score": candidate["score"],
+                        "candle_time": candidate["candle_time"],
+                        "created_ts": int(time.time()),
+                        "market_state": market_state,
+                        "alt_mode": alt_mode,
+                        "btc_mode": btc_mode,
+                        "entry_timing": candidate["entry_timing"],
+                        "opportunity_type": candidate["opportunity_type"],
+                        "early_priority": candidate["early_priority"],
+                        "is_reverse": candidate["is_reverse"],
+                        "setup_type": candidate["setup_type"],
+                        "above_upper_bb": candidate["above_upper_bb"],
+                        "change_4h": candidate["change_4h"],
+                        "late_pump_risk": candidate["late_guard"].get("late_pump_risk", False),
+                        "bull_continuation_risk": candidate["late_guard"].get("bull_continuation_risk", False),
+                        "rsi_now": candidate["rsi_now"],
+                        "dist_ma": candidate["dist_ma"],
+                        "vol_ratio": candidate["vol_ratio"],
+                        "pullback_low": candidate["pullback_low"],
+                        "pullback_high": candidate["pullback_high"],
+                        "has_pullback_plan": candidate["has_pullback_plan"],
+                        "market_guard_active": bool(market_guard.get("active", False)),
+                        "market_guard_level": market_guard.get("level", "normal"),
+                        "market_red_ratio_15m": market_guard.get("red_ratio_15m", 0.0),
+                        "market_avg_change_15m": market_guard.get("avg_change_15m", 0.0),
+                        "btc_change_15m": market_guard.get("btc_change_15m", 0.0),
+                        "vwap_distance": candidate["vwap_distance"],
+                        "rsi_slope": candidate["rsi_slope"],
+                        "macd_hist": candidate["macd_hist"],
+                        "macd_hist_slope": candidate["macd_hist_slope"],
+                        "upper_wick_ratio": candidate["upper_wick_ratio"],
+                        "retest_required": False,
+                        "late_breakout_guard_reason": candidate["late_breakout_guard_reason"],
+                        "fib_position": candidate.get("fib_position", "unknown"),
+                        "fib_position_ratio": candidate.get("fib_position_ratio", 0.0),
+                        "fib_label": candidate.get("fib_label", "غير معروف"),
+                        "had_pullback": candidate.get("had_pullback", False),
+                        "pullback_pct": candidate.get("pullback_pct", 0.0),
+                        "pullback_label": candidate.get("pullback_label", "غير معروف"),
+                        "wave_estimate": candidate.get("wave_estimate", 0),
+                        "wave_peaks": candidate.get("wave_peaks", 0),
+                        "wave_label": candidate.get("wave_label", "غير معروف"),
+                        "entry_maturity": candidate.get("entry_maturity", "unknown"),
+                        "maturity_penalty": candidate.get("maturity_penalty", 0.0),
+                        "maturity_bonus": candidate.get("maturity_bonus", 0.0),
+                        "final_threshold": candidate["final_threshold"],
+                        "adjustments_log": candidate["adjustments_log"],
+                        "warning_penalty": candidate["warning_penalty"],
+                        "warning_penalty_details": candidate["warning_penalty_details"],
+                        "falling_knife_risk": candidate["falling_knife_risk"],
+                        "falling_knife_reasons": candidate["falling_knife_reasons"],
+                        "target_method": candidate["target_method"],
+                        "nearest_resistance": candidate["nearest_resistance"],
+                        "nearest_support": candidate["nearest_support"],
+                        "resistance_warning": candidate["resistance_warning"],
+                        "support_warning": candidate["support_warning"],
+                        "target_notes": candidate["target_notes"],
+                        "sl_method": candidate["sl_method"],
+                        "sl_notes": candidate["sl_notes"],
+                        "wave_context": candidate["wave_context"],
+                        "setup_context": candidate["setup_context"],
+                        "reversal_quality": candidate["reversal_quality"],
+                        "reversal_structure_confirmed": candidate["reversal_structure_confirmed"],
+                        "strong_bull_pullback": candidate["strong_bull_pullback"],
+                        "strong_breakout_exception": candidate["strong_breakout_exception"],
+                        "htf_1h_context": candidate["htf_1h_context"],
+                        "htf_4h_context": candidate["htf_4h_context"],
+                        "has_extra_strong_setup": candidate["has_extra_strong_setup"],
+                        "extra_setup_names": candidate["extra_setup_names"],
+                        "extra_setup_bonus": candidate["extra_setup_bonus"],
+                        "primary_extra_setup": candidate["primary_extra_setup"],
+                        "extra_setups_details": candidate.get("extra_setups_details", {}),
+                        "context_setups": candidate.get("context_setups", []),
+                        "tp1_close_pct": TP1_CLOSE_PCT,
+                        "tp2_close_pct": TP2_CLOSE_PCT,
+                        "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                        "execution_entry": candidate.get("execution_entry"),
+                        "execution_sl": candidate.get("execution_sl"),
+                        "execution_tp1": candidate.get("execution_tp1"),
+                        "execution_tp2": candidate.get("execution_tp2"),
+                        "block_exception": candidate.get("block_exception", False),
+                        "relative_strength_short": candidate.get("relative_strength_short"),
+                        "relative_strength_24": candidate.get("relative_strength_24"),
+                        "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
+                    }
+                    save_alert_snapshot(alert_snapshot, message_id=message_id)
+                    candidate_alert_id = candidate["alert_id"]
+                    register_ok = register_trade_from_candidate(candidate)
+                    set_alert_registration_status(candidate_alert_id, register_ok)
+                    if not register_ok:
+                        logger.error(
+                            f"REGISTRATION FAILED after send: symbol={symbol}, "
+                            f"alert_id={candidate_alert_id}, setup={candidate['setup_type']}, "
+                            f"mode={current_mode}, entry={candidate.get('entry')}, "
+                            f"sl={candidate.get('sl')}, tp1={candidate.get('tp1')}, "
+                            f"tp2={candidate.get('tp2')}"
+                        )
+
+                    try:
+                        if is_execution_paused():
+                            logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
+                        elif EXECUTION_AVAILABLE:
+                            exec_result = process_trade_candidate(r, symbol, candidate)
+                            status = exec_result.get("status")
+                            if status in ("accepted_preview", "pending_pullback_preview"):
+                                execution_message = exec_result.get("execution_message")
+                                if execution_message:
+                                    send_result = send_telegram_message(execution_message)
+                                    if not send_result.get("ok"):
+                                        logger.warning(
+                                            f"⚠️ Execution message HTML failed | status={status} | symbol={symbol} | "
+                                            f"error={send_result.get('description') or send_result}"
+                                        )
+                                        plain_result = send_telegram_message_plain(execution_message)
+                                        if plain_result.get("ok"):
+                                            logger.info(
+                                                f"✅ Execution message sent as plain text | status={status} | symbol={symbol}"
+                                            )
+                                        else:
+                                            logger.error(
+                                                f"❌ Execution message failed completely | status={status} | symbol={symbol} | "
+                                                f"error={plain_result.get('description') or plain_result}"
+                                            )
+                                    else:
+                                        logger.info(
+                                            f"✅ Execution message sent | status={status} | symbol={symbol}"
+                                        )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ Execution status matched but no execution_message | "
+                                        f"status={status} | symbol={symbol}"
+                                    )
+                                logger.info(f"EXEC {status}: {symbol}")
+                            else:
+                                logger.info(
+                                    f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
+                                )
+                    except Exception as _exec_e:
+                        logger.error(f"Execution preview error for {symbol}: {_exec_e}")
+                    logger.info(f"✅ SENT LONG ---> {symbol}")
+                else:
+                    release_signal_slot(symbol, candidate["candle_time"], "long")
+                    logger.error(f"❌ FAILED SEND ---> {symbol}")
+            if sent_count > 0:
+                set_global_cooldown()
+                logger.info(f"Global long cooldown set for {GLOBAL_COOLDOWN_SECONDS}s after {sent_count} alert(s)")
+            logger.info(f"Sent long alerts this run: {sent_count}")
+            logger.info(f"Tested {tested} pairs")
+            logger.info(f"Scan complete. Sleeping {SCAN_LOOP_SLEEP_SECONDS}s before next run...")
+            time.sleep(SCAN_LOOP_SLEEP_SECONDS)
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            time.sleep(10)
+        finally:
+            if scan_locked:
+                release_scan_lock()
+
+def run():
+    logger.info(
+        f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
+    )
+    clear_webhook()
+    clear_stale_scan_locks_on_startup()
+    command_thread = threading.Thread(target=run_command_poller, daemon=True)
+    command_thread.start()
+    run_scanner_loop()
+
+if __name__ == "__main__":
+    run()
