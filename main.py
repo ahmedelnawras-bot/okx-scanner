@@ -29,7 +29,8 @@ from tracking.performance import (
  format_period_summary, 
  get_setup_type_stats, 
  get_open_trades_summary, 
- format_open_trades_message, 
+ format_open_trades_message,
+ build_trade_summary_from_trades, 
 ) 
 from analysis.rejection_tracking import (
     log_rejected_candidate,
@@ -1630,15 +1631,24 @@ def build_deep_report_message() -> str:
 def build_help_message() -> str:
  return """<b>😋 OKX Scanner Bot - LONG</b>
 
-<b>⚡ أوامر سريعة:</b>
-/mood - حالة السوق والمود الحالي
-/status - نفس أمر /mood
-/open_trades - الصفقات المفتوحة وملخص سريع
-/report_1h - تقرير آخر ساعة
-/report_today - تقرير اليوم
-/report_7d - تقرير آخر 7 أيام
-/report_30d - تقرير آخر 30 يوم
-/report_all - كل الصفقات
+<b>⚡ أوامر سريعة وواضحة:</b>
+/mood - حالة السوق الحالية والمود
+/status - نفس /mood
+/open_trades - الصفقات المفتوحة والتراكنج الحالي
+
+<b>📊 تقارير كل الصفقات:</b>
+/report_1h - تقرير كل الصفقات آخر ساعة
+/report_today - تقرير كل الصفقات اليوم
+/report_7d - تقرير كل الصفقات آخر 7 أيام
+/report_30d - تقرير كل الصفقات آخر 30 يوم
+/report_all - تقرير كل الصفقات من البداية
+
+<b>🚀 تقارير الصفقات المرشحة للتنفيذ فقط:</b>
+/report_candidates - تقرير المرشحين من البداية
+/report_candidates_today - تقرير المرشحين اليوم
+/report_candidates_7d - تقرير المرشحين آخر 7 أيام
+/report_candidates_30d - تقرير المرشحين آخر 30 يوم
+/report_execution - نفس /report_candidates
 
 <b>⚙️ التنفيذ:</b>
 /exec_status - اختبار اتصال OKX API
@@ -1646,50 +1656,24 @@ def build_help_message() -> str:
 /stop_trading - إيقاف الدخول في صفقات جديدة فقط
 /resume_trading - إعادة السماح بالدخول في صفقات جديدة
 
-<b>📊 تحليل الأداء:</b>
-/report_deep - تحليل متقدم شامل
+<b>🧠 تشخيص وتحليل:</b>
 /report_exits - جودة الخروج TP1/TP2/SL
-/report_execution - صفقات مرشحة للتنفيذ فقط
 /report_rejections - تحليل أسباب رفض الفرص
-/report_setups - أفضل وأسوأ أنواع الإشارات
+/report_setups - أداء أنواع الإشارات
 /report_scores - تحليل السكور
 /report_market - الأداء حسب حالة السوق
 /report_losses - تحليل أسباب الخسارة
 /report_diagnostics - تقرير تشخيصي كامل
+/report_deep - تحليل متقدم شامل
 
 <b>🛠 إدارة:</b>
-/reset_stats - تصفير إحصائيات اللونج (soft)
-/hard_reset - مسح كامل لبيانات اللونج فقط (للمدراء فقط)
+/reset_stats - تصفير إحصائيات اللونج soft
+/hard_reset - مسح كامل لبيانات اللونج للمدراء فقط
 /stats_since_reset - الأداء منذ آخر تصفير
 /how_it_work - شرح طريقة عمل البوت
+"""
 
-<b>ℹ️ ملاحظة:</b>
-البوت يستخدم Entry Maturity لتقليل الدخول المتأخر في نهاية الموجة."""
 
-def build_how_it_work_message() -> str:
- return """📘 <b>كيف يعمل بوت اللونج؟</b>
-
-🧠 <b>فكرة البوت:</b>
-البوت يبحث عن فرص <b>Long Futures</b> على OKX - بفترة متوازنة حتى لا يخنق الإشارات الجيدة.
-
-🔍 <b>منطق العمل:</b>
-1. اختيار العملات الأعلى سيولة وحجم تداول
-2. تحليل فريم 15m
-3. قياس قوة الزخم الصاعد
-4. تقييم:
-• الفوليوم
-• RSI
-• موقع السعر من المتوسط
-• Breakout / Pre-Breakout
-• تأكيد فريم 1H
-• حالة السوق العامة
-• Entry Maturity (موجات وبولباك)
-5. Smart Early Priority للإشارات المبكرة
-6. إعطاء Score من 10
-7. إرسال فقط الفرص المقبولة نهائيًا
-
-📈 <b>Track:</b>
-يعرض الحقًا أداء الصفقة بعد إرسالها"""
 
 def reset_stats(chat_id: str):
  if not r:
@@ -2666,34 +2650,84 @@ def is_execution_candidate_trade(trade: dict) -> bool:
         return False
 
 
-def build_execution_report_message() -> str:
+def _candidate_report_period_filter(trades: list, period: str) -> list:
+    period = str(period or "all").strip().lower()
+    now_ts = int(time.time())
+    if period == "1h":
+        since_ts = now_ts - 3600
+    elif period == "today":
+        since_ts = get_local_day_start_ts()
+    elif period in ("7d", "week"):
+        since_ts = now_ts - 7 * 24 * 3600
+    elif period in ("30d", "month"):
+        since_ts = now_ts - 30 * 24 * 3600
+    else:
+        since_ts = None
+    if since_ts is None:
+        return trades or []
+    out = []
+    for trade in trades or []:
+        try:
+            created_at = int(float(trade.get("created_at") or trade.get("candle_time") or 0))
+            if created_at >= since_ts:
+                out.append(trade)
+        except Exception:
+            continue
+    return out
+
+
+def _format_execution_candidate_details(trades: list, max_items: int = 8) -> str:
+    if not trades:
+        return ""
+    lines = ["", "🚀 <b>آخر الصفقات المرشحة للتنفيذ</b>"]
+    for trade in sorted(trades, key=lambda t: int(float(t.get("created_at") or 0)), reverse=True)[:max_items]:
+        plan = _execution_plan_for_trade(trade)
+        symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+        status = html.escape(str(trade.get("status", "?") or "?"))
+        result = html.escape(str(trade.get("result", "") or ""))
+        setup_type = html.escape(str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or ""))
+        entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
+        score = _trade_field(trade, "score", "N/A")
+        lines.extend([
+            f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''} | score={score}",
+            f"  setup: {setup_type}",
+            f"  entry_mode: {entry_mode}",
+            f"  exec: entry={plan.get('entry', 'N/A')} | SL={plan.get('sl', 'N/A')} | TP1={plan.get('tp1', 'N/A')} | TP2={plan.get('tp2', 'N/A')}",
+        ])
+    return "\n".join(lines)
+
+
+def build_execution_candidates_report_message(period: str = "all") -> str:
     try:
-        trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
-        if not trades:
-            return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
-        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
-        for trade in trades[:12]:
-            plan = _execution_plan_for_trade(trade)
-            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-            status = html.escape(str(trade.get("status", "?") or "?"))
-            result = html.escape(str(trade.get("result", "") or ""))
-            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
-            entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
-            score = _trade_field(trade, "score", "N/A")
-            lines.extend([
-                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
-                f"  setup: {setup_type}",
-                f"  score: {score} | entry_mode: {entry_mode}",
-                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
-                f"  execution: entry={plan.get('entry', 'N/A')} | sl={plan.get('sl', 'N/A')} | tp1={plan.get('tp1', 'N/A')} | tp2={plan.get('tp2', 'N/A')}",
-                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
-                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
-                "",
-            ])
-        return _limit_telegram_message("\n".join(lines))
+        all_candidates = [
+            t for t in _load_long_trades_from_redis(limit=1500)
+            if is_execution_candidate_trade(t)
+        ]
+        candidates = _candidate_report_period_filter(all_candidates, period)
+        if not candidates:
+            return "📭 لا توجد صفقات مرشحة للتنفيذ في هذه الفترة."
+
+        title_map = {
+            "1h": "Execution Candidates Report - Last 1H",
+            "today": "Execution Candidates Report - Today",
+            "7d": "Execution Candidates Report - Last 7 Days",
+            "30d": "Execution Candidates Report - Last 30 Days",
+            "month": "Execution Candidates Report - Last 30 Days",
+            "all": "Execution Candidates Report - All Time",
+        }
+        title = title_map.get(str(period or "all").lower(), "Execution Candidates Report")
+        summary = build_trade_summary_from_trades(candidates, market_type="futures", side="long")
+        report = format_period_summary(f"🚀 {title}", summary)
+        details = _format_execution_candidate_details(candidates, max_items=8)
+        return _limit_telegram_message(report + details)
     except Exception as e:
-        logger.error(f"build_execution_report_message error: {e}", exc_info=True)
-        return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
+        logger.error(f"build_execution_candidates_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير الصفقات المرشحة: {html.escape(str(e))}"
+
+
+def build_execution_report_message() -> str:
+    # Backward-compatible alias: full all-time candidate report.
+    return build_execution_candidates_report_message("all")
 
 
 def build_setup_performance_report_message() -> str:
@@ -2940,7 +2974,11 @@ COMMAND_HANDLERS = {
  "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
  "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
- "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message()),
+ "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("all")),
+ "/report_candidates": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("all")),
+ "/report_candidates_today": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("today")),
+ "/report_candidates_7d": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("7d")),
+ "/report_candidates_30d": lambda chat_id: send_telegram_reply(chat_id, build_execution_candidates_report_message("30d")),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -6972,12 +7010,14 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         block = True
         reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
     elif MARKET_GUARD_ALT_WEAK_BLOCK and "ضعيف" in alt_mode_str:
-        if "صاعد" in btc_mode:
-            alt_weak_cautious = True
-            reason = f"alt_weak & btc_up -> STRONG_LONG_ONLY (cautious)"
-        else:
+        # ضعف الألتات وحده لا يكفي للـ BLOCK إذا لم يكن هناك هبوط جماعي واضح.
+        # السوق المختلط/السيولة الانتقائية يجب أن يتحول إلى STRONG_LONG_ONLY بدل منع كامل.
+        if red_ratio >= 0.70 and avg_change <= -0.80 and btc_change <= -0.25:
             block = True
-            reason = f"alt_weak & red_ratio={red_ratio:.2f} and btc not up"
+            reason = f"alt_weak_severe & red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f} & btc_change={btc_change:.2f}"
+        else:
+            alt_weak_cautious = True
+            reason = f"alt_weak/mixed -> STRONG_LONG_ONLY | red_ratio={red_ratio:.2f} | btc_change={btc_change:.2f}"
     return {
         "active": True,
         "block_longs": bool(block),
@@ -7108,9 +7148,9 @@ def determine_long_market_mode(
         crash_reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
     elif alt_weak_cautious:
         pass  # will be handled below as STRONG_LONG_ONLY
-    elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
+    elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.72 and avg_change <= -0.80 and btc_change <= -0.25:
         crash_triggered = True
-        crash_reason = f"alt_weak & red_ratio={red_ratio:.2f}"
+        crash_reason = f"alt_weak_severe & red_ratio={red_ratio:.2f} & avg_change={avg_change:.2f} & btc_change={btc_change:.2f}"
  if crash_triggered:
     if allow_state_writes and r:
         try:
@@ -7127,7 +7167,7 @@ def determine_long_market_mode(
             r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
         except Exception:
             pass
-    return {"mode": MODE_STRONG_LONG_ONLY, "reason": "alt ضعيف + BTC صاعد → وضع حذر (إشارات قوية فقط)"}
+    return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق مختلط/الألتات ضعيفة بدون كراش واضح → إشارات قوية فقط"}
 
  if current_mode == MODE_BLOCK_LONGS:
     if now_ts - last_recovery_check_ts >= RECOVERY_CHECK_INTERVAL:
@@ -7357,6 +7397,10 @@ HEAVY_TELEGRAM_COMMANDS = {
     "/report_deep",
     "/report_setups",
     "/report_execution",
+    "/report_candidates",
+    "/report_candidates_today",
+    "/report_candidates_7d",
+    "/report_candidates_30d",
     "/report_scores",
     "/report_market",
     "/report_losses",
