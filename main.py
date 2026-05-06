@@ -3502,24 +3502,44 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
         protected_exit = bool(trade.get("protected_breakeven_exit", False))
 
-        if result == "loss":
-            phase_line = "🔴 الصفقة مغلقة | SL"
-        elif result == "breakeven" or protected_exit:
-            phase_line = "⚪ الصفقة مغلقة | خروج على Entry"
-        elif result == "trailing_win":
-            phase_line = "🔄 الصفقة مغلقة | Trailing 20%"
-        elif result == "tp2_win":
-            phase_line = "🏁 TP2 تحقق | الصفقة مغلقة"
-        elif result == "tp1_win":
-            phase_line = "🎯 TP1 تحقق | الصفقة مغلقة"
-        elif trailing_active:
-            phase_line = "🔄 Trailing مفعل | يتبقى 20%"
-        elif tp2_hit:
-            phase_line = "🏁 TP2 تحقق | يتبقى 20% Trailing"
-        elif tp1_hit:
-            phase_line = "🎯 TP1 تحقق | 40% اتقفل | SL Entry"
+        entry_for_state = _safe_float(
+            trade.get("effective_entry")
+            or trade.get("execution_entry")
+            or trade.get("recommended_entry")
+            or trade.get("pullback_entry")
+            or trade.get("entry"),
+            0.0,
+        )
+        price_for_state = _safe_float(current_price, 0.0)
+        if entry_for_state > 0 and price_for_state > 0:
+            move_from_entry = ((price_for_state - entry_for_state) / entry_for_state) * 100.0
+            if abs(move_from_entry) <= 0.05:
+                price_state_line = "⚪ حول سعر الدخول"
+            elif move_from_entry > 0:
+                price_state_line = "🟢 فوق سعر الدخول"
+            else:
+                price_state_line = "🔴 تحت سعر الدخول"
         else:
-            phase_line = "🟢 الصفقة نشطة | قبل TP1"
+            price_state_line = "⚪ غير محددة"
+
+        if result == "loss":
+            phase_line = "مغلقة على SL"
+        elif result == "breakeven" or protected_exit:
+            phase_line = "مغلقة | خروج على Entry"
+        elif result == "trailing_win":
+            phase_line = "مغلقة | Trailing 20%"
+        elif result == "tp2_win":
+            phase_line = "TP2 تحقق | الصفقة مغلقة"
+        elif result == "tp1_win":
+            phase_line = "TP1 تحقق | الصفقة مغلقة"
+        elif trailing_active:
+            phase_line = "Trailing مفعل | يتبقى 20%"
+        elif tp2_hit:
+            phase_line = "بعد TP2 | يتبقى 20% Trailing"
+        elif tp1_hit:
+            phase_line = "بعد TP1 | 40% اتقفل | SL Entry"
+        else:
+            phase_line = "قبل TP1"
 
         tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
         tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
@@ -3540,7 +3560,7 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         elif sl_moved_to_entry:
             sl_text = "🔒 على Entry"
         else:
-            sl_text = "🟢 سليم"
+            sl_text = "لم يتفعل"
 
         if lifecycle_pnl.get("available"):
             raw = _safe_float(lifecycle_pnl.get("raw_pct"), 0.0)
@@ -3553,12 +3573,12 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
 
         return (
             f"{title}\n"
-            f"• الحالة: {phase_line}\n"
+            f"• حالة الصفقة: {price_state_line}\n"
+            f"• المرحلة: {phase_line}\n"
             f"• 🎯 TP1: {tp1_text}\n"
             f"• 🏁 TP2: {tp2_text}\n"
             f"• 🔄 20%: {trailing_text}\n"
-            f"• 🛑 SL: {sl_text}\n"
-            f"• 💵 السعر الحالي: {_fmt_price(current_price)}\n"
+            f"• 🛡️ وقف الخسارة: {sl_text}\n"
             f"💰 الربح الفعلي: {pnl_line}\n"
             f"⚡ بعد الرافعة: {lev_line}"
         )
@@ -3647,12 +3667,12 @@ def build_track_message(alert: dict) -> str:
         f"{status_line}\n"
         f"{recovery_extra}\n"
         f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
-        f"{format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
     )
     if entry_mode == "pullback_pending" and not pullback_triggered:
         msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
     msg += (
         f"💰 Signal Entry: {entry:.6f}\n"
+        f"💵 السعر الحالي: {_fmt_price(current_price)}\n"
     )
     if entry_mode == "pullback_pending" and market_entry > 0:
         msg += f"💵 سعر السوق عند الإرسال: {market_entry:.6f}\n"
@@ -3660,6 +3680,7 @@ def build_track_message(alert: dict) -> str:
         msg += f"📌 Recommended Entry: {recommended_entry:.6f}\n"
     if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
         msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
+    msg += f"{format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
     msg += (
         f"🛑 SL: {sl:.6f}\n"
         f"🎯 TP1: {tp1:.6f} | إغلاق 40%\n"
