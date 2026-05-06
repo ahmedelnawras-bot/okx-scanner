@@ -3784,33 +3784,40 @@ def _format_open_trade_lifecycle_pnl_block(t: dict) -> List[str]:
     if phase == "pending_pullback":
         return [
             "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
-            "   • الحالة: ⏳ Pending Pullback — لم يتفعل الدخول",
+            "   • حالة الصفقة: ⏳ Pending Pullback — لم يتفعل الدخول",
             "   💰 الربح الفعلي: —",
             "   ⚡ بعد الرافعة: —",
         ]
 
-    if trailing_active:
-        state = "🔄 Trailing مفعل | يتبقى 20%"
-    elif tp2_hit:
-        state = "🏁 TP2 تحقق | يتبقى 20% Trailing"
-    elif tp1_hit:
-        state = "🎯 TP1 تحقق | 40% اتقفل | SL Entry"
+    if cur_pnl > 0.05:
+        price_state = "🟢 فوق سعر الدخول"
+    elif cur_pnl < -0.05:
+        price_state = "🔴 تحت سعر الدخول"
     else:
-        state = "🟢 الصفقة نشطة | قبل TP1"
+        price_state = "⚪ حول سعر الدخول"
+
+    if trailing_active:
+        stage = "Trailing مفعل | يتبقى 20%"
+    elif tp2_hit:
+        stage = "بعد TP2 | يتبقى 20% Trailing"
+    elif tp1_hit:
+        stage = "بعد TP1 | 40% اتقفل | SL Entry"
+    else:
+        stage = "قبل TP1"
 
     tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
     tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
     trailing_text = "🔄 شغال" if trailing_active else ("🔄 بدأ" if tp2_hit else "⏳ لم يبدأ")
-    sl_text = "🔒 على Entry" if sl_is_entry else "🟢 سليم"
+    sl_text = "🔒 على Entry" if sl_is_entry else "لم يتفعل"
 
     return [
         "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
-        f"   • الحالة: {state}",
+        f"   • حالة الصفقة: {price_state}",
+        f"   • المرحلة: {stage}",
         f"   • 🎯 TP1: {tp1_text}",
         f"   • 🏁 TP2: {tp2_text}",
         f"   • 🔄 20%: {trailing_text}",
-        f"   • 🛑 SL: {sl_text}",
-        f"   • السعر الحالي: <code>{_fmt_price_perf(current_price)}</code>",
+        f"   • 🛡️ وقف الخسارة: {sl_text}",
         f"   💰 الربح الفعلي: <code>{w_pnl:+.2f}%</code>",
         f"   ⚡ بعد الرافعة: <code>{w_lev:+.1f}%</code>",
         f"   📈 حركة السعر الحالية: <code>{cur_pnl:+.2f}%</code> | بعد الرافعة: <code>{cur_lev:+.1f}%</code>",
@@ -3873,12 +3880,12 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | ⏱ {age}")
         lines.append(f"   {phase_line}")
 
-        # ── الربح الفعلي 40/40/20 يظهر مبكرًا وبوضوح ─────────────
+        # ── أسعار الدخول ثم الربح الفعلي 40/40/20 بوضوح ─────────
+        lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
+        lines.append(f"   💵 السعر الحالي: {_fmt_price_perf(current_price)}")
         lines.extend(_format_open_trade_lifecycle_pnl_block(t))
         
-        # ── أسعار الدخول والـ SL ────────────────────────────────
-        lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
-
+        # ── الـ SL ───────────────────────────────────────────────
         if sl_is_entry:
             lines.append(f"   🔒 SL: محمي على Entry ({_fmt_price_perf(sl)})")
         else:
