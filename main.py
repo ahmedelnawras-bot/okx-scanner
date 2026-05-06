@@ -65,12 +65,6 @@ try:
 except Exception: 
  analyze_entry_maturity = None
 
-# استيراد calc_trade_result_pct على مستوى الموديول (تجنب inline import داخل دوال متكررة)
-try:
-    from tracking.summary_helpers import calc_trade_result_pct as _summary_calc_trade_result_pct
-except ImportError:
-    _summary_calc_trade_result_pct = None
-
 # =====================
 # LOGGING
 # =====================
@@ -228,41 +222,6 @@ STRONG_ONLY_ALLOWED_SETUPS = {
 STRONG_ONLY_MIN_SCORE = 8.0
 STRONG_ONLY_MIN_VOL_RATIO = 1.2
 
-# Setups that are allowed to pass some guards as warnings/penalties instead of hard blocks.
-# This applies only to execution-quality contexts and does NOT open the gate for weak/random signals.
-RELAXED_EXECUTION_SETUPS = {
-    "vwap_reclaim",
-    "retest_breakout_confirmed",
-    "wave_3",
-    "relative_strength_vs_btc",
-    "higher_low_continuation",
-    "liquidity_sweep_reclaim",
-    "support_bounce_confirmed",
-}
-
-def is_relaxed_execution_setup(
-    setup_type: str = "",
-    extra_setup_names=None,
-    primary_extra_setup: str = "",
-    mtf_confirmed: bool = False,
-    vol_ratio: float = 0.0,
-    score: float = 0.0,
-) -> bool:
-    try:
-        parts = []
-        if setup_type:
-            parts.append(str(setup_type))
-        if primary_extra_setup:
-            parts.append(str(primary_extra_setup))
-        if extra_setup_names:
-            parts.extend([str(x) for x in extra_setup_names if x])
-        blob = "|".join(parts)
-        has_setup = any(s in blob for s in RELAXED_EXECUTION_SETUPS)
-        # Keep this conservative: a strong setup also needs either MTF, volume, or score support.
-        return bool(has_setup and (mtf_confirmed or float(vol_ratio or 0) >= 1.35 or float(score or 0) >= 7.5))
-    except Exception:
-        return False
-
 MODE_TRANSITION_MIN_INTERVAL = 240
 RECOVERY_CHECK_INTERVAL = 120
 NORMAL_CANDIDATE_DURATION = 180
@@ -336,6 +295,27 @@ last_global_send_ts = 0.0
 _local_news_cache = {"created_ts": 0, "events": []}
 _last_scan_skip_log_ts = 0.0
 
+# Telegram command responsiveness: run heavy command handlers away from the polling loop.
+COMMAND_EXECUTOR = ThreadPoolExecutor(max_workers=3)
+ASYNC_TELEGRAM_COMMANDS = {
+    "/open_trades",
+    "/report_1h",
+    "/report_today",
+    "/report_7d",
+    "/report_30d",
+    "/report_month",
+    "/report_all",
+    "/report_deep",
+    "/report_exits",
+    "/report_execution",
+    "/report_rejections",
+    "/report_setups",
+    "/report_scores",
+    "/report_market",
+    "/report_losses",
+    "/report_diagnostics",
+}
+
 
 def clean_symbol_for_message(symbol: str) -> str:
  return symbol.replace("-SWAP", "")
@@ -408,42 +388,11 @@ def release_signal_slot(symbol: str, candle_time: int, signal_type: str = "long"
  except Exception as e:
     logger.error(f"Redis release error: {e}")
 
-def clear_stale_scan_locks_on_startup() -> None:
- if not r:
-    return
- try:
-    # Clean legacy lock name from older versions if it exists.
-    try:
-        if r.delete("scan:running"):
-            logger.info("🧹 Cleared legacy stale scan lock: scan:running")
-    except Exception:
-        pass
-
-    # Current lock should always have TTL. If it has no expiry, it is stale/dead.
-    ttl = r.ttl(SCAN_LOCK_KEY)
-    if ttl == -1:
-        r.delete(SCAN_LOCK_KEY)
-        logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
-    elif ttl and ttl > 0:
-        logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
- except Exception as e:
-    logger.warning(f"Failed to clear stale scan locks on startup: {e}")
-
-def get_scan_lock_ttl() -> int:
- if not r:
-    return 0
- try:
-    ttl = r.ttl(SCAN_LOCK_KEY)
-    return int(ttl or 0)
- except Exception:
-    return 0
-
 def acquire_scan_lock() -> bool:
  if not r:
     return True
  try:
-    # Always set an expiry so a crash/redeploy cannot leave a permanent dead lock.
-    locked = r.set(SCAN_LOCK_KEY, str(os.getpid()), ex=SCAN_LOCK_TTL, nx=True)
+    locked = r.set(SCAN_LOCK_KEY, "1", ex=SCAN_LOCK_TTL, nx=True)
     return bool(locked)
  except Exception as e:
     logger.error(f"Scan lock acquire error: {e}")
@@ -1430,84 +1379,46 @@ def answer_callback_query(callback_query_id: str, text: str = " ") -> None:
     payload["text"] = text
  telegram_api_call("answerCallbackQuery", payload)
 
-def _telegram_chunks(message: str, limit: int = 3900) -> list:
-    """Split long Telegram messages safely so reports do not fail with 400 message too long."""
-    text = str(message or "")
-    if len(text) <= limit:
-        return [text]
-    chunks = []
-    current = ""
-    for line in text.splitlines(True):
-        if len(line) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            for i in range(0, len(line), limit):
-                chunks.append(line[i:i + limit])
-            continue
-        if len(current) + len(line) > limit:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-    if current:
-        chunks.append(current)
-    return chunks or [""]
-
-
-def _send_telegram_payload(chat_id: str, text: str, reply_markup=None, use_html: bool = True) -> dict:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    if use_html:
-        payload["parse_mode"] = "HTML"
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return telegram_api_call("sendMessage", payload)
-
-
 def send_telegram_message(message: str, reply_markup=None) -> dict:
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.error("❌ Telegram config missing")
-        return {"ok": False}
-    last = {"ok": True}
-    chunks = _telegram_chunks(message)
-    for i, chunk in enumerate(chunks):
-        rm = reply_markup if i == 0 else None
-        data = _send_telegram_payload(CHAT_ID, chunk, reply_markup=rm, use_html=True)
-        if not data.get("ok"):
-            logger.warning(f"Telegram HTML send failed, retrying plain text: {data.get('description') or data.get('error')}")
-            data = _send_telegram_payload(CHAT_ID, chunk, reply_markup=rm, use_html=False)
-        last = data
-    return last
+ if not BOT_TOKEN or not CHAT_ID:
+    logger.error("❌ Telegram config missing")
+    return {"ok": False}
+ payload = {
+    "chat_id": CHAT_ID,
+    "text": message,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True,
+ }
+ if reply_markup:
+    payload["reply_markup"] = reply_markup
+ return telegram_api_call("sendMessage", payload)
 
 
 def send_telegram_message_plain(message: str, reply_markup=None) -> dict:
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.error("❌ Telegram config missing")
-        return {"ok": False}
-    last = {"ok": True}
-    chunks = _telegram_chunks(message)
-    for i, chunk in enumerate(chunks):
-        last = _send_telegram_payload(CHAT_ID, chunk, reply_markup=(reply_markup if i == 0 else None), use_html=False)
-    return last
-
+ if not BOT_TOKEN or not CHAT_ID:
+    logger.error("❌ Telegram config missing")
+    return {"ok": False}
+ payload = {
+    "chat_id": CHAT_ID,
+    "text": message,
+    "disable_web_page_preview": True,
+ }
+ if reply_markup:
+    payload["reply_markup"] = reply_markup
+ return telegram_api_call("sendMessage", payload)
 
 def send_telegram_reply(chat_id: str, message: str) -> bool:
-    if not BOT_TOKEN or not chat_id:
-        logger.error("❌ Telegram reply config missing")
-        return False
-    ok_all = True
-    chunks = _telegram_chunks(message)
-    for chunk in chunks:
-        data = _send_telegram_payload(chat_id, chunk, use_html=True)
-        if not data.get("ok"):
-            logger.warning(f"Telegram reply HTML failed, retrying plain text: {data.get('description') or data.get('error')}")
-            data = _send_telegram_payload(chat_id, chunk, use_html=False)
-        ok_all = ok_all and bool(data.get("ok"))
-    return ok_all
+ if not BOT_TOKEN or not chat_id:
+    logger.error("❌ Telegram reply config missing")
+    return False
+ payload = {
+    "chat_id": chat_id,
+    "text": message,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True,
+ }
+ data = telegram_api_call("sendMessage", payload)
+ return bool(data.get("ok"))
 
 def get_telegram_updates(offset: int = 0):
  if not BOT_TOKEN:
@@ -2023,9 +1934,8 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    if _summary_calc_trade_result_pct is None:
-        return 0.0
-    raw = _summary_calc_trade_result_pct(trade)
+    from tracking.summary_helpers import calc_trade_result_pct
+    raw = calc_trade_result_pct(trade)
     if raw is None:
         return 0.0
     return round(raw * TRACK_LEVERAGE, 4)
@@ -2576,34 +2486,122 @@ def _trade_field(trade: dict, key: str, default=None):
     return trade.get(key, diagnostics.get(key, default))
 
 
+def _execution_trade_status_label(trade: dict) -> str:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    if status == "pending_pullback":
+        return "⏳ Pending"
+    if status in ("open", "partial", "trailing", "trailing_open", "tp2_partial"):
+        if status == "partial":
+            return "🟡 TP1/Open"
+        if status in ("trailing", "trailing_open", "tp2_partial"):
+            return "🔄 Trailing"
+        return "🟢 Open"
+    if result == "tp2_win":
+        return "🏁 TP2 Win"
+    if result == "trailing_win":
+        return "🔄 Trail Win"
+    if result == "tp1_win":
+        return "✅ TP1 Win"
+    if result == "loss":
+        return "🔴 SL"
+    if result in ("breakeven", "pending_expired"):
+        return "⚪ BE/Expired"
+    if result == "expired":
+        return "⚫ Expired"
+    if trade.get("tp1_hit"):
+        return "🟡 TP1"
+    return status or result or "unknown"
+
+
+def _execution_trade_is_closed(trade: dict) -> bool:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    return status == "closed" or result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven", "expired", "pending_expired")
+
+
+def _execution_trade_is_win(trade: dict) -> bool:
+    result = str(trade.get("result", "") or "").lower()
+    return result in ("tp1_win", "tp2_win", "trailing_win") or bool(trade.get("tp1_hit") and result != "loss")
+
+
+def _execution_trade_is_loss(trade: dict) -> bool:
+    return str(trade.get("result", "") or "").lower() == "loss"
+
+
 def build_execution_report_message() -> str:
+    """Compact execution report focused on what matters: result and PnL."""
     try:
         trades = [t for t in _load_long_trades_from_redis(limit=1200) if is_execution_candidate_trade(t)]
         if not trades:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
-        lines = ["🚀 <b>Execution Candidates Report</b>", f"العدد: {len(trades)}", ""]
-        for trade in trades[:12]:
-            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-            status = html.escape(str(trade.get("status", "?") or "?"))
-            result = html.escape(str(trade.get("result", "") or ""))
-            setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
-            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or ""))
-            score = _trade_field(trade, "score", "N/A")
-            lines.extend([
-                f"• <b>{symbol}</b> | {status}{('/' + result) if result else ''}",
-                f"  setup: {setup_type}",
-                f"  score: {score} | entry_mode: {entry_mode}",
-                f"  market/recommended: {_trade_field(trade, 'market_entry', 'N/A')} / {_trade_field(trade, 'recommended_entry', 'N/A')}",
-                f"  execution: entry={_trade_field(trade, 'execution_entry', 'N/A')} | sl={_trade_field(trade, 'execution_sl', 'N/A')} | tp1={_trade_field(trade, 'execution_tp1', 'N/A')} | tp2={_trade_field(trade, 'execution_tp2', 'N/A')}",
-                f"  signal: sl={trade.get('sl', 'N/A')} | tp1={trade.get('tp1', 'N/A')} | tp2={trade.get('tp2', 'N/A')}",
-                f"  tp1_hit={trade.get('tp1_hit', False)} | tp2_hit={trade.get('tp2_hit', False)} | SL_entry={trade.get('sl_moved_to_entry', False)}",
-                "",
-            ])
+
+        closed = [t for t in trades if _execution_trade_is_closed(t)]
+        open_trades = [t for t in trades if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")]
+        pending = [t for t in trades if str(t.get("status", "") or "").lower() == "pending_pullback"]
+        wins = [t for t in closed if _execution_trade_is_win(t)]
+        losses = [t for t in closed if _execution_trade_is_loss(t)]
+        breakeven = [t for t in closed if str(t.get("result", "") or "").lower() in ("breakeven", "pending_expired")]
+
+        pnls = []
+        for t in closed:
+            try:
+                pnls.append(float(_get_trade_pnl_pct(t)))
+            except Exception:
+                pass
+        net_pnl = sum(pnls) if pnls else 0.0
+        avg_pnl = _avg(pnls) if pnls else 0.0
+        winrate = (len(wins) / len(closed) * 100.0) if closed else 0.0
+
+        best_trade = None
+        worst_trade = None
+        if closed:
+            scored = []
+            for t in closed:
+                try:
+                    scored.append((float(_get_trade_pnl_pct(t)), t))
+                except Exception:
+                    pass
+            if scored:
+                best_trade = max(scored, key=lambda x: x[0])
+                worst_trade = min(scored, key=lambda x: x[0])
+
+        lines = [
+            "🚀 <b>Execution Report - LONG</b>",
+            "",
+            f"📊 الإجمالي: {len(trades)} | مغلقة: {len(closed)} | مفتوحة: {len(open_trades)} | Pending: {len(pending)}",
+            f"✅ Wins: {len(wins)} | 🔴 Losses: {len(losses)} | ⚪ BE/Expired: {len(breakeven)}",
+            f"📈 Winrate: {winrate:.1f}%",
+            f"💰 Net PnL: {_pct_safe(net_pnl)} | Avg: {_pct_safe(avg_pnl)}",
+        ]
+
+        if best_trade:
+            lines.append(f"🏆 Best: {html.escape(clean_symbol_for_message(best_trade[1].get('symbol', '?')))} {_pct_safe(best_trade[0])}")
+        if worst_trade:
+            lines.append(f"💀 Worst: {html.escape(clean_symbol_for_message(worst_trade[1].get('symbol', '?')))} {_pct_safe(worst_trade[0])}")
+
+        lines.append("")
+        lines.append("<b>آخر 12 صفقة:</b>")
+
+        for idx, trade in enumerate(trades[:12], 1):
+            symbol = html.escape(clean_symbol_for_message(str(trade.get("symbol", "?") or "?")))
+            label = _execution_trade_status_label(trade)
+            pnl = _get_trade_pnl_pct(trade) if _execution_trade_is_closed(trade) or trade.get("tp1_hit") else None
+            pnl_txt = _pct_safe(pnl) if pnl is not None else "قيد المتابعة"
+            setup_type = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type", "") or "")
+            setup_short = html.escape(setup_type[:42])
+            entry_mode = html.escape(str(_trade_field(trade, "entry_mode", "") or "market"))
+            score = _safe_float(_trade_field(trade, "score", 0.0), 0.0)
+
+            lines.append(
+                f"{idx}) <b>{symbol}</b> | {label} | {pnl_txt}\n"
+                f"   score={score:.2f} | {entry_mode} | {setup_short}"
+            )
+
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
-
 
 def build_setup_performance_report_message() -> str:
     try:
@@ -5704,13 +5702,8 @@ SMART_TP1_RESISTANCE_BUFFER_ATR = 0.20
 SMART_TP1_NEAR_RESISTANCE_RR = 1.2
 # Ignore micro/noise resistance levels that are too close to entry.
 # These tiny levels were causing excessive near_resistance_before_tp1 rejections.
-SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.005  # 0.50% | noise/micro level, ignore completely
+SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.004  # 0.40%
 SMART_TP1_IGNORE_NEAR_ROUND_PCT = 0.005       # 0.50%
-SMART_TP1_WARNING_RESISTANCE_PCT = 0.012      # 1.20% | warning band, not automatic rejection
-SMART_TP1_HARD_REJECT_RR = 0.70               # normal setups reject only if resistance reward is clearly weak
-SMART_TP1_RELAXED_HARD_REJECT_RR = 0.35       # relaxed/strong execution setups reject only if RR is extremely poor
-SMART_TP1_HARD_REJECT_DIST_PCT = 0.008        # 0.80% normal hard reject distance
-SMART_TP1_RELAXED_HARD_REJECT_DIST_PCT = 0.004 # 0.40% relaxed hard reject distance
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
@@ -6374,22 +6367,45 @@ def build_message(
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
 
- if has_pullback_plan and market_price is not None:
-    price_line = f"🎯 <b>الدخول المخطط:</b> {fmt_num(price, 6)} | 💰 <b>السوق:</b> {fmt_num(market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+ # Unified entry / execution decision block so normal alerts and execution-candidate alerts look consistent.
+ current_market_price = market_price if market_price is not None else price
+ price_line = f"💰 <b>سعر السوق الحالي:</b> {fmt_num(current_market_price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+
+ if has_pullback_plan and pullback_low is not None and pullback_high is not None:
+    entry_decision_block = (
+        f"🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}\n"
+        f"📌 <b>قرار الدخول:</b> انتظار Pullback\n"
+        f"📥 <b>منطقة الدخول:</b> {fmt_num(pullback_low, 6)} → {fmt_num(pullback_high, 6)}\n"
+        f"🎯 <b>دخول التنفيذ المخطط:</b> {fmt_num(execution_entry if execution_entry is not None else price, 6)}\n"
+    )
  else:
-    price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
+    entry_decision_block = (
+        f"🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}\n"
+        f"📌 <b>قرار الدخول:</b> Market Entry\n"
+        f"🎯 <b>سعر الدخول المعتمد:</b> {fmt_num(price, 6)}\n"
+    )
+
+ execution_targets_block = ""
+ if has_pullback_plan:
+    if execution_sl is not None:
+        execution_targets_block += f"🛑 <b>Execution SL:</b> {fmt_num(execution_sl, 6)}\n"
+    if execution_tp1 is not None:
+        execution_targets_block += f"🎯 <b>Execution TP1:</b> {fmt_num(execution_tp1, 6)}\n"
+    if execution_tp2 is not None:
+        execution_targets_block += f"🏁 <b>Execution TP2:</b> {fmt_num(execution_tp2, 6)}\n"
+
+ setup_details_block = f"{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}"
 
  return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 {price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
-{pullback_text}
+{entry_decision_block}{execution_targets_block}{setup_details_block}
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
 🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}
 🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
@@ -6941,6 +6957,18 @@ def bootstrap_telegram_offset_once():
  finally:
     release_telegram_poll_lock()
 
+def _run_telegram_command_handler(command: str, chat_id: str, handler):
+    """Run one Telegram command safely outside the polling loop."""
+    try:
+        handler(chat_id)
+    except Exception as e:
+        logger.error(f"telegram command handler error | command={command} | chat_id={chat_id} | error={e}", exc_info=True)
+        try:
+            send_telegram_reply(chat_id, f"❌ حصل خطأ أثناء تنفيذ الأمر {html.escape(command)}\n{html.escape(str(e))}")
+        except Exception:
+            pass
+
+
 def handle_telegram_commands():
  if not acquire_telegram_poll_lock():
     return
@@ -6952,7 +6980,8 @@ def handle_telegram_commands():
         try:
             latest_offset = update["update_id"] + 1
             if update.get("callback_query"):
-                handle_callback_query(update["callback_query"])
+                # Callback tracking can fetch candles, so do not block polling.
+                COMMAND_EXECUTOR.submit(handle_callback_query, update["callback_query"])
                 continue
             message = update.get("message") or {}
             text = (message.get("text") or "").strip()
@@ -6963,9 +6992,13 @@ def handle_telegram_commands():
             command = text.split()[0].split("@")[0]
             handler = COMMAND_HANDLERS.get(command)
             if handler:
-                handler(chat_id)
+                if command in ASYNC_TELEGRAM_COMMANDS:
+                    send_telegram_reply(chat_id, f"⏳ جاري تجهيز {html.escape(command)}...")
+                    COMMAND_EXECUTOR.submit(_run_telegram_command_handler, command, chat_id, handler)
+                else:
+                    _run_telegram_command_handler(command, chat_id, handler)
         except Exception as e:
-            logger.error(f"handle_telegram_commands error: {e}")
+            logger.error(f"handle_telegram_commands error: {e}", exc_info=True)
     if latest_offset != offset:
         save_telegram_offset(latest_offset)
  finally:
@@ -7107,8 +7140,7 @@ def run_scanner_loop():
             if not scan_locked:
                 _now_ts = time.time()
                 if _now_ts - _last_scan_skip_log_ts >= 60:
-                    _lock_ttl = get_scan_lock_ttl()
-                    logger.info(f"⏳ Scan lock active, waiting... (ttl={_lock_ttl}s)")
+                    logger.debug("Another long scan is running --- skipping")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
                 continue
@@ -7594,34 +7626,6 @@ def run_scanner_loop():
                 final_threshold_min = None
                 tested += 1
                 symbol = pair_data["instId"]
-                # =========================
-                # SAFE PER-SYMBOL DEFAULTS
-                # =========================
-                # Keep these defined before any early Smart TP / relaxed-guard block.
-                # This prevents a single candidate from crashing the whole scan when a
-                # later block references a value that is only assigned on some branches.
-                setup_type = "unknown"
-                setup_type_base = "unknown"
-                setup_type_candidate = {}
-                setup_type_candidate_final = {}
-                # score_result و pre_score_adjustments_log يجب تعريفهما هنا
-                # لأن بعض البلوكات المبكرة تستخدمهما قبل calculate_long_score
-                score_result = {
-                    "score": 0.0, "reasons": [], "warning_reasons": [],
-                    "funding_label": "🟡 محايد", "signal_rating": "⚡ عادي", "fake_signal": False,
-                }
-                pre_score_adjustments_log = []
-                relative_strength = 0.0
-                relative_strength_short = 0.0
-                relative_strength_24 = 0.0
-                relative_strength_vs_btc = False
-                nearest_resistance = None
-                nearest_resistance_source = None
-                resistance_warning = ""
-                target_method = "rr"
-                target_notes = []
-                support_warning = ""
-                res_dynamic_penalty = 0.0
                 change_24h = extract_24h_change_percent(pair_data)
                 candles = candles_map.get(symbol, [])
                 if not candles:
@@ -8079,49 +8083,29 @@ def run_scanner_loop():
                     logger.info(f"{symbol} --> late breakout guard BLOCKED: {guard['reason']}")
                     continue
                 if guard["retest_required"]:
-                    relaxed_retest_allowed = is_relaxed_execution_setup(
-                        setup_type=setup_type,
-                        extra_setup_names=extra_setup_names,
-                        primary_extra_setup=primary_extra_setup,
-                        mtf_confirmed=mtf_confirmed,
+                    log_long_rejection(
+                        symbol=symbol,
+                        reason="retest_required",
+                        candle_time=candle_time,
+                        market_state=market_state,
+                        current_mode=current_mode,
+                        entry_timing=entry_timing_temp,
+                        dist_ma=dist_ma,
+                        rsi_now=rsi_now,
                         vol_ratio=vol_ratio,
-                        score=0.0,  # Score not yet computed at this stage
+                        vwap_distance=vwap_distance,
+                        mtf_confirmed=mtf_confirmed,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                        extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
+                               "has_extra_strong_setup": has_extra_strong_setup,
+                               "extra_setup_names": extra_setup_names,
+                               "primary_extra_setup": primary_extra_setup,
+                               "extra_setup_bonus": extra_setup_bonus},
                     )
-                    if not relaxed_retest_allowed:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="retest_required",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            entry_timing=entry_timing_temp,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"guard_reason": guard["reason"], "upper_wick_ratio": guard["upper_wick_ratio"],
-                                   "has_extra_strong_setup": has_extra_strong_setup,
-                                   "extra_setup_names": extra_setup_names,
-                                   "primary_extra_setup": primary_extra_setup,
-                                   "extra_setup_bonus": extra_setup_bonus},
-                        )
-                        logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
-                        continue
-                    else:
-                        logger.info(f"{symbol} --> retest required but allowed as relaxed execution setup: {guard['reason']}")
-                        if not isinstance(entry_maturity_data.get("warning_reasons"), list):
-                            entry_maturity_data["warning_reasons"] = []
-                        entry_maturity_data["warning_reasons"].append("Retest مطلوب لكن setup قوي؛ تم السماح مع تحذير")
-                        pre_score_adjustments_log = locals().get("pre_score_adjustments_log", [])
-                        pre_score_adjustments_log.append({
-                            "name": "relaxed_retest_warning_penalty",
-                            "value": -0.20,
-                            "reason": "relaxed_execution_retest_allowed",
-                        })
+                    logger.info(f"{symbol} --> retest required: {guard['reason']} (skipped direct alert)")
+                    continue
 
                 strong_bull_pullback = (
                     market_state in ("bull_market", "alt_season")
@@ -8261,24 +8245,6 @@ def run_scanner_loop():
                                 entry_maturity_data["warning_reasons"] = []
                             entry_maturity_data["warning_reasons"].append(warning_msg)
                             logger.info(f"{symbol} --> wave5 overridden: {wave5_eval['label']}, penalty={wave5_eval['penalty']}")
-                        elif is_relaxed_execution_setup(
-                            setup_type=setup_type,
-                            extra_setup_names=extra_setup_names,
-                            primary_extra_setup=primary_extra_setup,
-                            mtf_confirmed=mtf_confirmed,
-                            vol_ratio=vol_ratio,
-                            score=0.0,  # Score not yet computed at this stage
-                        ):
-                            hard_late_entry = False
-                            pre_score_adjustments_log.append({
-                                "name": "relaxed_late_entry_penalty",
-                                "value": -0.45,
-                                "reason": "late_entry_allowed_for_strong_execution_setup",
-                            })
-                            if "warning_reasons" not in entry_maturity_data:
-                                entry_maturity_data["warning_reasons"] = []
-                            entry_maturity_data["warning_reasons"].append("دخول متأخر لكن setup قوي؛ تم السماح مع خصم")
-                            logger.info(f"{symbol} --> late entry allowed as relaxed execution setup, penalty=-0.45")
                         else:
                             reason_specific = wave5_eval["label"] or classify_hard_late_rejection_reason(
                                 entry_timing=entry_timing_temp,
@@ -8811,76 +8777,21 @@ def run_scanner_loop():
                 sl_method = smart_sl.get("sl_method", "atr")
                 sl_notes = smart_sl.get("sl_notes", [])
 
-                # Default values before Smart TP / relaxed guards.
-                # مهم: تمنع UnboundLocal/free-variable errors لو أي شرط اتخطى أو smart target فشل.
-                smart_targets_early = {
-                    "tp1": calc_tp_long(entry_price_for_trade, stop_loss, rr=rr1),
-                    "tp2": calc_tp_long(entry_price_for_trade, stop_loss, rr=rr2),
-                    "target_method": "rr",
-                    "nearest_resistance": None,
-                    "nearest_resistance_source": None,
-                    "resistance_warning": "",
-                    "support_warning": "",
-                    "target_notes": [],
-                    "rr1_effective": rr1,
-                    "rr2_effective": rr2,
-                }
-                early_resistance_warning = ""
-                early_nearest_resistance = None
-                resistance_rejected = False
-                resistance_dynamic_penalty = 0.0
-                target_method = "rr"
-                target_notes = []
-                nearest_resistance = None
-                nearest_resistance_source = None
-                resistance_warning = ""
-                support_warning = ""
-
-                # Build a provisional setup_type before Smart Resistance checks.
-                # The final setup_type is rebuilt later after all final context is known.
-                try:
-                    wave_context_early_for_resistance = infer_wave_context(
-                        entry_maturity_data=entry_maturity_data,
-                        is_reverse=is_reverse,
-                        dist_ma=dist_ma,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                    )
-                    if primary_extra_setup:
-                        wave_context_early_for_resistance = primary_extra_setup
-                    setup_type_candidate = {
-                        "is_reverse": is_reverse,
-                        "breakout": breakout,
-                        "pre_breakout": pre_breakout,
-                        "mtf_confirmed": mtf_confirmed,
-                        "vol_ratio": vol_ratio,
-                        "market_state": market_state,
-                        "wave_context": wave_context_early_for_resistance,
-                    }
-                    setup_type = build_setup_type(setup_type_candidate)
-                    setup_type_base = "|".join(str(setup_type).split("|")[:4])
-                except Exception as _setup_type_early_error:
-                    logger.warning(f"setup_type early build skipped for {symbol}: {_setup_type_early_error}")
-                    setup_type = "unknown"
-                    setup_type_base = "unknown"
-
-                try:
-                    smart_targets_early = build_smart_tp1_long(
-                        df=df,
-                        entry=entry_price_for_trade,
-                        sl=stop_loss,
-                        rr1=rr1,
-                        rr2=rr2,
-                        atr_value=atr_value,
-                        market_state=market_state,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                    ) or smart_targets_early
-                except Exception as _smart_tp_build_error:
-                    logger.warning(f"smart target build error for {symbol}: {_smart_tp_build_error}")
-
+                smart_targets_early = build_smart_tp1_long(
+                    df=df,
+                    entry=entry_price_for_trade,
+                    sl=stop_loss,
+                    rr1=rr1,
+                    rr2=rr2,
+                    atr_value=atr_value,
+                    market_state=market_state,
+                    breakout=breakout,
+                    pre_breakout=pre_breakout,
+                )
                 early_resistance_warning = smart_targets_early.get("resistance_warning", "")
                 early_nearest_resistance = smart_targets_early.get("nearest_resistance", None)
+                resistance_rejected = False
+                resistance_dynamic_penalty = 0.0
 
                 try:
                     _risk_for_quality = float(entry_price_for_trade) - float(stop_loss)
@@ -8888,28 +8799,7 @@ def run_scanner_loop():
                     if _nearest_res > float(entry_price_for_trade) and _risk_for_quality > 0:
                         _res_dist_pct = ((_nearest_res - float(entry_price_for_trade)) / float(entry_price_for_trade)) * 100.0
                         _res_r = (_nearest_res - float(entry_price_for_trade)) / _risk_for_quality
-                        relaxed_resistance_allowed = is_relaxed_execution_setup(
-                            setup_type=setup_type,
-                            extra_setup_names=extra_setup_names,
-                            primary_extra_setup=primary_extra_setup,
-                            mtf_confirmed=mtf_confirmed,
-                            vol_ratio=vol_ratio,
-                            score=score_result.get("score", 0.0),
-                        )
-                        # Smart Resistance Balance v3:
-                        # Normal setups remain protected. Relaxed/strong setups should not be killed
-                        # by borderline resistance; only truly poor distance/RR is hard rejected.
-                        if relaxed_resistance_allowed:
-                            hard_reject_rr = SMART_TP1_RELAXED_HARD_REJECT_RR
-                            hard_reject_dist_pct = SMART_TP1_RELAXED_HARD_REJECT_DIST_PCT
-                        else:
-                            hard_reject_rr = SMART_TP1_HARD_REJECT_RR
-                            hard_reject_dist_pct = SMART_TP1_HARD_REJECT_DIST_PCT
-
-                        _res_dist_ratio = _res_dist_pct / 100.0
-                        hard_near_resistance = (_res_dist_ratio < hard_reject_dist_pct) or (_res_r < hard_reject_rr)
-
-                        if hard_near_resistance:
+                        if _res_dist_pct < 1.0 or _res_r < 1.2:
                             log_long_rejection(
                                 symbol=symbol,
                                 reason="near_resistance_before_tp1",
@@ -8933,23 +8823,10 @@ def run_scanner_loop():
                                     "resistance_distance_pct": _res_dist_pct,
                                     "resistance_r": _res_r,
                                     "category": "trade_quality",
-                                    "relaxed_execution_setup": relaxed_resistance_allowed,
-                                    "hard_reject_rr": hard_reject_rr,
-                                    "hard_reject_dist_pct": hard_reject_dist_pct * 100.0,
                                 },
                             )
-                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed} | limits=dist<{hard_reject_dist_pct*100:.2f}% or R<{hard_reject_rr:.2f}")
+                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}")
                             continue
-                        elif _res_dist_pct < (SMART_TP1_WARNING_RESISTANCE_PCT * 100.0) or _res_r < SMART_TP1_MIN_RR:
-                            early_resistance_warning = "مقاومة قريبة قبل TP1 - تحذير فقط"
-                            try:
-                                if isinstance(smart_targets_early.get("target_notes"), list):
-                                    smart_targets_early["target_notes"].append(
-                                        f"near_resistance_warning dist={_res_dist_pct:.2f}% rr={_res_r:.2f} relaxed={relaxed_resistance_allowed}"
-                                    )
-                            except Exception:
-                                pass
-                            logger.info(f"⚠️ {symbol} near resistance warning only | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed}")
                 except Exception as _smart_reject_error:
                     logger.warning(f"smart resistance hard reject check error for {symbol}: {_smart_reject_error}")
                 
@@ -9588,36 +9465,6 @@ def run_scanner_loop():
                 final_base_risk = get_base_risk_label(score_result, final_warnings_count)
                 final_display_risk = adjust_risk_with_entry_timing(final_base_risk, entry_timing)
 
-                # Relative-strength defaults/calc for BLOCK_LONGS exceptions and reports.
-                # These are intentionally fail-safe: if BTC comparison data is unavailable,
-                # they stay neutral instead of crashing the scan.
-                try:
-                    btc_change_24h_safe = float(globals().get("btc_change_24h", 0.0) or 0.0)
-                except Exception:
-                    btc_change_24h_safe = 0.0
-                try:
-                    btc_change_short_safe = float(globals().get("btc_change_15m", 0.0) or globals().get("btc_change_8", 0.0) or 0.0)
-                except Exception:
-                    btc_change_short_safe = 0.0
-                try:
-                    coin_short_change_safe = float(change_4h or 0.0)
-                except Exception:
-                    coin_short_change_safe = 0.0
-                try:
-                    relative_strength_short = round(coin_short_change_safe - btc_change_short_safe, 4)
-                except Exception:
-                    relative_strength_short = 0.0
-                try:
-                    relative_strength_24 = round(float(change_24h or 0.0) - btc_change_24h_safe, 4)
-                except Exception:
-                    relative_strength_24 = 0.0
-                relative_strength_vs_btc = bool(
-                    relative_strength_short >= 1.5
-                    or relative_strength_24 >= 2.0
-                    or ("relative_strength_vs_btc" in str(setup_type))
-                    or ("relative_strength_vs_btc" in [str(x) for x in (extra_setup_names or [])])
-                )
-
                 candidate = {
                     "symbol": symbol,
                     "candle_time": candle_time,
@@ -9713,9 +9560,9 @@ def run_scanner_loop():
                     "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
                     "momentum_priority": momentum_priority,
                     "now": now,
-                    "relative_strength_short": relative_strength_short,
-                    "relative_strength_24": relative_strength_24,
-                    "relative_strength_vs_btc": relative_strength_vs_btc,
+                    "relative_strength_short": round(get_change_8(df) - get_change_8(btc_df), 4),
+                    "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4),
+                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_df), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
                     "block_exception": False,
                     "current_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
@@ -9727,7 +9574,6 @@ def run_scanner_loop():
                         since_ts=stats_reset_ts,
                     ),
                     "reversal_4h_result": reversal_4h_result,
-                    "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
                     "above_upper_bb": above_upper_bb,
                     "change_4h": change_4h,
                     "late_guard": late_guard,
@@ -10071,7 +9917,6 @@ def run():
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
     )
     clear_webhook()
-    clear_stale_scan_locks_on_startup()
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
     run_scanner_loop()
