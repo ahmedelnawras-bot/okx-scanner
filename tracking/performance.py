@@ -4182,3 +4182,4 @@ def format_pending_pullback_summary(title: str, summary: dict) -> str:
         if avg_delay > 60:
             lines.append("• ⏳ متوسط وقت التفعيل طويل (> 60 دقيقة)، قد تحتاج صبر أكبر أو تعديل زمن الصلاحية.")
     return "\n".join(lines)
+a
