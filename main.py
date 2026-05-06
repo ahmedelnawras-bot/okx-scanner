@@ -65,6 +65,12 @@ try:
 except Exception: 
  analyze_entry_maturity = None
 
+# استيراد calc_trade_result_pct على مستوى الموديول (تجنب inline import داخل دوال متكررة)
+try:
+    from tracking.summary_helpers import calc_trade_result_pct as _summary_calc_trade_result_pct
+except ImportError:
+    _summary_calc_trade_result_pct = None
+
 # =====================
 # LOGGING
 # =====================
@@ -139,7 +145,7 @@ ALT_MARKET_TIMEFRAME = "1H"
 ALT_MARKET_CANDLE_LIMIT = 60
 
 SCAN_LOCK_KEY = "scan:long:running"
-SCAN_LOCK_TTL = 180
+SCAN_LOCK_TTL = 600
 
 SCAN_LOOP_SLEEP_SECONDS = 5
 SCAN_IDLE_SLEEP_SECONDS = 8
@@ -418,9 +424,6 @@ def clear_stale_scan_locks_on_startup() -> None:
     if ttl == -1:
         r.delete(SCAN_LOCK_KEY)
         logger.info(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
-    elif ttl and ttl > 300:
-        r.delete(SCAN_LOCK_KEY)
-        logger.info(f"🧹 Cleared long startup scan lock: {SCAN_LOCK_KEY} ttl={ttl}s")
     elif ttl and ttl > 0:
         logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
  except Exception as e:
@@ -2020,8 +2023,9 @@ def _trade_exit_bucket(trade: dict) -> str:
 
 
 def _get_trade_pnl_pct(trade: dict) -> float:
-    from tracking.summary_helpers import calc_trade_result_pct
-    raw = calc_trade_result_pct(trade)
+    if _summary_calc_trade_result_pct is None:
+        return 0.0
+    raw = _summary_calc_trade_result_pct(trade)
     if raw is None:
         return 0.0
     return round(raw * TRACK_LEVERAGE, 4)
@@ -5703,8 +5707,10 @@ SMART_TP1_NEAR_RESISTANCE_RR = 1.2
 SMART_TP1_IGNORE_NEAR_RESISTANCE_PCT = 0.005  # 0.50% | noise/micro level, ignore completely
 SMART_TP1_IGNORE_NEAR_ROUND_PCT = 0.005       # 0.50%
 SMART_TP1_WARNING_RESISTANCE_PCT = 0.012      # 1.20% | warning band, not automatic rejection
-SMART_TP1_HARD_REJECT_RR = 1.0                # normal setups reject below 1R
-SMART_TP1_RELAXED_HARD_REJECT_RR = 0.75       # strong execution setups get warning unless RR is extremely bad
+SMART_TP1_HARD_REJECT_RR = 0.70               # normal setups reject only if resistance reward is clearly weak
+SMART_TP1_RELAXED_HARD_REJECT_RR = 0.35       # relaxed/strong execution setups reject only if RR is extremely poor
+SMART_TP1_HARD_REJECT_DIST_PCT = 0.008        # 0.80% normal hard reject distance
+SMART_TP1_RELAXED_HARD_REJECT_DIST_PCT = 0.004 # 0.40% relaxed hard reject distance
 SMART_TP1_LOOKBACK_SWING = 50
 SMART_TP1_ROUND_LEVELS_ENABLED = True
 
@@ -7100,16 +7106,8 @@ def run_scanner_loop():
             scan_locked = acquire_scan_lock()
             if not scan_locked:
                 _now_ts = time.time()
-                _lock_ttl = get_scan_lock_ttl()
-                if _lock_ttl > 300 and r:
-                    try:
-                        r.delete(SCAN_LOCK_KEY)
-                        logger.warning(f"🧹 Stale scan lock detected during loop, cleared automatically (ttl={_lock_ttl}s)")
-                        time.sleep(1)
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Failed to clear stale scan lock during loop: {e}")
                 if _now_ts - _last_scan_skip_log_ts >= 60:
+                    _lock_ttl = get_scan_lock_ttl()
                     logger.info(f"⏳ Scan lock active, waiting... (ttl={_lock_ttl}s)")
                     _last_scan_skip_log_ts = _now_ts
                 time.sleep(SCAN_IDLE_SLEEP_SECONDS)
@@ -7606,6 +7604,13 @@ def run_scanner_loop():
                 setup_type_base = "unknown"
                 setup_type_candidate = {}
                 setup_type_candidate_final = {}
+                # score_result و pre_score_adjustments_log يجب تعريفهما هنا
+                # لأن بعض البلوكات المبكرة تستخدمهما قبل calculate_long_score
+                score_result = {
+                    "score": 0.0, "reasons": [], "warning_reasons": [],
+                    "funding_label": "🟡 محايد", "signal_rating": "⚡ عادي", "fake_signal": False,
+                }
+                pre_score_adjustments_log = []
                 relative_strength = 0.0
                 relative_strength_short = 0.0
                 relative_strength_24 = 0.0
@@ -8080,7 +8085,7 @@ def run_scanner_loop():
                         primary_extra_setup=primary_extra_setup,
                         mtf_confirmed=mtf_confirmed,
                         vol_ratio=vol_ratio,
-                        score=score_result.get("score", 0.0),
+                        score=0.0,  # Score not yet computed at this stage
                     )
                     if not relaxed_retest_allowed:
                         log_long_rejection(
@@ -8262,7 +8267,7 @@ def run_scanner_loop():
                             primary_extra_setup=primary_extra_setup,
                             mtf_confirmed=mtf_confirmed,
                             vol_ratio=vol_ratio,
-                            score=score_result.get("score", 0.0),
+                            score=0.0,  # Score not yet computed at this stage
                         ):
                             hard_late_entry = False
                             pre_score_adjustments_log.append({
@@ -8891,12 +8896,18 @@ def run_scanner_loop():
                             vol_ratio=vol_ratio,
                             score=score_result.get("score", 0.0),
                         )
-                        # Smart Resistance Balance:
-                        # - ignored micro-resistance was already filtered earlier (<0.5%).
-                        # - normal setups reject only below 1R.
-                        # - strong execution setups convert close resistance to warning unless RR is extremely poor.
-                        hard_reject_rr = SMART_TP1_RELAXED_HARD_REJECT_RR if relaxed_resistance_allowed else SMART_TP1_HARD_REJECT_RR
-                        hard_near_resistance = (_res_r < hard_reject_rr)
+                        # Smart Resistance Balance v3:
+                        # Normal setups remain protected. Relaxed/strong setups should not be killed
+                        # by borderline resistance; only truly poor distance/RR is hard rejected.
+                        if relaxed_resistance_allowed:
+                            hard_reject_rr = SMART_TP1_RELAXED_HARD_REJECT_RR
+                            hard_reject_dist_pct = SMART_TP1_RELAXED_HARD_REJECT_DIST_PCT
+                        else:
+                            hard_reject_rr = SMART_TP1_HARD_REJECT_RR
+                            hard_reject_dist_pct = SMART_TP1_HARD_REJECT_DIST_PCT
+
+                        _res_dist_ratio = _res_dist_pct / 100.0
+                        hard_near_resistance = (_res_dist_ratio < hard_reject_dist_pct) or (_res_r < hard_reject_rr)
 
                         if hard_near_resistance:
                             log_long_rejection(
@@ -8924,9 +8935,10 @@ def run_scanner_loop():
                                     "category": "trade_quality",
                                     "relaxed_execution_setup": relaxed_resistance_allowed,
                                     "hard_reject_rr": hard_reject_rr,
+                                    "hard_reject_dist_pct": hard_reject_dist_pct * 100.0,
                                 },
                             )
-                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed}")
+                            logger.info(f"⛔ {symbol} rejected: near_resistance_before_tp1 | res={_nearest_res} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | relaxed={relaxed_resistance_allowed} | limits=dist<{hard_reject_dist_pct*100:.2f}% or R<{hard_reject_rr:.2f}")
                             continue
                         elif _res_dist_pct < (SMART_TP1_WARNING_RESISTANCE_PCT * 100.0) or _res_r < SMART_TP1_MIN_RR:
                             early_resistance_warning = "مقاومة قريبة قبل TP1 - تحذير فقط"
@@ -9715,6 +9727,7 @@ def run_scanner_loop():
                         since_ts=stats_reset_ts,
                     ),
                     "reversal_4h_result": reversal_4h_result,
+                    "reversal_4h_confirmed": reversal_4h_result.get("confirmed", False),
                     "above_upper_bb": above_upper_bb,
                     "change_4h": change_4h,
                     "late_guard": late_guard,
