@@ -3478,11 +3478,13 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
         return {"available": False}
 
 def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, current_price: float) -> str:
-    """Clear display-only 40/40/20 financial status for Track messages."""
+    """Clear, compact display-only 40/40/20 financial status for Track messages."""
     try:
+        title = "📊 <b>الربح الحالي الفعلي (40/40/20)</b>"
+
         if not isinstance(trade, dict) or not trade:
             return (
-                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+                f"{title}\n"
                 "⚠️ لا توجد صفقة مسجلة — الحساب تقديري فقط"
             )
 
@@ -3490,7 +3492,7 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         result = str(trade.get("result", "") or "").lower()
         if status == "pending_pullback":
             return (
-                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+                f"{title}\n"
                 "⏳ لم يتم تفعيل الدخول بعد — لا يوجد PnL فعلي"
             )
 
@@ -3500,26 +3502,45 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
         protected_exit = bool(trade.get("protected_breakeven_exit", False))
 
-        tp1_line = "✅ اتضرب | 40% اتقفل" if tp1_hit else "⏳ لم يضرب"
-        tp2_line = "✅ اتضرب | 40% إضافي اتقفل" if tp2_hit else "⏳ لم يضرب"
+        if result == "loss":
+            phase_line = "🔴 الصفقة مغلقة | SL"
+        elif result == "breakeven" or protected_exit:
+            phase_line = "⚪ الصفقة مغلقة | خروج على Entry"
+        elif result == "trailing_win":
+            phase_line = "🔄 الصفقة مغلقة | Trailing 20%"
+        elif result == "tp2_win":
+            phase_line = "🏁 TP2 تحقق | الصفقة مغلقة"
+        elif result == "tp1_win":
+            phase_line = "🎯 TP1 تحقق | الصفقة مغلقة"
+        elif trailing_active:
+            phase_line = "🔄 Trailing مفعل | يتبقى 20%"
+        elif tp2_hit:
+            phase_line = "🏁 TP2 تحقق | يتبقى 20% Trailing"
+        elif tp1_hit:
+            phase_line = "🎯 TP1 تحقق | 40% اتقفل | SL Entry"
+        else:
+            phase_line = "🟢 الصفقة نشطة | قبل TP1"
+
+        tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
+        tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
 
         if result == "trailing_win":
-            trailing_line = "✅ مغلق على Trailing"
+            trailing_text = "✅ مغلق"
         elif trailing_active:
-            trailing_line = "🔄 شغال Trailing"
+            trailing_text = "🔄 شغال"
         elif tp2_hit:
-            trailing_line = "🔄 بدأ بعد TP2"
+            trailing_text = "🔄 بدأ"
         else:
-            trailing_line = "⏳ لم يبدأ"
+            trailing_text = "⏳ لم يبدأ"
 
         if result == "loss":
-            sl_line = "✅ اتضرب"
+            sl_text = "✅ اتضرب"
         elif result == "breakeven" or protected_exit:
-            sl_line = "🔒 خرج على Entry بعد TP1"
+            sl_text = "🔒 خروج Entry"
         elif sl_moved_to_entry:
-            sl_line = "🔒 على Entry"
+            sl_text = "🔒 على Entry"
         else:
-            sl_line = "⏳ لم يضرب"
+            sl_text = "🟢 سليم"
 
         if lifecycle_pnl.get("available"):
             raw = _safe_float(lifecycle_pnl.get("raw_pct"), 0.0)
@@ -3531,18 +3552,19 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
             lev_line = "—"
 
         return (
-            "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
-            f"• 🎯 TP1: {tp1_line}\n"
-            f"• 🏁 TP2: {tp2_line}\n"
-            f"• 🔄 الجزء المتبقي 20%: {trailing_line}\n"
-            f"• 🛑 SL: {sl_line}\n"
+            f"{title}\n"
+            f"• الحالة: {phase_line}\n"
+            f"• 🎯 TP1: {tp1_text}\n"
+            f"• 🏁 TP2: {tp2_text}\n"
+            f"• 🔄 20%: {trailing_text}\n"
+            f"• 🛑 SL: {sl_text}\n"
             f"• 💵 السعر الحالي: {_fmt_price(current_price)}\n"
-            f"• 💰 الربح/الخسارة الفعلي: {pnl_line}\n"
-            f"• ⚡ بعد الرافعة: {lev_line}"
+            f"💰 الربح الفعلي: {pnl_line}\n"
+            f"⚡ بعد الرافعة: {lev_line}"
         )
     except Exception as e:
         logger.warning(f"format_lifecycle_pnl_block_for_track error: {e}")
-        return "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n⚠️ تعذر حساب الربح الفعلي"
+        return "📊 <b>الربح الحالي الفعلي (40/40/20)</b>\n⚠️ تعذر حساب الربح الفعلي"
 
 def build_track_message(alert: dict) -> str:
  try:
