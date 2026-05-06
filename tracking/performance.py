@@ -3224,7 +3224,10 @@ def format_period_summary(title: str, summary: dict) -> str:
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
     breakeven_exits = safe_int(summary.get("breakeven_exits", 0))
-    closed = wins + losses + expired + breakeven_exits
+    closed = max(
+        safe_int(summary.get("closed", 0)),
+        wins + losses + expired + breakeven_exits,
+    )
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
     gross_loss = safe_float(summary.get("gross_loss_pct", 0.0))
@@ -3247,12 +3250,14 @@ def format_period_summary(title: str, summary: dict) -> str:
     trailing_wins = safe_int(summary.get("trailing_wins", 0))
     trailing_open_count = safe_int(summary.get("trailing_open", 0))
 
-    # Full Wins TP2 يجب ألا يقل عن TP2 Hits الفعلية
-    if full_wins < tp2_hits:
-        full_wins = tp2_hits
+    # Full Wins TP2 = الصفقات المغلقة فعلاً على TP2 فقط.
+    # لا نرفعه إلى TP2 Hits حتى لا يظهر تناقض مثل Closed: 0 و Full Wins: 1.
+    # TP2 Reached يعرض الوصول للهدف سواء مغلق أو ما زال Trailing/Open.
+    tp2_reached = max(tp2_hits, full_wins + trailing_wins + trailing_open_count)
 
-    # TP2 Reached = tp2_win + trailing_win + trailing_open
-    tp2_reached = full_wins + trailing_wins + trailing_open_count
+    # حماية إضافية من أي ملخص قديم غير متسق.
+    wins = max(wins, tp1_only + full_wins + trailing_wins)
+    closed = max(closed, wins + losses + expired + breakeven_exits)
 
     tp1_rate = safe_float(summary.get("tp1_rate", 0))
     tp2_rate = safe_float(summary.get("tp2_rate", 0))
@@ -3346,14 +3351,14 @@ def format_period_summary(title: str, summary: dict) -> str:
 
     financial_block = (
         f"\n\n💰 <b>النتيجة المالية الفعلية</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🟢 إجمالي أرباح الصفقات الرابحة: {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
-        f"🔴 إجمالي خسائر الصفقات الخاسرة: {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
-        f"⚖️ صافي الربح/الخسارة بعد الرافعة: {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
-        f"💼 التأثير الحقيقي على المحفظة: {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
+        f"────────────\n"
+        f"🟢 الأرباح بعد الرافعة: {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
+        f"🔴 الخسائر بعد الرافعة: {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
+        f"⚖️ الصافي بعد الرافعة: {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
+        f"💼 المحفظة: {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
         f"📊 صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
         + partial_open_block +
-        f"━━━━━━━━━━━━━━\n"
+        f"────────────\n"
         + settings_block +
         f"\n📊 <b>تفاصيل إضافية:</b>\n"
         f"• متوسط الصفقة الرابحة بعد الرافعة: {avg_win:+.2f}%\n"
@@ -3764,47 +3769,51 @@ def get_open_trades_summary(
 
 
 def _format_open_trade_lifecycle_pnl_block(t: dict) -> List[str]:
-    """بلوك مختصر يوضح المرحلة والربح الفعلي لخطة 40/40/20 في /open_trades."""
+    """بلوك مختصر وواضح يوضح المرحلة والربح الفعلي لخطة 40/40/20 في /open_trades."""
     phase = str(t.get("phase", "open") or "open")
     current_price = safe_float(t.get("current_price", 0.0), 0.0)
     w_pnl = safe_float(t.get("weighted_pnl_pct", 0.0), 0.0)
     w_lev = safe_float(t.get("weighted_pnl_leveraged", 0.0), 0.0)
     cur_pnl = safe_float(t.get("current_pnl_pct", 0.0), 0.0)
     cur_lev = safe_float(t.get("current_pnl_leveraged", 0.0), 0.0)
-    tp1_hit = bool(t.get("tp1_hit", False))
-    tp2_hit = bool(t.get("tp2_hit", False))
+    tp1_hit = bool(t.get("tp1_hit", False)) or phase in ("tp1_hit", "tp2_hit", "trailing")
+    tp2_hit = bool(t.get("tp2_hit", False)) or phase in ("tp2_hit", "trailing")
     trailing_active = bool(t.get("trailing_active", False)) or phase == "trailing"
     sl_is_entry = bool(t.get("sl_is_entry", False))
 
     if phase == "pending_pullback":
         return [
-            "   📊 <b>الربح الفعلي 40/40/20:</b>",
+            "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
             "   • الحالة: ⏳ Pending Pullback — لم يتفعل الدخول",
-            "   • PnL فعلي: —",
+            "   💰 الربح الفعلي: —",
+            "   ⚡ بعد الرافعة: —",
         ]
 
-    if phase == "trailing":
-        state = "🔄 Trailing شغال | الجزء المتبقي 20%"
-    elif tp2_hit or phase == "tp2_hit":
-        state = "🏁 TP2 اتضرب | 40% إضافي اتقفل"
-    elif tp1_hit or phase == "tp1_hit":
-        state = "🎯 TP1 اتضرب | 40% اتقفل | SL Entry"
+    if trailing_active:
+        state = "🔄 Trailing مفعل | يتبقى 20%"
+    elif tp2_hit:
+        state = "🏁 TP2 تحقق | يتبقى 20% Trailing"
+    elif tp1_hit:
+        state = "🎯 TP1 تحقق | 40% اتقفل | SL Entry"
     else:
-        state = "🟢 قبل TP1"
+        state = "🟢 الصفقة نشطة | قبل TP1"
 
-    tp1_text = "✅ اتضرب" if tp1_hit or phase in ("tp1_hit", "tp2_hit", "trailing") else "⏳ لم يضرب"
-    tp2_text = "✅ اتضرب" if tp2_hit or phase in ("tp2_hit", "trailing") else "⏳ لم يضرب"
-    trailing_text = "شغال" if trailing_active else ("لم يبدأ" if not tp2_hit else "مغلق/غير نشط")
-    sl_text = "🔒 على Entry" if sl_is_entry else "لم يضرب"
+    tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
+    tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
+    trailing_text = "🔄 شغال" if trailing_active else ("🔄 بدأ" if tp2_hit else "⏳ لم يبدأ")
+    sl_text = "🔒 على Entry" if sl_is_entry else "🟢 سليم"
 
     return [
-        "   📊 <b>الربح الفعلي 40/40/20:</b>",
+        "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
         f"   • الحالة: {state}",
-        f"   • TP1: {tp1_text} | TP2: {tp2_text} | 20%: {trailing_text}",
-        f"   • SL: {sl_text}",
+        f"   • 🎯 TP1: {tp1_text}",
+        f"   • 🏁 TP2: {tp2_text}",
+        f"   • 🔄 20%: {trailing_text}",
+        f"   • 🛑 SL: {sl_text}",
         f"   • السعر الحالي: <code>{_fmt_price_perf(current_price)}</code>",
-        f"   • PnL فعلي: <code>{w_pnl:+.2f}%</code> | بعد الرافعة: <code>{w_lev:+.1f}%</code>",
-        f"   • حركة السعر الحالية: <code>{cur_pnl:+.2f}%</code> | بعد الرافعة: <code>{cur_lev:+.1f}%</code>",
+        f"   💰 الربح الفعلي: <code>{w_pnl:+.2f}%</code>",
+        f"   ⚡ بعد الرافعة: <code>{w_lev:+.1f}%</code>",
+        f"   📈 حركة السعر الحالية: <code>{cur_pnl:+.2f}%</code> | بعد الرافعة: <code>{cur_lev:+.1f}%</code>",
     ]
 
 
@@ -3824,7 +3833,7 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
 
     lines = [
         f"📋 <b>الصفقات المفتوحة ({total} صفقة)</b>",
-        "━━━━━━━━━━━━━━",
+        "────────────",
     ]
 
     for i, t in enumerate(trades, 1):
@@ -3892,7 +3901,7 @@ def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
         lines.append(f'   📊 <a href="{t["tv_link"]}">TradingView</a>')
 
     # ── ملخص ─────────────────────────────────────────────────────
-    lines.append("\n━━━━━━━━━━━━━━")
+    lines.append("\n────────────")
     lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة")
     if winning_count:
         lines.append(f"🟢 رابحة الآن: {winning_count}")
