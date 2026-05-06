@@ -2773,24 +2773,76 @@ def _execution_trade_pnl_404020(trade: dict) -> float:
         return 0.0
 
 
-def _execution_status_label(trade: dict) -> str:
+def _execution_exit_type_label(trade: dict) -> str:
+    """Human-readable execution exit category for 40/40/20 reporting."""
     result = str(trade.get("result", "") or "").lower()
     status = str(trade.get("status", "") or "").lower()
-    if result == "loss":
-        return "🔴 Stopped"
-    if result == "trailing_win":
-        return "🔄 Trailing Win"
-    if result == "tp2_win" or bool(trade.get("tp2_hit")):
-        return "🏁 TP2"
-    if result == "tp1_win" or bool(trade.get("tp1_hit")):
-        return "🎯 TP1"
+    tp1_hit = bool(trade.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
+    tp2_hit = bool(trade.get("tp2_hit")) or result in ("tp2_win", "trailing_win")
+    protected_be = bool(trade.get("protected_breakeven_exit")) or bool(trade.get("sl_moved_to_entry"))
+
     if status == "pending_pullback":
         return "⏳ Pending Pullback"
     if status == "open":
-        return "🟢 مفتوحة"
-    if result == "breakeven":
-        return "⚪ Breakeven"
+        if tp2_hit:
+            return "🔄 TP2 + Trail Active"
+        if tp1_hit:
+            return "🎯 TP1 + Protected"
+        return "🟢 Open Before TP1"
+    if result == "trailing_win":
+        return "🔄 TP2 + Trail Win"
+    if result == "tp2_win" or tp2_hit:
+        return "🏁 Full TP2"
+    if result == "tp1_win" or tp1_hit:
+        return "🎯 TP1 Only"
+    if result == "breakeven" or protected_be:
+        return "⚪ TP1 then Breakeven" if tp1_hit else "⚪ Breakeven"
+    if result == "loss":
+        return "🔴 Direct SL" if not tp1_hit else "🔴 TP1 then SL/Trail Loss"
+    if result == "expired":
+        return "⚫ Expired"
+    if result == "pending_expired":
+        return "⚫ Pullback Expired"
     return html.escape(status or result or "غير معروفة")
+
+
+def _execution_status_label(trade: dict) -> str:
+    result = str(trade.get("result", "") or "").lower()
+    if result == "loss":
+        return "🔴 SL Hit"
+    return _execution_exit_type_label(trade)
+
+
+def _execution_trade_duration_label(trade: dict) -> str:
+    """Return compact trade duration from created_at/candle_time to close or now."""
+    start_ts = _execution_trade_ts(trade)
+    if not start_ts:
+        return "N/A"
+    end_candidates = (
+        trade.get("closed_at"),
+        trade.get("exit_ts"),
+        trade.get("updated_at"),
+        trade.get("last_update_ts"),
+    )
+    end_ts = 0
+    for value in end_candidates:
+        try:
+            if value:
+                end_ts = int(float(value))
+                break
+        except Exception:
+            pass
+    if not end_ts or end_ts < start_ts:
+        end_ts = int(time.time())
+    seconds = max(0, int(end_ts - start_ts))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _execution_primary_setup(trade: dict) -> str:
@@ -2822,6 +2874,11 @@ def build_execution_report_message(period: str = "all") -> str:
         tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit")) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
         trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
         losses = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss")
+        direct_sl = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss" and not bool(t.get("tp1_hit")))
+        tp1_then_be = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "breakeven" and bool(t.get("tp1_hit")))
+        tp1_then_sl_or_trail_loss = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss" and bool(t.get("tp1_hit")))
+        full_tp2 = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "tp2_win")
+        tp2_plus_trail = trailing_wins
         win_rate = (tp1_hits / total) * 100.0 if total else 0.0
         tp2_rate = (tp2_hits / total) * 100.0 if total else 0.0
         tp1_to_tp2 = (tp2_hits / tp1_hits) * 100.0 if tp1_hits else 0.0
@@ -2848,16 +2905,25 @@ def build_execution_report_message(period: str = "all") -> str:
             f"• 🎯 TP1 Hits: {tp1_hits}",
             f"• 🏁 TP2 Hits: {tp2_hits}",
             f"• 🔄 Trailing Wins: {trailing_wins}",
-            f"• 🔴 Stopped: {losses}",
+            f"• 🔴 SL Hit: {losses}",
             "",
             "📊 <b>أداء 40/40/20</b>",
-            f"• 📈 Win Rate TP1+: <b>{win_rate:.2f}%</b>",
-            f"• 🏁 TP2 Rate: <b>{tp2_rate:.2f}%</b>",
+            f"• 🎯 TP1 Success: <b>{win_rate:.2f}%</b>",
+            f"• 🏁 TP2 Success: <b>{tp2_rate:.2f}%</b>",
+            f"• 🔄 Trail Success: <b>{(trailing_wins / total * 100.0 if total else 0.0):.2f}%</b>",
+            f"• 🛑 Direct SL: <b>{(direct_sl / total * 100.0 if total else 0.0):.2f}%</b>",
             f"• 🔁 TP1 → TP2: <b>{tp1_to_tp2:.2f}%</b>",
+            "",
+            "🧾 <b>أنواع الإغلاق</b>",
+            f"• 🔴 Direct SL: {direct_sl}",
+            f"• ⚪ TP1 ثم Breakeven: {tp1_then_be}",
+            f"• 🔴 TP1 ثم SL/Trail Loss: {tp1_then_sl_or_trail_loss}",
+            f"• 🏁 Full TP2: {full_tp2}",
+            f"• 🔄 TP2 + Trail: {tp2_plus_trail}",
             "",
             "💰 <b>النتيجة الفعلية 40/40/20</b>",
             f"• 🟢 أرباح محققة/مفتوحة: +{gross_profit:.2f}%",
-            f"• 🔴 خسائر Stopped: {gross_loss:.2f}%",
+            f"• 🔴 خسائر SL Hit: {gross_loss:.2f}%",
             f"• ⚖️ الصافي بعد الرافعة: <b>{net_pnl:+.2f}%</b>",
             "────────────",
             "🚀 <b>آخر الصفقات المرشحة</b>",
@@ -2870,18 +2936,22 @@ def build_execution_report_message(period: str = "all") -> str:
             score = _trade_field(trade, "score", "N/A")
             entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
             pnl = _execution_trade_pnl_404020(trade)
+            duration_label = _execution_trade_duration_label(trade)
+            exit_type_label = _execution_exit_type_label(trade)
             lines.extend([
                 "",
                 f"{i}️⃣ <b>{symbol}</b>",
                 f"📌 الحالة: {_execution_status_label(trade)}",
+                f"🧾 نوع الإغلاق: {exit_type_label}",
+                f"⏱️ المدة: {duration_label}",
                 f"🧠 setup: {setup}",
                 f"⭐ score: {score} | entry: {entry_mode}",
                 f"📍 دخول: {plan.get('entry', 'N/A')}",
                 f"🛑 SL: {plan.get('sl', 'N/A')}",
                 f"🎯 TP1: {plan.get('tp1', 'N/A')} | إغلاق 40%",
                 f"🏁 TP2: {plan.get('tp2', 'N/A')} | إغلاق 40%",
-                "🔄 20%: Trailing",
-                f"💰 PnL 40/40/20: {pnl:+.2f}%",
+                "🔄 Trail: 20%",
+                f"💰 Final Result 40/40/20: {pnl:+.2f}%",
             ])
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
