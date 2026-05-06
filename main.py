@@ -109,16 +109,6 @@ PRE_BREAKOUT_VOLUME_SIGNIFICANCE = 1.20
 PRE_BREAKOUT_RECENT_VOL_BARS = 3
 PRE_BREAKOUT_BASELINE_VOL_BARS = 12
 
-# Range Position Context (light layer, not a separate market mode)
-RANGE_POSITION_ENABLED = True
-RANGE_LOOKBACK_CANDLES = 40
-RANGE_MIN_WIDTH_PCT = 1.20
-RANGE_MAX_WIDTH_PCT = 8.00
-RANGE_LOW_ZONE_MAX = 0.35
-RANGE_HIGH_ZONE_MIN = 0.70
-RANGE_HIGH_SOFT_PENALTY = 0.25
-RANGE_HIGH_STRONG_PENALTY = 0.45
-
 # Late pump / bull-market protection
 LATE_PUMP_DIST_MA = 4.2
 LATE_PUMP_RSI = 67.0
@@ -1910,14 +1900,6 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "execution_sl": candidate.get("execution_sl"),
         "execution_tp1": candidate.get("execution_tp1"),
         "execution_tp2": candidate.get("execution_tp2"),
-        "range_detected": candidate.get("range_detected", False),
-        "range_high": candidate.get("range_high"),
-        "range_low": candidate.get("range_low"),
-        "range_width_pct": candidate.get("range_width_pct"),
-        "range_position_pct": candidate.get("range_position_pct"),
-        "range_zone": candidate.get("range_zone"),
-        "range_note": candidate.get("range_note"),
-        "confirmed_range_breakout": candidate.get("confirmed_range_breakout", False),
     }
 
 
@@ -3496,13 +3478,11 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
         return {"available": False}
 
 def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, current_price: float) -> str:
-    """Clear, compact display-only 40/40/20 financial status for Track messages."""
+    """Clear display-only 40/40/20 financial status for Track messages."""
     try:
-        title = "📊 <b>الربح الحالي الفعلي (40/40/20)</b>"
-
         if not isinstance(trade, dict) or not trade:
             return (
-                f"{title}\n"
+                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
                 "⚠️ لا توجد صفقة مسجلة — الحساب تقديري فقط"
             )
 
@@ -3510,7 +3490,7 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         result = str(trade.get("result", "") or "").lower()
         if status == "pending_pullback":
             return (
-                f"{title}\n"
+                "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
                 "⏳ لم يتم تفعيل الدخول بعد — لا يوجد PnL فعلي"
             )
 
@@ -3520,45 +3500,26 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         sl_moved_to_entry = bool(trade.get("sl_moved_to_entry", False))
         protected_exit = bool(trade.get("protected_breakeven_exit", False))
 
-        if result == "loss":
-            phase_line = "🔴 الصفقة مغلقة | SL"
-        elif result == "breakeven" or protected_exit:
-            phase_line = "⚪ الصفقة مغلقة | خروج على Entry"
-        elif result == "trailing_win":
-            phase_line = "🔄 الصفقة مغلقة | Trailing 20%"
-        elif result == "tp2_win":
-            phase_line = "🏁 TP2 تحقق | الصفقة مغلقة"
-        elif result == "tp1_win":
-            phase_line = "🎯 TP1 تحقق | الصفقة مغلقة"
-        elif trailing_active:
-            phase_line = "🔄 Trailing مفعل | يتبقى 20%"
-        elif tp2_hit:
-            phase_line = "🏁 TP2 تحقق | يتبقى 20% Trailing"
-        elif tp1_hit:
-            phase_line = "🎯 TP1 تحقق | 40% اتقفل | SL Entry"
-        else:
-            phase_line = "🟢 الصفقة نشطة | قبل TP1"
-
-        tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
-        tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
+        tp1_line = "✅ اتضرب | 40% اتقفل" if tp1_hit else "⏳ لم يضرب"
+        tp2_line = "✅ اتضرب | 40% إضافي اتقفل" if tp2_hit else "⏳ لم يضرب"
 
         if result == "trailing_win":
-            trailing_text = "✅ مغلق"
+            trailing_line = "✅ مغلق على Trailing"
         elif trailing_active:
-            trailing_text = "🔄 شغال"
+            trailing_line = "🔄 شغال Trailing"
         elif tp2_hit:
-            trailing_text = "🔄 بدأ"
+            trailing_line = "🔄 بدأ بعد TP2"
         else:
-            trailing_text = "⏳ لم يبدأ"
+            trailing_line = "⏳ لم يبدأ"
 
         if result == "loss":
-            sl_text = "✅ اتضرب"
+            sl_line = "✅ اتضرب"
         elif result == "breakeven" or protected_exit:
-            sl_text = "🔒 خروج Entry"
+            sl_line = "🔒 خرج على Entry بعد TP1"
         elif sl_moved_to_entry:
-            sl_text = "🔒 على Entry"
+            sl_line = "🔒 على Entry"
         else:
-            sl_text = "🟢 سليم"
+            sl_line = "⏳ لم يضرب"
 
         if lifecycle_pnl.get("available"):
             raw = _safe_float(lifecycle_pnl.get("raw_pct"), 0.0)
@@ -3570,19 +3531,18 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
             lev_line = "—"
 
         return (
-            f"{title}\n"
-            f"• الحالة: {phase_line}\n"
-            f"• 🎯 TP1: {tp1_text}\n"
-            f"• 🏁 TP2: {tp2_text}\n"
-            f"• 🔄 20%: {trailing_text}\n"
-            f"• 🛑 SL: {sl_text}\n"
+            "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n"
+            f"• 🎯 TP1: {tp1_line}\n"
+            f"• 🏁 TP2: {tp2_line}\n"
+            f"• 🔄 الجزء المتبقي 20%: {trailing_line}\n"
+            f"• 🛑 SL: {sl_line}\n"
             f"• 💵 السعر الحالي: {_fmt_price(current_price)}\n"
-            f"💰 الربح الفعلي: {pnl_line}\n"
-            f"⚡ بعد الرافعة: {lev_line}"
+            f"• 💰 الربح/الخسارة الفعلي: {pnl_line}\n"
+            f"• ⚡ بعد الرافعة: {lev_line}"
         )
     except Exception as e:
         logger.warning(f"format_lifecycle_pnl_block_for_track error: {e}")
-        return "📊 <b>الربح الحالي الفعلي (40/40/20)</b>\n⚠️ تعذر حساب الربح الفعلي"
+        return "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n⚠️ تعذر حساب الربح الفعلي"
 
 def build_track_message(alert: dict) -> str:
  try:
@@ -4952,6 +4912,93 @@ def get_btc_mode():
     logger.error(f"BTC mode error: {e}")
     return "🟡 محايد"
 
+def get_btc_range_context() -> dict:
+ try:
+    candles = get_candles("BTC-USDT-SWAP", "1H", 40)
+    df = to_dataframe(candles)
+    if df is None or df.empty or len(df) < 24:
+        return {"zone": "unknown", "note": "BTC range data insufficient", "relax_near_resistance": False}
+
+    signal_row = get_signal_row(df)
+    if signal_row is None:
+        return {"zone": "unknown", "note": "BTC range signal row missing", "relax_near_resistance": False}
+
+    idx = signal_row.name
+    if idx is None:
+        return {"zone": "unknown", "note": "BTC range index missing", "relax_near_resistance": False}
+
+    lookback = min(36, max(24, int(idx) + 1))
+    window = df.iloc[max(0, int(idx) - lookback + 1):int(idx) + 1]
+    if window is None or window.empty or len(window) < 20:
+        return {"zone": "unknown", "note": "BTC range window insufficient", "relax_near_resistance": False}
+
+    range_high = float(window["high"].astype(float).max())
+    range_low = float(window["low"].astype(float).min())
+    close = _safe_float(signal_row.get("close"), 0.0)
+    open_ = _safe_float(signal_row.get("open"), close)
+    high = _safe_float(signal_row.get("high"), close)
+    low = _safe_float(signal_row.get("low"), close)
+    ma_value = _safe_float(signal_row.get("ma"), close)
+
+    if range_high <= range_low or close <= 0:
+        return {"zone": "unknown", "note": "BTC range invalid", "relax_near_resistance": False}
+
+    range_width_pct = ((range_high - range_low) / close) * 100.0
+    position_pct = (close - range_low) / (range_high - range_low)
+
+    if position_pct <= 0.35:
+        zone = "btc_range_low"
+        zone_label = "أسفل نطاق BTC"
+    elif position_pct >= 0.70:
+        zone = "btc_range_high"
+        zone_label = "أعلى نطاق BTC"
+    else:
+        zone = "btc_range_mid"
+        zone_label = "منتصف نطاق BTC"
+
+    prev_close = _safe_float(df.iloc[int(idx) - 1].get("close"), close) if int(idx) > 0 else close
+    candle_range = max(high - low, 0.0)
+    body = abs(close - open_)
+    lower_wick = min(open_, close) - low
+    upper_wick = high - max(open_, close)
+
+    bounce = (
+        zone == "btc_range_low"
+        and close >= open_
+        and close >= prev_close
+        and (ma_value <= 0 or close >= ma_value * 0.985)
+        and (candle_range <= 0 or lower_wick >= body * 0.6 or close >= low + candle_range * 0.55)
+    )
+    rejection = (
+        zone == "btc_range_high"
+        and candle_range > 0
+        and upper_wick >= max(body * 1.2, candle_range * 0.25)
+        and close < high - candle_range * 0.25
+    )
+
+    if bounce:
+        note = "BTC أسفل النطاق مع ارتداد أولي"
+    elif rejection:
+        note = "BTC أعلى النطاق مع رفض سعري"
+    else:
+        note = zone_label
+
+    return {
+        "zone": zone,
+        "zone_label": zone_label,
+        "position_pct": round(position_pct, 4),
+        "range_high": range_high,
+        "range_low": range_low,
+        "range_width_pct": round(range_width_pct, 2),
+        "bounce": bool(bounce),
+        "rejection": bool(rejection),
+        "relax_near_resistance": bool(bounce),
+        "note": note,
+    }
+ except Exception as e:
+    logger.warning(f"BTC range context error: {e}")
+    return {"zone": "unknown", "note": "BTC range error", "relax_near_resistance": False}
+
 def is_gaining_intraday_strength(df) -> bool:
  try:
     if df is None or df.empty or len(df) < 5:
@@ -5275,118 +5322,6 @@ def is_pre_breakout(df, lookback=PRE_BREAKOUT_LOOKBACK) -> bool:
     return vol_increasing and volume_significant and compressed and above_ma
  except Exception:
     return False
-
-def analyze_range_position_long(df, lookback: int = RANGE_LOOKBACK_CANDLES) -> dict:
- try:
-    result = {
-        "range_detected": False,
-        "range_high": None,
-        "range_low": None,
-        "range_width_pct": 0.0,
-        "range_position_pct": None,
-        "range_zone": "not_range",
-        "range_note": "",
-    }
-    if not RANGE_POSITION_ENABLED or df is None or getattr(df, "empty", True):
-        return result
-    if len(df) < max(lookback, 20):
-        return result
-    signal_row = get_signal_row(df)
-    if signal_row is None:
-        return result
-    current_price = _safe_float(signal_row.get("close"), 0.0)
-    if current_price <= 0:
-        return result
-    recent = df.tail(int(lookback)).copy()
-    if recent.empty:
-        return result
-    range_high = _safe_float(recent["high"].astype(float).max(), 0.0)
-    range_low = _safe_float(recent["low"].astype(float).min(), 0.0)
-    if range_high <= range_low or range_low <= 0:
-        return result
-    range_width_pct = ((range_high - range_low) / current_price) * 100.0
-    if range_width_pct < RANGE_MIN_WIDTH_PCT or range_width_pct > RANGE_MAX_WIDTH_PCT:
-        result.update({
-            "range_high": range_high,
-            "range_low": range_low,
-            "range_width_pct": round(range_width_pct, 4),
-            "range_note": "range_width_outside_limits",
-        })
-        return result
-    position_pct = (current_price - range_low) / (range_high - range_low)
-    position_pct = max(0.0, min(1.0, position_pct))
-    if position_pct <= RANGE_LOW_ZONE_MAX:
-        zone = "range_low_zone"
-        note = "شراء قرب أسفل النطاق"
-    elif position_pct >= RANGE_HIGH_ZONE_MIN:
-        zone = "range_high_zone"
-        note = "قرب أعلى النطاق - خطر شراء متأخر"
-    else:
-        zone = "range_mid_zone"
-        note = "منتصف النطاق"
-    result.update({
-        "range_detected": True,
-        "range_high": round(range_high, 8),
-        "range_low": round(range_low, 8),
-        "range_width_pct": round(range_width_pct, 4),
-        "range_position_pct": round(position_pct, 4),
-        "range_zone": zone,
-        "range_note": note,
-    })
-    return result
- except Exception as e:
-    logger.warning(f"analyze_range_position_long error: {e}")
-    return {
-        "range_detected": False,
-        "range_high": None,
-        "range_low": None,
-        "range_width_pct": 0.0,
-        "range_position_pct": None,
-        "range_zone": "error",
-        "range_note": "range_analysis_error",
-    }
-
-def is_confirmed_range_breakout(range_context: dict, price: float, breakout: bool, breakout_quality: str, vol_ratio: float, mtf_confirmed: bool) -> bool:
- try:
-    if not range_context or not range_context.get("range_detected"):
-        return False
-    range_high = _safe_float(range_context.get("range_high"), 0.0)
-    if range_high <= 0 or price <= 0:
-        return False
-    return bool(
-        breakout
-        and price > range_high * 1.002
-        and str(breakout_quality) in ("strong", "ok")
-        and float(vol_ratio or 0.0) >= 1.35
-        and bool(mtf_confirmed)
-    )
- except Exception:
-    return False
-
-def get_range_zone_message(range_context: dict) -> str:
- try:
-    if not range_context or not range_context.get("range_detected"):
-        return ""
-    zone = str(range_context.get("range_zone", ""))
-    note = str(range_context.get("range_note", ""))
-    pos = range_context.get("range_position_pct")
-    pos_text = ""
-    try:
-        if pos is not None:
-            pos_text = f" | {float(pos) * 100:.0f}% داخل النطاق"
-    except Exception:
-        pos_text = ""
-    if zone == "confirmed_range_breakout":
-        return f"📦 اختراق مؤكد للنطاق{pos_text}"
-    if zone == "range_low_zone":
-        return f"📦 {note}{pos_text}"
-    if zone == "range_mid_zone":
-        return f"📦 {note}{pos_text}"
-    if zone == "range_high_zone":
-        return f"📦 {note}{pos_text}"
-    return f"📦 {note or zone}{pos_text}"
- except Exception:
-    return ""
 
 def is_valid_candle_timing(df) -> bool:
  try:
@@ -6539,9 +6474,15 @@ def near_resistance_guard_long(
     dist_ma: float,
     vwap_distance: float,
     score_after_penalties: float,
+    btc_range_context: dict = None,
 ) -> tuple:
     if not resistance_warning or resistance_warning != "مقاومة قريبة جدًا قبل TP1":
         return False, 0.0
+
+    btc_range_context = btc_range_context or {}
+    btc_range_zone = str(btc_range_context.get("zone", "unknown"))
+    btc_range_bounce = bool(btc_range_context.get("bounce") or btc_range_context.get("relax_near_resistance"))
+    btc_range_rejection = bool(btc_range_context.get("rejection"))
 
     if market_state in ("risk_off",):
         base_penalty = 0.75
@@ -6551,6 +6492,11 @@ def near_resistance_guard_long(
         base_penalty = 0.45
     else:
         base_penalty = 0.25
+
+    if btc_range_bounce and market_state not in ("risk_off",):
+        base_penalty = min(base_penalty, 0.25)
+    elif btc_range_rejection or btc_range_zone == "btc_range_high":
+        base_penalty = max(base_penalty, 0.50)
 
     weak_market_conditions = (
         market_state in ("risk_off", "btc_leading", "mixed")
@@ -6576,7 +6522,18 @@ def near_resistance_guard_long(
             and score_after_penalties >= 7.8
             and market_state != "risk_off"
         )
-        if not strong_exception:
+        btc_low_range_exception = (
+            btc_range_bounce
+            and market_state not in ("risk_off",)
+            and mtf_confirmed
+            and score_after_penalties >= 7.0
+            and dist_ma <= 3.5
+            and vwap_distance <= 2.2
+            and upper_wick_ratio < 0.35
+            and not late_guard.get("late_pump_risk", False)
+            and not (vol_ratio >= 1.8 and candle_strength >= 0.60)
+        )
+        if not strong_exception and not btc_low_range_exception:
             return True, 0.0
 
     return False, base_penalty
@@ -6699,7 +6656,6 @@ def build_message(
  execution_sl=None,
  execution_tp1=None,
  execution_tp2=None,
- range_context=None,
 ):
  symbol_clean = clean_symbol_for_message(symbol)
  bullish, inferred_warnings = classify_reasons(score_result.get("reasons", []))
@@ -6820,11 +6776,6 @@ def build_message(
     context_joined = " | ".join(html.escape(s) for s in context_setups)
     context_text = f"\n🧩 <b>Context:</b> {context_joined}"
 
- range_text = ""
- range_msg = get_range_zone_message(range_context or {})
- if range_msg:
-    range_text = f"\n{html.escape(range_msg)}"
-
  sl_method_text = ""
  if sl_method:
     sl_method_text = f"\n🛡 <b>SL Method:</b> {html.escape(sl_method)}"
@@ -6845,7 +6796,7 @@ def build_message(
 🛡 <b>بعد TP1:</b> نقل SL إلى Entry
 🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
 🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}
-🌍 <b>السوق:</b> {safe_market}{range_text}
+🌍 <b>السوق:</b> {safe_market}
 💸 <b>التمويل:</b> {safe_funding}
 📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
 📊 <b>أسباب الدخول:</b>
@@ -7621,6 +7572,17 @@ def run_scanner_loop():
             ranked_pairs = get_ranked_pairs()
             logger.info(f"SCAN_LIMIT CONFIG = {SCAN_LIMIT} | ranked_pairs_count = {len(ranked_pairs)}")
             btc_mode = get_btc_mode()
+            btc_range_context = get_btc_range_context()
+            try:
+                logger.info(
+                    f"BTC RANGE CONTEXT | zone={btc_range_context.get('zone')} | "
+                    f"pos={btc_range_context.get('position_pct')} | "
+                    f"bounce={btc_range_context.get('bounce')} | "
+                    f"rejection={btc_range_context.get('rejection')} | "
+                    f"note={btc_range_context.get('note')}"
+                )
+            except Exception:
+                pass
             alt_snapshot = None
             if r:
                 try:
@@ -9065,6 +9027,10 @@ def run_scanner_loop():
                             "extra_setup_names": extra_setup_names,
                             "primary_extra_setup": primary_extra_setup,
                             "extra_setup_bonus": extra_setup_bonus,
+                            "btc_range_zone": btc_range_context.get("zone"),
+                            "btc_range_note": btc_range_context.get("note"),
+                            "btc_range_bounce": btc_range_context.get("bounce"),
+                            "btc_range_rejection": btc_range_context.get("rejection"),
                         },
                     )
                     continue
@@ -9294,18 +9260,6 @@ def run_scanner_loop():
                 score_result["score"] = round(effective_score, 2)
 
                 price = _safe_float(signal_row["close"], 0)
-                range_context = analyze_range_position_long(df)
-                confirmed_range_breakout = is_confirmed_range_breakout(
-                    range_context=range_context,
-                    price=price,
-                    breakout=breakout,
-                    breakout_quality=breakout_quality,
-                    vol_ratio=vol_ratio,
-                    mtf_confirmed=mtf_confirmed,
-                )
-                if confirmed_range_breakout:
-                    range_context["range_zone"] = "confirmed_range_breakout"
-                    range_context["range_note"] = "اختراق مؤكد للنطاق"
 
                 # دخول السوق الأصلي
                 market_entry = price
@@ -9584,6 +9538,7 @@ def run_scanner_loop():
                     dist_ma=dist_ma,
                     vwap_distance=vwap_distance,
                     score_after_penalties=score_result["score"],
+                    btc_range_context=btc_range_context,
                 )
                 if should_reject_near_resistance:
                     log_long_rejection(
@@ -9635,81 +9590,10 @@ def run_scanner_loop():
                     adjustments_log.append({
                         "name": "near_resistance_dynamic_penalty",
                         "value": -res_dynamic_penalty,
-                        "reason": early_resistance_warning
+                        "reason": early_resistance_warning,
+                        "btc_range_zone": btc_range_context.get("zone"),
+                        "btc_range_note": btc_range_context.get("note"),
                     })
-
-                # Range Position Context: light layer inside current market modes.
-                # It is not a fifth mode and it should not duplicate Smart Resistance/Late Entry.
-                if range_context.get("range_detected") and not is_reverse:
-                    range_zone = str(range_context.get("range_zone", ""))
-                    if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
-                        score_result["warning_reasons"] = []
-                    range_message = get_range_zone_message(range_context)
-                    if range_message and range_message not in score_result["warning_reasons"]:
-                        score_result["warning_reasons"].append(range_message)
-
-                    range_high_risky_context = (
-                        range_zone == "range_high_zone"
-                        and not confirmed_range_breakout
-                        and (
-                            late_guard.get("late_pump_risk", False)
-                            or late_guard.get("bull_continuation_risk", False)
-                            or "متأخر" in str(entry_timing_temp)
-                            or bool(early_resistance_warning)
-                            or float(res_dynamic_penalty or 0.0) > 0
-                            or breakout_quality == "weak"
-                            or current_mode == MODE_STRONG_LONG_ONLY
-                        )
-                    )
-
-                    if range_high_risky_context:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="range_high_late_or_resistance",
-                            candle_time=candle_time,
-                            score=score_result.get("score"),
-                            raw_score=raw_score,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            entry_timing=entry_timing_temp,
-                            opportunity_type=temp_opportunity_type,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={
-                                "range_context": range_context,
-                                "early_resistance_warning": early_resistance_warning,
-                                "res_dynamic_penalty": res_dynamic_penalty,
-                                "late_pump_risk": late_guard.get("late_pump_risk", False),
-                                "bull_continuation_risk": late_guard.get("bull_continuation_risk", False),
-                                "breakout_quality": breakout_quality,
-                                "category": "range_position",
-                            },
-                        )
-                        logger.info(
-                            f"⛔ {symbol} rejected: range_high_late_or_resistance | "
-                            f"pos={range_context.get('range_position_pct')} | mode={current_mode} | bq={breakout_quality}"
-                        )
-                        continue
-
-                    if range_zone == "range_high_zone" and not confirmed_range_breakout:
-                        range_penalty = RANGE_HIGH_STRONG_PENALTY if current_mode == MODE_STRONG_LONG_ONLY else RANGE_HIGH_SOFT_PENALTY
-                        effective_score -= range_penalty
-                        score_result["score"] = round(effective_score, 2)
-                        adjustments_log.append({
-                            "name": "range_high_zone_penalty",
-                            "value": -range_penalty,
-                            "reason": "range_high_zone"
-                        })
-                    elif range_zone == "range_low_zone":
-                        if range_message and range_message not in score_result.get("reasons", []):
-                            score_result.setdefault("reasons", [])
-                            score_result["reasons"].append(range_message)
 
                 wave_context_early = infer_wave_context(
                     entry_maturity_data=entry_maturity_data,
@@ -10367,14 +10251,6 @@ def run_scanner_loop():
                     "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
                     "block_exception": False,
                     "current_mode": current_mode,
-                    "range_detected": bool(range_context.get("range_detected", False)),
-                    "range_high": range_context.get("range_high"),
-                    "range_low": range_context.get("range_low"),
-                    "range_width_pct": range_context.get("range_width_pct"),
-                    "range_position_pct": range_context.get("range_position_pct"),
-                    "range_zone": range_context.get("range_zone"),
-                    "range_note": range_context.get("range_note"),
-                    "confirmed_range_breakout": bool(confirmed_range_breakout),
                     "late_breakout_guard_reason": late_breakout_guard_reason,
                     "setup_stats": get_setup_type_stats(
                         redis_client=r,
@@ -10538,15 +10414,6 @@ def run_scanner_loop():
                     execution_sl=candidate.get("execution_sl"),
                     execution_tp1=candidate.get("execution_tp1"),
                     execution_tp2=candidate.get("execution_tp2"),
-                    range_context={
-                        "range_detected": candidate.get("range_detected"),
-                        "range_high": candidate.get("range_high"),
-                        "range_low": candidate.get("range_low"),
-                        "range_width_pct": candidate.get("range_width_pct"),
-                        "range_position_pct": candidate.get("range_position_pct"),
-                        "range_zone": candidate.get("range_zone"),
-                        "range_note": candidate.get("range_note"),
-                    },
                 )
                 reply_markup = build_track_reply_markup(candidate["alert_id"])
 
@@ -10670,14 +10537,6 @@ def run_scanner_loop():
                         "relative_strength_short": candidate.get("relative_strength_short"),
                         "relative_strength_24": candidate.get("relative_strength_24"),
                         "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
-                        "range_detected": candidate.get("range_detected"),
-                        "range_high": candidate.get("range_high"),
-                        "range_low": candidate.get("range_low"),
-                        "range_width_pct": candidate.get("range_width_pct"),
-                        "range_position_pct": candidate.get("range_position_pct"),
-                        "range_zone": candidate.get("range_zone"),
-                        "range_note": candidate.get("range_note"),
-                        "confirmed_range_breakout": candidate.get("confirmed_range_breakout"),
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
                     candidate_alert_id = candidate["alert_id"]
