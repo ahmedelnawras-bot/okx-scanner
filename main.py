@@ -2651,22 +2651,44 @@ def _is_late_risky_execution_context(data: dict) -> bool:
         return False
 
 
-def _has_strict_execution_setup(data: dict) -> bool:
+EXECUTION_WHITELIST_KEYWORDS = (
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+    "relative_strength_vs_btc",
+)
+
+
+def _execution_candidate_blob(data: dict) -> str:
+    """Collect setup/context fields used only to decide execution-candidate eligibility."""
     diagnostics = data.get("diagnostics", {}) or {}
-    setup_type = str(data.get("setup_type") or diagnostics.get("setup_type") or "").lower()
-    if not setup_type:
-        return False
-    execution_keywords = (
-        "vwap_reclaim",
-        "retest_breakout_confirmed",
-        "wave_3",
-        "liquidity_sweep_reclaim",
-        "support_bounce_confirmed",
-        "higher_low_continuation",
-        "relative_strength_vs_btc",
-        "failed_breakdown_trap",
-    )
-    return any(k in setup_type for k in execution_keywords)
+    values = [
+        data.get("setup_type"),
+        diagnostics.get("setup_type"),
+        data.get("setup_type_base"),
+        diagnostics.get("setup_type_base"),
+        data.get("primary_extra_setup"),
+        diagnostics.get("primary_extra_setup"),
+    ]
+    for key in ("extra_setup_names", "context_setups"):
+        raw = data.get(key, diagnostics.get(key, []))
+        if isinstance(raw, (list, tuple, set)):
+            values.extend(list(raw))
+        elif raw:
+            values.append(raw)
+    return "|".join(str(v) for v in values if v).lower()
+
+
+def _has_strict_execution_setup(data: dict) -> bool:
+    """Execution whitelist: only agreed setups become real Execution Candidates."""
+    blob = _execution_candidate_blob(data)
+    return any(k in blob for k in EXECUTION_WHITELIST_KEYWORDS)
+
+
+def _is_block_mode_execution_candidate(data: dict) -> bool:
+    """Any signal that passed BLOCK_LONGS is considered strong enough for execution candidate flow."""
+    mode = normalize_market_mode(_trade_field(data, "current_mode", ""))
+    return mode == MODE_BLOCK_LONGS or bool(_trade_field(data, "block_exception", False))
 
 
 def _execution_plan_for_trade(trade: dict) -> dict:
@@ -2702,7 +2724,7 @@ def is_execution_candidate_trade(trade: dict) -> bool:
     try:
         if _is_late_risky_execution_context(trade):
             return False
-        if not (_has_strict_execution_setup(trade) or bool(_trade_field(trade, "block_exception", False))):
+        if not (_has_strict_execution_setup(trade) or _is_block_mode_execution_candidate(trade)):
             return False
         plan = _execution_plan_for_trade(trade)
         return bool(plan.get("complete"))
@@ -6847,15 +6869,13 @@ def _apply_market_execution_fallback(candidate: dict) -> dict:
 
 
 def is_candidate_for_execution(candidate: dict) -> bool:
-    """Compatibility helper: execution candidates are no longer blocked by strict setup gates.
-
-    A sent execution candidate should enter the execution preview flow whenever it has
-    a valid order plan. The executor/risk manager is responsible for rejecting only
-    clear execution reasons such as max open positions, existing symbol, or invalid order.
-    """
+    """True only for signals that passed the final execution whitelist plus a complete plan."""
     try:
         planned = _apply_market_execution_fallback(dict(candidate or {}))
-        return _candidate_has_complete_execution_plan(planned)
+        return bool(
+            (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
+            and _candidate_has_complete_execution_plan(planned)
+        )
     except Exception:
         return False
 
@@ -7894,6 +7914,41 @@ def build_execution_rejection_message(symbol: str, status: str, reason: str = ""
         f"❌ <b>السبب:</b> {html.escape(_execution_rejection_reason_ar(status, reason))}\n\n"
         "📊 ستظل الصفقة موجودة في /report_execution للمتابعة والتحليل."
     )
+
+
+def build_execution_paused_message(symbol: str) -> str:
+    return (
+        "⚠️ <b>Execution Candidate لم يتم تنفيذه</b>\n\n"
+        f"🪙 <b>Symbol:</b> {html.escape(str(symbol or '?'))}\n"
+        "📌 <b>Status:</b> execution_paused\n"
+        "❌ <b>السبب:</b> التنفيذ متوقف يدويًا أو بسبب Daily DD\n\n"
+        "📊 ستظل الصفقة موجودة في /report_execution للمتابعة والتحليل."
+    )
+
+
+def _execution_message_already_sent(candidate: dict, expected_status: str = "") -> bool:
+    if not r or not candidate:
+        return False
+    try:
+        symbol = str(candidate.get("symbol") or "")
+        candle_time = int(float(candidate.get("candle_time") or 0))
+        if not symbol or candle_time <= 0:
+            return False
+        for key in (f"trade:futures:long:{symbol}:{candle_time}", f"trade_history:futures:long:{symbol}:{candle_time}"):
+            raw = r.get(key)
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            diag = data.get("diagnostics", {}) or {}
+            status = str(data.get("execution_status") or diag.get("execution_status") or "")
+            sent = bool(data.get("execution_message_sent") or diag.get("execution_message_sent"))
+            if sent and (not expected_status or status == expected_status):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def update_execution_status_for_candidate(candidate: dict, status: str, reason: str = "", message_sent: bool = False) -> None:
@@ -10975,7 +11030,13 @@ def run_scanner_loop():
                             update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
                             logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
                         elif is_execution_paused():
-                            logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
+                            exec_status = "execution_paused"
+                            exec_reason = "execution_paused_manual_or_daily_dd"
+                            already_sent = _execution_message_already_sent(candidate, exec_status)
+                            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=True)
+                            if not already_sent:
+                                send_telegram_message(build_execution_paused_message(symbol))
+                            logger.info(f"EXEC PAUSED: {symbol} | message_sent={not already_sent}")
                         else:
                             dd_guard = enforce_execution_daily_drawdown_guard()
                             if dd_guard.get("locked"):
