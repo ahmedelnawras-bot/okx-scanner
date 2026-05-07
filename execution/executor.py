@@ -215,7 +215,6 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
     is_pullback = (
         order.get("entry_mode") == "pullback_pending"
         or order.get("status") == "pending_pullback_preview"
-        or bool(order.get("has_pullback_plan"))
     )
 
     result_status = "pending_pullback_preview" if is_pullback else "accepted_preview"
