@@ -7039,26 +7039,50 @@ def format_entry_maturity_block(entry_maturity_data: dict) -> str:
 # =====================
 # EXECUTION BADGE
 # =====================
+def _is_active_pullback_execution(candidate: dict) -> bool:
+    """Return True only when execution must wait for a pullback.
+
+    Important distinction:
+    - has_pullback_plan=True can mean a displayed pullback zone only.
+    - only entry_mode=pullback_pending should force execution_* pullback fields.
+    """
+    try:
+        entry_mode = str((candidate or {}).get("entry_mode", "market") or "market").strip().lower()
+        status = str((candidate or {}).get("status", "") or "").strip().lower()
+        execution_status = str((candidate or {}).get("execution_status", "") or "").strip().lower()
+        return (
+            entry_mode in ("pullback_pending", "pending_pullback")
+            or status == "pending_pullback"
+            or execution_status == "pending_pullback_preview"
+        )
+    except Exception:
+        return False
+
+
 def _candidate_has_complete_execution_plan(candidate: dict) -> bool:
     try:
-        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
-        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
-        if has_pullback:
+        if _is_active_pullback_execution(candidate):
             required = (candidate.get("execution_entry"), candidate.get("execution_sl"), candidate.get("execution_tp1"))
             return all(_safe_trade_float_value(v) is not None for v in required)
-        # Market execution can use the normal signal plan.
-        required = (candidate.get("entry"), candidate.get("sl"), candidate.get("tp1"))
+        # Market execution can use the normal signal plan even if a display-only pullback zone exists.
+        required = (
+            candidate.get("execution_entry") or candidate.get("recommended_entry") or candidate.get("market_entry") or candidate.get("entry"),
+            candidate.get("execution_sl") or candidate.get("sl"),
+            candidate.get("execution_tp1") or candidate.get("tp1"),
+        )
         return all(_safe_trade_float_value(v) is not None for v in required)
     except Exception:
         return False
 
 
 def _apply_market_execution_fallback(candidate: dict) -> dict:
-    """Fill execution_* for market entries so preview/report never shows None."""
+    """Fill execution_* for market entries so preview/report never shows None.
+
+    Do not treat has_pullback_plan as pending execution by itself; it may only be
+    a pullback zone shown in the Telegram signal.
+    """
     try:
-        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
-        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
-        if not has_pullback:
+        if not _is_active_pullback_execution(candidate):
             candidate["execution_entry"] = candidate.get("execution_entry") or candidate.get("recommended_entry") or candidate.get("market_entry") or candidate.get("entry")
             candidate["execution_sl"] = candidate.get("execution_sl") or candidate.get("sl")
             candidate["execution_tp1"] = candidate.get("execution_tp1") or candidate.get("tp1")
@@ -8223,6 +8247,84 @@ def update_execution_status_for_candidate(candidate: dict, status: str, reason: 
     except Exception as e:
         logger.warning(f"update_execution_status_for_candidate error: {e}")
 
+
+def handle_execution_preview_for_candidate(candidate: dict, symbol: str = "") -> None:
+    """Run execution-candidate evaluation independently from Telegram alert sending.
+
+    Telegram duplicate/local-send cache must only suppress duplicate alert messages.
+    It must not suppress execution preview evaluation for an already accepted signal.
+    """
+    try:
+        if not candidate:
+            return
+        symbol = str(symbol or candidate.get("symbol") or "")
+        candidate = _apply_market_execution_fallback(candidate)
+        _ensure_execution_setup_tags(candidate)
+
+        if not is_candidate_for_execution(candidate):
+            update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
+            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
+            return
+
+        if is_execution_paused():
+            exec_status = "execution_paused"
+            exec_reason = "execution_paused_manual_or_daily_dd"
+            already_sent = _execution_message_already_sent(candidate, exec_status)
+            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=True)
+            if not already_sent:
+                send_telegram_message(build_execution_paused_message(symbol))
+            logger.info(f"EXEC PAUSED: {symbol} | message_sent={not already_sent}")
+            return
+
+        dd_guard = enforce_execution_daily_drawdown_guard()
+        if dd_guard.get("locked"):
+            exec_status = "daily_drawdown_lock"
+            exec_reason = dd_guard.get("reason", "daily_drawdown_lock")
+            already_sent = _execution_message_already_sent(candidate, exec_status)
+            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=not already_sent)
+            if not already_sent:
+                send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
+            logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message={not already_sent}")
+            return
+
+        if not EXECUTION_AVAILABLE:
+            update_execution_status_for_candidate(candidate, "preview_rejected", "execution_module_not_available", message_sent=False)
+            logger.info(f"EXEC RESULT: {symbol} | status=preview_rejected | reason=execution_module_not_available | has_message=False")
+            return
+
+        if not _candidate_has_complete_execution_plan(candidate):
+            exec_status = "rejected_invalid_order"
+            exec_reason = "missing_or_invalid_entry_sl_tp"
+            already_sent = _execution_message_already_sent(candidate, exec_status)
+            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=not already_sent)
+            if not already_sent:
+                send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
+            logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message={not already_sent}")
+            return
+
+        exec_result = process_trade_candidate(r, symbol, candidate)
+        raw_status = exec_result.get("status")
+        raw_reason = exec_result.get("reason", "")
+        exec_status = _normalize_execution_status(raw_status, raw_reason)
+        execution_message = exec_result.get("execution_message")
+        already_sent = _execution_message_already_sent(candidate, exec_status)
+        has_message = bool(execution_message)
+
+        if exec_status in ("accepted_preview", "pending_pullback_preview"):
+            if execution_message and not already_sent:
+                send_telegram_message(execution_message)
+            update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=bool(execution_message or already_sent))
+            has_message = bool(execution_message and not already_sent)
+        else:
+            if not already_sent:
+                send_telegram_message(build_execution_rejection_message(symbol, exec_status, raw_reason))
+            update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
+            has_message = not already_sent
+
+        logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}")
+    except Exception as _exec_e:
+        logger.error(f"Execution preview error for {symbol or (candidate or {}).get('symbol')}: {_exec_e}")
+
 # =========================
 # MAIN LOOP
 # =========================
@@ -8790,12 +8892,13 @@ def run_scanner_loop():
                     continue
                 candle_time = get_signal_candle_time(df)
                 now = time.time()
+                telegram_recent_send_suppressed = False
                 if symbol in last_candle_cache and last_candle_cache[symbol] == candle_time:
                     logger.info(f"{symbol} skipped: local same candle cache")
                     continue
                 if symbol in sent_cache and now - sent_cache[symbol] < LOCAL_RECENT_SEND_SECONDS:
-                    logger.info(f"{symbol} skipped: local recent send cache")
-                    continue
+                    telegram_recent_send_suppressed = True
+                    logger.info(f"{symbol} telegram suppressed: local recent send cache; execution evaluation will continue")
                 if already_sent_same_candle(symbol, candle_time, "long"):
                     logger.info(f"⏭ {symbol} skipped: duplicate candle")
                     continue
@@ -11036,6 +11139,7 @@ def run_scanner_loop():
                     "recommended_entry": recommended,
                     "entry_mode": entry_mode,
                     "pullback_triggered": pullback_triggered,
+                    "telegram_recent_send_suppressed": bool(telegram_recent_send_suppressed),
                     "execution_entry": execution_entry,
                     "execution_sl": execution_sl,
                     "execution_tp1": execution_tp1,
@@ -11182,9 +11286,31 @@ def run_scanner_loop():
                 if candidate.get("block_exception"):
                     message = "🔥 <b>استثناء BLOCK_LONGS:</b> العملة أقوى من BTC أو Setup قوي جدًا\n\n" + message
 
+                # Build the execution plan/tags before the badge so Telegram and executor use the same decision.
+                candidate = _apply_market_execution_fallback(candidate)
+                _ensure_execution_setup_tags(candidate)
                 badge = build_execution_badge_line(candidate)
                 if badge:
                     message = badge + "\n\n" + message
+
+                if candidate.get("telegram_recent_send_suppressed"):
+                    logger.info(f"{symbol} main Telegram suppressed by local recent send cache; running execution evaluation only")
+                    candidate.setdefault("execution_status", "candidate_only")
+                    candidate_alert_id = candidate.get("alert_id")
+                    try:
+                        register_ok = register_trade_from_candidate(candidate)
+                        if candidate_alert_id:
+                            set_alert_registration_status(candidate_alert_id, register_ok)
+                        if not register_ok:
+                            logger.warning(
+                                f"REGISTRATION WARNING for Telegram-suppressed signal: symbol={symbol}, "
+                                f"alert_id={candidate_alert_id}, setup={candidate.get('setup_type')}, mode={current_mode}"
+                            )
+                    except Exception as _reg_e:
+                        logger.error(f"Registration error for Telegram-suppressed signal {symbol}: {_reg_e}")
+                    handle_execution_preview_for_candidate(candidate, symbol)
+                    release_signal_slot(symbol, candidate["candle_time"], "long")
+                    continue
 
                 sent_data = send_telegram_message(
                     message,
@@ -11318,58 +11444,7 @@ def run_scanner_loop():
                             f"tp2={candidate.get('tp2')}"
                         )
 
-                    try:
-                        if not is_candidate_for_execution(candidate):
-                            update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
-                            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
-                        elif is_execution_paused():
-                            exec_status = "execution_paused"
-                            exec_reason = "execution_paused_manual_or_daily_dd"
-                            already_sent = _execution_message_already_sent(candidate, exec_status)
-                            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=True)
-                            if not already_sent:
-                                send_telegram_message(build_execution_paused_message(symbol))
-                            logger.info(f"EXEC PAUSED: {symbol} | message_sent={not already_sent}")
-                        else:
-                            dd_guard = enforce_execution_daily_drawdown_guard()
-                            if dd_guard.get("locked"):
-                                exec_status = "daily_drawdown_lock"
-                                exec_reason = dd_guard.get("reason", "daily_drawdown_lock")
-                                update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
-                                send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
-                                logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
-                            elif EXECUTION_AVAILABLE:
-                                candidate = _apply_market_execution_fallback(candidate)
-                                _ensure_execution_setup_tags(candidate)
-                                if not _candidate_has_complete_execution_plan(candidate):
-                                    exec_status = "rejected_invalid_order"
-                                    exec_reason = "missing_or_invalid_entry_sl_tp"
-                                    update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
-                                    send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
-                                    logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
-                                else:
-                                    exec_result = process_trade_candidate(r, symbol, candidate)
-                                    raw_status = exec_result.get("status")
-                                    raw_reason = exec_result.get("reason", "")
-                                    exec_status = _normalize_execution_status(raw_status, raw_reason)
-                                    execution_message = exec_result.get("execution_message")
-                                    has_message = bool(execution_message)
-                                    if exec_status in ("accepted_preview", "pending_pullback_preview"):
-                                        if execution_message:
-                                            send_telegram_message(execution_message)
-                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
-                                    else:
-                                        rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
-                                        send_telegram_message(rejection_message)
-                                        has_message = True
-                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
-                                    logger.info(
-                                        f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
-                                    )
-                            else:
-                                update_execution_status_for_candidate(candidate, "preview_rejected", "execution_module_not_available", message_sent=False)
-                    except Exception as _exec_e:
-                        logger.error(f"Execution preview error for {symbol}: {_exec_e}")
+                    handle_execution_preview_for_candidate(candidate, symbol)
                     logger.info(f"✅ SENT LONG ---> {symbol}")
                 else:
                     release_signal_slot(symbol, candidate["candle_time"], "long")
