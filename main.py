@@ -2768,6 +2768,73 @@ def _has_strict_execution_setup(data: dict) -> bool:
     except Exception:
         return False
 
+def _compact_debug_value(value, max_items=8, max_len=180):
+    """Small helper for readable execution tag debug logs."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            items = []
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    items.append("...")
+                    break
+                items.append(f"{k}:{v}")
+            text = "{" + ", ".join(items) + "}"
+        elif isinstance(value, (list, tuple, set)):
+            vals = list(value)
+            text = "[" + ", ".join(str(x) for x in vals[:max_items])
+            if len(vals) > max_items:
+                text += ", ..."
+            text += "]"
+        else:
+            text = str(value)
+        text = text.replace("\n", " ").replace("\r", " ").strip()
+        if len(text) > max_len:
+            text = text[: max_len - 3] + "..."
+        return text
+    except Exception:
+        return "<debug_format_error>"
+
+
+def log_execution_tags_debug(candidate: dict, stage: str = "") -> None:
+    """Diagnose the exact gap between displayed setup fields and execution_setup_tags.
+
+    This is intentionally log-only. It does not change execution decisions.
+    """
+    try:
+        if not isinstance(candidate, dict):
+            return
+        symbol = candidate.get("symbol") or candidate.get("instId") or "unknown"
+        diagnostics = candidate.get("diagnostics", {}) or {}
+        tags = candidate.get("execution_setup_tags") or _collect_execution_setup_tags(candidate)
+        normalized_tags = sorted({_normalize_execution_tag(t) for t in tags if _normalize_execution_tag(t)})
+        whitelist_hits = sorted(
+            tag for tag in normalized_tags
+            if tag in {_normalize_execution_tag(k) for k in EXECUTION_WHITELIST_KEYWORDS}
+        )
+        strict = bool(whitelist_hits)
+        block_candidate = _is_block_mode_execution_candidate(candidate)
+        complete_plan = _candidate_has_complete_execution_plan(_apply_market_execution_fallback(dict(candidate)))
+        is_candidate = bool((strict or block_candidate) and complete_plan)
+        logger.info(
+            "EXEC TAGS DEBUG | "
+            f"stage={stage or 'unknown'} | symbol={symbol} | "
+            f"primary={_compact_debug_value(candidate.get('primary_extra_setup') or diagnostics.get('primary_extra_setup'))} | "
+            f"extra_names={_compact_debug_value(candidate.get('extra_setup_names') or diagnostics.get('extra_setup_names'))} | "
+            f"extra_setups={_compact_debug_value(candidate.get('extra_setups') or diagnostics.get('extra_setups'))} | "
+            f"extra_details={_compact_debug_value(candidate.get('extra_setups_details') or diagnostics.get('extra_setups_details'))} | "
+            f"context={_compact_debug_value(candidate.get('context_setups') or diagnostics.get('context_setups'))} | "
+            f"wave_context={_compact_debug_value(candidate.get('wave_context') or diagnostics.get('wave_context'))} | "
+            f"setup_type={_compact_debug_value(candidate.get('setup_type') or diagnostics.get('setup_type'))} | "
+            f"entry_mode={candidate.get('entry_mode')} | "
+            f"tags={normalized_tags} | whitelist_hits={whitelist_hits} | "
+            f"strict={strict} | block_candidate={block_candidate} | complete_plan={complete_plan} | is_candidate={is_candidate}"
+        )
+    except Exception as e:
+        logger.warning(f"EXEC TAGS DEBUG error: {e}")
+
+
 def _is_block_mode_execution_candidate(data: dict) -> bool:
     """Any alert that actually passed while BLOCK_LONGS is active becomes an execution candidate."""
     mode_value = (
@@ -8260,6 +8327,7 @@ def handle_execution_preview_for_candidate(candidate: dict, symbol: str = "") ->
         symbol = str(symbol or candidate.get("symbol") or "")
         candidate = _apply_market_execution_fallback(candidate)
         _ensure_execution_setup_tags(candidate)
+        log_execution_tags_debug(candidate, stage="execution_preview")
 
         if not is_candidate_for_execution(candidate):
             update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
@@ -11289,6 +11357,7 @@ def run_scanner_loop():
                 # Build the execution plan/tags before the badge so Telegram and executor use the same decision.
                 candidate = _apply_market_execution_fallback(candidate)
                 _ensure_execution_setup_tags(candidate)
+                log_execution_tags_debug(candidate, stage="pre_badge")
                 badge = build_execution_badge_line(candidate)
                 if badge:
                     message = badge + "\n\n" + message
