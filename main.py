@@ -3713,6 +3713,72 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
         logger.warning(f"calculate_trade_lifecycle_pnl_for_track error: {e}")
         return {"available": False}
 
+
+def _is_track_trade_closed(trade: dict) -> bool:
+    """Display-only helper: determine whether Track should show final realized outcome."""
+    try:
+        if not isinstance(trade, dict) or not trade:
+            return False
+        status = str(trade.get("status", "") or "").lower()
+        result = str(trade.get("result", "") or "").lower()
+        if status in ("closed", "expired"):
+            return True
+        return result in (
+            "loss", "tp1_win", "tp2_win", "trailing_win",
+            "breakeven", "protected_breakeven", "expired", "pending_expired",
+        )
+    except Exception:
+        return False
+
+
+def _format_track_tp1_result_line(trade: dict) -> str:
+    try:
+        result = str(trade.get("result", "") or "").lower()
+        tp1_hit = bool(trade.get("tp1_hit", False)) or result in ("tp1_win", "tp2_win", "trailing_win")
+        return "تحقق" if tp1_hit else "لم يتحقق"
+    except Exception:
+        return "غير معروف"
+
+
+def format_final_result_block_for_track(trade: dict, favorable_pct: float = 0.0, adverse_pct: float = 0.0) -> str:
+    """Final-result Track block for closed trades.
+
+    Closed trades should not show floating/current PnL. This block separates:
+    - final realized result
+    - max favorable move during the trade
+    - max adverse move during the trade
+    """
+    try:
+        close_type = _execution_close_type_for_trade(trade) if isinstance(trade, dict) else "Closed"
+        close_icon = "❌" if close_type in ("Direct SL", "SL Hit") else "🏁" if "TP2" in close_type else "🎯" if "TP1" in close_type else "🛡️" if "BE" in close_type or "Breakeven" in close_type else "⌛" if "Expired" in close_type else "📌"
+
+        final_pct = _execution_final_pnl_pct(trade) if isinstance(trade, dict) else None
+        if final_pct is None:
+            lifecycle = calculate_trade_lifecycle_pnl_for_track(trade, None) if isinstance(trade, dict) else {"available": False}
+            if lifecycle.get("available"):
+                final_pct = _safe_float(lifecycle.get("leveraged_pct"), 0.0)
+
+        final_line = f"{final_pct:+.2f}%" if final_pct is not None else "—"
+        max_up = _safe_float(favorable_pct, 0.0) * TRACK_LEVERAGE
+        max_down = _safe_float(adverse_pct, 0.0) * TRACK_LEVERAGE
+        tp1_line = _format_track_tp1_result_line(trade if isinstance(trade, dict) else {})
+
+        return (
+            "📌 <b>النتيجة النهائية:</b>\n"
+            f"{close_icon} {html.escape(str(close_type))}\n\n"
+            "💰 <b>Final Result 40/40/20:</b>\n"
+            f"{final_line}\n\n"
+            "📉 <b>أقصى صعود أثناء الصفقة:</b>\n"
+            f"{max_up:+.2f}%\n\n"
+            "📉 <b>أقصى هبوط:</b>\n"
+            f"-{abs(max_down):.2f}%\n\n"
+            "🎯 <b>TP1:</b>\n"
+            f"{tp1_line}"
+        )
+    except Exception as e:
+        logger.warning(f"format_final_result_block_for_track error: {e}")
+        return "📌 <b>النتيجة النهائية:</b>\n⚠️ تعذر حساب النتيجة النهائية"
+
 def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, current_price: float) -> str:
     """Clear display-only 40/40/20 financial status for Track messages."""
     try:
@@ -3841,6 +3907,7 @@ def build_track_message(alert: dict) -> str:
     tv_link = build_track_tradingview_link(alert.get("symbol", ""))
     leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
     lifecycle_pnl = calculate_trade_lifecycle_pnl_for_track(trade, current_price) if trade else {"available": False}
+    track_trade_closed = _is_track_trade_closed(trade) if trade else False
     leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
     leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
     recovery_extra = ""
@@ -3861,7 +3928,7 @@ def build_track_message(alert: dict) -> str:
         f"{status_line}\n"
         f"{recovery_extra}\n"
         f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
-        f"{format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
+        f"{format_final_result_block_for_track(trade, favorable_pct, adverse_pct) if track_trade_closed else format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
     )
     if entry_mode == "pullback_pending" and not pullback_triggered:
         msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
@@ -3903,14 +3970,15 @@ def build_track_message(alert: dict) -> str:
                 f"• أعلى سعر وصله: {_fmt_price(t_high)} (+{gain_from_entry:.2f}%)\n"
                 f"• Trailing SL الحالي: {_fmt_price(t_sl)} ({t_pct:.1f}% تحت الـ High)"
             )
+    if not track_trade_closed:
+        msg += (
+            f"\n💵 السعر الحالي: {current_price:.6f}\n"
+            f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
+            f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
+            f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
+            f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
+        )
     msg += (
-        f"\n💵 السعر الحالي: {current_price:.6f}\n"
-        f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
-        f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
-    )
-    msg += (
-        f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
-        f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
         f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
         f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
     )
