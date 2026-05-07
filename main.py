@@ -2471,7 +2471,7 @@ def get_market_mode_arabic_description(mode: str) -> str:
     mapping = {
         MODE_NORMAL_LONG: "🟢 الوضع طبيعي: السوق يسمح بإشارات اللونج العادية حسب الفلاتر. أفضل تعامل: متابعة الفرص بدون تهور.",
         MODE_STRONG_LONG_ONLY: "🟡 وضع حذر: السوق فيه ضعف أو تذبذب، يسمح فقط بأقوى فرص اللونج (إعدادات محددة، سكور ≥ 8.0، فوليوم ≥ 1.2). أفضل تعامل: انتقاء setups قوية فقط وعدم مطاردة الحركة.",
-        MODE_BLOCK_LONGS: "🔴 وضع حماية: السوق في ضغط أو هبوط جماعي، يتم إيقاف دخول صفقات لونج جديدة مؤقتًا. أفضل تعامل: حماية الأرباح ومتابعة الصفقات المفتوحة فقط.",
+        MODE_BLOCK_LONGS: "🔴 وضع حماية: السوق في ضغط أو هبوط جماعي. الإشارات العادية يتم تشديدها/منعها حسب الفلاتر، لكن Execution Candidates مسموحة فقط إذا اجتازت قواعد التنفيذ: حد الـ7، عدم تكرار نفس الزوج، Daily DD، وصحة بيانات الأمر.",
         MODE_RECOVERY_LONG: "🔵 وضع تعافي: السوق يحاول الخروج من هبوط، يسمح بفرص تعافي محدودة وبحذر. أفضل تعامل: حجم أقل وتأكيد أقوى.",
     }
     return mapping.get(mode, "ℹ️ وضع غير معروف")
@@ -2534,32 +2534,10 @@ def build_market_status_message() -> str:
         data_source = "⚠️ Live (Snapshot غير متاح)"
         age_str = ""
 
-    mode_ar = {
-        MODE_NORMAL_LONG: "🟢 NORMAL LONG",
-        MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
-        MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
-        MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
-    }.get(current_mode, html.escape(str(current_mode)))
-
-    suggested_mode_ar = {
-        MODE_NORMAL_LONG: "🟢 NORMAL LONG",
-        MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
-        MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
-        MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
-    }.get(suggested_mode, html.escape(str(suggested_mode)))
-
+    mode_ar = _market_mode_label(current_mode)
+    suggested_mode_ar = _market_mode_label(suggested_mode)
     mode_desc = get_market_mode_arabic_description(current_mode)
-
-    if current_mode == MODE_NORMAL_LONG:
-        action = "✅ مسموح باللونج العادي مع الالتزام بالفلاتر."
-    elif current_mode == MODE_STRONG_LONG_ONLY:
-        action = "⚠️ لا تدخل إلا الفرص القوية جدًا (مسموح فقط vwap_reclaim, retest_breakout_confirmed, wave_3، مع Score ≥ 8.0 و Vol ≥ 1.2)."
-    elif current_mode == MODE_BLOCK_LONGS:
-        action = "🛑 الأفضل وقف اللونج الجديد مؤقتًا وانتظار خروج السوق من الضغط."
-    elif current_mode == MODE_RECOVERY_LONG:
-        action = "🛟 فرص Recovery فقط وبحجم صغير، ولا تتعامل معها كإشارة لونج عادية."
-    else:
-        action = "ℹ️ مراقبة السوق قبل الدخول"
+    action = get_market_mode_action_text(current_mode)
 
     lines = [
         "🧭 <b>Market Mood - LONG</b>",
@@ -7534,50 +7512,67 @@ def determine_long_market_mode(
     return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق ضعيف/مختلط لكن ليس كراش"}
  return {"mode": MODE_NORMAL_LONG, "reason": "لا يوجد تغيير في المود"}
 
+def _market_mode_label(mode: str) -> str:
+    mode = normalize_market_mode(mode)
+    return {
+        MODE_NORMAL_LONG: "🟢 NORMAL LONG",
+        MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
+        MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
+        MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
+    }.get(mode, html.escape(str(mode)))
+
+def get_market_mode_action_text(mode: str) -> str:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_NORMAL_LONG:
+        return "✅ مسموح باللونج العادي مع الالتزام بالفلاتر."
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "⚠️ الإشارات العادية مقتصرة على أقوى الفرص فقط؛ Execution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
+    if mode == MODE_BLOCK_LONGS:
+        return "🛡 الإشارات العادية تحت حماية مشددة، لكن Execution Candidates مسموحة حسب قواعد التنفيذ الجديدة فقط: حد الـ7 + عدم تكرار نفس الزوج + Daily DD + صحة بيانات الأمر."
+    if mode == MODE_RECOVERY_LONG:
+        return "🛟 فرص Recovery فقط وبحذر، وExecution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
+    return "ℹ️ مراقبة السوق قبل الدخول"
+
 def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
- transition = f"{html.escape(old_mode)} → {html.escape(new_mode)}"
- lines = []
- if new_mode == MODE_NORMAL_LONG:
+    old_mode = normalize_market_mode(old_mode)
+    new_mode = normalize_market_mode(new_mode)
+    transition = f"{_market_mode_label(old_mode)} → {_market_mode_label(new_mode)}"
     lines = [
-        "🟢 <b>Mode Changed: NORMAL LONG</b>",
-        "• السوق رجع طبيعي نسبيًا",
-        "• البوت رجع يرسل إشارات Long بالحجم والمنطق العادي",
-        f"• الانتقال: {transition}",
-        "• الفحص: Market Guard / 15m"
+        "🧭 <b>Market Mood - LONG</b>",
+        "🔁 <b>تغيير المود</b>",
+        f"⚙️ <b>المود الحالي:</b> {_market_mode_label(new_mode)}",
+        f"📋 <b>الوصف:</b> {get_market_mode_arabic_description(new_mode)}",
+        f"🎯 <b>التصرف:</b> {html.escape(get_market_mode_action_text(new_mode))}",
+        "",
+        f"🔄 <b>الانتقال:</b> {transition}",
     ]
- elif new_mode == MODE_STRONG_LONG_ONLY:
-    lines = [
-        "🟡 <b>Mode Changed: STRONG LONG ONLY (وضع حذر)</b>",
-        "• السوق غير مثالي، يسمح فقط بأقوى فرص اللونج وفق معايير صارمة",
-        "• مسموح setups قوية: vwap_reclaim, retest_breakout_confirmed, wave_3, higher_low, relative_strength, support_bounce",
-        f"• Score ≥ {STRONG_ONLY_MIN_SCORE} & Vol ratio ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
-        f"• الانتقال: {transition}",
-    ]
- elif new_mode == MODE_BLOCK_LONGS:
-    lines = [
-        "🔴 <b>Mode Changed: BLOCK LONGS</b>",
-        "• السوق يهبط بعنف أو فيه ضغط جماعي واضح",
-        "• تم إيقاف إشارات Long الجديدة مؤقتًا",
-        f"• الانتقال: {transition}",
-        "• الأوامر والتقارير و Track شغالة عادي",
-        "🛡️ تم تفعيل حماية الصفقات المفتوحة الرابحة إن وجدت."
-    ]
- elif new_mode == MODE_RECOVERY_LONG:
-    lines = [
-        "🟠 <b>Mode Changed: RECOVERY LONG</b>",
-        "• السوق بدأ يهدأ بعد ضغط/كراش",
-        "• البوت سيسمح فقط بفرص Recovery Long بشروط خاصة",
-        f"• الانتقال: {transition}",
-        f"• حجم الصفقة: {RECOVERY_TOTAL_SIZE_PCT}% من الحجم الطبيعي",
-        f"• Entry 1 = {RECOVERY_ENTRY1_SIZE_PCT}%",
-        f"• Entry 2 = {RECOVERY_ENTRY2_SIZE_PCT}%"
-    ]
- else:
-    lines = [f"Mode: {html.escape(new_mode)}"]
- if reason:
-    lines.append("")
-    lines.append(f"🧠 <b>السبب:</b> {html.escape(str(reason))}")
- return "\n".join(lines)
+    if reason:
+        lines.append(f"🧠 <b>السبب:</b> {html.escape(str(reason))}")
+    if new_mode == MODE_STRONG_LONG_ONLY:
+        lines.extend([
+            "",
+            "✅ <b>المسموح:</b>",
+            "• الإشارات العادية: أقوى setups فقط",
+            f"• Strong filters: Score ≥ {STRONG_ONLY_MIN_SCORE} و Vol ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
+            "• Execution Candidates: حسب قواعد التنفيذ الجديدة",
+        ])
+    elif new_mode == MODE_BLOCK_LONGS:
+        lines.extend([
+            "",
+            "🛡 <b>حماية:</b>",
+            "• حماية الصفقات المفتوحة الرابحة إن وجدت",
+            "• Track والتقارير والأوامر مستمرة",
+            "• Execution Candidates لا تُمنع بسبب BLOCK وحده، لكنها تخضع لقواعد التنفيذ",
+        ])
+    elif new_mode == MODE_RECOVERY_LONG:
+        lines.extend([
+            "",
+            "🛟 <b>Recovery:</b>",
+            f"• حجم الصفقة: {RECOVERY_TOTAL_SIZE_PCT}% من الحجم الطبيعي",
+            f"• Entry 1 = {RECOVERY_ENTRY1_SIZE_PCT}%",
+            f"• Entry 2 = {RECOVERY_ENTRY2_SIZE_PCT}%",
+        ])
+    return "\n".join(lines)
 
 def handle_market_mode_transition(mode_result: dict) -> str:
  new_mode = mode_result.get("mode", MODE_NORMAL_LONG)
@@ -8114,13 +8109,7 @@ def run_scanner_loop():
                 try:
                     last_reminder = int(r.get(MARKET_MODE_LAST_REMINDER_KEY) or 0)
                     if now_ts_local - last_reminder >= REMINDER_INTERVAL:
-                        mode_desc = get_market_mode_arabic_description(current_mode)
-                        reminder_msg = (
-                            f"⏱️ تحديث Market Mode - LONG\n"
-                            f"المود الحالي: {current_mode}\n"
-                            f"الوصف: {mode_desc}\n"
-                            f"سبب آخر حساب: {mode_result.get('reason', 'غير محدد')}"
-                        )
+                        reminder_msg = "⏱️ <b>Market Mood Reminder</b>\n\n" + build_market_status_message()
                         send_telegram_message(reminder_msg)
                         r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
                 except Exception as e:
