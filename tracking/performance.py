@@ -2288,8 +2288,8 @@ def calculate_trade_pnl(trade: dict) -> dict:
     tp1         = safe_float(trade.get("tp1"), 0.0)
     tp2         = safe_float(trade.get("tp2"), 0.0)
 
-    # فحص breakeven: SL == effective_entry
-    _sl_for_check = initial_sl if initial_sl > 0 else sl
+    # فحص breakeven: استخدم SL الحالي أولاً لأن SL ينتقل إلى entry بعد TP1
+    _sl_for_check = sl if sl > 0 else initial_sl
     _is_sl_on_entry = (
         _sl_for_check > 0
         and effective_entry > 0
