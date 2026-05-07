@@ -2841,7 +2841,17 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
     exec_status = html.escape(_execution_status_for_trade(trade))
     reject_reason = html.escape(str(_trade_field(trade, "execution_reject_reason", "") or ""))
     duration = _execution_duration_text(trade)
-    lines = [f"• <b>{symbol}</b>"]
+    pnl_for_icon = _execution_floating_pnl_pct(trade) if is_open else _execution_final_pnl_pct(trade)
+    if pnl_for_icon is None:
+        result_for_icon = str(trade.get("result", "") or "").lower()
+        icon = "🟢" if result_for_icon in ("tp1_win", "tp2_win", "trailing_win") else ("🔴" if result_for_icon == "loss" else "⚪")
+    elif pnl_for_icon > 0:
+        icon = "🟢"
+    elif pnl_for_icon < 0:
+        icon = "🔴"
+    else:
+        icon = "⚪"
+    lines = [f"• {icon} <b>{symbol}</b>"]
     if is_open:
         pnl = _execution_floating_pnl_pct(trade)
         lines.append(f"  📌 Phase: {_execution_phase_for_trade(trade)} | ⏱ {duration}")
@@ -2898,6 +2908,8 @@ def build_execution_report_message(period: str = "all") -> str:
             f"🚀 <b>Execution Candidates Report</b> — {title_period}",
             f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
             f"🟢 مفتوحة: {len(open_trades)} | 🏁 مغلقة: {len(closed_trades)}",
+            f"🟢 عدد الصفقات الرابحة: {len(winners)}",
+            f"🔴 عدد الصفقات الخاسرة: {len(losers)}",
             "",
             "🧠 <b>Summary 40/40/20</b>",
             f"🟢 Open Floating: {_pct_safe(sum(open_pnls)) if open_pnls else '+0.00%'}",
@@ -8308,6 +8320,13 @@ def run_scanner_loop():
             logger.info(f"Parallel candle fetch completed: {len(candles_map)} symbols")
             btc_15m_candles = get_candles("BTC-USDT-SWAP", TIMEFRAME, 100)
             btc_15m_df = to_dataframe(btc_15m_candles)
+            # BTC 24h change is needed for relative_strength_24.
+            # Use the ticker snapshot from this scan instead of relying on locals().
+            try:
+                btc_ticker_24h = next((p for p in scan_pairs if str(p.get("instId", "")) == "BTC-USDT-SWAP"), None)
+                btc_change_24h = extract_24h_change_percent(btc_ticker_24h or {})
+            except Exception:
+                btc_change_24h = 0.0
             tested = 0
             sent_count = 0
             sent_symbols_this_run = set()
@@ -9529,10 +9548,45 @@ def run_scanner_loop():
                 pullback_triggered = True
 
                 wait_pullback = False
-                # حساب early_resistance_warning من smart_targets_early لاستخدامه في should_wait
-                # نستخدم قيم مؤقتة حالياً، لكن smart_targets_early سيحتاج stop_loss و rr1/rr2 التي لم تحسب بعد
-                # لذا نمرر early_resistance_warning فارغاً
-                early_resistance_warning = ""  # سيتحدد لاحقاً
+                # Pre-compute an early resistance warning before pullback decision.
+                # The final TP/SL calculation is still performed later after the final entry is chosen.
+                early_resistance_warning = ""
+                try:
+                    if breakout:
+                        _early_sl_type = "breakout"
+                    elif pre_breakout:
+                        _early_sl_type = "pre_breakout"
+                    elif is_new:
+                        _early_sl_type = "new_listing"
+                    else:
+                        _early_sl_type = "standard"
+                    _early_rr1, _early_rr2 = get_rr_targets_long(signal_type=_early_sl_type, entry_timing=entry_timing_temp)
+                    _early_smart_sl = build_smart_sl_long(
+                        df=df,
+                        entry=market_entry,
+                        atr_value=atr_value,
+                        signal_type=_early_sl_type,
+                        market_state=market_state,
+                        breakout=breakout,
+                        pre_breakout=pre_breakout,
+                        is_reverse=is_reverse,
+                    )
+                    _early_stop_loss = _safe_float(_early_smart_sl.get("sl"), 0.0)
+                    if _early_stop_loss > 0:
+                        _early_targets = build_smart_tp1_long(
+                            df=df,
+                            entry=market_entry,
+                            sl=_early_stop_loss,
+                            rr1=_early_rr1,
+                            rr2=_early_rr2,
+                            atr_value=atr_value,
+                            market_state=market_state,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                        )
+                        early_resistance_warning = str(_early_targets.get("resistance_warning", "") or "")
+                except Exception:
+                    early_resistance_warning = ""
                 if has_pullback_plan:
                     temp_cand_dec = {
                         "market_entry": market_entry,
@@ -10505,8 +10559,8 @@ def run_scanner_loop():
                     "momentum_priority": momentum_priority,
                     "now": now,
                     "relative_strength_short": round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4),
-                    "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4),
-                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h if 'btc_change_24h' in locals() else 0.0), 4) >= 2.0),
+                    "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h or 0.0), 4),
+                    "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h or 0.0), 4) >= 2.0),
                     "block_exception": False,
                     "current_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
