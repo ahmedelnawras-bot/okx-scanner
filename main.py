@@ -2767,7 +2767,11 @@ def _is_block_mode_execution_candidate(data: dict) -> bool:
         or _trade_field(data, "mode", "")
     )
     mode = normalize_market_mode(mode_value)
-    return mode == MODE_BLOCK_LONGS or bool(_trade_field(data, "block_exception", False))
+    return (
+        mode == MODE_BLOCK_LONGS
+        or bool(_trade_field(data, "block_exception", False))
+        or bool(_trade_field(data, "block_longs_execution_candidate", False))
+    )
 
 
 def _execution_plan_for_trade(trade: dict) -> dict:
@@ -10838,7 +10842,9 @@ def run_scanner_loop():
                     "relative_strength_24": round(float(change_24h or 0.0) - float(btc_change_24h or 0.0), 4),
                     "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h or 0.0), 4) >= 2.0),
                     "block_exception": False,
+                    "block_longs_execution_candidate": False,
                     "current_mode": current_mode,
+                    "market_mode": current_mode,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
                     "setup_stats": get_setup_type_stats(
                         redis_client=r,
@@ -10899,6 +10905,8 @@ def run_scanner_loop():
                         logger.info(f"⛔ BLOCK_LONGS | skipped {symbol}")
                         continue
                     candidate["block_exception"] = True
+                    candidate["block_longs_execution_candidate"] = True
+                    candidate["market_mode"] = current_mode
                     logger.info(f"🔥 BLOCK_LONGS EXCEPTION | allowed {symbol}")
 
                 candidate["bucket"] = get_candidate_bucket(candidate)
@@ -11122,6 +11130,9 @@ def run_scanner_loop():
                         "execution_tp1": candidate.get("execution_tp1"),
                         "execution_tp2": candidate.get("execution_tp2"),
                         "block_exception": candidate.get("block_exception", False),
+                        "block_longs_execution_candidate": candidate.get("block_longs_execution_candidate", False),
+                        "current_mode": current_mode,
+                        "market_mode": current_mode,
                         "relative_strength_short": candidate.get("relative_strength_short"),
                         "relative_strength_24": candidate.get("relative_strength_24"),
                         "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
