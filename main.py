@@ -184,6 +184,8 @@ ALERT_TTL_SECONDS = 14 * 24 * 3600
 
 # Execution control
 EXECUTION_PAUSE_KEY = "execution:paused:long"
+EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT = 35.0
+EXECUTION_DRAWDOWN_LOCK_REASON_KEY = "execution:drawdown_lock_reason:long"
 
 # Track leverage display
 TRACK_LEVERAGE = 15.0
@@ -1528,6 +1530,57 @@ def send_telegram_reply(chat_id: str, message: str) -> bool:
  data = telegram_api_call("sendMessage", payload)
  return bool(data.get("ok"))
 
+
+def split_telegram_message(text: str, limit: int = 3600) -> list:
+ try:
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= limit:
+            current = block
+        else:
+            lines = block.split("\n")
+            line_chunk = ""
+            for line in lines:
+                cand = line if not line_chunk else line_chunk + "\n" + line
+                if len(cand) <= limit:
+                    line_chunk = cand
+                else:
+                    if line_chunk:
+                        chunks.append(line_chunk)
+                    line_chunk = line[:limit]
+            if line_chunk:
+                current = line_chunk
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+ except Exception:
+    return [str(text or "")[:limit]]
+
+
+def send_telegram_reply_chunks(chat_id: str, messages) -> bool:
+ if isinstance(messages, str):
+    messages = split_telegram_message(messages)
+ ok = True
+ total = len(messages or [])
+ for idx, msg in enumerate(messages or [], start=1):
+    final_msg = msg
+    if total > 1:
+        final_msg = f"{msg}\n\n📨 <b>جزء {idx}/{total}</b>"
+    ok = send_telegram_reply(chat_id, final_msg) and ok
+    time.sleep(0.25)
+ return ok
+
 def get_telegram_updates(offset: int = 0):
  if not BOT_TOKEN:
     return []
@@ -1631,44 +1684,49 @@ def build_deep_report_message() -> str:
 def build_help_message() -> str:
  return """<b>😋 OKX Scanner Bot - LONG</b>
 
-<b>⚡ أوامر سريعة:</b>
-/mood - حالة السوق والمود الحالي
-/status - نفس أمر /mood
-/open_trades - الصفقات المفتوحة وملخص سريع
-/report_1h - تقرير آخر ساعة
-/report_today - تقرير اليوم
-/report_7d - تقرير آخر 7 أيام
-/report_30d - تقرير آخر 30 يوم
-/report_all - كل الصفقات
+<b>⚡ أساسي:</b>
+/mood — حالة السوق
+/status — نفس /mood
+/open_trades — الصفقات المفتوحة
+/help — قائمة الأوامر
 
-<b>⚙️ التنفيذ:</b>
-/exec_status - اختبار اتصال OKX API
-/exec_mode - عرض وضع التنفيذ الحالي
-/stop_trading - إيقاف الدخول في صفقات جديدة فقط
-/resume_trading - إعادة السماح بالدخول في صفقات جديدة
+<b>📊 تقارير عادية:</b>
+/report_1h — آخر ساعة
+/report_today — اليوم
+/report_7d — آخر 7 أيام
+/report_30d — آخر 30 يوم
+/report_all — كل الصفقات
 
-<b>📊 تحليل الأداء:</b>
-/report_deep - تحليل متقدم شامل
-/report_exits - جودة الخروج TP1/TP2/SL
-/report_execution - مرشحو التنفيذ منذ البداية
-/report_execution_today - مرشحو التنفيذ اليوم
-/report_execution_7d - مرشحو آخر 7 أيام
-/report_execution_30d - مرشحو آخر 30 يوم
-/report_rejections - تحليل أسباب رفض الفرص
-/report_setups - أفضل وأسوأ أنواع الإشارات
-/report_scores - تحليل السكور
-/report_market - الأداء حسب حالة السوق
-/report_losses - تحليل أسباب الخسارة
-/report_diagnostics - تقرير تشخيصي كامل
+<b>🚀 تقارير التنفيذ:</b>
+/report_execution — منذ البداية
+/report_execution_today — اليوم
+/report_execution_7d — آخر 7 أيام
+/report_execution_30d — آخر 30 يوم
+
+<b>⚙️ أوامر التنفيذ:</b>
+/exec_status — اختبار OKX
+/exec_mode — وضع التنفيذ
+/stop_trading — إيقاف تنفيذ جديد
+/resume_trading — تشغيل التنفيذ
+
+<b>🧠 تحليلات:</b>
+/report_deep — تحليل شامل
+/report_exits — جودة الخروج
+/report_rejections — أسباب الرفض
+/report_setups — أداء setups
+/report_scores — تحليل السكور
+/report_market — أداء السوق
+/report_losses — أسباب الخسارة
+/report_diagnostics — تشخيص كامل
 
 <b>🛠 إدارة:</b>
-/reset_stats - تصفير إحصائيات اللونج (soft)
-/hard_reset - مسح كامل لبيانات اللونج فقط (للمدراء فقط)
-/stats_since_reset - الأداء منذ آخر تصفير
-/how_it_work - شرح طريقة عمل البوت
+/reset_stats — تصفير ناعم
+/hard_reset — مسح بيانات اللونج
+/stats_since_reset — منذ آخر تصفير
+/how_it_work — شرح البوت
 
 <b>ℹ️ ملاحظة:</b>
-البوت يستخدم Entry Maturity لتقليل الدخول المتأخر في نهاية الموجة."""
+التنفيذ الآن لأي Execution Candidate، مع حماية 7 صفقات، نفس الزوج، وDaily Drawdown."""
 
 def build_how_it_work_message() -> str:
  return """📘 <b>كيف يعمل بوت اللونج؟</b>
@@ -2895,15 +2953,6 @@ def build_execution_report_message(period: str = "all") -> str:
         tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
         trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
         direct_sl = sum(1 for t in closed_trades if _execution_close_type_for_trade(t) == "Direct SL")
-        direct_sl_pnls = []
-        for t in closed_trades:
-            if _execution_close_type_for_trade(t) == "Direct SL":
-                pnl = _execution_final_pnl_pct(t)
-                if pnl is not None:
-                    direct_sl_pnls.append(pnl)
-        actual_profit_pnl = sum(winners) + sum(open_pnls)
-        actual_sl_loss_pnl = sum(direct_sl_pnls)
-        actual_net_pnl = actual_profit_pnl + actual_sl_loss_pnl
 
         title_map = {
             "all": "منذ البداية",
@@ -2913,6 +2962,13 @@ def build_execution_report_message(period: str = "all") -> str:
             "month": "آخر 30 يوم",
         }
         title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
+        actual_profit = sum(p for p in closed_pnls if p > 0) + sum(p for p in open_pnls if p > 0)
+        actual_sl_loss = sum(
+            p for p, t in zip((_execution_final_pnl_pct(x) for x in closed_trades), closed_trades)
+            if p is not None and p < 0 and _execution_close_type_for_trade(t) == "Direct SL"
+        )
+        actual_net = actual_profit + actual_sl_loss
+
         lines = [
             f"🚀 <b>Execution Candidates Report</b> — {title_period}",
             f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
@@ -2929,16 +2985,16 @@ def build_execution_report_message(period: str = "all") -> str:
             f"🔄 Trail Success: {trailing_wins / total * 100:.1f}%",
             f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
             "",
-            "<b>النتيجة الفعلية</b>",
-            f"• 🟢 أرباح محققة/مفتوحة: {_pct_safe(actual_profit_pnl)}",
-            f"• 🔴 خسائر SL Hit: {_pct_safe(actual_sl_loss_pnl)}",
-            f"• ⚖️ الصافي بعد الرافعة: <b>{_pct_safe(actual_net_pnl)}</b>",
+            "<b>النتيجة الفعلية </b>",
+            f"• 🟢 أرباح محققة/مفتوحة: {_pct_safe(actual_profit)}",
+            f"• 🔴 خسائر SL Hit: {_pct_safe(actual_sl_loss)}",
+            f"• ⚖️ الصافي بعد الرافعة: <b>{_pct_safe(actual_net)}</b>",
             "─",
             "",
             f"🟢 <b>الصفقات المفتوحة ({len(open_trades)})</b>",
         ]
         if open_trades:
-            for t in open_trades[:8]:
+            for t in open_trades:
                 lines.extend(_format_execution_trade_card(t, is_open=True))
                 lines.append("")
         else:
@@ -2946,12 +3002,12 @@ def build_execution_report_message(period: str = "all") -> str:
             lines.append("")
         lines.append(f"🏁 <b>الصفقات المغلقة ({len(closed_trades)})</b>")
         if closed_trades:
-            for t in closed_trades[:10]:
+            for t in closed_trades:
                 lines.extend(_format_execution_trade_card(t, is_open=False))
                 lines.append("")
         else:
             lines.append("لا توجد صفقات مغلقة في هذه الفترة.")
-        return _limit_telegram_message("\n".join(lines))
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
@@ -3137,6 +3193,7 @@ def build_exec_resume_message() -> str:
         return "⚠️ Redis غير متصل، لا يمكن إعادة التداول الآن."
     try:
         r.delete(EXECUTION_PAUSE_KEY)
+        r.delete(EXECUTION_DRAWDOWN_LOCK_REASON_KEY)
         return (
             "✅ <b>تمت إعادة تفعيل الدخول في صفقات جديدة</b>\n\n"
             "📌 البوت يستطيع الآن قبول فرص جديدة حسب شروط التنفيذ.\n"
@@ -3200,10 +3257,10 @@ COMMAND_HANDLERS = {
  "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
  "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
- "/report_execution": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("all")),
- "/report_execution_today": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("today")),
- "/report_execution_7d": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("7d")),
- "/report_execution_30d": lambda chat_id: send_telegram_reply(chat_id, build_execution_report_message("30d")),
+ "/report_execution": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
+ "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
+ "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
+ "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -7755,19 +7812,62 @@ def cleanup_local_caches():
         last_candle_cache_meta.pop(sym, None)
 
 
+def _execution_daily_pnl_pct() -> float:
+    """Calculate today's execution-candidate PnL after leverage from tracked trades."""
+    try:
+        since_ts = get_local_day_start_ts()
+        try:
+            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1500)
+            trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+        trades = [t for t in trades if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")]
+        total = 0.0
+        for t in trades:
+            pnl = _execution_floating_pnl_pct(t) if _is_execution_trade_open(t) else _execution_final_pnl_pct(t)
+            if pnl is not None:
+                total += float(pnl)
+        return float(total)
+    except Exception as e:
+        logger.warning(f"_execution_daily_pnl_pct error: {e}")
+        return 0.0
+
+
+def enforce_execution_daily_drawdown_guard() -> dict:
+    """Stop execution like /stop_trading when daily execution drawdown reaches -35%."""
+    if not r:
+        return {"locked": False, "pnl": 0.0}
+    try:
+        if is_execution_paused():
+            return {"locked": True, "pnl": _execution_daily_pnl_pct(), "reason": "execution_paused"}
+        daily_pnl = _execution_daily_pnl_pct()
+        if daily_pnl <= -abs(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT):
+            reason = f"daily_drawdown_{daily_pnl:.2f}%"
+            r.set(EXECUTION_PAUSE_KEY, "1")
+            r.set(EXECUTION_DRAWDOWN_LOCK_REASON_KEY, reason)
+            logger.warning(f"EXECUTION DAILY DRAWDOWN LOCK: {reason}")
+            return {"locked": True, "pnl": daily_pnl, "reason": reason}
+        return {"locked": False, "pnl": daily_pnl}
+    except Exception as e:
+        logger.warning(f"enforce_execution_daily_drawdown_guard error: {e}")
+        return {"locked": False, "pnl": 0.0}
+
+
 def _normalize_execution_status(status: str, reason: str = "") -> str:
     status_l = str(status or "").lower().strip()
     reason_l = str(reason or "").lower().strip()
     text = f"{status_l}|{reason_l}"
     if status_l in ("accepted_preview", "pending_pullback_preview"):
         return status_l
-    if "max_open" in text or "limit" in text or "too_many" in text or "position_limit" in text:
+    if "daily_drawdown" in text or "drawdown_lock" in text:
+        return "daily_drawdown_lock"
+    if "max_open" in text or "limit" in text or "too_many" in text or "position_limit" in text or "max_positions" in text:
         return "rejected_limit"
-    if "existing" in text or "same_symbol" in text or "already_open" in text or "duplicate" in text:
+    if "existing" in text or "same_symbol" in text or "already_open" in text or "duplicate" in text or "already_in_execution" in text:
         return "rejected_existing_symbol"
     if "invalid" in text or "missing" in text or ("entry" in text and "sl" in text):
         return "rejected_invalid_order"
-    if status_l in ("rejected_limit", "rejected_existing_symbol", "rejected_invalid_order", "preview_rejected", "candidate_only"):
+    if status_l in ("rejected_limit", "rejected_existing_symbol", "rejected_invalid_order", "daily_drawdown_lock", "preview_rejected", "candidate_only"):
         return status_l
     if status_l in ("rejected", "skipped", "unavailable"):
         return "preview_rejected"
@@ -7776,6 +7876,8 @@ def _normalize_execution_status(status: str, reason: str = "") -> str:
 
 def _execution_rejection_reason_ar(status: str, reason: str = "") -> str:
     status = str(status or "")
+    if status == "daily_drawdown_lock":
+        return "تم إيقاف التنفيذ بسبب تجاوز حد الخسارة اليومية 35%، والعودة فقط عبر /resume_trading"
     if status == "rejected_limit":
         return "تم الوصول للحد الأقصى للصفقات المفتوحة"
     if status == "rejected_existing_symbol":
@@ -10880,35 +10982,48 @@ def run_scanner_loop():
                         )
 
                     try:
-                        if is_execution_paused():
+                        if not is_candidate_for_execution(candidate):
+                            update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
+                            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
+                        elif is_execution_paused():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
-                        elif EXECUTION_AVAILABLE:
-                            candidate = _apply_market_execution_fallback(candidate)
-                            if not _candidate_has_complete_execution_plan(candidate):
-                                exec_status = "rejected_invalid_order"
-                                exec_reason = "missing_or_invalid_entry_sl_tp"
+                        else:
+                            dd_guard = enforce_execution_daily_drawdown_guard()
+                            if dd_guard.get("locked"):
+                                exec_status = "daily_drawdown_lock"
+                                exec_reason = dd_guard.get("reason", "daily_drawdown_lock")
                                 update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
                                 send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
                                 logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
-                            else:
-                                exec_result = process_trade_candidate(r, symbol, candidate)
-                                raw_status = exec_result.get("status")
-                                raw_reason = exec_result.get("reason", "")
-                                exec_status = _normalize_execution_status(raw_status, raw_reason)
-                                execution_message = exec_result.get("execution_message")
-                                has_message = bool(execution_message)
-                                if exec_status in ("accepted_preview", "pending_pullback_preview"):
-                                    if execution_message:
-                                        send_telegram_message(execution_message)
-                                    update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
+                            elif EXECUTION_AVAILABLE:
+                                candidate = _apply_market_execution_fallback(candidate)
+                                if not _candidate_has_complete_execution_plan(candidate):
+                                    exec_status = "rejected_invalid_order"
+                                    exec_reason = "missing_or_invalid_entry_sl_tp"
+                                    update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
+                                    send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
+                                    logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
                                 else:
-                                    rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
-                                    send_telegram_message(rejection_message)
-                                    has_message = True
-                                    update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
-                                logger.info(
-                                    f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
-                                )
+                                    exec_result = process_trade_candidate(r, symbol, candidate)
+                                    raw_status = exec_result.get("status")
+                                    raw_reason = exec_result.get("reason", "")
+                                    exec_status = _normalize_execution_status(raw_status, raw_reason)
+                                    execution_message = exec_result.get("execution_message")
+                                    has_message = bool(execution_message)
+                                    if exec_status in ("accepted_preview", "pending_pullback_preview"):
+                                        if execution_message:
+                                            send_telegram_message(execution_message)
+                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
+                                    else:
+                                        rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
+                                        send_telegram_message(rejection_message)
+                                        has_message = True
+                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
+                                    logger.info(
+                                        f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
+                                    )
+                            else:
+                                update_execution_status_for_candidate(candidate, "preview_rejected", "execution_module_not_available", message_sent=False)
                     except Exception as _exec_e:
                         logger.error(f"Execution preview error for {symbol}: {_exec_e}")
                     logger.info(f"✅ SENT LONG ---> {symbol}")
