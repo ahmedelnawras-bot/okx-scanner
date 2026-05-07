@@ -2491,6 +2491,7 @@ def build_market_status_message() -> str:
         current_mode = normalize_market_mode(snapshot.get("current_mode", MODE_NORMAL_LONG))
         mode_reason = snapshot.get("mode_reason", "")
         btc_mode = snapshot.get("btc_mode", "🟡 محايد")
+        btc_zone = snapshot.get("btc_zone", {}) or {}
         alt_snapshot = snapshot.get("alt_snapshot", {})
         alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
         market_info = snapshot.get("market_info", {})
@@ -2510,13 +2511,14 @@ def build_market_status_message() -> str:
         if not current_mode:
             current_mode = MODE_NORMAL_LONG
         btc_mode = get_btc_mode()
+        btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
         ranked_pairs = get_ranked_pairs()
         alt_snapshot = get_alt_market_snapshot(ranked_pairs)
         alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
         market_info = get_market_state(btc_mode, alt_snapshot)
         market_state_label = market_info.get("market_state_label", "Mixed")
         market_bias_label = market_info.get("market_bias_label", "السوق مختلط")
-        market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot)
+        market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot, btc_zone=btc_zone)
         red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
         avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
@@ -2551,10 +2553,17 @@ def build_market_status_message() -> str:
     ]
     if age_seconds > 0:
         lines.append(f"⏱ <b>عمر البيانات:</b> {age_str}")
+    btc_zone_label = str((btc_zone or {}).get("label", "⚪ BTC Zone غير متاح"))
+    btc_zone_pos = (btc_zone or {}).get("position_pct")
+    btc_zone_adj = float((btc_zone or {}).get("score_adjustment", 0.0) or 0.0)
+    btc_zone_extra = f" | Pos {btc_zone_pos}%" if btc_zone_pos is not None else ""
+    btc_zone_extra += f" | Score {btc_zone_adj:+.2f}" if btc_zone_adj else ""
+
     lines.extend([
         "",
         "🌍 <b>السوق:</b>",
         f"• BTC: {html.escape(str(btc_mode))}",
+        f"• BTC Zone: {html.escape(btc_zone_label + btc_zone_extra)}",
         f"• Alt Mode: {html.escape(str(alt_mode))}",
         f"• State: {html.escape(str(market_state_label))}",
         f"• Flow: {html.escape(str(market_bias_label))}",
@@ -5397,6 +5406,100 @@ def get_btc_mode():
     logger.error(f"BTC mode error: {e}")
     return "🟡 محايد"
 
+
+def get_btc_range_zone(timeframe: str = "1H", lookback: int = 50) -> dict:
+ """Classify BTC position inside its recent range.
+
+ This is a market-context helper only. It does not change execution rules,
+ whitelist, TP/SL, tracking, or risk-manager logic.
+ """
+ try:
+    candles = get_candles("BTC-USDT-SWAP", timeframe, max(lookback + 5, 60))
+    df = to_dataframe(candles)
+    if df is None or df.empty or len(df) < 20:
+        return {
+            "zone": "unknown",
+            "label": "⚪ BTC Zone غير متاح",
+            "score_adjustment": 0.0,
+            "position_pct": None,
+            "breakdown": False,
+            "reason": "not_enough_data",
+        }
+
+    recent = df.tail(lookback).copy()
+    signal_row = get_signal_row(df)
+    if signal_row is None:
+        signal_row = df.iloc[-1]
+
+    close = _safe_float(signal_row.get("close"), 0.0)
+    high_range = _safe_float(recent["high"].max(), 0.0)
+    low_range = _safe_float(recent["low"].min(), 0.0)
+    if close <= 0 or high_range <= 0 or low_range <= 0 or high_range <= low_range:
+        return {
+            "zone": "unknown",
+            "label": "⚪ BTC Zone غير واضح",
+            "score_adjustment": 0.0,
+            "position_pct": None,
+            "breakdown": False,
+            "reason": "invalid_range",
+        }
+
+    position_pct = max(0.0, min(100.0, ((close - low_range) / (high_range - low_range)) * 100.0))
+    prev_range = df.tail(lookback + 1).head(lookback)
+    prev_low = _safe_float(prev_range["low"].min(), low_range) if prev_range is not None and not prev_range.empty else low_range
+    last_change = get_last_candle_change_pct(df)
+    breakdown = bool(close < prev_low * 0.997 and last_change <= -0.35)
+
+    if breakdown:
+        zone = "breakdown"
+        label = "🔴 كسر أسفل رينج BTC"
+        score_adjustment = -0.45
+        reason = "confirmed_breakdown"
+    elif position_pct <= 35:
+        zone = "lower_range"
+        label = "🟢 أسفل رينج BTC / ارتداد محتمل"
+        score_adjustment = 0.35
+        reason = "lower_range_rebound_zone"
+    elif position_pct >= 78:
+        zone = "upper_range"
+        label = "🟠 أعلى رينج BTC / احتمال جني أرباح"
+        score_adjustment = -0.25
+        reason = "upper_range_extended"
+    elif position_pct >= 58:
+        zone = "upper_mid"
+        label = "🟡 BTC قرب أعلى النطاق"
+        score_adjustment = -0.10
+        reason = "upper_mid_caution"
+    else:
+        zone = "middle_range"
+        label = "🟡 BTC منتصف الرينج"
+        score_adjustment = 0.0
+        reason = "neutral_range"
+
+    return {
+        "zone": zone,
+        "label": label,
+        "score_adjustment": round(float(score_adjustment), 2),
+        "position_pct": round(float(position_pct), 1),
+        "range_low": low_range,
+        "range_high": high_range,
+        "close": close,
+        "breakdown": breakdown,
+        "timeframe": timeframe,
+        "lookback": lookback,
+        "reason": reason,
+    }
+ except Exception as e:
+    logger.error(f"BTC range zone error: {e}")
+    return {
+        "zone": "unknown",
+        "label": "⚪ BTC Zone error",
+        "score_adjustment": 0.0,
+        "position_pct": None,
+        "breakdown": False,
+        "reason": f"error: {e}",
+    }
+
 def is_gaining_intraday_strength(df) -> bool:
  try:
     if df is None or df.empty or len(df) < 5:
@@ -7276,7 +7379,7 @@ def get_last_candle_change_pct(df) -> float:
  except Exception:
     return 0.0
 
-def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, candles_map_15m: dict = None) -> dict:
+def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, candles_map_15m: dict = None, btc_zone: dict = None) -> dict:
  if not MARKET_GUARD_ENABLED:
     return {
         "active": False,
@@ -7302,6 +7405,10 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "alt_weak_cautious": False,
     }
  try:
+    btc_zone = btc_zone or {}
+    btc_zone_name = str(btc_zone.get("zone", "") or "")
+    btc_zone_breakdown = bool(btc_zone.get("breakdown", False))
+    btc_lower_range = btc_zone_name == "lower_range" and not btc_zone_breakdown
     sample = sorted(
         ranked_pairs,
         key=lambda x: x.get("_rank_volume_24h", 0),
@@ -7359,12 +7466,20 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         block = True
         reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
     elif MARKET_GUARD_ALT_WEAK_BLOCK and "ضعيف" in alt_mode_str:
-        if "صاعد" in btc_mode:
-            alt_weak_cautious = True
-            reason = f"alt_weak & btc_up -> STRONG_LONG_ONLY (cautious)"
-        else:
+        if btc_zone_breakdown and red_ratio >= 0.55:
             block = True
-            reason = f"alt_weak & red_ratio={red_ratio:.2f} and btc not up"
+            reason = f"alt_weak + BTC range breakdown & red_ratio={red_ratio:.2f}"
+        else:
+            # Alt weakness alone is no longer a BLOCK trigger.
+            # If BTC is still inside the range (especially lower range without breakdown),
+            # treat it as STRONG_LONG_ONLY / cautious instead of full panic block.
+            alt_weak_cautious = True
+            if btc_lower_range:
+                reason = "alt_weak but BTC lower range rebound zone -> STRONG_LONG_ONLY"
+            elif "صاعد" in btc_mode:
+                reason = "alt_weak & btc_up -> STRONG_LONG_ONLY"
+            else:
+                reason = f"alt_weak & btc not up -> STRONG_LONG_ONLY (red_ratio={red_ratio:.2f})"
     return {
         "active": True,
         "block_longs": bool(block),
@@ -7375,6 +7490,7 @@ def get_market_guard_snapshot(ranked_pairs, btc_mode: str, alt_snapshot: dict, c
         "btc_change_15m": btc_change,
         "reason": reason,
         "alt_weak_cautious": alt_weak_cautious,
+        "btc_zone": btc_zone,
     }
  except Exception as e:
     logger.error(f"Market guard snapshot error: {e}")
@@ -7471,6 +7587,10 @@ def determine_long_market_mode(
  btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
  alt_mode = alt_snapshot.get("alt_mode", "")
  alt_weak_cautious = market_guard.get("alt_weak_cautious", False)
+ btc_zone = market_guard.get("btc_zone") or {}
+ btc_zone_name = str(btc_zone.get("zone", "") or "")
+ btc_zone_breakdown = bool(btc_zone.get("breakdown", False))
+ btc_lower_range = btc_zone_name == "lower_range" and not btc_zone_breakdown
  last_transition_ts = 0
  last_recovery_check_ts = 0
  normal_candidate_since = 0
@@ -7496,8 +7616,12 @@ def determine_long_market_mode(
     elif alt_weak_cautious:
         pass  # will be handled below as STRONG_LONG_ONLY
     elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
-        crash_triggered = True
-        crash_reason = f"alt_weak & red_ratio={red_ratio:.2f}"
+        if btc_zone_breakdown and red_ratio >= 0.60:
+            crash_triggered = True
+            crash_reason = f"alt_weak + BTC breakdown & red_ratio={red_ratio:.2f}"
+        else:
+            alt_weak_cautious = True
+            crash_reason = f"alt_weak -> STRONG_LONG_ONLY (red_ratio={red_ratio:.2f})"
  if crash_triggered:
     if allow_state_writes and r:
         try:
@@ -7531,7 +7655,10 @@ def determine_long_market_mode(
                 except Exception:
                     pass
             return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
-    if is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode):
+    block_exit_ready = is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode)
+    if btc_lower_range and not btc_zone_breakdown and red_ratio < 0.68 and avg_change > -1.05 and btc_change > -0.65:
+        block_exit_ready = True
+    if block_exit_ready:
         if safe_since == 0:
             if allow_state_writes and r:
                 try:
@@ -8139,6 +8266,7 @@ def run_scanner_loop():
             ranked_pairs = get_ranked_pairs()
             logger.info(f"SCAN_LIMIT CONFIG = {SCAN_LIMIT} | ranked_pairs_count = {len(ranked_pairs)}")
             btc_mode = get_btc_mode()
+            btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
             alt_snapshot = None
             if r:
                 try:
@@ -8177,6 +8305,7 @@ def run_scanner_loop():
                 btc_mode=btc_mode,
                 alt_snapshot=alt_snapshot,
                 candles_map_15m=guard_candles_map,
+                btc_zone=btc_zone,
             )
             current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
             if not current_mode:
@@ -8260,6 +8389,7 @@ def run_scanner_loop():
                 "current_mode": current_mode,
                 "mode_reason": mode_result.get("reason", ""),
                 "btc_mode": btc_mode,
+                "btc_zone": btc_zone,
                 "alt_snapshot": alt_snapshot,
                 "market_info": market_info,
                 "market_guard": market_guard,
@@ -9817,6 +9947,39 @@ def run_scanner_loop():
                         "reason": warning_penalty_details
                     })
 
+                # BTC Range Zone context adjustment (market-context only).
+                # This does not change execution whitelist, risk manager, TP/SL, or tracking logic.
+                try:
+                    _btc_zone = btc_zone if isinstance(btc_zone, dict) else {}
+                    _btc_zone_adj = float(_btc_zone.get("score_adjustment", 0.0) or 0.0)
+                    _btc_zone_label = str(_btc_zone.get("label", "") or "")
+                    _btc_zone_pos = _btc_zone.get("position_pct")
+                    if _btc_zone_adj != 0.0:
+                        effective_score += _btc_zone_adj
+                        adjustments_log.append({
+                            "name": "btc_range_zone_adjustment",
+                            "value": _btc_zone_adj,
+                            "reason": _btc_zone.get("reason", "btc_range_zone"),
+                        })
+                    if _btc_zone_label:
+                        _btc_zone_display = _btc_zone_label
+                        if _btc_zone_pos is not None:
+                            _btc_zone_display += f" | Pos {_btc_zone_pos}%"
+                        if _btc_zone_adj:
+                            _btc_zone_display += f" | Score {_btc_zone_adj:+.2f}"
+                        if _btc_zone_adj > 0:
+                            score_result.setdefault("reasons", [])
+                            if _btc_zone_display not in score_result["reasons"]:
+                                score_result["reasons"].append(_btc_zone_display)
+                        elif _btc_zone_adj < 0:
+                            if "warning_reasons" not in score_result or score_result["warning_reasons"] is None:
+                                score_result["warning_reasons"] = []
+                            if _btc_zone_display not in score_result["warning_reasons"]:
+                                score_result["warning_reasons"].append(_btc_zone_display)
+                    score_result["btc_zone"] = _btc_zone
+                except Exception as _btc_zone_score_err:
+                    logger.warning(f"BTC zone score adjustment error for {symbol}: {_btc_zone_score_err}")
+
                 score_result["score"] = round(effective_score, 2)
 
                 price = _safe_float(signal_row["close"], 0)
@@ -10845,6 +11008,9 @@ def run_scanner_loop():
                     "block_longs_execution_candidate": False,
                     "current_mode": current_mode,
                     "market_mode": current_mode,
+                    "btc_zone": btc_zone if isinstance(btc_zone, dict) else {},
+                    "btc_zone_label": (btc_zone or {}).get("label", "") if isinstance(btc_zone, dict) else "",
+                    "btc_zone_score_adjustment": (btc_zone or {}).get("score_adjustment", 0.0) if isinstance(btc_zone, dict) else 0.0,
                     "late_breakout_guard_reason": late_breakout_guard_reason,
                     "setup_stats": get_setup_type_stats(
                         redis_client=r,
