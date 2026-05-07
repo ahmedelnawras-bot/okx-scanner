@@ -29,15 +29,13 @@ from tracking.performance import (
  format_period_summary, 
  get_setup_type_stats, 
  get_open_trades_summary, 
- format_open_trades_message, 
- load_all_trades_for_report,
+ format_open_trades_message,
+ load_all_trades_for_report, 
 ) 
 from analysis.rejection_tracking import (
     log_rejected_candidate,
     build_rejections_report_message,
 )
-
-from tracking.summary_helpers import calc_trade_result_pct
 
 # Execution folder integration (safe preview only)
 try:
@@ -91,7 +89,6 @@ OKX_TICKER_SINGLE_URL = "https://www.okx.com/api/v5/market/ticker"
 SCAN_LIMIT = 200
 TIMEFRAME = "15m"
 HTF_TIMEFRAME = "1H"
-DEFAULT_LEVERAGE = 15
 FINAL_MIN_SCORE = 6.2
 PRE_BREAKOUT_EXTRA_SCORE = 0.2
 MAX_ALERTS_PER_RUN = 5
@@ -1638,19 +1635,11 @@ def build_help_message() -> str:
 /mood - حالة السوق والمود الحالي
 /status - نفس أمر /mood
 /open_trades - الصفقات المفتوحة وملخص سريع
-
-<b>📊 تقارير كل الصفقات:</b>
 /report_1h - تقرير آخر ساعة
 /report_today - تقرير اليوم
 /report_7d - تقرير آخر 7 أيام
 /report_30d - تقرير آخر 30 يوم
-/report_all - كل الصفقات من البداية
-
-<b>🚀 تقارير المرشحين للتنفيذ:</b>
-/report_execution - المرشحين من البداية
-/report_execution_today - مرشحين اليوم
-/report_execution_7d - مرشحين آخر 7 أيام
-/report_execution_30d - مرشحين آخر 30 يوم
+/report_all - كل الصفقات
 
 <b>⚙️ التنفيذ:</b>
 /exec_status - اختبار اتصال OKX API
@@ -1661,6 +1650,10 @@ def build_help_message() -> str:
 <b>📊 تحليل الأداء:</b>
 /report_deep - تحليل متقدم شامل
 /report_exits - جودة الخروج TP1/TP2/SL
+/report_execution - مرشحو التنفيذ منذ البداية
+/report_execution_today - مرشحو التنفيذ اليوم
+/report_execution_7d - مرشحو آخر 7 أيام
+/report_execution_30d - مرشحو آخر 30 يوم
 /report_rejections - تحليل أسباب رفض الفرص
 /report_setups - أفضل وأسوأ أنواع الإشارات
 /report_scores - تحليل السكور
@@ -1911,6 +1904,10 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "execution_sl": candidate.get("execution_sl"),
         "execution_tp1": candidate.get("execution_tp1"),
         "execution_tp2": candidate.get("execution_tp2"),
+        "execution_status": candidate.get("execution_status", "candidate_only"),
+        "execution_reject_reason": candidate.get("execution_reject_reason", ""),
+        "execution_message_sent": candidate.get("execution_message_sent", False),
+        "execution_result_status": candidate.get("execution_result_status", ""),
     }
 
 
@@ -1948,29 +1945,60 @@ def interpret_register_trade_result(result, candidate: dict) -> bool:
 
 # ----------- Helper functions for exits report -----------
 def _load_long_trades_from_redis(limit: int = 700) -> list:
-    """
-    تحميل موحد لصفقات اللونج من Redis باستخدام مصدر performance.py الرسمي.
-    الهدف: منع اختلاف الأعداد بين /report_all و /report_exits و /report_setups و /report_execution.
-    """
+    trades = []
     if not r:
-        return []
+        return trades
     try:
-        trades = load_all_trades_for_report(
-            redis_client=r,
-            market_type="futures",
-            side="long",
-            since_ts=None,
-            include_open=True,
-        )
-        trades.sort(
-            key=lambda x: int(float(x.get("created_ts") or x.get("created_at") or x.get("candle_time") or 0)),
-            reverse=True,
-        )
-        logger.info(f"Loaded long trades via unified loader: {len(trades)}")
-        return trades[:limit]
+        trade_count = 0
+        history_count = 0
+        seen_ids = set()
+
+        for key in r.scan_iter("trade:futures:long:*"):
+            try:
+                raw = r.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                data["_redis_key"] = key
+                trades.append(data)
+                trade_count += 1
+            except Exception:
+                continue
+
+        for key in r.scan_iter("trade_history:futures:long:*"):
+            try:
+                raw = r.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                uid = data.get("alert_id") or f"{data.get('symbol','')}:{data.get('candle_time','')}"
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                data["_redis_key"] = key
+                trades.append(data)
+                history_count += 1
+            except Exception:
+                continue
+
+        logger.info(f"Loaded trades: trade={trade_count} history={history_count} after dedupe={len(trades)}")
     except Exception as e:
-        logger.error(f"_load_long_trades_from_redis unified loader error: {e}", exc_info=True)
-        return []
+        logger.error(f"_load_long_trades_from_redis error: {e}")
+        return trades
+
+    trades.sort(
+        key=lambda x: int(float(x.get("created_ts") or x.get("candle_time") or 0)),
+        reverse=True
+    )
+    return trades[:limit]
 
 
 def _pct_safe(value, decimals=2):
@@ -2647,316 +2675,259 @@ def is_execution_candidate_trade(trade: dict) -> bool:
 
 
 def _execution_report_since_ts(period: str):
-    period = str(period or "all").strip().lower()
-    now_ts = int(time.time())
+    period = str(period or "all").lower()
+    now = int(time.time())
     if period == "today":
         return get_local_day_start_ts()
-    if period == "7d":
-        return now_ts - (7 * 86400)
+    if period in ("7d", "week"):
+        return now - 7 * 86400
     if period in ("30d", "month"):
-        return now_ts - (30 * 86400)
+        return now - 30 * 86400
     return None
 
 
-def _execution_report_title(period: str) -> str:
-    period = str(period or "all").strip().lower()
-    if period == "today":
-        return "🚀 <b>Execution Candidates - Today</b>"
-    if period == "7d":
-        return "🚀 <b>Execution Candidates - Last 7 Days</b>"
-    if period in ("30d", "month"):
-        return "🚀 <b>Execution Candidates - Last 30 Days</b>"
-    return "🚀 <b>Execution Candidates - Since Start</b>"
-
-
-def _execution_trade_ts(trade: dict) -> int:
+def _format_exec_num(value, decimals=6):
     try:
-        return int(float(trade.get("created_ts") or trade.get("created_at") or trade.get("candle_time") or 0))
+        v = float(value)
+        if abs(v) >= 100:
+            return f"{v:.2f}"
+        if abs(v) >= 1:
+            return f"{v:.4f}"
+        return f"{v:.{decimals}f}"
     except Exception:
-        return 0
-
-
-def _execution_trade_closed(trade: dict) -> bool:
-    status = str(trade.get("status", "") or "").lower()
-    result = str(trade.get("result", "") or "").lower()
-    return status == "closed" or result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven", "expired", "pending_expired")
-
-
-def _execution_trade_pnl_404020(trade: dict) -> float:
-    """Return leveraged 40/40/20 PnL for execution-candidate reports.
-
-    Closed trades use the unified calc_trade_result_pct() from summary_helpers so
-    /report_execution stays consistent with the rest of the performance reports.
-    Open/partial trades use the current/latest price as a live estimate only.
-    """
-    try:
-        leverage = _safe_float(trade.get("leverage"), DEFAULT_LEVERAGE)
-        if leverage <= 0:
-            leverage = DEFAULT_LEVERAGE
-
-        plan = _execution_plan_for_trade(trade)
-        trade_for_calc = dict(trade)
-        if _safe_float(trade_for_calc.get("entry"), 0.0) <= 0 and _safe_float(plan.get("entry"), 0.0) > 0:
-            trade_for_calc["entry"] = plan.get("entry")
-        if _safe_float(trade_for_calc.get("effective_entry"), 0.0) <= 0 and _safe_float(plan.get("entry"), 0.0) > 0:
-            trade_for_calc["effective_entry"] = plan.get("entry")
-        if _safe_float(trade_for_calc.get("sl"), 0.0) <= 0 and _safe_float(plan.get("sl"), 0.0) > 0:
-            trade_for_calc["sl"] = plan.get("sl")
-        if _safe_float(trade_for_calc.get("initial_sl"), 0.0) <= 0 and _safe_float(plan.get("sl"), 0.0) > 0:
-            trade_for_calc["initial_sl"] = plan.get("sl")
-        if _safe_float(trade_for_calc.get("tp1"), 0.0) <= 0 and _safe_float(plan.get("tp1"), 0.0) > 0:
-            trade_for_calc["tp1"] = plan.get("tp1")
-        if _safe_float(trade_for_calc.get("tp2"), 0.0) <= 0 and _safe_float(plan.get("tp2"), 0.0) > 0:
-            trade_for_calc["tp2"] = plan.get("tp2")
-
-        # Closed trades: use the same raw PnL function used by normal reports.
-        raw_unified = calc_trade_result_pct(trade_for_calc)
-        if raw_unified is not None:
-            return round(raw_unified * leverage, 4)
-
-        # Live/open fallback only.
-        side = str(trade_for_calc.get("side", "long") or "long").lower()
-        entry = _safe_float(trade_for_calc.get("effective_entry") or trade_for_calc.get("entry") or plan.get("entry"), 0.0)
-        if entry <= 0:
-            return 0.0
-
-        def _bool_value(value):
-            if isinstance(value, bool):
-                return value
-            return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
-
-        result = str(trade_for_calc.get("result", "") or "").lower()
-        status = str(trade_for_calc.get("status", "") or "").lower()
-        tp1_hit = _bool_value(trade_for_calc.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
-        tp2_hit = _bool_value(trade_for_calc.get("tp2_hit")) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing_closed")
-        tp1 = _safe_float(trade_for_calc.get("tp1") or plan.get("tp1"), 0.0)
-        tp2 = _safe_float(trade_for_calc.get("tp2") or plan.get("tp2"), 0.0)
-        current_price = _safe_float(
-            trade_for_calc.get("current_price")
-            or trade_for_calc.get("last_price")
-            or trade_for_calc.get("exit_price")
-            or trade_for_calc.get("trailing_exit_price")
-            or trade_for_calc.get("trailing_sl"),
-            0.0,
-        )
-
-        def raw_pct(price):
-            price = _safe_float(price, 0.0)
-            if price <= 0:
-                return 0.0
-            if side == "short":
-                return ((entry - price) / entry) * 100.0
-            return ((price - entry) / entry) * 100.0
-
-        if result == "loss":
-            sl_price = _safe_float(trade_for_calc.get("initial_sl") or trade_for_calc.get("sl") or trade_for_calc.get("exit_price"), 0.0)
-            return round(raw_pct(sl_price or current_price) * leverage, 4)
-        if result == "breakeven":
-            return 0.0
-
-        pnl_raw = 0.0
-        if tp1_hit and tp1 > 0:
-            pnl_raw += raw_pct(tp1) * 0.40
-        if tp2_hit and tp2 > 0:
-            pnl_raw += raw_pct(tp2) * 0.40
-            if current_price > 0:
-                pnl_raw += raw_pct(current_price) * 0.20
-            else:
-                pnl_raw += raw_pct(tp2) * 0.20
-        elif current_price > 0:
-            if tp1_hit:
-                pnl_raw += raw_pct(current_price) * 0.60
-            else:
-                pnl_raw += raw_pct(current_price)
-        return round(pnl_raw * leverage, 4)
-    except Exception:
-        return 0.0
-
-
-def _execution_exit_type_label(trade: dict) -> str:
-    """Human-readable execution exit category for 40/40/20 reporting."""
-    result = str(trade.get("result", "") or "").lower()
-    status = str(trade.get("status", "") or "").lower()
-    tp1_hit = bool(trade.get("tp1_hit")) or result in ("tp1_win", "tp2_win", "trailing_win")
-    tp2_hit = bool(trade.get("tp2_hit")) or result in ("tp2_win", "trailing_win")
-    protected_be = bool(trade.get("protected_breakeven_exit")) or bool(trade.get("sl_moved_to_entry"))
-
-    if status == "pending_pullback":
-        return "⏳ Pending Pullback"
-    if status == "open":
-        if tp2_hit:
-            return "🔄 TP2 + Trail Active"
-        if tp1_hit:
-            return "🎯 TP1 + Protected"
-        return "🟢 Open Before TP1"
-    if result == "trailing_win":
-        return "🔄 TP2 + Trail Win"
-    if result == "tp2_win" or tp2_hit:
-        return "🏁 Full TP2"
-    if result == "tp1_win" or tp1_hit:
-        return "🎯 TP1 Only"
-    if result == "breakeven" or protected_be:
-        return "⚪ TP1 then Breakeven" if tp1_hit else "⚪ Breakeven"
-    if result == "loss":
-        return "🔴 Direct SL" if not tp1_hit else "🔴 TP1 then SL/Trail Loss"
-    if result == "expired":
-        return "⚫ Expired"
-    if result == "pending_expired":
-        return "⚫ Pullback Expired"
-    return html.escape(status or result or "غير معروفة")
-
-
-def _execution_status_label(trade: dict) -> str:
-    result = str(trade.get("result", "") or "").lower()
-    if result == "loss":
-        return "🔴 SL Hit"
-    return _execution_exit_type_label(trade)
-
-
-def _execution_trade_duration_label(trade: dict) -> str:
-    """Return compact trade duration from created_at/candle_time to close or now."""
-    start_ts = _execution_trade_ts(trade)
-    if not start_ts:
         return "N/A"
-    end_candidates = (
-        trade.get("closed_at"),
-        trade.get("exit_ts"),
-        trade.get("updated_at"),
-        trade.get("last_update_ts"),
-    )
-    end_ts = 0
-    for value in end_candidates:
+
+
+def _trade_created_ts_for_exec(trade: dict) -> int:
+    for key in ("created_ts", "created_at", "candle_time"):
         try:
-            if value:
-                end_ts = int(float(value))
-                break
+            v = int(float(trade.get(key) or 0))
+            if v > 0:
+                return v
         except Exception:
             pass
-    if not end_ts or end_ts < start_ts:
-        end_ts = int(time.time())
-    seconds = max(0, int(end_ts - start_ts))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
+    return 0
 
 
-def _execution_primary_setup(trade: dict) -> str:
-    setup = str(_trade_field(trade, "primary_extra_setup") or _trade_field(trade, "setup_type") or "unknown")
-    for token in ("vwap_reclaim", "retest_breakout_confirmed", "wave_3", "support_bounce_confirmed", "higher_low_continuation", "relative_strength_vs_btc", "failed_breakdown_trap"):
-        if token in setup:
-            return token
-    return setup[:70]
+def _execution_status_for_trade(trade: dict) -> str:
+    status = str(_trade_field(trade, "execution_status", "") or "").strip()
+    if status:
+        return status
+    result_status = str(_trade_field(trade, "execution_result_status", "") or "").strip()
+    if result_status:
+        return result_status
+    if is_execution_candidate_trade(trade):
+        return "candidate_only"
+    return "not_candidate"
+
+
+def _execution_phase_for_trade(trade: dict) -> str:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    trailing_active = bool(trade.get("trailing_active", False)) or status in ("trailing", "trailing_open", "tp2_partial")
+    if status == "pending_pullback":
+        return "Pending Pullback"
+    if trailing_active or tp2_hit:
+        return "Trailing Active" if status not in ("closed", "expired") else "TP2 Hit"
+    if tp1_hit or status == "partial":
+        return "TP1 Hit"
+    return "Before TP1"
+
+
+def _execution_close_type_for_trade(trade: dict) -> str:
+    result = str(trade.get("result", "") or "").lower()
+    status = str(trade.get("status", "") or "").lower()
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    if result == "trailing_win":
+        return "TP2 + Trail Win"
+    if result == "tp2_win" or tp2_hit:
+        return "TP2 Win"
+    if result == "tp1_win":
+        return "TP1 Only"
+    if result in ("breakeven", "protected_breakeven") or bool(trade.get("protected_breakeven_exit", False)):
+        return "TP1 → BE" if tp1_hit else "Breakeven"
+    if result == "loss":
+        return "Direct SL"
+    if result == "pending_expired":
+        return "Pending Expired"
+    if result == "expired" or status == "expired":
+        return "Expired"
+    return result or status or "Closed"
+
+
+def _execution_final_pnl_pct(trade: dict):
+    try:
+        from tracking.summary_helpers import calc_trade_result_pct
+        raw = calc_trade_result_pct(trade)
+        if raw is None:
+            return None
+        leverage = float(_trade_field(trade, "leverage", TRACK_LEVERAGE) or TRACK_LEVERAGE)
+        return float(raw) * leverage
+    except Exception:
+        return None
+
+
+def _execution_floating_pnl_pct(trade: dict):
+    try:
+        plan = _execution_plan_for_trade(trade)
+        entry = _safe_trade_float_value(plan.get("entry") or _trade_field(trade, "entry"), 0.0)
+        if entry <= 0:
+            return None
+        current = None
+        for key in ("current_price", "last_price", "market_price", "last_tracked_price"):
+            current = _safe_trade_float_value(_trade_field(trade, key), None)
+            if current and current > 0:
+                break
+        if not current or current <= 0:
+            try:
+                current = _safe_trade_float_value(get_last_price(str(trade.get("symbol") or "")), None)
+            except Exception:
+                current = None
+        if not current or current <= 0:
+            return None
+        tp1 = _safe_trade_float_value(plan.get("tp1") or trade.get("tp1"), 0.0)
+        tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), 0.0)
+        tp1_hit = bool(trade.get("tp1_hit", False))
+        tp2_hit = bool(trade.get("tp2_hit", False))
+        raw = 0.0
+        if not tp1_hit:
+            raw = (current - entry) / entry * 100.0
+        elif not tp2_hit:
+            tp1_part = ((tp1 - entry) / entry * 100.0) * 0.40 if tp1 > 0 else 0.0
+            float_part = ((current - entry) / entry * 100.0) * 0.60
+            raw = tp1_part + float_part
+        else:
+            tp1_part = ((tp1 - entry) / entry * 100.0) * 0.40 if tp1 > 0 else 0.0
+            tp2_part = ((tp2 - entry) / entry * 100.0) * 0.40 if tp2 > 0 else 0.0
+            trail_part = ((current - entry) / entry * 100.0) * 0.20
+            raw = tp1_part + tp2_part + trail_part
+        leverage = float(_trade_field(trade, "leverage", TRACK_LEVERAGE) or TRACK_LEVERAGE)
+        return raw * leverage
+    except Exception:
+        return None
+
+
+def _execution_duration_text(trade: dict) -> str:
+    try:
+        start_ts = _trade_created_ts_for_exec(trade)
+        end_ts = int(float(trade.get("closed_ts") or trade.get("exit_ts") or trade.get("updated_ts") or time.time()))
+        if start_ts <= 0 or end_ts <= start_ts:
+            return "N/A"
+        minutes = int((end_ts - start_ts) / 60)
+        h, m = divmod(minutes, 60)
+        if h >= 24:
+            d, h = divmod(h, 24)
+            return f"{d}d {h}h"
+        return f"{h}h {m}m"
+    except Exception:
+        return "N/A"
+
+
+def _is_execution_trade_open(trade: dict) -> bool:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    return status in ("open", "partial", "tp2_partial", "trailing", "trailing_open", "pending_pullback") or result in ("", "open", "partial")
+
+
+def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
+    plan = _execution_plan_for_trade(trade)
+    symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+    setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
+    score = _trade_field(trade, "score", "N/A")
+    entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
+    exec_status = html.escape(_execution_status_for_trade(trade))
+    reject_reason = html.escape(str(_trade_field(trade, "execution_reject_reason", "") or ""))
+    duration = _execution_duration_text(trade)
+    lines = [f"• <b>{symbol}</b>"]
+    if is_open:
+        pnl = _execution_floating_pnl_pct(trade)
+        lines.append(f"  📌 Phase: {_execution_phase_for_trade(trade)} | ⏱ {duration}")
+        lines.append(f"  💰 Floating PnL 40/40/20: {_pct_safe(pnl) if pnl is not None else 'N/A'}")
+    else:
+        pnl = _execution_final_pnl_pct(trade)
+        lines.append(f"  📌 Close Type: {_execution_close_type_for_trade(trade)} | ⏱ {duration}")
+        lines.append(f"  💰 Final Result 40/40/20: {_pct_safe(pnl) if pnl is not None else 'N/A'}")
+    lines.extend([
+        f"  ⚙️ Execution Status: {exec_status}{(' | reason: ' + reject_reason) if reject_reason else ''}",
+        f"  🧠 setup: {setup_type}",
+        f"  ⭐ score: {score} | entry_mode: {entry_mode}",
+        f"  📍 Entry: {_format_exec_num(plan.get('entry'))} | 🛡 SL: {_format_exec_num(plan.get('sl'))}",
+        f"  🎯 TP1: {_format_exec_num(plan.get('tp1'))} | 🏁 TP2: {_format_exec_num(plan.get('tp2'))}",
+    ])
+    return lines
 
 
 def build_execution_report_message(period: str = "all") -> str:
     try:
         since_ts = _execution_report_since_ts(period)
-        trades = []
-        for t in _load_long_trades_from_redis(limit=1500):
-            if since_ts is not None and _execution_trade_ts(t) < since_ts:
-                continue
-            if is_execution_candidate_trade(t):
-                trades.append(t)
-
+        try:
+            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1500)
+            if since_ts:
+                trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+        trades = [t for t in trades if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")]
+        trades.sort(key=_trade_created_ts_for_exec, reverse=True)
         if not trades:
-            return f"{_execution_report_title(period)}\n\n📭 لا توجد صفقات مرشحة للتنفيذ في هذه الفترة."
+            return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
 
-        total = len(trades)
-        open_count = sum(1 for t in trades if str(t.get("status", "") or "").lower() == "open")
-        pending_count = sum(1 for t in trades if str(t.get("status", "") or "").lower() == "pending_pullback")
-        closed_count = sum(1 for t in trades if _execution_trade_closed(t))
-        tp1_hits = sum(1 for t in trades if bool(t.get("tp1_hit")) or str(t.get("result", "") or "").lower() in ("tp1_win", "tp2_win", "trailing_win"))
-        tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit")) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
+        open_trades = [t for t in trades if _is_execution_trade_open(t)]
+        closed_trades = [t for t in trades if not _is_execution_trade_open(t)]
+        open_pnls = [p for p in (_execution_floating_pnl_pct(t) for t in open_trades) if p is not None]
+        closed_pnls = [p for p in (_execution_final_pnl_pct(t) for t in closed_trades) if p is not None]
+        winners = [p for p in closed_pnls if p > 0]
+        losers = [p for p in closed_pnls if p < 0]
+        total = max(1, len(trades))
+        tp1_hits = sum(1 for t in trades if bool(t.get("tp1_hit", False)))
+        tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
         trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
-        losses = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss")
-        direct_sl = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss" and not bool(t.get("tp1_hit")))
-        tp1_then_be = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "breakeven" and bool(t.get("tp1_hit")))
-        tp1_then_sl_or_trail_loss = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "loss" and bool(t.get("tp1_hit")))
-        full_tp2 = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "tp2_win")
-        tp2_plus_trail = trailing_wins
-        win_rate = (tp1_hits / total) * 100.0 if total else 0.0
-        tp2_rate = (tp2_hits / total) * 100.0 if total else 0.0
-        tp1_to_tp2 = (tp2_hits / tp1_hits) * 100.0 if tp1_hits else 0.0
+        direct_sl = sum(1 for t in closed_trades if _execution_close_type_for_trade(t) == "Direct SL")
 
-        pnls = [_execution_trade_pnl_404020(t) for t in trades]
-        gross_profit = sum(p for p in pnls if p > 0)
-        gross_loss = sum(p for p in pnls if p < 0)
-        net_pnl = sum(pnls)
-
-        period_note = {
-            "today": "اليوم فقط",
+        title_map = {
+            "all": "منذ البداية",
+            "today": "اليوم",
             "7d": "آخر 7 أيام",
             "30d": "آخر 30 يوم",
             "month": "آخر 30 يوم",
-        }.get(str(period or "all").lower(), "منذ البداية")
-
+        }
+        title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
         lines = [
-            _execution_report_title(period),
-            f"🗓️ الفترة: <b>{period_note}</b>",
-            "────────────",
-            "📌 <b>ملخص المرشحين</b>",
-            f"• إجمالي المرشحين: <b>{total}</b>",
-            f"• مفتوحة: {open_count} | معلقة Pullback: {pending_count} | مغلقة: {closed_count}",
-            f"• 🎯 TP1 Hits: {tp1_hits}",
-            f"• 🏁 TP2 Hits: {tp2_hits}",
-            f"• 🔄 Trailing Wins: {trailing_wins}",
-            f"• 🔴 SL Hit: {losses}",
+            f"🚀 <b>Execution Candidates Report</b> — {title_period}",
+            f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
+            f"🟢 مفتوحة: {len(open_trades)} | 🏁 مغلقة: {len(closed_trades)}",
             "",
-            "📊 <b>أداء 40/40/20</b>",
-            f"• 🎯 TP1 Success: <b>{win_rate:.2f}%</b>",
-            f"• 🏁 TP2 Success: <b>{tp2_rate:.2f}%</b>",
-            f"• 🔄 Trail Success: <b>{(trailing_wins / total * 100.0 if total else 0.0):.2f}%</b>",
-            f"• 🛑 Direct SL: <b>{(direct_sl / total * 100.0 if total else 0.0):.2f}%</b>",
-            f"• 🔁 TP1 → TP2: <b>{tp1_to_tp2:.2f}%</b>",
+            "🧠 <b>Summary 40/40/20</b>",
+            f"🟢 Open Floating: {_pct_safe(sum(open_pnls)) if open_pnls else '+0.00%'}",
+            f"📈 Avg Winner: {_pct_safe(_avg(winners)) if winners else '+0.00%'}",
+            f"📉 Avg Loser: {_pct_safe(_avg(losers)) if losers else '+0.00%'}",
+            f"🎯 TP1 Success: {tp1_hits / total * 100:.1f}%",
+            f"🏁 TP2 Success: {tp2_hits / total * 100:.1f}%",
+            f"🔄 Trail Success: {trailing_wins / total * 100:.1f}%",
+            f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
             "",
-            "🧾 <b>أنواع الإغلاق</b>",
-            f"• 🔴 Direct SL: {direct_sl}",
-            f"• ⚪ TP1 ثم Breakeven: {tp1_then_be}",
-            f"• 🔴 TP1 ثم SL/Trail Loss: {tp1_then_sl_or_trail_loss}",
-            f"• 🏁 Full TP2: {full_tp2}",
-            f"• 🔄 TP2 + Trail: {tp2_plus_trail}",
-            "",
-            "💰 <b>النتيجة الفعلية 40/40/20</b>",
-            f"• 🟢 أرباح محققة/مفتوحة: +{gross_profit:.2f}%",
-            f"• 🔴 خسائر SL Hit: {gross_loss:.2f}%",
-            f"• ⚖️ الصافي بعد الرافعة: <b>{net_pnl:+.2f}%</b>",
-            "────────────",
-            "🚀 <b>آخر الصفقات المرشحة</b>",
+            f"🟢 <b>الصفقات المفتوحة ({len(open_trades)})</b>",
         ]
-
-        for i, trade in enumerate(trades[:10], 1):
-            plan = _execution_plan_for_trade(trade)
-            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
-            setup = html.escape(_execution_primary_setup(trade))
-            score = _trade_field(trade, "score", "N/A")
-            entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
-            pnl = _execution_trade_pnl_404020(trade)
-            duration_label = _execution_trade_duration_label(trade)
-            exit_type_label = _execution_exit_type_label(trade)
-            lines.extend([
-                "",
-                f"{i}️⃣ <b>{symbol}</b>",
-                f"📌 الحالة: {_execution_status_label(trade)}",
-                f"🧾 نوع الإغلاق: {exit_type_label}",
-                f"⏱️ المدة: {duration_label}",
-                f"🧠 setup: {setup}",
-                f"⭐ score: {score} | entry: {entry_mode}",
-                f"📍 دخول: {plan.get('entry', 'N/A')}",
-                f"🛑 SL: {plan.get('sl', 'N/A')}",
-                f"🎯 TP1: {plan.get('tp1', 'N/A')} | إغلاق 40%",
-                f"🏁 TP2: {plan.get('tp2', 'N/A')} | إغلاق 40%",
-                "🔄 Trail: 20%",
-                f"💰 Final Result 40/40/20: {pnl:+.2f}%",
-            ])
+        if open_trades:
+            for t in open_trades[:8]:
+                lines.extend(_format_execution_trade_card(t, is_open=True))
+                lines.append("")
+        else:
+            lines.append("لا توجد صفقات مفتوحة حاليًا.")
+            lines.append("")
+        lines.append(f"🏁 <b>الصفقات المغلقة ({len(closed_trades)})</b>")
+        if closed_trades:
+            for t in closed_trades[:10]:
+                lines.extend(_format_execution_trade_card(t, is_open=False))
+                lines.append("")
+        else:
+            lines.append("لا توجد صفقات مغلقة في هذه الفترة.")
         return _limit_telegram_message("\n".join(lines))
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
-        return f"❌ خطأ في تقرير المرشحين: {html.escape(str(e))}"
+        return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
 
 def build_setup_performance_report_message() -> str:
     try:
@@ -6746,12 +6717,15 @@ def _apply_market_execution_fallback(candidate: dict) -> dict:
 
 
 def is_candidate_for_execution(candidate: dict) -> bool:
+    """Compatibility helper: execution candidates are no longer blocked by strict setup gates.
+
+    A sent execution candidate should enter the execution preview flow whenever it has
+    a valid order plan. The executor/risk manager is responsible for rejecting only
+    clear execution reasons such as max open positions, existing symbol, or invalid order.
+    """
     try:
-        if _is_late_risky_execution_context(candidate):
-            return False
-        if not _has_strict_execution_setup(candidate):
-            return False
-        return _candidate_has_complete_execution_plan(candidate)
+        planned = _apply_market_execution_fallback(dict(candidate or {}))
+        return _candidate_has_complete_execution_plan(planned)
     except Exception:
         return False
 
@@ -7513,9 +7487,6 @@ HEAVY_TELEGRAM_COMMANDS = {
     "/report_deep",
     "/report_setups",
     "/report_execution",
-    "/report_execution_today",
-    "/report_execution_7d",
-    "/report_execution_30d",
     "/report_scores",
     "/report_market",
     "/report_losses",
@@ -7687,6 +7658,84 @@ def cleanup_local_caches():
     for sym in stale_candle:
         last_candle_cache.pop(sym, None)
         last_candle_cache_meta.pop(sym, None)
+
+
+def _normalize_execution_status(status: str, reason: str = "") -> str:
+    status_l = str(status or "").lower().strip()
+    reason_l = str(reason or "").lower().strip()
+    text = f"{status_l}|{reason_l}"
+    if status_l in ("accepted_preview", "pending_pullback_preview"):
+        return status_l
+    if "max_open" in text or "limit" in text or "too_many" in text or "position_limit" in text:
+        return "rejected_limit"
+    if "existing" in text or "same_symbol" in text or "already_open" in text or "duplicate" in text:
+        return "rejected_existing_symbol"
+    if "invalid" in text or "missing" in text or ("entry" in text and "sl" in text):
+        return "rejected_invalid_order"
+    if status_l in ("rejected_limit", "rejected_existing_symbol", "rejected_invalid_order", "preview_rejected", "candidate_only"):
+        return status_l
+    if status_l in ("rejected", "skipped", "unavailable"):
+        return "preview_rejected"
+    return status_l or "candidate_only"
+
+
+def _execution_rejection_reason_ar(status: str, reason: str = "") -> str:
+    status = str(status or "")
+    if status == "rejected_limit":
+        return "تم الوصول للحد الأقصى للصفقات المفتوحة"
+    if status == "rejected_existing_symbol":
+        return "توجد صفقة تنفيذ مفتوحة لنفس العملة"
+    if status == "rejected_invalid_order":
+        return "بيانات الأمر غير مكتملة أو غير صالحة"
+    if status == "candidate_only":
+        return "مرشح فقط ولم يدخل مرحلة التنفيذ التجريبي"
+    if status == "preview_rejected":
+        return str(reason or "تم رفض التنفيذ من وحدة التنفيذ / إدارة المخاطر")
+    return str(reason or "سبب غير محدد")
+
+
+def build_execution_rejection_message(symbol: str, status: str, reason: str = "") -> str:
+    return (
+        "⚠️ <b>Execution Candidate لم يتم تنفيذه</b>\n\n"
+        f"🪙 <b>Symbol:</b> {html.escape(str(symbol or '?'))}\n"
+        f"📌 <b>Status:</b> {html.escape(str(status or 'preview_rejected'))}\n"
+        f"❌ <b>السبب:</b> {html.escape(_execution_rejection_reason_ar(status, reason))}\n\n"
+        "📊 ستظل الصفقة موجودة في /report_execution للمتابعة والتحليل."
+    )
+
+
+def update_execution_status_for_candidate(candidate: dict, status: str, reason: str = "", message_sent: bool = False) -> None:
+    if not r or not candidate:
+        return
+    try:
+        symbol = str(candidate.get("symbol") or "")
+        candle_time = int(float(candidate.get("candle_time") or 0))
+        if not symbol or candle_time <= 0:
+            return
+        updates = {
+            "execution_status": status,
+            "execution_result_status": status,
+            "execution_reject_reason": reason or "",
+            "execution_message_sent": bool(message_sent),
+            "execution_updated_ts": int(time.time()),
+        }
+        for key in (f"trade:futures:long:{symbol}:{candle_time}", f"trade_history:futures:long:{symbol}:{candle_time}"):
+            raw = r.get(key)
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            data.update(updates)
+            diagnostics = data.get("diagnostics", {}) or {}
+            diagnostics.update(updates)
+            data["diagnostics"] = diagnostics
+            ttl = r.ttl(key)
+            r.set(key, json.dumps(data, ensure_ascii=False))
+            if ttl and ttl > 0:
+                r.expire(key, ttl)
+    except Exception as e:
+        logger.warning(f"update_execution_status_for_candidate error: {e}")
 
 # =========================
 # MAIN LOOP
@@ -10680,6 +10729,7 @@ def run_scanner_loop():
                         "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
+                    candidate.setdefault("execution_status", "candidate_only")
                     candidate_alert_id = candidate["alert_id"]
                     register_ok = register_trade_from_candidate(candidate)
                     set_alert_registration_status(candidate_alert_id, register_ok)
@@ -10696,23 +10746,32 @@ def run_scanner_loop():
                         if is_execution_paused():
                             logger.info(f"EXEC PAUSED: skip execution preview for {symbol}")
                         elif EXECUTION_AVAILABLE:
-                            if not is_candidate_for_execution(candidate):
-                                logger.info(
-                                    f"EXEC SKIPPED: {symbol} | reason=not_strict_execution_candidate "
-                                    f"| setup={candidate.get('setup_type', '')} | entry_maturity={candidate.get('entry_maturity', '')}"
-                                )
+                            candidate = _apply_market_execution_fallback(candidate)
+                            if not _candidate_has_complete_execution_plan(candidate):
+                                exec_status = "rejected_invalid_order"
+                                exec_reason = "missing_or_invalid_entry_sl_tp"
+                                update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
+                                send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
+                                logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
                             else:
-                                candidate = _apply_market_execution_fallback(candidate)
                                 exec_result = process_trade_candidate(r, symbol, candidate)
-                                if exec_result.get("status") in ("accepted_preview", "pending_pullback_preview"):
-                                    execution_message = exec_result.get("execution_message")
+                                raw_status = exec_result.get("status")
+                                raw_reason = exec_result.get("reason", "")
+                                exec_status = _normalize_execution_status(raw_status, raw_reason)
+                                execution_message = exec_result.get("execution_message")
+                                has_message = bool(execution_message)
+                                if exec_status in ("accepted_preview", "pending_pullback_preview"):
                                     if execution_message:
                                         send_telegram_message(execution_message)
-                                    logger.info(f"EXEC {exec_result.get('status')}: {symbol}")
+                                    update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
                                 else:
-                                    logger.info(
-                                        f"EXEC REJECTED: {symbol} | reason={exec_result.get('reason')}"
-                                    )
+                                    rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
+                                    send_telegram_message(rejection_message)
+                                    has_message = True
+                                    update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
+                                logger.info(
+                                    f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
+                                )
                     except Exception as _exec_e:
                         logger.error(f"Execution preview error for {symbol}: {_exec_e}")
                     logger.info(f"✅ SENT LONG ---> {symbol}")
