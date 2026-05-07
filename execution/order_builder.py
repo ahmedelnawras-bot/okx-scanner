@@ -17,26 +17,23 @@ def _safe_float(value, default=0.0) -> float:
 
 def has_pullback_execution_plan(candidate: dict) -> bool:
     """
-    يحدد هل الإشارة فيها خطة Pullback Entry.
+    يحدد هل التنفيذ نفسه Pullback Pending.
+
+    مهم: وجود pullback_low/high أو has_pullback_plan قد يكون للعرض فقط داخل
+    رسالة Telegram. لا نحول الصفقة إلى pending execution إلا إذا entry_mode
+    صريح أنه pullback_pending.
     """
     if not isinstance(candidate, dict):
         return False
 
-    entry_mode = str(candidate.get("entry_mode", "") or "").lower()
-    has_pullback_plan = bool(candidate.get("has_pullback_plan", False))
-
-    pullback_low = _safe_float(candidate.get("pullback_low"), 0.0)
-    pullback_high = _safe_float(candidate.get("pullback_high"), 0.0)
-    pullback_entry = _safe_float(candidate.get("pullback_entry"), 0.0)
+    entry_mode = str(candidate.get("entry_mode", "") or "").strip().lower()
+    status = str(candidate.get("status", "") or "").strip().lower()
+    execution_status = str(candidate.get("execution_status", "") or "").strip().lower()
 
     return (
-        entry_mode == "pullback_pending"
-        or has_pullback_plan
-        or (
-            pullback_low > 0
-            and pullback_high > 0
-        )
-        or pullback_entry > 0
+        entry_mode in ("pullback_pending", "pending_pullback")
+        or status == "pending_pullback"
+        or execution_status == "pending_pullback_preview"
     )
 
 
@@ -79,9 +76,9 @@ def build_order_preview(symbol: str, candidate: dict) -> dict:
 
     entry = pullback_mid_entry if is_pullback and pullback_mid_entry > 0 else market_entry
 
-    sl = _safe_float(candidate.get("sl", 0.0), 0.0)
-    tp1 = _safe_float(candidate.get("tp1", 0.0), 0.0)
-    tp2 = _safe_float(candidate.get("tp2", 0.0), 0.0)
+    sl = _safe_float(candidate.get("execution_sl", candidate.get("sl", 0.0)) if is_pullback else candidate.get("sl", 0.0), 0.0)
+    tp1 = _safe_float(candidate.get("execution_tp1", candidate.get("tp1", 0.0)) if is_pullback else candidate.get("tp1", 0.0), 0.0)
+    tp2 = _safe_float(candidate.get("execution_tp2", candidate.get("tp2", 0.0)) if is_pullback else candidate.get("tp2", 0.0), 0.0)
     score = _safe_float(candidate.get("score", candidate.get("effective_score", 0.0)), 0.0)
 
     return {
