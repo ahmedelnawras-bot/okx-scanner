@@ -19,31 +19,14 @@ logger = logging.getLogger("okx-scanner")
 
 
 def is_setup_allowed_for_execution(candidate: dict) -> dict:
+    """
+    Final execution rule: main.py sends only real Execution Candidates here.
+    Therefore every candidate that reaches executor is allowed by setup; no setup whitelist gate.
+    """
     setup_type = str(candidate.get("setup_type", "") or "").strip()
-
-    if not LIVE_EXECUTION_SETUP_WHITELIST_ENABLED:
-        return {
-            "allowed": True,
-            "reason": "whitelist_disabled",
-            "setup_type": setup_type,
-        }
-
-    exact_allowed = setup_type in LIVE_EXECUTION_SETUP_WHITELIST
-    keyword_allowed = any(
-        keyword in setup_type
-        for keyword in LIVE_EXECUTION_SETUP_KEYWORDS
-    )
-
-    if exact_allowed or keyword_allowed:
-        return {
-            "allowed": True,
-            "reason": "setup_allowed",
-            "setup_type": setup_type,
-        }
-
     return {
-        "allowed": False,
-        "reason": "setup_not_whitelisted",
+        "allowed": True,
+        "reason": "execution_candidate_allowed",
         "setup_type": setup_type,
     }
 
