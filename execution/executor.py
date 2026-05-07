@@ -48,7 +48,11 @@ def is_setup_allowed_for_execution(candidate: dict) -> dict:
     """
     setup_type = str(candidate.get("setup_type", "") or "").strip()
     mode = str(candidate.get("current_mode") or candidate.get("market_mode") or candidate.get("mode") or "").upper()
-    block_exception = bool(candidate.get("block_exception")) or mode == "BLOCK_LONGS"
+    block_exception = (
+        bool(candidate.get("block_exception"))
+        or bool(candidate.get("block_longs_execution_candidate"))
+        or mode == "BLOCK_LONGS"
+    )
     tags = _get_execution_setup_tags(candidate)
     whitelist = {_normalize_execution_tag(k) for k in EXECUTION_WHITELIST_KEYWORDS}
     allowed = block_exception or bool(tags & whitelist)
@@ -58,6 +62,57 @@ def is_setup_allowed_for_execution(candidate: dict) -> dict:
         "setup_type": setup_type,
         "execution_setup_tags": sorted(tags),
     }
+
+
+def _safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _round_like(value: float, reference):
+    """Round adjusted TP using the visible precision of the original TP value."""
+    try:
+        ref_text = str(reference)
+        if "." in ref_text:
+            decimals = max(0, min(12, len(ref_text.rstrip("0").split(".", 1)[1])))
+            return round(float(value), decimals)
+        return round(float(value), 8)
+    except Exception:
+        return value
+
+
+def _is_block_longs_candidate(candidate: dict) -> bool:
+    mode = str((candidate or {}).get("current_mode") or (candidate or {}).get("market_mode") or (candidate or {}).get("mode") or "").upper()
+    return (
+        bool((candidate or {}).get("block_exception"))
+        or bool((candidate or {}).get("block_longs_execution_candidate"))
+        or mode == "BLOCK_LONGS"
+    )
+
+
+def _apply_block_longs_execution_tp1_adjustment(order: dict, candidate: dict) -> dict:
+    """For BLOCK_LONGS execution only, bring TP1 25% closer while keeping signal/tracking TP unchanged."""
+    try:
+        if not _is_block_longs_candidate(candidate):
+            return order
+        entry = _safe_float(order.get("entry"), None)
+        tp1 = _safe_float(order.get("tp1"), None)
+        if entry is None or tp1 is None or tp1 <= entry:
+            return order
+        original_tp1 = order.get("tp1")
+        adjusted_tp1 = entry + ((tp1 - entry) * 0.75)
+        order["original_tp1"] = original_tp1
+        order["tp1"] = _round_like(adjusted_tp1, original_tp1)
+        order["block_longs_tp1_adjusted"] = True
+        order["block_longs_tp1_factor"] = 0.75
+        order["block_longs_note"] = "BLOCK_LONGS: TP1 adjusted to 75% of normal TP1 distance for faster risk reduction"
+        return order
+    except Exception:
+        return order
 
 def _fmt(value) -> str:
     return html.escape(str(value if value is not None else ""))
@@ -78,6 +133,7 @@ def build_execution_preview_message(order: dict, setup_type: str, order_id: str)
         f"📍 <b>Entry:</b> {_fmt(order.get('entry'))}",
         f"🛑 <b>SL:</b> {_fmt(order.get('sl'))}",
         f"🎯 <b>TP1:</b> {_fmt(order.get('tp1'))} | إغلاق {_fmt(tp_plan.get('tp1_close_pct'))}%",
+        (f"⚠️ <b>BLOCK_LONGS TP1:</b> 75% من TP1 العادي | الأصلي: {_fmt(order.get('original_tp1'))}" if order.get("block_longs_tp1_adjusted") else ""),
         f"🎯 <b>TP2:</b> {_fmt(order.get('tp2'))} | إغلاق {_fmt(tp_plan.get('tp2_close_pct'))}%",
         f"🏃 <b>Trailing:</b> {_fmt(tp_plan.get('trailing_position_pct'))}% | {_fmt(tp_plan.get('trailing_pct'))}%",
         "",
@@ -104,6 +160,7 @@ def build_pending_pullback_message(order: dict, setup_type: str, order_id: str) 
         "",
         f"🛑 <b>SL:</b> {_fmt(order.get('sl'))}",
         f"🎯 <b>TP1:</b> {_fmt(order.get('tp1'))} | إغلاق {_fmt(tp_plan.get('tp1_close_pct'))}%",
+        (f"⚠️ <b>BLOCK_LONGS TP1:</b> 75% من TP1 العادي | الأصلي: {_fmt(order.get('original_tp1'))}" if order.get("block_longs_tp1_adjusted") else ""),
         f"🎯 <b>TP2:</b> {_fmt(order.get('tp2'))} | إغلاق {_fmt(tp_plan.get('tp2_close_pct'))}%",
         f"🏃 <b>Trailing:</b> {_fmt(tp_plan.get('trailing_position_pct'))}% | {_fmt(tp_plan.get('trailing_pct'))}%",
         "",
@@ -150,6 +207,7 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
 
     # 3) Build order preview
     order = build_order_preview(symbol, candidate)
+    order = _apply_block_longs_execution_tp1_adjustment(order, candidate)
 
     # 4) Generate fake order id
     order_id = f"sim_{symbol}_{int(time.time())}"
@@ -178,6 +236,8 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "pullback_entry": order.get("pullback_entry"),
         "sl": order.get("sl"),
         "tp1": order.get("tp1"),
+        "original_tp1": order.get("original_tp1"),
+        "block_longs_tp1_adjusted": order.get("block_longs_tp1_adjusted", False),
         "tp2": order.get("tp2"),
         "created_ts": int(time.time()),
     }
@@ -198,6 +258,9 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
             "entry_mode": order.get("entry_mode", "market"),
             "entry": order.get("entry"),
             "execution_entry": order.get("execution_entry"),
+            "tp1": order.get("tp1"),
+            "original_tp1": order.get("original_tp1"),
+            "block_longs_tp1_adjusted": order.get("block_longs_tp1_adjusted", False),
             "pullback_low": order.get("pullback_low"),
             "pullback_high": order.get("pullback_high"),
         },
