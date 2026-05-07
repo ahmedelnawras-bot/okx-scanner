@@ -2895,6 +2895,15 @@ def build_execution_report_message(period: str = "all") -> str:
         tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
         trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
         direct_sl = sum(1 for t in closed_trades if _execution_close_type_for_trade(t) == "Direct SL")
+        direct_sl_pnls = []
+        for t in closed_trades:
+            if _execution_close_type_for_trade(t) == "Direct SL":
+                pnl = _execution_final_pnl_pct(t)
+                if pnl is not None:
+                    direct_sl_pnls.append(pnl)
+        actual_profit_pnl = sum(winners) + sum(open_pnls)
+        actual_sl_loss_pnl = sum(direct_sl_pnls)
+        actual_net_pnl = actual_profit_pnl + actual_sl_loss_pnl
 
         title_map = {
             "all": "منذ البداية",
@@ -2919,6 +2928,12 @@ def build_execution_report_message(period: str = "all") -> str:
             f"🏁 TP2 Success: {tp2_hits / total * 100:.1f}%",
             f"🔄 Trail Success: {trailing_wins / total * 100:.1f}%",
             f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
+            "",
+            "<b>النتيجة الفعلية</b>",
+            f"• 🟢 أرباح محققة/مفتوحة: {_pct_safe(actual_profit_pnl)}",
+            f"• 🔴 خسائر SL Hit: {_pct_safe(actual_sl_loss_pnl)}",
+            f"• ⚖️ الصافي بعد الرافعة: <b>{_pct_safe(actual_net_pnl)}</b>",
+            "─",
             "",
             f"🟢 <b>الصفقات المفتوحة ({len(open_trades)})</b>",
         ]
