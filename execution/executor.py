@@ -18,15 +18,43 @@ from execution.execution_state import (
 logger = logging.getLogger("okx-scanner")
 
 
+EXECUTION_WHITELIST_KEYWORDS = (
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+    "relative_strength_vs_btc",
+)
+
+
+def _candidate_blob(candidate: dict) -> str:
+    diagnostics = candidate.get("diagnostics", {}) or {}
+    values = [
+        candidate.get("setup_type"),
+        diagnostics.get("setup_type"),
+        candidate.get("setup_type_base"),
+        diagnostics.get("setup_type_base"),
+        candidate.get("primary_extra_setup"),
+        diagnostics.get("primary_extra_setup"),
+    ]
+    for key in ("extra_setup_names", "context_setups"):
+        raw = candidate.get(key, diagnostics.get(key, []))
+        if isinstance(raw, (list, tuple, set)):
+            values.extend(list(raw))
+        elif raw:
+            values.append(raw)
+    return "|".join(str(v) for v in values if v).lower()
+
+
 def is_setup_allowed_for_execution(candidate: dict) -> dict:
-    """
-    Final execution rule: main.py sends only real Execution Candidates here.
-    Therefore every candidate that reaches executor is allowed by setup; no setup whitelist gate.
-    """
+    """Final execution whitelist defense. main.py should send only these candidates."""
     setup_type = str(candidate.get("setup_type", "") or "").strip()
+    mode = str(candidate.get("current_mode") or candidate.get("market_mode") or "").upper()
+    block_exception = bool(candidate.get("block_exception")) or mode == "BLOCK_LONGS"
+    blob = _candidate_blob(candidate)
+    allowed = block_exception or any(k in blob for k in EXECUTION_WHITELIST_KEYWORDS)
     return {
-        "allowed": True,
-        "reason": "execution_candidate_allowed",
+        "allowed": allowed,
+        "reason": "execution_candidate_allowed" if allowed else "setup_not_whitelisted",
         "setup_type": setup_type,
     }
 
