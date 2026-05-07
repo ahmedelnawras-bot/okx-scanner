@@ -353,29 +353,44 @@ def analyze_entry_maturity(df) -> dict:
 
         warning_reasons = []
 
-        # A) Overextended + Wave 5 = خطر واضح
+        fib_ratio = safe_float(result.get("fib_position_ratio"), 0.0)
+
+        # A) Overextended + Wave 5
+        # تعديل مهم: Entry Maturity أصبح penalty-first بدل hard-block افتراضي.
+        # لا نمنع الإشارة مبكرًا إلا في حالة امتداد شديد جدًا بدون Pullback.
+        # الهدف: عدم قتل continuation moves القوية، مع استمرار حماية القمم المتأخرة جدًا.
         if fib_position == "overextended" and wave_estimate == 5:
             result["entry_maturity"] = "danger_late"
-            result["maturity_penalty"] = 0.75
             result["maturity_bonus"] = 0.0
-            result["block_signal"] = True
-            warning_reasons.append("Entry Maturity: موجة متأخرة + امتداد فيبوناتشي")
+
+            if (not had_pb) and fib_ratio >= 0.98:
+                result["maturity_penalty"] = 0.65
+                result["block_signal"] = True
+                warning_reasons.append(
+                    "Entry Maturity: امتداد شديد جدًا + موجة متأخرة بدون Pullback"
+                )
+            else:
+                result["maturity_penalty"] = 0.45
+                result["block_signal"] = False
+                warning_reasons.append(
+                    "Entry Maturity: موجة متأخرة + امتداد فيبوناتشي؛ تحذير/خصم فقط"
+                )
 
         # B) Overextended فقط
         elif fib_position == "overextended":
             result["entry_maturity"] = "late"
-            result["maturity_penalty"] = 0.35
+            result["maturity_penalty"] = 0.25
             result["maturity_bonus"] = 0.0
             result["block_signal"] = False
-            warning_reasons.append("Entry Maturity: السعر قريب من نهاية الموجة")
+            warning_reasons.append("Entry Maturity: السعر قريب من نهاية الموجة؛ خصم فقط")
 
         # C) موجة خامسة بدون Pullback واضح
         elif wave_estimate == 5 and not had_pb:
             result["entry_maturity"] = "late"
-            result["maturity_penalty"] = 0.30
+            result["maturity_penalty"] = 0.25
             result["maturity_bonus"] = 0.0
             result["block_signal"] = False
-            warning_reasons.append("Entry Maturity: موجة خامسة بدون Pullback واضح")
+            warning_reasons.append("Entry Maturity: موجة خامسة بدون Pullback واضح؛ خصم فقط")
 
         # D) أفضل حالة
         elif fib_position == "golden_zone" and had_pb and wave_estimate in (1, 3):
