@@ -2651,32 +2651,72 @@ def _is_late_risky_execution_context(data: dict) -> bool:
         return False
 
 
-EXECUTION_WHITELIST_KEYWORDS = (
-    "vwap_reclaim",
-    "retest_breakout_confirmed",
-    "wave_3",
-    "relative_strength_vs_btc",
-)
+try:
+    from execution.config import EXECUTION_SETUP_WHITELIST
+except Exception:
+    EXECUTION_SETUP_WHITELIST = {
+        "vwap_reclaim",
+        "retest_breakout_confirmed",
+        "wave_3",
+        "relative_strength_vs_btc",
+    }
+
+EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
 
 def _execution_candidate_blob(data: dict) -> str:
-    """Collect setup/context fields used only to decide execution-candidate eligibility."""
+    """Collect every setup/context tag used only for execution-candidate eligibility.
+
+    Some strong setups are displayed in Telegram as "Setup إضافي" and are stored
+    in fields such as primary_extra_setup / extra_setup_names rather than inside
+    setup_type.  The execution whitelist must read all these fields, otherwise a
+    valid vwap_reclaim / relative_strength_vs_btc signal can be sent as a normal
+    signal without the Execution Candidate badge.
+    """
     diagnostics = data.get("diagnostics", {}) or {}
-    values = [
-        data.get("setup_type"),
-        diagnostics.get("setup_type"),
-        data.get("setup_type_base"),
-        diagnostics.get("setup_type_base"),
-        data.get("primary_extra_setup"),
-        diagnostics.get("primary_extra_setup"),
-    ]
-    for key in ("extra_setup_names", "context_setups"):
-        raw = data.get(key, diagnostics.get(key, []))
-        if isinstance(raw, (list, tuple, set)):
-            values.extend(list(raw))
-        elif raw:
-            values.append(raw)
-    return "|".join(str(v) for v in values if v).lower()
+
+    keys = (
+        "setup_type",
+        "setup_type_base",
+        "primary_extra_setup",
+        "extra_setup",
+        "setup_extra",
+        "extra_setup_name",
+        "extra_setup_names",
+        "extra_setups",
+        "extra_setups_details",
+        "context_setup",
+        "context_setups",
+        "setup_context",
+        "wave_context",
+        "wave_estimate",
+        "wave_label",
+        "wave",
+        "entry_maturity",
+        "entry_maturity_label",
+    )
+
+    values = []
+
+    def add_value(value):
+        if value is None or value == "":
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                add_value(k)
+                add_value(v)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add_value(item)
+            return
+        values.append(str(value))
+
+    for key in keys:
+        add_value(data.get(key))
+        add_value(diagnostics.get(key))
+
+    return "|".join(values).lower()
 
 
 def _has_strict_execution_setup(data: dict) -> bool:
