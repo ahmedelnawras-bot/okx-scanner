@@ -2976,7 +2976,12 @@ def _is_execution_trade_open(trade: dict) -> bool:
 
 def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
     plan = _execution_plan_for_trade(trade)
-    symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+    raw_symbol = str(trade.get("symbol", "?") or "?")
+    symbol = html.escape(raw_symbol)
+    try:
+        tv_link = build_tradingview_link(raw_symbol)
+    except Exception:
+        tv_link = ""
     setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
     score = _trade_field(trade, "score", "N/A")
     entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
@@ -2994,6 +2999,8 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
     else:
         icon = "⚪"
     lines = [f"• {icon} <b>{symbol}</b>"]
+    if tv_link:
+        lines.append(f'  🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView - 15m / 1H</a>')
     if is_open:
         pnl = _execution_floating_pnl_pct(trade)
         lines.append(f"  📌 Phase: {_execution_phase_for_trade(trade)} | ⏱ {duration}")
