@@ -4,9 +4,7 @@ import html
 
 from execution.config import (
     TRADING_MODE,
-    LIVE_EXECUTION_SETUP_WHITELIST_ENABLED,
-    LIVE_EXECUTION_SETUP_WHITELIST,
-    LIVE_EXECUTION_SETUP_KEYWORDS,
+    EXECUTION_SETUP_WHITELIST,
 )
 from execution.risk_manager import can_execute_trade
 from execution.order_builder import build_order_preview
@@ -18,31 +16,53 @@ from execution.execution_state import (
 logger = logging.getLogger("okx-scanner")
 
 
-EXECUTION_WHITELIST_KEYWORDS = (
-    "vwap_reclaim",
-    "retest_breakout_confirmed",
-    "wave_3",
-    "relative_strength_vs_btc",
-)
+EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
 
 def _candidate_blob(candidate: dict) -> str:
+    """Collect all setup/context tags for the execution whitelist defense."""
     diagnostics = candidate.get("diagnostics", {}) or {}
-    values = [
-        candidate.get("setup_type"),
-        diagnostics.get("setup_type"),
-        candidate.get("setup_type_base"),
-        diagnostics.get("setup_type_base"),
-        candidate.get("primary_extra_setup"),
-        diagnostics.get("primary_extra_setup"),
-    ]
-    for key in ("extra_setup_names", "context_setups"):
-        raw = candidate.get(key, diagnostics.get(key, []))
-        if isinstance(raw, (list, tuple, set)):
-            values.extend(list(raw))
-        elif raw:
-            values.append(raw)
-    return "|".join(str(v) for v in values if v).lower()
+    keys = (
+        "setup_type",
+        "setup_type_base",
+        "primary_extra_setup",
+        "extra_setup",
+        "setup_extra",
+        "extra_setup_name",
+        "extra_setup_names",
+        "extra_setups",
+        "extra_setups_details",
+        "context_setup",
+        "context_setups",
+        "setup_context",
+        "wave_context",
+        "wave_estimate",
+        "wave_label",
+        "wave",
+        "entry_maturity",
+        "entry_maturity_label",
+    )
+    values = []
+
+    def add_value(value):
+        if value is None or value == "":
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                add_value(k)
+                add_value(v)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add_value(item)
+            return
+        values.append(str(value))
+
+    for key in keys:
+        add_value(candidate.get(key))
+        add_value(diagnostics.get(key))
+
+    return "|".join(values).lower()
 
 
 def is_setup_allowed_for_execution(candidate: dict) -> dict:
