@@ -3320,8 +3320,13 @@ def format_winrate_summary(summary: dict) -> str:
 
 
 def format_period_summary(title: str, summary: dict) -> str:
+    """Format period summary in a cleaner Arabic-first layout.
+
+    الحسابات نفسها لا تتغير؛ هذا تنسيق عرض فقط.
+    """
     side = normalize_side(summary.get("side", "long"))
 
+    signals = safe_int(summary.get("signals", summary.get("trades_count", 0)))
     wins = safe_int(summary.get("wins", 0))
     losses = safe_int(summary.get("losses", 0))
     expired = safe_int(summary.get("expired", 0))
@@ -3330,6 +3335,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         safe_int(summary.get("closed", 0)),
         wins + losses + expired + breakeven_exits,
     )
+    open_count = safe_int(summary.get("open", 0))
 
     gross_profit = safe_float(summary.get("gross_profit_pct", 0.0))
     gross_loss = safe_float(summary.get("gross_loss_pct", 0.0))
@@ -3351,13 +3357,8 @@ def format_period_summary(title: str, summary: dict) -> str:
     full_wins = safe_int(summary.get("tp2_wins", 0))
     trailing_wins = safe_int(summary.get("trailing_wins", 0))
     trailing_open_count = safe_int(summary.get("trailing_open", 0))
-
-    # Full Wins TP2 = الصفقات المغلقة فعلاً على TP2 فقط.
-    # لا نرفعه إلى TP2 Hits حتى لا يظهر تناقض مثل Closed: 0 و Full Wins: 1.
-    # TP2 Reached يعرض الوصول للهدف سواء مغلق أو ما زال Trailing/Open.
     tp2_reached = max(tp2_hits, full_wins + trailing_wins + trailing_open_count)
 
-    # حماية إضافية من أي ملخص قديم غير متسق.
     wins = max(wins, tp1_only + full_wins + trailing_wins)
     closed = max(closed, wins + losses + expired + breakeven_exits)
 
@@ -3373,33 +3374,31 @@ def format_period_summary(title: str, summary: dict) -> str:
     gross_profit_usd = estimate_pct_to_usd(gross_profit, side=side)
     gross_loss_usd = estimate_pct_to_usd(abs(gross_loss), side=side)
     net_pnl_usd = estimate_pct_to_usd(net_pnl, side=side)
-
     wallet_pnl_pct, wallet_pnl_usd = estimate_wallet_pnl(summary, side=side)
 
-    # الخسارة تُعرض دائماً بالسالب بوضوح
     gross_loss_display = -abs(gross_loss)
     gross_loss_usd_display = -abs(gross_loss_usd)
 
+    partial_lifecycle_pnl = safe_float(summary.get("partial_lifecycle_leveraged_pnl_pct", 0.0))
+    partial_lifecycle_count = safe_int(summary.get("partial_lifecycle_count", 0))
+    total_lifecycle_pnl = safe_float(summary.get("total_lifecycle_leveraged_pnl_pct", net_pnl))
+
     if side == "short":
-        settings_block = (
-            f"\n⚙️ <b>إعدادات حساب الشورت:</b>\n"
-            f"• عدد الصفقات القصوى: {active_trade_slots}\n"
-            f"• مارجن الصفقة الواحدة: {margin_per_trade:.2f}$\n"
-            f"• الرافعة: {leverage:.0f}x\n"
-            f"• الحجم الاسمي للصفقة: {plan['notional_per_trade_usd']:.2f}$\n"
-            f"• إجمالي المارجن عند الامتلاء: {plan['total_margin_used_usd']:.2f}$\n"
-            f"• إجمالي التعرض الاسمي: {plan['total_notional_exposure_usd']:.2f}$\n"
-            f"• ملاحظة: حساب الدولار تقديري على أساس مارجن {margin_per_trade:.2f}$ للصفقة.\n"
-        )
+        settings_lines = [
+            f"• الرافعة: {leverage:.0f}x",
+            f"• الحد الأقصى للصفقات: {active_trade_slots}",
+            f"• مارجن الصفقة الواحدة: {margin_per_trade:.2f}$",
+            f"• الحجم الاسمي للصفقة: {plan['notional_per_trade_usd']:.2f}$",
+            f"• إجمالي المارجن عند الامتلاء: {plan['total_margin_used_usd']:.2f}$",
+        ]
     else:
         capital_used_usd = plan.get("capital_used_usd", 0.0)
-        settings_block = (
-            f"\n⚙️ <b>إعدادات الحساب:</b>\n"
-            f"• الرافعة المستخدمة: {leverage:.0f}x\n"
-            f"• طريقة الحساب: {active_trade_slots} صفقات مفتوحة كحد أقصى\n"
-            f"• رأس المال المستخدم من المحفظة: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$\n"
-            f"• حجم المارجن للصفقة الواحدة تقديريًا: {margin_per_trade:.2f}$\n"
-        )
+        settings_lines = [
+            f"• الرافعة: {leverage:.0f}x",
+            f"• الحد الأقصى للصفقات: {active_trade_slots}",
+            f"• رأس المال المستخدم: {capital_used_usd:.2f}$ من أصل {REPORT_ACCOUNT_BALANCE_USD:.0f}$",
+            f"• مارجن الصفقة الواحدة تقديريًا: {margin_per_trade:.2f}$",
+        ]
 
     status_ar = {
         "normal": "آمن ✅",
@@ -3415,78 +3414,65 @@ def format_period_summary(title: str, summary: dict) -> str:
     if side == "long":
         risk_lines.insert(0, f"• الحد الأقصى لاستخدام المحفظة: {REPORT_MAX_CAPITAL_USAGE_PCT:.0f}%")
 
-
-    partial_lifecycle_pnl = safe_float(summary.get("partial_lifecycle_leveraged_pnl_pct", 0.0))
-    partial_lifecycle_count = safe_int(summary.get("partial_lifecycle_count", 0))
-    total_lifecycle_pnl = safe_float(summary.get("total_lifecycle_leveraged_pnl_pct", net_pnl))
-
-    performance_block = (
-        f"\n\n🎯 <b>أداء الأهداف:</b>\n"
-        f"• TP1 Hits: {tp1_hits} | TP2 Reached: {tp2_reached}\n"
-        f"• TP1 Only: {tp1_only} | Full TP2 Closed: {full_wins}\n"
-        + (f"• 🔄 Trailing Wins: {trailing_wins}\n" if trailing_wins > 0 else "")
-        + (f"• 🔄 Trailing Open: {trailing_open_count}\n" if trailing_open_count > 0 else "") +
-        f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%\n"
-        f"• TP1 → TP2 Conversion: {tp1_to_tp2_rate:.1f}%"
-    )
-    if partial_lifecycle_count > 0:
-        performance_block += f"\n• ⚖️ صفقات جزئية مفتوحة 40/40/20: {partial_lifecycle_count}"
-    if breakeven_exits > 0:
-        performance_block += f"\n• Breakeven Protected Exits: {breakeven_exits}"
-
     diagnosis = diagnose_performance_problem(summary)
-    diagnosis_block = (
-        f"\n🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>\n"
-        f"• المشكلة الأساسية: {diagnosis['problem_label']}\n"
-        f"• السبب: {diagnosis['explanation']}\n"
-        f"• الإجراء المقترح: {diagnosis['action']}"
-    )
 
-    partial_open_block = ""
-    if partial_lifecycle_count > 0:
-        partial_open_block = (
-            f"\n⚖️ <b>الأرباح الجزئية المفتوحة 40/40/20</b>\n"
-            f"• صفقات جزئية مفتوحة: {partial_lifecycle_count}\n"
-            f"• ربح جزئي مفتوح بعد الرافعة: {partial_lifecycle_pnl:+.2f}%\n"
-            f"• إجمالي مغلق + جزئي بعد الرافعة: {total_lifecycle_pnl:+.2f}%\n"
-        )
-
-    financial_block = (
-        f"\n\n💰 <b>النتيجة المالية الفعلية</b>\n"
-        f"────────────\n"
-        f"🟢 الأرباح بعد الرافعة: {gross_profit:+.2f}% = {gross_profit_usd:+.2f}$\n"
-        f"🔴 الخسائر بعد الرافعة: {gross_loss_display:+.2f}% = {gross_loss_usd_display:+.2f}$\n"
-        f"⚖️ الصافي بعد الرافعة: {net_pnl:+.2f}% = {net_pnl_usd:+.2f}$\n"
-        f"💼 المحفظة: {wallet_pnl_pct:+.2f}% = {wallet_pnl_usd:+.2f}$\n"
-        f"📊 صافي حركة السعر بدون رافعة: {raw_pnl:+.2f}%\n"
-        + partial_open_block +
-        f"────────────\n"
-        + settings_block +
-        f"\n📊 <b>تفاصيل إضافية:</b>\n"
-        f"• متوسط الصفقة الرابحة بعد الرافعة: {avg_win:+.2f}%\n"
-        f"• متوسط الصفقة الخاسرة بعد الرافعة: {avg_loss:+.2f}%\n"
-        f"• أفضل صفقة بعد الرافعة: {best:+.2f}%\n"
-        f"• أسوأ صفقة بعد الرافعة: {worst:+.2f}%\n"
-        f"\n🧯 <b>إدارة المخاطرة:</b>\n"
-        + "\n".join(risk_lines) + "\n"
-    )
-
-    return (
-        f"📊 {title}\n"
-        f"Signals: {summary.get('signals', 0)}\n"
-        f"Closed: {closed}\n"
-        f"Wins (TP1+): {wins}\n"
-        f"• Full Wins (TP2): {full_wins}\n"
-        f"• TP1 Only: {tp1_only}\n"
-        f"Losses: {losses}\n"
-        f"Expired: {expired}\n"
-        + (f"Breakeven Exits: {breakeven_exits}\n" if breakeven_exits > 0 else "") +
-        f"Open: {summary.get('open', 0)}\n"
-        f"Win rate: {summary.get('winrate', 0)}%"
-        + financial_block
-        + performance_block
-        + diagnosis_block
-    )
+    lines = [
+        f"📊 <b>{title}</b>",
+        "",
+        "🧾 <b>الملخص</b>",
+        f"• إجمالي الإشارات: {signals}",
+        f"• المفتوحة: {open_count}",
+        f"• المغلقة: {closed}",
+        f"• الرابحة TP1+: {wins}",
+        f"• الخاسرة SL: {losses}",
+        f"• المنتهية Expired: {expired}",
+    ]
+    if breakeven_exits > 0:
+        lines.append(f"• خروج Breakeven: {breakeven_exits}")
+    lines += [
+        f"• Win Rate للمغلق فقط: {summary.get('winrate', 0)}%",
+        "",
+        "💰 <b>النتيجة المالية بعد الرافعة</b>",
+        f"• أرباح محققة: {gross_profit:+.2f}% | {gross_profit_usd:+.2f}$",
+        f"• خسائر محققة: {gross_loss_display:+.2f}% | {gross_loss_usd_display:+.2f}$",
+        f"• الصافي المحقق: {net_pnl:+.2f}% | {net_pnl_usd:+.2f}$",
+        f"• تأثير المحفظة: {wallet_pnl_pct:+.2f}% | {wallet_pnl_usd:+.2f}$",
+        f"• الحركة بدون رافعة: {raw_pnl:+.2f}%",
+        "",
+        "⚖️ <b>حالة 40/40/20</b>",
+        f"• صفقات جزئية مفتوحة: {partial_lifecycle_count}",
+        f"• ربح جزئي مفتوح: {partial_lifecycle_pnl:+.2f}%",
+        f"• إجمالي مغلق + جزئي: {total_lifecycle_pnl:+.2f}%",
+        "",
+        "🎯 <b>أداء الأهداف</b>",
+        f"• TP1 Hits: {tp1_hits} | TP2 Reached: {tp2_reached}",
+        f"• TP1 Only: {tp1_only} | Full TP2 Closed: {full_wins}",
+    ]
+    if trailing_wins > 0:
+        lines.append(f"• Trailing Wins: {trailing_wins}")
+    if trailing_open_count > 0:
+        lines.append(f"• Trailing Open: {trailing_open_count}")
+    lines += [
+        f"• TP1 Rate: {tp1_rate:.1f}% | TP2 Rate: {tp2_rate:.1f}%",
+        f"• TP1 → TP2 Conversion: {tp1_to_tp2_rate:.1f}%",
+        "",
+        "⚙️ <b>إعدادات الحساب</b>",
+        *settings_lines,
+        "",
+        "📊 <b>تفاصيل إضافية</b>",
+        f"• متوسط الصفقة الرابحة: {avg_win:+.2f}%",
+        f"• متوسط الصفقة الخاسرة: {avg_loss:+.2f}%",
+        f"• أفضل صفقة: {best:+.2f}%",
+        f"• أسوأ صفقة: {worst:+.2f}%",
+        "",
+        "🧯 <b>إدارة المخاطرة</b>",
+        *risk_lines,
+        "",
+        f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>",
+        f"• السبب: {diagnosis['explanation']}",
+        f"• الإجراء المقترح: {diagnosis['action']}",
+    ]
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------
