@@ -19,65 +19,45 @@ logger = logging.getLogger("okx-scanner")
 EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
 
-def _candidate_blob(candidate: dict) -> str:
-    """Collect all setup/context tags for the execution whitelist defense."""
-    diagnostics = candidate.get("diagnostics", {}) or {}
-    keys = (
-        "setup_type",
-        "setup_type_base",
-        "primary_extra_setup",
-        "extra_setup",
-        "setup_extra",
-        "extra_setup_name",
-        "extra_setup_names",
-        "extra_setups",
-        "extra_setups_details",
-        "context_setup",
-        "context_setups",
-        "setup_context",
-        "wave_context",
-        "wave_estimate",
-        "wave_label",
-        "wave",
-        "entry_maturity",
-        "entry_maturity_label",
-    )
-    values = []
+def _normalize_execution_tag(value) -> str:
+    try:
+        tag = str(value or "").strip().lower()
+        tag = tag.replace(" ", "_").replace("-", "_")
+        while "__" in tag:
+            tag = tag.replace("__", "_")
+        return tag.strip("_|")
+    except Exception:
+        return ""
 
-    def add_value(value):
-        if value is None or value == "":
-            return
-        if isinstance(value, dict):
-            for k, v in value.items():
-                add_value(k)
-                add_value(v)
-            return
-        if isinstance(value, (list, tuple, set)):
-            for item in value:
-                add_value(item)
-            return
-        values.append(str(value))
 
-    for key in keys:
-        add_value(candidate.get(key))
-        add_value(diagnostics.get(key))
-
-    return "|".join(values).lower()
+def _get_execution_setup_tags(candidate: dict) -> set:
+    """Read only the canonical tags built by main.py."""
+    raw_tags = (candidate or {}).get("execution_setup_tags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = raw_tags.replace(",", "|").split("|")
+    if not isinstance(raw_tags, (list, tuple, set)):
+        raw_tags = []
+    return {_normalize_execution_tag(tag) for tag in raw_tags if _normalize_execution_tag(tag)}
 
 
 def is_setup_allowed_for_execution(candidate: dict) -> dict:
-    """Final execution whitelist defense. main.py should send only these candidates."""
+    """Final execution whitelist defense.
+
+    Whitelist matching depends only on candidate['execution_setup_tags'].
+    BLOCK_LONGS exceptions remain allowed as agreed.
+    """
     setup_type = str(candidate.get("setup_type", "") or "").strip()
-    mode = str(candidate.get("current_mode") or candidate.get("market_mode") or "").upper()
+    mode = str(candidate.get("current_mode") or candidate.get("market_mode") or candidate.get("mode") or "").upper()
     block_exception = bool(candidate.get("block_exception")) or mode == "BLOCK_LONGS"
-    blob = _candidate_blob(candidate)
-    allowed = block_exception or any(k in blob for k in EXECUTION_WHITELIST_KEYWORDS)
+    tags = _get_execution_setup_tags(candidate)
+    whitelist = {_normalize_execution_tag(k) for k in EXECUTION_WHITELIST_KEYWORDS}
+    allowed = block_exception or bool(tags & whitelist)
     return {
         "allowed": allowed,
         "reason": "execution_candidate_allowed" if allowed else "setup_not_whitelisted",
         "setup_type": setup_type,
+        "execution_setup_tags": sorted(tags),
     }
-
 
 def _fmt(value) -> str:
     return html.escape(str(value if value is not None else ""))
@@ -244,4 +224,3 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "entry_mode": order.get("entry_mode", "market"),
         "execution_message": execution_message,
     }
-
