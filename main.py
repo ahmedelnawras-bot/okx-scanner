@@ -2666,17 +2666,27 @@ except Exception:
 EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
 
-def _execution_candidate_blob(data: dict) -> str:
-    """Collect every setup/context tag used only for execution-candidate eligibility.
+def _normalize_execution_tag(value) -> str:
+    """Normalize setup/context tags for execution whitelist matching."""
+    try:
+        tag = str(value or "").strip().lower()
+        tag = tag.replace(" ", "_").replace("-", "_")
+        while "__" in tag:
+            tag = tag.replace("__", "_")
+        return tag.strip("_|")
+    except Exception:
+        return ""
 
-    Some strong setups are displayed in Telegram as "Setup إضافي" and are stored
-    in fields such as primary_extra_setup / extra_setup_names rather than inside
-    setup_type.  The execution whitelist must read all these fields, otherwise a
-    valid vwap_reclaim / relative_strength_vs_btc signal can be sent as a normal
-    signal without the Execution Candidate badge.
+
+def _collect_execution_setup_tags(data: dict) -> list:
+    """Build one canonical execution tag list from every setup source.
+
+    This prevents mismatch between what Telegram displays as Setup إضافي and
+    what the execution whitelist sees.
     """
+    if not isinstance(data, dict):
+        return []
     diagnostics = data.get("diagnostics", {}) or {}
-
     keys = (
         "setup_type",
         "setup_type_base",
@@ -2687,6 +2697,7 @@ def _execution_candidate_blob(data: dict) -> str:
         "extra_setup_names",
         "extra_setups",
         "extra_setups_details",
+        "context",
         "context_setup",
         "context_setups",
         "setup_context",
@@ -2696,36 +2707,57 @@ def _execution_candidate_blob(data: dict) -> str:
         "wave",
         "entry_maturity",
         "entry_maturity_label",
+        "relative_strength_vs_btc",
     )
+    tags = set()
 
-    values = []
-
-    def add_value(value):
+    def add_value(value, source_key=""):
         if value is None or value == "":
             return
         if isinstance(value, dict):
             for k, v in value.items():
-                add_value(k)
-                add_value(v)
+                add_value(k, source_key)
+                add_value(v, source_key)
             return
         if isinstance(value, (list, tuple, set)):
             for item in value:
-                add_value(item)
+                add_value(item, source_key)
             return
-        values.append(str(value))
+        if isinstance(value, bool):
+            if value and source_key:
+                tags.add(_normalize_execution_tag(source_key))
+            return
+        text = str(value)
+        for part in text.replace(",", "|").replace(";", "|").split("|"):
+            tag = _normalize_execution_tag(part)
+            if tag:
+                tags.add(tag)
 
     for key in keys:
-        add_value(data.get(key))
-        add_value(diagnostics.get(key))
+        add_value(data.get(key), key)
+        add_value(diagnostics.get(key), key)
 
-    return "|".join(values).lower()
+    return sorted(tags)
+
+
+def _ensure_execution_setup_tags(candidate: dict) -> dict:
+    """Attach canonical execution_setup_tags to candidate in-place."""
+    try:
+        if not isinstance(candidate, dict):
+            return candidate
+        candidate["execution_setup_tags"] = _collect_execution_setup_tags(candidate)
+        return candidate
+    except Exception:
+        return candidate
 
 
 def _has_strict_execution_setup(data: dict) -> bool:
-    """Execution whitelist: only agreed setups become real Execution Candidates."""
-    blob = _execution_candidate_blob(data)
-    return any(k in blob for k in EXECUTION_WHITELIST_KEYWORDS)
-
+    """Execution whitelist: only agreed setup tags become Execution Candidates."""
+    try:
+        tags = set(_collect_execution_setup_tags(data))
+        return any(_normalize_execution_tag(k) in tags for k in EXECUTION_WHITELIST_KEYWORDS)
+    except Exception:
+        return False
 
 def _is_block_mode_execution_candidate(data: dict) -> bool:
     """Any alert that actually passed while BLOCK_LONGS is active becomes an execution candidate."""
@@ -6934,6 +6966,7 @@ def is_candidate_for_execution(candidate: dict) -> bool:
     """
     try:
         planned = _apply_market_execution_fallback(dict(candidate or {}))
+        _ensure_execution_setup_tags(planned)
         return bool(
             (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
             and _candidate_has_complete_execution_plan(planned)
@@ -6943,6 +6976,7 @@ def is_candidate_for_execution(candidate: dict) -> bool:
 
 
 def build_execution_badge_line(candidate: dict) -> str:
+    _ensure_execution_setup_tags(candidate)
     if not is_candidate_for_execution(candidate):
         return ""
     return (
@@ -11084,6 +11118,7 @@ def run_scanner_loop():
                         "relative_strength_short": candidate.get("relative_strength_short"),
                         "relative_strength_24": candidate.get("relative_strength_24"),
                         "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
+                        "execution_setup_tags": candidate.get("execution_setup_tags", []),
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
                     candidate.setdefault("execution_status", "candidate_only")
@@ -11121,6 +11156,7 @@ def run_scanner_loop():
                                 logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
                             elif EXECUTION_AVAILABLE:
                                 candidate = _apply_market_execution_fallback(candidate)
+                                _ensure_execution_setup_tags(candidate)
                                 if not _candidate_has_complete_execution_plan(candidate):
                                     exec_status = "rejected_invalid_order"
                                     exec_reason = "missing_or_invalid_entry_sl_tp"
