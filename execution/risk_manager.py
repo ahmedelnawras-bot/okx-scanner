@@ -1,71 +1,73 @@
+import os
+import json
+import ast
 from execution.config import (
     TRADING_MODE,
     EXECUTION_ENABLED,
     MAX_OPEN_POSITIONS,
     MIN_EXECUTION_SCORE,
-    MODE_BLOCK_LONGS,
 )
 
-from execution.okx_trade_client import OKXTradeClient
-from execution.execution_state import is_symbol_in_execution
+from execution.execution_state import is_symbol_blocking_execution, count_active_execution_trades
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _configured_max_positions() -> int:
+    # Final agreed rule: execution active limit is 7. Env can lower/raise if explicitly set later.
+    try:
+        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", "7"))
+    except Exception:
+        return 7
+
+
+def _candidate_score(candidate: dict) -> float:
+    return _safe_float(candidate.get("score", candidate.get("effective_score", 0.0)), 0.0)
 
 
 def can_execute_trade(redis_client, symbol: str, candidate: dict, market_mode: str = "") -> dict:
     """
-    يقرر هل مسموح تنفيذ الصفقة أم لا.
-    لا يرسل أي أوامر حقيقية.
+    Final execution risk gate.
+
+    Agreed rules:
+    - main.py sends only Execution Candidates.
+    - BLOCK_LONGS does not block execution candidates.
+    - No setup whitelist here.
+    - Max active execution trades = 7.
+    - A trade above TP1 with SL moved to entry does not count toward the 7.
+    - Same symbol is blocked only while an active execution trade exists and has not reached TP2.
+    - Daily drawdown lock is handled in main.py by setting the same stop-trading pause key.
     """
 
-    # 1) Execution disabled
     if not EXECUTION_ENABLED:
-        return {
-            "allowed": False,
-            "reason": "execution_disabled",
-        }
+        return {"allowed": False, "reason": "execution_disabled"}
 
-    # 2) Trading mode
     if TRADING_MODE not in ("demo", "paper", "live_small"):
-        return {
-            "allowed": False,
-            "reason": "mode_not_allowed",
-        }
+        return {"allowed": False, "reason": "mode_not_allowed"}
 
-    # 3) Market block mode
-    current_mode = str(market_mode or candidate.get("market_mode", "") or "").strip()
+    # No score/risk/market-mode block here: main.py already decided the signal is an Execution Candidate.
 
-    if current_mode == MODE_BLOCK_LONGS:
-        return {
-            "allowed": False,
-            "reason": "market_mode_block_longs",
-        }
+    if is_symbol_blocking_execution(redis_client, symbol):
+        return {"allowed": False, "reason": "same_symbol_open"}
 
-    # 4) Score filter
-    score = float(candidate.get("score", candidate.get("effective_score", 0.0)) or 0.0)
-
-    if score < MIN_EXECUTION_SCORE:
-        return {
-            "allowed": False,
-            "reason": "low_score",
-        }
-
-    # 5) Already executing same symbol
-    if is_symbol_in_execution(redis_client, symbol):
-        return {
-            "allowed": False,
-            "reason": "already_in_execution",
-        }
-
-    # 6) Open positions limit
-    client = OKXTradeClient()
-    open_positions = client.get_open_positions_count()
-
-    if open_positions >= MAX_OPEN_POSITIONS:
+    max_positions = _configured_max_positions()
+    active_count = count_active_execution_trades(redis_client)
+    if active_count >= max_positions:
         return {
             "allowed": False,
             "reason": "max_positions_reached",
+            "active_count": active_count,
+            "max_positions": max_positions,
         }
 
     return {
         "allowed": True,
         "reason": "ok",
+        "active_count": active_count,
+        "max_positions": max_positions,
     }
