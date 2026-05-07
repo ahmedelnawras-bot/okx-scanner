@@ -206,6 +206,8 @@ MARKET_MODE_NORMAL_CANDIDATE_KEY = "market_mode:long:normal_candidate_since"
 MARKET_MODE_BLOCK_STARTED_KEY = "market_mode:long:block_started_ts"
 MARKET_MODE_LAST_SAFE_SEEN_KEY = "market_mode:long:last_safe_seen_ts"
 MARKET_MODE_LAST_REMINDER_KEY = "market_mode:long:last_reminder_ts"
+MARKET_MODE_REMINDER_COUNT_KEY = "market_mode:long:reminder_count"
+MARKET_MODE_REMINDER_MODE_KEY = "market_mode:long:reminder_mode"
 
 MODE_NORMAL_LONG = "NORMAL_LONG"
 MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
@@ -2726,8 +2728,13 @@ def _has_strict_execution_setup(data: dict) -> bool:
 
 
 def _is_block_mode_execution_candidate(data: dict) -> bool:
-    """Any signal that passed BLOCK_LONGS is considered strong enough for execution candidate flow."""
-    mode = normalize_market_mode(_trade_field(data, "current_mode", ""))
+    """Any alert that actually passed while BLOCK_LONGS is active becomes an execution candidate."""
+    mode_value = (
+        _trade_field(data, "current_mode", "")
+        or _trade_field(data, "market_mode", "")
+        or _trade_field(data, "mode", "")
+    )
+    mode = normalize_market_mode(mode_value)
     return mode == MODE_BLOCK_LONGS or bool(_trade_field(data, "block_exception", False))
 
 
@@ -2761,9 +2768,14 @@ def _execution_plan_for_trade(trade: dict) -> dict:
 
 
 def is_execution_candidate_trade(trade: dict) -> bool:
+    """Report/analytics classification for true execution candidates.
+
+    Final rule: any alert that passed the normal signal filters becomes an
+    Execution Candidate if it either matches the execution whitelist or passed
+    while BLOCK_LONGS was active. Late/danger context is kept as warning data
+    only and must not block candidate classification here.
+    """
     try:
-        if _is_late_risky_execution_context(trade):
-            return False
         if not (_has_strict_execution_setup(trade) or _is_block_mode_execution_candidate(trade)):
             return False
         plan = _execution_plan_for_trade(trade)
@@ -3171,6 +3183,8 @@ def handle_hard_reset(chat_id: str):
             MARKET_MODE_BLOCK_STARTED_KEY,
             MARKET_MODE_LAST_SAFE_SEEN_KEY,
             MARKET_MODE_LAST_REMINDER_KEY,
+            MARKET_MODE_REMINDER_COUNT_KEY,
+            MARKET_MODE_REMINDER_MODE_KEY,
         ]
         for k in mode_keys:
             if r.delete(k):
@@ -6909,7 +6923,15 @@ def _apply_market_execution_fallback(candidate: dict) -> dict:
 
 
 def is_candidate_for_execution(candidate: dict) -> bool:
-    """True only for signals that passed the final execution whitelist plus a complete plan."""
+    """True only for alerts that match execution eligibility plus a complete plan.
+
+    Final rule:
+    - whitelist setup from execution/config.py, OR
+    - an alert that passed in BLOCK_LONGS,
+    plus valid entry/sl/tp1.
+
+    Late/danger context is warning-only at this stage.
+    """
     try:
         planned = _apply_market_execution_fallback(dict(candidate or {}))
         return bool(
@@ -7656,6 +7678,11 @@ def handle_market_mode_transition(mode_result: dict) -> str:
                 pass
         r.set(MARKET_MODE_LAST_KEY, new_mode)
         r.set(MARKET_MODE_LAST_TRANSITION_KEY, str(now_ts))
+        try:
+            r.delete(MARKET_MODE_REMINDER_COUNT_KEY)
+            r.set(MARKET_MODE_REMINDER_MODE_KEY, new_mode)
+        except Exception:
+            pass
         logger.info(f"MODE TRANSITION: {last_mode} → {new_mode} | reason: {mode_result.get('reason')}")
     r.set(MARKET_MODE_KEY, new_mode)
  except Exception as e:
@@ -8204,9 +8231,16 @@ def run_scanner_loop():
                 try:
                     last_reminder = int(r.get(MARKET_MODE_LAST_REMINDER_KEY) or 0)
                     if now_ts_local - last_reminder >= REMINDER_INTERVAL:
-                        reminder_msg = "⏱️ <b>Market Mood Reminder</b>\n\n" + build_market_status_message()
+                        reminder_mode = r.get(MARKET_MODE_REMINDER_MODE_KEY) or current_mode
+                        reminder_count = int(r.get(MARKET_MODE_REMINDER_COUNT_KEY) or 0)
+                        if reminder_mode != current_mode:
+                            reminder_count = 0
+                        reminder_count += 1
+                        reminder_msg = f"⏱️ <b>Market Mood Reminder #{reminder_count}</b>\n\n" + build_market_status_message()
                         send_telegram_message(reminder_msg)
                         r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
+                        r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
+                        r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
                 except Exception as e:
                     logger.warning(f"Market mode reminder error: {e}")
 
