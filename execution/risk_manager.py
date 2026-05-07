@@ -1,73 +1,197 @@
-import os
+import time
 import json
 import ast
-from execution.config import (
-    TRADING_MODE,
-    EXECUTION_ENABLED,
-    MAX_OPEN_POSITIONS,
-    MIN_EXECUTION_SCORE,
-)
 
-from execution.execution_state import is_symbol_blocking_execution, count_active_execution_trades
+# مفاتيح Redis (نفس النمط عندك في main)
+EXECUTION_STATE_PREFIX = "exec:state"
+EXECUTION_ORDER_PREFIX = "exec:order"
 
 
-def _safe_float(value, default=0.0) -> float:
+def get_exec_state_key(symbol: str) -> str:
+    return f"{EXECUTION_STATE_PREFIX}:{symbol}"
+
+
+def get_exec_order_key(order_id: str) -> str:
+    return f"{EXECUTION_ORDER_PREFIX}:{order_id}"
+
+
+def _encode(data: dict) -> str:
+    return json.dumps(data or {}, ensure_ascii=False)
+
+
+def _decode(raw) -> dict:
+    if not raw:
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, dict):
+        return raw
     try:
-        return float(value)
+        return json.loads(raw)
     except Exception:
-        return default
+        try:
+            value = ast.literal_eval(str(raw))
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
 
 
-def _configured_max_positions() -> int:
-    # Final agreed rule: execution active limit is 7. Env can lower/raise if explicitly set later.
+def set_active_trade(redis_client, symbol: str, data: dict, ttl: int = 86400) -> bool:
+    """تسجيل صفقة تنفيذ نشطة."""
+    if not redis_client:
+        return False
+    key = get_exec_state_key(symbol)
     try:
-        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", "7"))
+        payload = dict(data or {})
+        payload["updated_ts"] = int(time.time())
+        redis_client.set(key, _encode(payload), ex=ttl)
+        return True
     except Exception:
-        return 7
+        return False
 
 
-def _candidate_score(candidate: dict) -> float:
-    return _safe_float(candidate.get("score", candidate.get("effective_score", 0.0)), 0.0)
+def get_active_trade(redis_client, symbol: str) -> dict:
+    """قراءة صفقة تنفيذ نشطة."""
+    if not redis_client:
+        return {}
+    try:
+        return _decode(redis_client.get(get_exec_state_key(symbol)))
+    except Exception:
+        return {}
 
 
-def can_execute_trade(redis_client, symbol: str, candidate: dict, market_mode: str = "") -> dict:
+def clear_active_trade(redis_client, symbol: str) -> bool:
+    """حذف الصفقة من حالة التنفيذ."""
+    if not redis_client:
+        return False
+    try:
+        redis_client.delete(get_exec_state_key(symbol))
+        return True
+    except Exception:
+        return False
+
+
+def _boolish(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _trade_execution_status(trade: dict) -> str:
+    diag = trade.get("diagnostics", {}) or {}
+    return str(trade.get("execution_status") or diag.get("execution_status") or trade.get("execution_result_status") or diag.get("execution_result_status") or "").lower()
+
+
+def _is_protected_after_tp1(trade: dict) -> bool:
+    return _boolish(trade.get("tp1_hit")) and _boolish(trade.get("sl_moved_to_entry"))
+
+
+def _has_reached_tp2(trade: dict) -> bool:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    return (
+        _boolish(trade.get("tp2_hit"))
+        or status in ("tp2_partial", "trailing", "trailing_open")
+        or result in ("tp2_win", "trailing_win")
+    )
+
+
+def _is_execution_trade_active(trade: dict) -> bool:
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    exec_status = _trade_execution_status(trade)
+    if exec_status in ("candidate_only", "preview_rejected", "rejected_invalid_order", "rejected_limit", "daily_drawdown_lock", "not_candidate"):
+        return False
+    if result in ("loss", "tp1_win", "tp2_win", "trailing_win", "breakeven", "expired", "pending_expired"):
+        return False
+    return status in ("open", "partial", "pending_pullback", "tp2_partial", "trailing", "trailing_open") or exec_status in ("accepted_preview", "pending_pullback_preview")
+
+
+def _load_execution_trades_from_performance(redis_client) -> list:
+    if not redis_client:
+        return []
+    out = []
+    seen = set()
+    for pattern in ("trade:futures:long:*", "trade_history:futures:long:*"):
+        try:
+            for key in redis_client.scan_iter(pattern):
+                key_s = key.decode() if isinstance(key, bytes) else str(key)
+                if key_s in seen:
+                    continue
+                seen.add(key_s)
+                trade = _decode(redis_client.get(key))
+                if not trade:
+                    continue
+                exec_status = _trade_execution_status(trade)
+                if exec_status or _boolish((trade.get("diagnostics", {}) or {}).get("block_exception")):
+                    out.append(trade)
+        except Exception:
+            continue
+    return out
+
+
+def count_active_execution_trades(redis_client) -> int:
     """
-    Final execution risk gate.
-
-    Agreed rules:
-    - main.py sends only Execution Candidates.
-    - BLOCK_LONGS does not block execution candidates.
-    - No setup whitelist here.
-    - Max active execution trades = 7.
-    - A trade above TP1 with SL moved to entry does not count toward the 7.
-    - Same symbol is blocked only while an active execution trade exists and has not reached TP2.
-    - Daily drawdown lock is handled in main.py by setting the same stop-trading pause key.
+    Count active execution trades for the 7-trade limit.
+    Trades that hit TP1 and moved SL to entry are protected and do not count.
     """
+    count = 0
+    for trade in _load_execution_trades_from_performance(redis_client):
+        if not _is_execution_trade_active(trade):
+            continue
+        if _is_protected_after_tp1(trade):
+            continue
+        count += 1
+    return count
 
-    if not EXECUTION_ENABLED:
-        return {"allowed": False, "reason": "execution_disabled"}
 
-    if TRADING_MODE not in ("demo", "paper", "live_small"):
-        return {"allowed": False, "reason": "mode_not_allowed"}
+def is_symbol_blocking_execution(redis_client, symbol: str) -> bool:
+    """Block same symbol only while an active execution trade exists and has not reached TP2."""
+    symbol = str(symbol or "").strip()
+    if not symbol:
+        return False
+    for trade in _load_execution_trades_from_performance(redis_client):
+        if str(trade.get("symbol") or "").strip() != symbol:
+            continue
+        if not _is_execution_trade_active(trade):
+            continue
+        if _has_reached_tp2(trade):
+            continue
+        return True
 
-    # No score/risk/market-mode block here: main.py already decided the signal is an Execution Candidate.
+    # Fallback to lightweight execution state if performance trade was not registered yet.
+    state = get_active_trade(redis_client, symbol)
+    if not state:
+        return False
+    if _has_reached_tp2(state):
+        return False
+    status = str(state.get("status", "") or "").lower()
+    return status in ("accepted_preview", "pending_pullback_preview", "open", "partial", "pending_pullback")
 
-    if is_symbol_blocking_execution(redis_client, symbol):
-        return {"allowed": False, "reason": "same_symbol_open"}
 
-    max_positions = _configured_max_positions()
-    active_count = count_active_execution_trades(redis_client)
-    if active_count >= max_positions:
-        return {
-            "allowed": False,
-            "reason": "max_positions_reached",
-            "active_count": active_count,
-            "max_positions": max_positions,
-        }
+def is_symbol_in_execution(redis_client, symbol: str) -> bool:
+    """Backward-compatible alias."""
+    return is_symbol_blocking_execution(redis_client, symbol)
 
-    return {
-        "allowed": True,
-        "reason": "ok",
-        "active_count": active_count,
-        "max_positions": max_positions,
-    }
+
+def register_order(redis_client, order_id: str, data: dict, ttl: int = 86400) -> bool:
+    """تسجيل order."""
+    if not redis_client:
+        return False
+    try:
+        payload = dict(data or {})
+        payload["created_ts"] = int(time.time())
+        redis_client.set(get_exec_order_key(order_id), _encode(payload), ex=ttl)
+        return True
+    except Exception:
+        return False
+
+
+def get_order(redis_client, order_id: str) -> dict:
+    """قراءة order."""
+    if not redis_client:
+        return {}
+    try:
+        return _decode(redis_client.get(get_exec_order_key(order_id)))
+    except Exception:
+        return {}
