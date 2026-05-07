@@ -9000,7 +9000,7 @@ def run_scanner_loop():
                         entry_maturity_data["block_signal"] = False
                         entry_maturity_data["maturity_penalty"] = min(
                             float(entry_maturity_data.get("maturity_penalty", 0.0) or 0.0),
-                            -0.35,
+                            0.25,
                         )
                         if not isinstance(entry_maturity_data.get("warning_reasons"), list):
                             entry_maturity_data["warning_reasons"] = []
