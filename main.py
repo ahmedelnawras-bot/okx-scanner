@@ -7940,8 +7940,16 @@ def normalize_market_mode(mode: str) -> str:
     MODE_BLOCK_LONGS,
     MODE_RECOVERY_LONG,
  }
+
+ # Normalize stale/empty Redis values safely.
+ # Empty mode should silently fallback to NORMAL_LONG without warning spam.
+ mode = str(mode or "").strip().upper()
+ if not mode:
+    return MODE_NORMAL_LONG
+
  if mode in allowed:
     return mode
+
  logger.warning(f"Invalid market mode '{mode}', fallback to {MODE_NORMAL_LONG}")
  return MODE_NORMAL_LONG
 
