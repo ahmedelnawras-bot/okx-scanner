@@ -2610,6 +2610,9 @@ def build_market_status_message() -> str:
         "",
         f"🧠 <b>السبب:</b> {html.escape(reason_text)}",
         "",
+        "🧪 <b>Weak Drift Block:</b>",
+        f"{html.escape(get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label).get('label', '🟢 Weak Drift: OFF'))} — {html.escape(get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label).get('note', 'التنفيذ يعمل طبيعيًا.'))}",
+        "",
         "🌍 <b>السوق:</b>",
         f"• BTC: {html.escape(str(btc_mode))}",
         f"• Alt Mode: {html.escape(str(alt_mode))}",
@@ -3326,10 +3329,12 @@ def build_execution_report_message(period: str = "all") -> str:
         wallet_pct = (portfolio_net_usd / wallet_capital_usd * 100.0) if wallet_capital_usd else 0.0
 
         def money(v: float) -> str:
-            return f"{v:+.2f}$"
+            # LRM keeps Telegram RTL rendering stable: +0.00$ instead of $0.00+
+            return f"\u200e{v:+.2f}$"
 
         def exposure(v: float) -> str:
-            return f"{_pct_safe(v)} Exposure"
+            # LRM keeps Telegram RTL rendering stable: +0.00% Exposure
+            return f"\u200e{_pct_safe(v)} Exposure"
 
         def compact_setup(trade: dict) -> str:
             setup = str(
@@ -3391,7 +3396,7 @@ def build_execution_report_message(period: str = "all") -> str:
                 pieces = [str(close_type or "سياق غير واضح")]
             return f"{prefix} {html.escape(' + '.join(str(x) for x in pieces[:3]))}"
 
-        def short_trade_line(trade: dict, pnl: float, icon: str, is_win: bool) -> list:
+        def short_trade_line(trade: dict, pnl: float, icon: str, is_win: bool, label: str = None) -> list:
             raw_symbol = str(trade.get("symbol", "?") or "?")
             symbol = html.escape(raw_symbol)
             try:
@@ -3399,15 +3404,16 @@ def build_execution_report_message(period: str = "all") -> str:
             except Exception:
                 tv_link = ""
             score = _trade_field(trade, "score", "N/A")
-            close_type = _execution_close_type_for_trade(trade)
-            setup = html.escape(compact_setup(trade))
+            result_label = label or _execution_close_type_for_trade(trade)
             tv = f' | <a href="{html.escape(tv_link, quote=True)}">TradingView</a>' if tv_link else ""
             return [
-                f"{icon} <b>{symbol}</b>{tv}",
-                f"{_pct_safe(pnl)} | {html.escape(str(close_type))}",
+                f"{icon} <b>{symbol}</b>",
+                f"{exposure(pnl)} | {html.escape(str(result_label))}",
+                "",
                 market_context_line(trade),
                 concise_trade_reason(trade, is_win=is_win),
-                f"🧠 {setup} | ⭐ {html.escape(str(score))}",
+                "",
+                f"⭐ {html.escape(str(score))}{tv}",
             ]
 
         avg_winner = _avg([p for _, p in winners_pairs]) if winners_pairs else 0.0
@@ -3454,8 +3460,27 @@ def build_execution_report_message(period: str = "all") -> str:
             f"⚡ متوسط الربح العائم: {exposure(avg_open_floating)}",
             f"💡 جودة العائد مقابل المخاطرة: {rr_quality}",
             "━━━━━━━━━━━━",
-            "🏆 <b>آخر 5 صفقات رابحة</b>",
+            "🟢 <b>آخر 5 صفقات مفتوحة</b>",
         ]
+
+        latest_open = sorted(open_trades, key=_trade_created_ts_for_exec, reverse=True)[:5]
+        if latest_open:
+            for trade in latest_open:
+                pnl = _execution_floating_pnl_pct(trade)
+                if pnl is None:
+                    pnl = 0.0
+                phase = _execution_phase_for_trade(trade)
+                icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
+                lines.extend(short_trade_line(trade, pnl, icon, is_win=(pnl >= 0), label=phase))
+                lines.append("")
+        else:
+            lines.append("لا توجد صفقات مفتوحة حاليًا.")
+            lines.append("")
+
+        lines.extend([
+            "━━━━━━━━━━━━",
+            "🏆 <b>آخر 5 صفقات رابحة</b>",
+        ])
 
         latest_winners = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]
         if latest_winners:
@@ -3615,6 +3640,16 @@ def handle_hard_reset(chat_id: str):
         r.delete(TELEGRAM_BOOTSTRAP_DONE_KEY)
         r.delete(TELEGRAM_POLL_LOCK_KEY)
         del_mode_cache += 3
+
+        # Reset execution stop/daily drawdown state as part of hard reset.
+        # This does not close or modify trades; it only clears the execution pause flags.
+        try:
+            r.delete(EXECUTION_PAUSE_KEY)
+            r.delete(EXECUTION_DRAWDOWN_LOCK_REASON_KEY)
+            del_mode_cache += 2
+        except Exception as e:
+            logger.warning(f"Failed to clear execution pause/DD state on hard reset: {e}")
+
         for key in r.scan_iter("candles:long:*"):
             r.delete(key)
             del_candle += 1
@@ -3669,6 +3704,7 @@ def build_exec_resume_message() -> str:
         r.delete(EXECUTION_DRAWDOWN_LOCK_REASON_KEY)
         return (
             "✅ <b>تمت إعادة تفعيل الدخول في صفقات جديدة</b>\n\n"
+            "📌 تم تصفير حالة إيقاف التنفيذ وDaily DD Lock يدويًا.\n"
             "📌 البوت يستطيع الآن قبول فرص جديدة حسب شروط التنفيذ.\n"
             "📌 هذا لا يغير حالة الصفقات المفتوحة."
         )
@@ -8171,30 +8207,129 @@ def get_market_mode_execution_policy_short(mode: str) -> str:
     return "Watch Only"
 
 
+def _format_mode_duration_text(seconds: int) -> str:
+    try:
+        seconds = max(0, int(seconds or 0))
+        minutes = seconds // 60
+        if minutes < 1:
+            return "0m"
+        if minutes < 60:
+            return f"{minutes}m"
+        hours, mins = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h {mins}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours}h"
+    except Exception:
+        return "0m"
+
+
+def get_market_mode_duration_text(current_mode: str = "") -> str:
+    try:
+        now_ts = int(time.time())
+        transition_ts = 0
+        if r:
+            transition_ts = int(float(r.get(MARKET_MODE_LAST_TRANSITION_KEY) or 0))
+        if transition_ts <= 0:
+            return "0m"
+        return _format_mode_duration_text(now_ts - transition_ts)
+    except Exception:
+        return "0m"
+
+
+def _btc_short_label(btc_mode: str) -> str:
+    text = str(btc_mode or "")
+    if "هابط" in text or "Weak" in text:
+        return "🔴 BTC Weak"
+    if "صاعد" in text or "Strong" in text:
+        return "🟢 BTC Strong"
+    if "محايد" in text or "Neutral" in text:
+        return "🟡 BTC Neutral"
+    return html.escape(text or "BTC N/A")
+
+
+def _market_short_label(market_state_label: str = "", alt_mode: str = "", market_bias_label: str = "") -> str:
+    text = " | ".join(str(x or "") for x in (market_state_label, alt_mode, market_bias_label))
+    low = text.lower()
+    if "risk" in low or "weak" in low or "ضعيف" in text:
+        return "🔴 Weak Market"
+    if "bull" in low or "strong" in low or "قوي" in text:
+        return "🟢 Strong Market"
+    if "mixed" in low or "متماسك" in text or "مختلط" in text or "محايد" in text:
+        return "🟡 Mixed Market"
+    return html.escape(str(market_state_label or alt_mode or "Mixed Market"))
+
+
+def get_weak_drift_display_status(
+    current_mode: str,
+    btc_mode: str = "",
+    market_state_label: str = "",
+    alt_mode: str = "",
+    market_bias_label: str = "",
+) -> dict:
+    """Display-only Weak Drift status for mood/reminder messages.
+
+    The real execution gate remains get_weak_trend_drift_status(candidate).
+    This helper does not change trading decisions; it only explains whether
+    the current market context is likely to restrict weak execution candidates.
+    """
+    try:
+        mode = normalize_market_mode(current_mode)
+        if mode == MODE_BLOCK_LONGS:
+            return {
+                "active": True,
+                "label": "🔴 Weak Drift: STRICT",
+                "note": "التنفيذ مقيد جدًا لأن BLOCK LONGS مفعل.",
+            }
+        text = " | ".join(str(x or "") for x in (btc_mode, market_state_label, alt_mode, market_bias_label))
+        low = text.lower()
+        active = bool(
+            "هابط" in text
+            or "weak" in low
+            or "mixed" in low
+            or "مختلط" in text
+            or "متماسك" in text
+            or "محايد" in text
+            or "ضعيف" in text
+            or mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG)
+        )
+        if active:
+            return {
+                "active": True,
+                "label": "🔴 Weak Drift: ON",
+                "note": "التنفيذ الضعيف مقيد مؤقتًا بسبب ضعف/تذبذب الزخم.",
+            }
+        return {
+            "active": False,
+            "label": "🟢 Weak Drift: OFF",
+            "note": "التنفيذ يعمل طبيعيًا حسب Whitelist + Quality Filters.",
+        }
+    except Exception:
+        return {"active": False, "label": "🟢 Weak Drift: OFF", "note": "التنفيذ يعمل طبيعيًا."}
+
+
 def build_compact_market_mode_reminder(
     reminder_count: int,
     current_mode: str,
     btc_mode: str = "",
     market_state_label: str = "",
     alt_mode: str = "",
+    market_bias_label: str = "",
 ) -> str:
     """Very short Market Mood reminder, optimized for Telegram mobile."""
     mode_label = _market_mode_label(current_mode)
-    btc_text = str(btc_mode or "BTC N/A").replace("هابط", "Weak").replace("صاعد", "Strong").replace("محايد", "Neutral")
-    state_text = str(market_state_label or alt_mode or "Mixed")
-    if "bull" in state_text.lower() or "قوي" in state_text:
-        state_short = "🟢 Strong"
-    elif "risk" in state_text.lower() or "ضعيف" in state_text:
-        state_short = "🔴 Weak"
-    elif "mixed" in state_text.lower() or "مختلط" in state_text:
-        state_short = "🟡 Mixed"
-    else:
-        state_short = state_text
+    btc_short = _btc_short_label(btc_mode)
+    market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
     policy = get_market_mode_execution_policy_short(current_mode)
+    duration_text = get_market_mode_duration_text(current_mode)
+    drift = get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
     return (
-        f"🧭 <b>Reminder #{int(reminder_count)}</b>\n\n"
-        f"{mode_label} {html.escape(btc_text)} | {html.escape(state_short)}\n\n"
-        f"🎯 <b>Execution:</b> {html.escape(policy)}"
+        f"🧭 <b>Reminder #{int(reminder_count)}</b>\n"
+        f"⏱ {html.escape(duration_text)} in {html.escape(normalize_market_mode(current_mode))} | {html.escape(drift.get('label', '🟢 Weak Drift: OFF'))}\n\n"
+        f"{mode_label}\n"
+        f"{btc_short} | {market_short}\n\n"
+        f"🎯 <b>Execution:</b>\n"
+        f"{html.escape(policy)}"
     )
 
 def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
@@ -8476,8 +8611,47 @@ def cleanup_local_caches():
         last_candle_cache_meta.pop(sym, None)
 
 
+def _is_trade_counted_for_execution_drawdown_guard(trade: dict) -> bool:
+    """Daily DD counts only trades that entered the execution path.
+
+    Count: accepted_preview, pending_pullback_preview, live/placed/executed.
+    Ignore: candidate_only, rejected_limit, execution_paused, daily_drawdown_lock, preview_rejected.
+    """
+    try:
+        status = str(_trade_field(trade, "execution_status", "") or "").strip().lower()
+        result_status = str(_trade_field(trade, "execution_result_status", "") or "").strip().lower()
+        combined = {status, result_status}
+        counted = {
+            "accepted_preview",
+            "pending_pullback_preview",
+            "live_execute",
+            "live_executed",
+            "live_order_placed",
+            "executed",
+            "order_placed",
+        }
+        ignored = {
+            "",
+            "candidate_only",
+            "execution_paused",
+            "rejected_limit",
+            "rejected_existing_symbol",
+            "rejected_invalid_order",
+            "daily_drawdown_lock",
+            "preview_rejected",
+            "not_candidate",
+        }
+        if combined & counted:
+            return True
+        if combined <= ignored:
+            return False
+        return False
+    except Exception:
+        return False
+
+
 def _execution_daily_pnl_pct() -> float:
-    """Calculate today's execution-candidate PnL after leverage from tracked trades."""
+    """Calculate today's executed/accepted-preview PnL after leverage from tracked trades."""
     try:
         since_ts = get_local_day_start_ts()
         try:
@@ -8485,7 +8659,7 @@ def _execution_daily_pnl_pct() -> float:
         except Exception:
             trades = _load_long_trades_from_redis(limit=1500)
             trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
-        trades = [t for t in trades if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")]
+        trades = [t for t in trades if _is_trade_counted_for_execution_drawdown_guard(t)]
         total = 0.0
         for t in trades:
             pnl = _execution_floating_pnl_pct(t) if _is_execution_trade_open(t) else _execution_final_pnl_pct(t)
