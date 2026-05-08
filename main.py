@@ -2873,7 +2873,7 @@ def get_weak_trend_drift_status(candidate: dict) -> dict:
             str(_trade_field(data, "fib_position", "") or ""),
         ]).lower()
         late_or_danger = any(token in entry_text for token in (
-            "late", "danger", "overextended", "متأخر", "امتداد", "موجة خامسة"
+            "late", "danger", "overextended", "متأخر", "امتداد", "نهاية موجة", "موجة خامسة"
         ))
 
         btc_mode = str(_trade_field(data, "btc_mode", "") or "")
@@ -2886,21 +2886,16 @@ def get_weak_trend_drift_status(candidate: dict) -> dict:
         weak_market_context = (
             "risk_off" in market_state
             or "btc_leading" in market_state
-            or "mixed" in market_state
             or "weak" in market_state_label
-            or "mixed" in market_state_label
             or "ضعيف" in market_state_label
-            or "مختلط" in market_state_label
             or "weak" in market_bias_label
-            or "mixed" in market_bias_label
             or "ضعيف" in market_bias_label
-            or "مختلط" in market_bias_label
-            or btc_mode in ("🔴 هابط", "🟡 محايد")
-            or alt_mode in ("🔴 ضعيف", "🟡 متماسك")
+            or btc_mode in ("🔴 هابط",)
+            or alt_mode in ("🔴 ضعيف",)
         )
 
-        low_momentum = (not mtf_confirmed and vol_ratio < 1.15)
-        drifting_range = (weak_market_context and vol_ratio < 1.25 and not mtf_confirmed)
+        low_momentum = (not mtf_confirmed and vol_ratio < 1.05)
+        drifting_range = (weak_market_context and vol_ratio < 1.15 and not mtf_confirmed)
         soft_chase = (dist_ma > 3.2 and vol_ratio < 1.30 and not (breakout or pre_breakout))
         near_resistance_without_force = bool(resistance_warning) and vol_ratio < 1.25 and not mtf_confirmed
 
@@ -2966,13 +2961,13 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             str(_trade_field(data, "fib_position", "") or ""),
         ]).lower()
         late_or_danger = any(token in entry_text for token in (
-            "danger", "hard_late", "overextended", "امتداد سعري", "متأخر جدًا"
+            "danger", "hard_late", "overextended", "امتداد سعري", "متأخر جدًا", "نهاية موجة", "موجة خامسة"
         ))
 
         allowed = bool(
             has_whitelist
             and score >= 7.5
-            and (mtf_confirmed or vol_ratio >= 1.20)
+            and (mtf_confirmed or vol_ratio >= 1.15)
             and not late_or_danger
         )
         if not allowed:
