@@ -7496,15 +7496,61 @@ def _apply_market_execution_fallback(candidate: dict) -> dict:
         return candidate
 
 
+def _candidate_passes_light_execution_price_safety(candidate: dict) -> bool:
+    """Light execution price sanity check only.
+
+    This is not a trading-quality filter. The normal signal has already passed
+    score, entry maturity, resistance, Smart TP/SL, market guard, cooldown,
+    and data-quality gates. Here we only reject impossible/invalid execution
+    plans such as invalid long risk or a market entry that has already reached
+    TP1. No thresholds, percentages, report format, or strategy values are
+    changed here.
+    """
+    try:
+        data = candidate or {}
+        entry_mode = str(data.get("entry_mode", "market") or "market").lower()
+        has_pullback = bool(data.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
+
+        if has_pullback:
+            entry = _safe_trade_float_value(data.get("execution_entry"), None)
+            sl = _safe_trade_float_value(data.get("execution_sl"), None)
+            tp1 = _safe_trade_float_value(data.get("execution_tp1"), None)
+        else:
+            entry = _safe_trade_float_value(data.get("execution_entry") or data.get("recommended_entry") or data.get("market_entry") or data.get("entry"), None)
+            sl = _safe_trade_float_value(data.get("execution_sl") or data.get("sl"), None)
+            tp1 = _safe_trade_float_value(data.get("execution_tp1") or data.get("tp1"), None)
+
+        if entry is None or sl is None or tp1 is None:
+            return False
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return False
+
+        # Long-only sanity: risk and reward must be mathematically valid.
+        if sl >= entry or tp1 <= entry:
+            return False
+
+        # Market execution only: do not badge a trade that is already at/above TP1.
+        # Pullback plans may wait, so they are not blocked by the current market price here.
+        if not has_pullback:
+            market_price = _safe_trade_float_value(data.get("market_entry") or data.get("current_price") or data.get("last_price"), None)
+            if market_price is not None and market_price >= tp1:
+                return False
+
+        return True
+    except Exception as e:
+        logger.warning(f"_candidate_passes_light_execution_price_safety error: {e}")
+        return True
+
+
 def is_candidate_for_execution(candidate: dict) -> bool:
     """True only for alerts that match execution eligibility plus a complete plan.
 
-    Final rule:
-    - whitelist setup from execution/config.py, OR
-    - an alert that passed in BLOCK_LONGS,
-    plus valid entry/sl/tp1.
+    Final execution-candidate path:
+    Telegram signal -> whitelist or BLOCK exception -> complete plan ->
+    light price safety -> Weak Drift -> badge/candidate.
 
-    Late/danger context is warning-only at this stage.
+    Late/danger context is not re-evaluated here except through the existing
+    Weak Drift function exactly as currently configured.
     """
     try:
         planned = _apply_market_execution_fallback(dict(candidate or {}))
@@ -7512,6 +7558,7 @@ def is_candidate_for_execution(candidate: dict) -> bool:
         return bool(
             (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
             and _candidate_has_complete_execution_plan(planned)
+            and _candidate_passes_light_execution_price_safety(planned)
             and _candidate_passes_weak_drift_execution_quality(planned)
         )
     except Exception:
