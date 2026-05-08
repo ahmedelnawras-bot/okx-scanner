@@ -1,3 +1,4 @@
+# UI PATCH VERIFIED 2026-05-08: mood transition/reminder titles + compact open execution report formatting.
 # Version: main_v08_modes_ui_final
 # Date: 2026-05-08
 # Changes: UI/Text only for Market Mood and Reminder; no logic/filter/execution changes
@@ -2586,6 +2587,7 @@ def build_market_status_message() -> str:
         suggested_reason = mode_result.get("reason", "")
 
     mode_ar = _market_mode_label(current_mode)
+    mode_icon = str(mode_ar).split(" ", 1)[0] if mode_ar else "🧭"
     suggested_mode_ar = _market_mode_label(suggested_mode)
     mode_desc = get_market_mode_arabic_description(current_mode)
     reason_text = get_market_mode_reason_text(current_mode, suggested_reason)
@@ -2601,7 +2603,7 @@ def build_market_status_message() -> str:
     transition = f"{_market_mode_label(last_mode)} → {mode_ar}" if last_mode != current_mode else f"{mode_ar}"
 
     lines = [
-        "🧭 <b>Market Mood - LONG</b>",
+        f"{mode_icon} <b>Market Mood - LONG</b>",
         "",
         f"⚙️ <b>المود الحالي:</b> {mode_ar}",
         f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
@@ -3396,7 +3398,7 @@ def build_execution_report_message(period: str = "all") -> str:
                 pieces = [str(close_type or "سياق غير واضح")]
             return f"{prefix} {html.escape(' + '.join(str(x) for x in pieces[:3]))}"
 
-        def short_trade_line(trade: dict, pnl: float, icon: str, is_win: bool, label: str = None) -> list:
+        def short_trade_line(trade: dict, pnl: float, icon: str, is_win: bool, label: str = None, compact_open: bool = False) -> list:
             raw_symbol = str(trade.get("symbol", "?") or "?")
             symbol = html.escape(raw_symbol)
             try:
@@ -3406,6 +3408,28 @@ def build_execution_report_message(period: str = "all") -> str:
             score = _trade_field(trade, "score", "N/A")
             result_label = label or _execution_close_type_for_trade(trade)
             tv = f' | <a href="{html.escape(tv_link, quote=True)}">TradingView</a>' if tv_link else ""
+            if compact_open:
+                status = str(trade.get("status", "") or "").lower()
+                phase_text = str(result_label or "")
+                tp1_hit = bool(trade.get("tp1_hit", False)) or status == "partial"
+                tp2_hit = bool(trade.get("tp2_hit", False)) or status in ("tp2_partial", "trailing_open", "trailing")
+                trailing_active = bool(trade.get("trailing_active", False)) or status in ("tp2_partial", "trailing_open", "trailing")
+                sl_entry = bool(trade.get("sl_moved_to_entry", False)) or bool(trade.get("protected_breakeven", False))
+                if trailing_active or tp2_hit or "tp2" in phase_text.lower() or "trailing" in phase_text.lower():
+                    status_line = "🔵 قرب TP2"
+                elif tp1_hit or "tp1" in phase_text.lower():
+                    status_line = "🟡 جزئية | بعد TP1"
+                else:
+                    status_line = "🟢 مفتوحة | قبل TP1"
+                if sl_entry and "SL Entry" not in status_line:
+                    status_line += " | 🔒 SL Entry"
+                return [
+                    f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
+                    f"📌 الحالة: {html.escape(status_line)}",
+                    market_context_line(trade),
+                    concise_trade_reason(trade, is_win=is_win),
+                    f"⭐ {html.escape(str(score))}{tv}",
+                ]
             return [
                 f"{icon} <b>{symbol}</b>",
                 f"{exposure(pnl)} | {html.escape(str(result_label))}",
@@ -3471,7 +3495,7 @@ def build_execution_report_message(period: str = "all") -> str:
                     pnl = 0.0
                 phase = _execution_phase_for_trade(trade)
                 icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
-                lines.extend(short_trade_line(trade, pnl, icon, is_win=(pnl >= 0), label=phase))
+                lines.extend(short_trade_line(trade, pnl, icon, is_win=(pnl >= 0), label=phase, compact_open=True))
                 lines.append("")
         else:
             lines.append("لا توجد صفقات مفتوحة حاليًا.")
@@ -8317,60 +8341,61 @@ def build_compact_market_mode_reminder(
     market_bias_label: str = "",
 ) -> str:
     """Very short Market Mood reminder, optimized for Telegram mobile."""
-    mode_label = _market_mode_label(current_mode)
+    normalized_mode = normalize_market_mode(current_mode)
+    mode_label = _market_mode_label(normalized_mode)
+    mode_icon = str(mode_label).split(" ", 1)[0] if mode_label else "🧭"
     btc_short = _btc_short_label(btc_mode)
     market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
-    policy = get_market_mode_execution_policy_short(current_mode)
-    duration_text = get_market_mode_duration_text(current_mode)
-    drift = get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
+    policy = get_market_mode_execution_policy_short(normalized_mode)
+    duration_text = get_market_mode_duration_text(normalized_mode)
+    drift = get_weak_drift_display_status(normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
     return (
-        f"🧭 <b>Reminder #{int(reminder_count)}</b>\n"
-        f"⏱ {html.escape(duration_text)} in {html.escape(normalize_market_mode(current_mode))} | {html.escape(drift.get('label', '🟢 Weak Drift: OFF'))}\n\n"
+        f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b> | {html.escape(normalized_mode)}\n"
+        f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)} | {html.escape(drift.get('label', '🟢 Weak Drift: OFF'))}\n\n"
         f"{mode_label}\n"
         f"{btc_short} | {market_short}\n\n"
         f"🎯 <b>Execution:</b>\n"
         f"{html.escape(policy)}"
     )
-
 def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
     old_mode = normalize_market_mode(old_mode)
     new_mode = normalize_market_mode(new_mode)
-    transition = f"{_market_mode_label(old_mode)} → {_market_mode_label(new_mode)}"
+    mode_ar = _market_mode_label(new_mode)
+    mode_icon = str(mode_ar).split(" ", 1)[0] if mode_ar else "🧭"
+    transition = f"{_market_mode_label(old_mode)} → {mode_ar}"
+    mode_desc = get_market_mode_arabic_description(new_mode)
+    action = get_market_mode_action_text(new_mode)
+    allowed_lines = get_market_mode_allowed_lines(new_mode)
+
     lines = [
-        "🧭 <b>Market Mood - LONG</b>",
+        f"{mode_icon} <b>Market Mood - LONG</b>",
+        "",
         "🔁 <b>تغيير المود</b>",
-        f"⚙️ <b>المود الحالي:</b> {_market_mode_label(new_mode)}",
-        f"📋 <b>الوصف:</b> {get_market_mode_arabic_description(new_mode)}",
-        f"🎯 <b>التصرف:</b> {html.escape(get_market_mode_action_text(new_mode))}",
+        "",
+        f"⚙️ <b>المود الحالي:</b> {mode_ar}",
+        f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
         "",
         f"🔄 <b>الانتقال:</b> {transition}",
     ]
     if reason:
-        lines.append(f"🧠 <b>السبب:</b> {html.escape(str(reason))}")
-    if new_mode == MODE_STRONG_LONG_ONLY:
         lines.extend([
             "",
-            "✅ <b>المسموح:</b>",
-            "• الإشارات العادية: أقوى setups فقط",
-            f"• Strong filters: Score ≥ {STRONG_ONLY_MIN_SCORE} و Vol ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
-            "• Execution Candidates: حسب قواعد التنفيذ الجديدة",
+            f"🧠 <b>السبب:</b> {html.escape(str(reason))}",
         ])
-    elif new_mode == MODE_BLOCK_LONGS:
-        lines.extend([
-            "",
-            "🛡 <b>حماية:</b>",
-            "• حماية الصفقات المفتوحة الرابحة إن وجدت",
-            "• Track والتقارير والأوامر مستمرة",
-            "• Execution Candidates لا تُمنع بسبب BLOCK وحده، لكنها تخضع لقواعد التنفيذ",
-        ])
-    elif new_mode == MODE_RECOVERY_LONG:
-        lines.extend([
-            "",
-            "🛟 <b>Recovery:</b>",
-            f"• حجم الصفقة: {RECOVERY_TOTAL_SIZE_PCT}% من الحجم الطبيعي",
-            f"• Entry 1 = {RECOVERY_ENTRY1_SIZE_PCT}%",
-            f"• Entry 2 = {RECOVERY_ENTRY2_SIZE_PCT}%",
-        ])
+    lines.extend([
+        "",
+        "🎯 <b>التصرف:</b>",
+        html.escape(action),
+        "",
+        "✅ <b>المسموح:</b>",
+    ])
+    lines.extend([html.escape(x) for x in allowed_lines])
+    lines.extend([
+        "",
+        "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
+    ])
+    if new_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
+        lines.append("🧩 <b>Weak Drift:</b> يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة العادية.")
     return "\n".join(lines)
 
 def handle_market_mode_transition(mode_result: dict) -> str:
