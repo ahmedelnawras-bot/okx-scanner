@@ -177,6 +177,12 @@ ALT_SNAPSHOT_CACHE_TTL = 600
 MARKET_STATUS_SNAPSHOT_KEY = "cache:long:market_status_snapshot"
 MARKET_STATUS_SNAPSHOT_TTL = 180
 
+# Weak Trend Drift snapshot (execution safety only)
+WEAK_TREND_DRIFT_KEY = "cache:long:weak_trend_drift"
+WEAK_TREND_DRIFT_TTL = 600
+WEAK_DRIFT_MIN_VOL_RATIO = 1.35
+WEAK_DRIFT_MIN_RETEST_VOL_RATIO = 1.50
+
 # Alert tracking
 ALERT_KEY_PREFIX = "alert:long"
 ALERT_BY_MESSAGE_KEY_PREFIX = "alertmsg:long"
@@ -2478,6 +2484,204 @@ def get_market_mode_arabic_description(mode: str) -> str:
     }
     return mapping.get(mode, "ℹ️ وضع غير معروف")
 
+
+# =========================
+# WEAK TREND DRIFT (EXECUTION SAFETY ONLY)
+# =========================
+def _okx_candle_close(candle):
+    try:
+        return float(candle[4])
+    except Exception:
+        return None
+
+
+def _simple_ma(values, length: int):
+    try:
+        vals = [float(v) for v in values if v is not None]
+        if len(vals) < length:
+            return None
+        return sum(vals[-length:]) / float(length)
+    except Exception:
+        return None
+
+
+def _build_weak_trend_drift_snapshot(force_refresh: bool = False) -> dict:
+    """Detect slow bleeding / weak drift market for execution candidates only.
+
+    This does not block normal Telegram signals. It only tightens execution badge
+    eligibility when BTC structure is weak without being a full crash/BLOCK_LONGS.
+    Cached for ~10 minutes to avoid noisy mode flips.
+    """
+    now_ts = int(time.time())
+    if r and not force_refresh:
+        try:
+            raw = r.get(WEAK_TREND_DRIFT_KEY)
+            if raw:
+                cached = json.loads(raw)
+                if isinstance(cached, dict) and now_ts - int(cached.get("created_ts", 0) or 0) < WEAK_TREND_DRIFT_TTL:
+                    return cached
+        except Exception:
+            pass
+
+    snapshot = {
+        "active": False,
+        "label": "🟢 طبيعي",
+        "reason": "لا يوجد Weak Drift واضح",
+        "created_ts": now_ts,
+        "btc_close": None,
+        "btc_ma5": None,
+        "btc_ma10": None,
+        "btc_ma20": None,
+        "red_ratio_15m": None,
+        "avg_change_15m": None,
+        "btc_change_15m": None,
+        "market_state": "",
+        "alt_mode": "",
+    }
+    try:
+        market_status = load_market_status_snapshot(max_age_seconds=300) or {}
+        market_guard = market_status.get("market_guard", {}) or {}
+        market_info = market_status.get("market_info", {}) or {}
+        alt_snapshot = market_status.get("alt_snapshot", {}) or {}
+
+        red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
+        avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+        btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+        guard_block = bool(market_guard.get("block_longs", False))
+        market_state = str(market_info.get("market_state", "") or "").lower()
+        alt_mode = str(alt_snapshot.get("alt_mode", "") or "")
+
+        candles = get_candles("BTC-USDT-SWAP", "15m", 40)
+        closes = []
+        for c in reversed(candles or []):
+            close = _okx_candle_close(c)
+            if close is not None:
+                closes.append(close)
+        btc_close = closes[-1] if closes else None
+        ma5 = _simple_ma(closes, 5)
+        ma10 = _simple_ma(closes, 10)
+        ma20 = _simple_ma(closes, 20)
+
+        below_ma20 = bool(btc_close and ma20 and btc_close < ma20)
+        bearish_stack = bool(ma5 and ma10 and ma20 and ma5 < ma10 < ma20)
+        below_ma10 = bool(btc_close and ma10 and btc_close < ma10)
+        weak_btc_structure = bool(below_ma20 and (bearish_stack or below_ma10))
+        not_crash = not guard_block and red_ratio < MARKET_GUARD_RED_RATIO_BLOCK and btc_change > MARKET_GUARD_BTC_CHANGE_15M_BLOCK
+        weak_flow = (
+            market_state in ("mixed", "btc_leading", "risk_off", "")
+            or (0.42 <= red_ratio < MARKET_GUARD_RED_RATIO_BLOCK)
+            or avg_change <= 0.20
+            or ("ضعيف" in alt_mode)
+        )
+        active = bool(not_crash and weak_btc_structure and weak_flow)
+        reasons = []
+        if weak_btc_structure:
+            reasons.append("BTC تحت MA20/MA10")
+        if bearish_stack:
+            reasons.append("MA5<MA10<MA20")
+        if avg_change <= 0.20:
+            reasons.append(f"Avg15m ضعيف {avg_change:+.2f}%")
+        if 0.42 <= red_ratio < MARKET_GUARD_RED_RATIO_BLOCK:
+            reasons.append(f"RedRatio {red_ratio*100:.1f}%")
+        if market_state:
+            reasons.append(f"State={market_state}")
+
+        snapshot.update({
+            "active": active,
+            "label": "🟠 Weak Drift" if active else "🟢 طبيعي",
+            "reason": " | ".join(reasons[:4]) if active else "لا يوجد ضعف زاحف واضح",
+            "btc_close": btc_close,
+            "btc_ma5": ma5,
+            "btc_ma10": ma10,
+            "btc_ma20": ma20,
+            "red_ratio_15m": red_ratio,
+            "avg_change_15m": avg_change,
+            "btc_change_15m": btc_change,
+            "market_state": market_state,
+            "alt_mode": alt_mode,
+        })
+        if r:
+            try:
+                r.set(WEAK_TREND_DRIFT_KEY, json.dumps(snapshot, ensure_ascii=False), ex=WEAK_TREND_DRIFT_TTL)
+            except Exception:
+                pass
+        return snapshot
+    except Exception as e:
+        snapshot.update({"active": False, "label": "⚪ غير متاح", "reason": f"Weak Drift error: {e}"})
+        return snapshot
+
+
+def get_weak_trend_drift_snapshot(force_refresh: bool = False) -> dict:
+    return _build_weak_trend_drift_snapshot(force_refresh=force_refresh)
+
+
+def _candidate_text_blob(candidate: dict) -> str:
+    try:
+        if not isinstance(candidate, dict):
+            return ""
+        diagnostics = candidate.get("diagnostics", {}) or {}
+        values = []
+        for source in (candidate, diagnostics):
+            for key in (
+                "entry_maturity", "entry_maturity_label", "wave_label", "wave_context",
+                "entry_timing", "display_risk", "resistance_warning", "warning_reasons",
+                "reasons", "setup_type", "primary_extra_setup", "extra_setup_names",
+            ):
+                values.append(source.get(key))
+        return _compact_debug_value(values, max_items=30, max_len=1000).lower()
+    except Exception:
+        return ""
+
+
+def _passes_weak_trend_drift_execution_rules(candidate: dict) -> bool:
+    """Extra quality gate only when Weak Trend Drift is active.
+
+    Whitelist remains the first permission layer. This function only says:
+    if the market is weak-drifting, a whitelisted setup must prove higher quality.
+    """
+    try:
+        drift = get_weak_trend_drift_snapshot()
+        candidate["weak_trend_drift"] = bool(drift.get("active"))
+        candidate["weak_trend_drift_label"] = drift.get("label", "")
+        candidate["weak_trend_drift_reason"] = drift.get("reason", "")
+        if not drift.get("active"):
+            return True
+
+        tags = set(_collect_execution_setup_tags(candidate))
+        whitelist = {_normalize_execution_tag(k) for k in EXECUTION_WHITELIST_KEYWORDS}
+        hits = tags & whitelist
+        if not hits:
+            return True  # let normal whitelist/block logic handle it
+
+        blob = _candidate_text_blob(candidate)
+        mtf = bool(_trade_field(candidate, "mtf_confirmed", False))
+        vol_ratio = float(_trade_field(candidate, "vol_ratio", 0.0) or 0.0)
+        has_retest = "retest_breakout_confirmed" in hits
+        min_vol = WEAK_DRIFT_MIN_RETEST_VOL_RATIO if has_retest else WEAK_DRIFT_MIN_VOL_RATIO
+
+        late_or_chasing = any(x in blob for x in (
+            "danger_late", "late", "wave_5", "موجة خامسة", "نهاية", "مطاردة", "متأخر", "تشبع شراء"
+        ))
+        btc_against = "btc غير داعم" in blob or "غير داعم" in blob
+        near_resistance = any(x in blob for x in ("near_resistance", "مقاومة قريبة", "rr_min_due_close_resistance"))
+
+        # relative_strength_vs_btc as a lone boolean is too broad in weak drift.
+        # Require it to be backed by a real clean setup/context.
+        relative_only = hits == {"relative_strength_vs_btc"}
+        if relative_only and not ({"vwap_reclaim", "retest_breakout_confirmed", "wave_3"} & tags):
+            return False
+
+        if not mtf:
+            return False
+        if vol_ratio < min_vol:
+            return False
+        if late_or_chasing or btc_against or near_resistance:
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Weak Drift execution gate error: {e}")
+        return True
+
 # =========================
 # MARKET STATUS MESSAGE
 # =========================
@@ -2574,6 +2778,13 @@ def build_market_status_message() -> str:
         f"• Red Ratio: {red_ratio * 100:.1f}%",
         f"• Avg 15m: {avg_change:+.2f}%",
         f"• BTC 15m: {btc_change:+.2f}%",
+    ])
+
+    weak_drift = get_weak_trend_drift_snapshot()
+    weak_label = str(weak_drift.get("label", "⚪ غير متاح"))
+    weak_reason = str(weak_drift.get("reason", ""))
+    lines.extend([
+        f"• Weak Drift: {html.escape(weak_label)}{(' | ' + html.escape(weak_reason)) if weak_reason else ''}",
         "",
         f"🎯 <b>التصرف:</b> {html.escape(action)}",
     ])
@@ -2816,7 +3027,9 @@ def log_execution_tags_debug(candidate: dict, stage: str = "") -> None:
         strict = bool(whitelist_hits)
         block_candidate = _is_block_mode_execution_candidate(candidate)
         complete_plan = _candidate_has_complete_execution_plan(_apply_market_execution_fallback(dict(candidate)))
-        is_candidate = bool((strict or block_candidate) and complete_plan)
+        weak_drift = get_weak_trend_drift_snapshot()
+        weak_ok = _passes_weak_trend_drift_execution_rules(dict(candidate))
+        is_candidate = bool((strict or block_candidate) and complete_plan and weak_ok)
         logger.info(
             "EXEC TAGS DEBUG | "
             f"stage={stage or 'unknown'} | symbol={symbol} | "
@@ -2829,7 +3042,8 @@ def log_execution_tags_debug(candidate: dict, stage: str = "") -> None:
             f"setup_type={_compact_debug_value(candidate.get('setup_type') or diagnostics.get('setup_type'))} | "
             f"entry_mode={candidate.get('entry_mode')} | "
             f"tags={normalized_tags} | whitelist_hits={whitelist_hits} | "
-            f"strict={strict} | block_candidate={block_candidate} | complete_plan={complete_plan} | is_candidate={is_candidate}"
+            f"strict={strict} | block_candidate={block_candidate} | complete_plan={complete_plan} | "
+            f"weak_drift={bool(weak_drift.get('active'))} | weak_ok={weak_ok} | is_candidate={is_candidate}"
         )
     except Exception as e:
         logger.warning(f"EXEC TAGS DEBUG error: {e}")
@@ -3100,6 +3314,11 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
 
 
 def build_execution_report_message(period: str = "all") -> str:
+    """Compact execution report: max ~2 Telegram pages.
+
+    Separates accepted execution performance from missed/blocked candidates so
+    rejected_limit/execution_paused are not counted as real execution losses.
+    """
     try:
         since_ts = _execution_report_since_ts(period)
         try:
@@ -3108,76 +3327,93 @@ def build_execution_report_message(period: str = "all") -> str:
             trades = _load_long_trades_from_redis(limit=1500)
             if since_ts:
                 trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+
         trades = [t for t in trades if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")]
         trades.sort(key=_trade_created_ts_for_exec, reverse=True)
         if not trades:
             return "📭 لا توجد صفقات مرشحة للتنفيذ حتى الآن."
 
-        open_trades = [t for t in trades if _is_execution_trade_open(t)]
-        closed_trades = [t for t in trades if not _is_execution_trade_open(t)]
-        open_pnls = [p for p in (_execution_floating_pnl_pct(t) for t in open_trades) if p is not None]
-        closed_pnls = [p for p in (_execution_final_pnl_pct(t) for t in closed_trades) if p is not None]
-        winners = [p for p in closed_pnls if p > 0]
-        losers = [p for p in closed_pnls if p < 0]
-        total = max(1, len(trades))
-        tp1_hits = sum(1 for t in trades if bool(t.get("tp1_hit", False)))
-        tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
-        trailing_wins = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win")
-        direct_sl = sum(1 for t in closed_trades if _execution_close_type_for_trade(t) == "Direct SL")
+        executed_statuses = {"accepted_preview", "pending_pullback_preview", "live_open", "live_closed"}
+        blocked_statuses = {"rejected_limit", "execution_paused", "daily_drawdown_lock", "preview_rejected", "rejected_existing_symbol", "rejected_invalid_order", "skipped", "candidate_only", "not_candidate"}
+        executed = [t for t in trades if _execution_status_for_trade(t) in executed_statuses]
+        blocked = [t for t in trades if t not in executed]
 
-        title_map = {
-            "all": "منذ البداية",
-            "today": "اليوم",
-            "7d": "آخر 7 أيام",
-            "30d": "آخر 30 يوم",
-            "month": "آخر 30 يوم",
-        }
+        executed_open = [t for t in executed if _is_execution_trade_open(t)]
+        executed_closed = [t for t in executed if not _is_execution_trade_open(t)]
+        ex_open_pnls = [p for p in (_execution_floating_pnl_pct(t) for t in executed_open) if p is not None]
+        ex_closed_pnls = [p for p in (_execution_final_pnl_pct(t) for t in executed_closed) if p is not None]
+        ex_winners = [p for p in ex_closed_pnls if p > 0]
+        ex_losers = [p for p in ex_closed_pnls if p < 0]
+        ex_total = max(1, len(executed))
+        ex_tp1 = sum(1 for t in executed if bool(t.get("tp1_hit", False)))
+        ex_tp2 = sum(1 for t in executed if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
+        ex_direct_sl = sum(1 for t in executed_closed if _execution_close_type_for_trade(t) == "Direct SL")
+        ex_net = sum(ex_open_pnls) + sum(ex_closed_pnls)
+
+        blocked_pnls = []
+        for t in blocked:
+            p = _execution_floating_pnl_pct(t) if _is_execution_trade_open(t) else _execution_final_pnl_pct(t)
+            if p is not None:
+                blocked_pnls.append(p)
+        blocked_tp1 = sum(1 for t in blocked if bool(t.get("tp1_hit", False)))
+        blocked_sl = sum(1 for t in blocked if (not _is_execution_trade_open(t) and _execution_close_type_for_trade(t) == "Direct SL"))
+        status_counts = {}
+        for t in trades:
+            st = _execution_status_for_trade(t)
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+        title_map = {"all": "منذ البداية", "today": "اليوم", "7d": "آخر 7 أيام", "30d": "آخر 30 يوم", "month": "آخر 30 يوم"}
         title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
-        actual_profit = sum(p for p in closed_pnls if p > 0) + sum(p for p in open_pnls if p > 0)
-        actual_sl_loss = sum(
-            p for p, t in zip((_execution_final_pnl_pct(x) for x in closed_trades), closed_trades)
-            if p is not None and p < 0 and _execution_close_type_for_trade(t) == "Direct SL"
-        )
-        actual_net = actual_profit + actual_sl_loss
+        weak_drift = get_weak_trend_drift_snapshot()
+
+        def status_summary(max_items=5):
+            items = sorted(status_counts.items(), key=lambda x: x[1], reverse=True)[:max_items]
+            return " | ".join(f"{html.escape(str(k))}:{v}" for k, v in items) if items else "N/A"
+
+        def compact_card(t, prefix="•"):
+            raw_symbol = str(t.get("symbol", "?") or "?")
+            st = html.escape(_execution_status_for_trade(t))
+            setup = html.escape(str(_trade_field(t, "setup_type", "") or ""))
+            phase = _execution_phase_for_trade(t) if _is_execution_trade_open(t) else _execution_close_type_for_trade(t)
+            pnl = _execution_floating_pnl_pct(t) if _is_execution_trade_open(t) else _execution_final_pnl_pct(t)
+            score = _trade_field(t, "score", "N/A")
+            reason = str(_trade_field(t, "execution_reject_reason", "") or "")
+            reason_part = f" | {html.escape(reason)}" if reason else ""
+            icon = "🟢" if (pnl or 0) > 0 else ("🔴" if (pnl or 0) < 0 else "⚪")
+            return f"{prefix} {icon} <b>{html.escape(raw_symbol)}</b> | {phase} | {_pct_safe(pnl) if pnl is not None else 'N/A'} | {st}{reason_part}\n  🧠 {setup} | ⭐ {score}"
 
         lines = [
-            f"🚀 <b>Execution Candidates Report</b> — {title_period}",
-            f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
-            f"🟢 مفتوحة: {len(open_trades)} | 🏁 مغلقة: {len(closed_trades)}",
-            f"🟢 عدد الصفقات الرابحة: {len(winners)}",
-            f"🔴 عدد الصفقات الخاسرة: {len(losers)}",
+            f"🚀 <b>Execution Report</b> — {title_period}",
+            f"📌 Total Candidates: <b>{len(trades)}</b>",
+            f"✅ Executed/Preview: <b>{len(executed)}</b> | 🟡 Missed/Blocked: <b>{len(blocked)}</b>",
+            f"🧭 Weak Drift: {html.escape(str(weak_drift.get('label', 'N/A')))} | {html.escape(str(weak_drift.get('reason', '')))}",
+            f"⚙️ Status Mix: {status_summary()}",
             "",
-            "🧠 <b>Summary 40/40/20</b>",
-            f"🟢 Open Floating: {_pct_safe(sum(open_pnls)) if open_pnls else '+0.00%'}",
-            f"📈 Avg Winner: {_pct_safe(_avg(winners)) if winners else '+0.00%'}",
-            f"📉 Avg Loser: {_pct_safe(_avg(losers)) if losers else '+0.00%'}",
-            f"🎯 TP1 Success: {tp1_hits / total * 100:.1f}%",
-            f"🏁 TP2 Success: {tp2_hits / total * 100:.1f}%",
-            f"🔄 Trail Success: {trailing_wins / total * 100:.1f}%",
-            f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
+            "✅ <b>Executed Only Performance</b>",
+            f"• Open: {len(executed_open)} | Closed: {len(executed_closed)}",
+            f"• Net 40/40/20: <b>{_pct_safe(ex_net)}</b>",
+            f"• Avg Winner: {_pct_safe(_avg(ex_winners)) if ex_winners else '+0.00%'} | Avg Loser: {_pct_safe(_avg(ex_losers)) if ex_losers else '+0.00%'}",
+            f"• TP1: {ex_tp1 / ex_total * 100:.1f}% | TP2: {ex_tp2 / ex_total * 100:.1f}% | Direct SL: {ex_direct_sl / ex_total * 100:.1f}%",
             "",
-            "<b>النتيجة الفعلية </b>",
-            f"• 🟢 أرباح محققة/مفتوحة: {_pct_safe(actual_profit)}",
-            f"• 🔴 خسائر SL Hit: {_pct_safe(actual_sl_loss)}",
-            f"• ⚖️ الصافي بعد الرافعة: <b>{_pct_safe(actual_net)}</b>",
-            "─",
+            "🟡 <b>Missed / Blocked Follow-up</b>",
+            f"• Count: {len(blocked)} | Follow-up Net: {_pct_safe(sum(blocked_pnls)) if blocked_pnls else '+0.00%'}",
+            f"• Would TP1: {blocked_tp1} | Would Direct SL: {blocked_sl}",
             "",
-            f"🟢 <b>الصفقات المفتوحة ({len(open_trades)})</b>",
         ]
-        if open_trades:
-            for t in open_trades:
-                lines.extend(_format_execution_trade_card(t, is_open=True))
-                lines.append("")
-        else:
-            lines.append("لا توجد صفقات مفتوحة حاليًا.")
+
+        if executed:
+            lines.append("📍 <b>آخر Executed/Preview</b>")
+            for t in executed[:6]:
+                lines.append(compact_card(t))
             lines.append("")
-        lines.append(f"🏁 <b>الصفقات المغلقة ({len(closed_trades)})</b>")
-        if closed_trades:
-            for t in closed_trades:
-                lines.extend(_format_execution_trade_card(t, is_open=False))
-                lines.append("")
-        else:
-            lines.append("لا توجد صفقات مغلقة في هذه الفترة.")
+        if blocked:
+            lines.append("🚧 <b>آخر Missed/Blocked</b>")
+            for t in blocked[:6]:
+                lines.append(compact_card(t))
+            lines.append("")
+
+        # Keep the report readable; detailed cards can be added later as /report_execution_deep.
+        lines.append("ℹ️ التقرير المختصر يفصل الأداء الحقيقي عن المرشحين المرفوضين/الموقوفين حتى لا تختلط الخسائر الافتراضية بالتنفيذ الفعلي.")
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
@@ -3430,10 +3666,10 @@ COMMAND_HANDLERS = {
  "/report_all": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
  "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
- "/report_execution": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
- "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
- "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
- "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
+ "/report_execution": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))[:2]),
+ "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))[:2]),
+ "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))[:2]),
+ "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))[:2]),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -7175,6 +7411,7 @@ def is_candidate_for_execution(candidate: dict) -> bool:
         return bool(
             (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
             and _candidate_has_complete_execution_plan(planned)
+            and _passes_weak_trend_drift_execution_rules(planned)
         )
     except Exception:
         return False
@@ -8330,8 +8567,10 @@ def handle_execution_preview_for_candidate(candidate: dict, symbol: str = "") ->
         log_execution_tags_debug(candidate, stage="execution_preview")
 
         if not is_candidate_for_execution(candidate):
-            update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
-            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
+            drift = get_weak_trend_drift_snapshot()
+            reason = "weak_trend_drift_quality_gate" if drift.get("active") and not _passes_weak_trend_drift_execution_rules(dict(candidate)) else "not_execution_candidate"
+            update_execution_status_for_candidate(candidate, "not_candidate", reason, message_sent=False)
+            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate | reason={reason}")
             return
 
         if is_execution_paused():
