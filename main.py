@@ -231,7 +231,10 @@ STRONG_ONLY_MIN_VOL_RATIO = 1.2
 MODE_TRANSITION_MIN_INTERVAL = 480
 RECOVERY_CHECK_INTERVAL = 120
 NORMAL_CANDIDATE_DURATION = 480
-BLOCK_EXIT_CONFIRM_DURATION = 240
+# Mode stability / hysteresis:
+# BLOCK -> STRONG requires about 15 minutes of stable improvement.
+# STRONG -> NORMAL is faster because NORMAL itself still has execution filters.
+BLOCK_EXIT_CONFIRM_DURATION = 900
 STRONG_TO_NORMAL_CONFIRM_DURATION = 480
 
 # Market Crash Guard
@@ -1701,9 +1704,9 @@ def build_help_message() -> str:
 
 <b>🚀 تقارير التنفيذ:</b>
 /report_execution — منذ البداية
-/report_execution_today — اليوم
 /report_execution_7d — آخر 7 أيام
-/report_execution_30d — آخر 30 يوم
+/report_execution_today — آخر يوم
+/report_execution_1h — آخر ساعة
 
 <b>⚙️ أوامر التنفيذ:</b>
 /exec_status — اختبار OKX
@@ -2466,6 +2469,110 @@ def load_market_status_snapshot(max_age_seconds: int = 240):
     logger.warning(f"Failed to load market status snapshot: {e}")
     return None
 
+
+# =========================
+# WEAK TREND DRIFT — EXECUTION QUALITY LAYER
+# =========================
+def _weak_drift_from_values(btc_mode: str, market_state_label: str, market_bias_label: str, market_guard: dict) -> dict:
+    try:
+        red_ratio = float((market_guard or {}).get("red_ratio_15m", 0.0) or 0.0)
+        avg_change = float((market_guard or {}).get("avg_change_15m", 0.0) or 0.0)
+        btc_change = float((market_guard or {}).get("btc_change_15m", 0.0) or 0.0)
+        guard_level = str((market_guard or {}).get("level", "normal") or "normal").lower()
+        btc_s = str(btc_mode or "")
+        state_s = str(market_state_label or "").lower()
+        flow_s = str(market_bias_label or "")
+        active = (
+            guard_level in ("danger", "block")
+            or ("هابط" in btc_s and red_ratio >= 0.42 and avg_change <= 0.20)
+            or (btc_change < -0.10 and avg_change <= 0.05 and red_ratio >= 0.45)
+            or (("mixed" in state_s or "مختلط" in flow_s or "غير محسومة" in flow_s) and btc_change <= 0.05 and avg_change <= 0.10 and red_ratio >= 0.46)
+        )
+        watch = (not active) and (
+            red_ratio >= 0.42
+            or avg_change <= 0.05
+            or btc_change <= -0.05
+            or "محايد" in btc_s
+        )
+        if active:
+            return {"active": True, "level": "active", "line": "🔴 نشط | التنفيذ أكثر تشددًا"}
+        if watch:
+            return {"active": False, "level": "watch", "line": "🟡 مراقبة | زخم غير محسوم"}
+        return {"active": False, "level": "normal", "line": "🟢 طبيعي | لا يوجد ضعف واضح"}
+    except Exception:
+        return {"active": False, "level": "unknown", "line": "⚪ غير متاح"}
+
+
+def get_weak_trend_drift_status(snapshot: dict = None) -> dict:
+    try:
+        snap = snapshot or load_market_status_snapshot(max_age_seconds=900) or {}
+        btc_mode = snap.get("btc_mode", "")
+        market_info = snap.get("market_info", {}) or {}
+        market_state_label = market_info.get("market_state_label") or market_info.get("market_state") or ""
+        market_bias_label = market_info.get("market_bias_label", "")
+        market_guard = snap.get("market_guard", {}) or {}
+        return _weak_drift_from_values(btc_mode, market_state_label, market_bias_label, market_guard)
+    except Exception:
+        return {"active": False, "level": "unknown", "line": "⚪ غير متاح"}
+
+
+def get_weak_trend_drift_status_line(snapshot: dict = None) -> str:
+    return str(get_weak_trend_drift_status(snapshot).get("line", "⚪ غير متاح"))
+
+
+def is_weak_trend_drift_active(snapshot: dict = None) -> bool:
+    return bool(get_weak_trend_drift_status(snapshot).get("active", False))
+
+
+def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> tuple:
+    """When Weak Drift is active, whitelist alone is not enough for execution."""
+    try:
+        if not is_weak_trend_drift_active():
+            return True, "weak_drift_inactive"
+        score = float(candidate.get("effective_score", candidate.get("score", 0.0)) or 0.0)
+        vol_ratio = float(candidate.get("vol_ratio", 0.0) or 0.0)
+        mtf = bool(candidate.get("mtf_confirmed", False))
+        if _is_late_risky_execution_context(candidate):
+            return False, "weak_drift_blocks_late_context"
+        if score < float(os.getenv("WEAK_DRIFT_EXEC_MIN_SCORE", "8.0") or 8.0):
+            return False, f"weak_drift_score_too_low_{score:.2f}"
+        if not (mtf or vol_ratio >= float(os.getenv("WEAK_DRIFT_EXEC_MIN_VOL", "1.20") or 1.20)):
+            return False, "weak_drift_needs_mtf_or_volume"
+        return True, "weak_drift_quality_ok"
+    except Exception as e:
+        return False, f"weak_drift_guard_error:{e}"
+
+
+def get_mode_execution_rule_text(mode: str) -> str:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_NORMAL_LONG:
+        return "🎯 التصرف:\n• الإشارات العادية: مسموحة\n• التنفيذ التجريبي: حسب جودة الحركة والـ Whitelist"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "🎯 التصرف:\n• الإشارات العادية: أقوى الفرص فقط\n• التنفيذ التجريبي: حركة قوية + Whitelist"
+    if mode == MODE_BLOCK_LONGS:
+        return "🎯 التصرف:\n• الإشارات العادية: متابعة وتحليل فقط\n• التنفيذ التجريبي: متوقف إلا للحالات الاستثنائية"
+    if mode == MODE_RECOVERY_LONG:
+        return "🎯 التصرف:\n• الإشارات العادية: فرص تعافي محدودة\n• التنفيذ التجريبي: بحذر وتأكيد قوي"
+    return "🎯 التصرف: مراقبة السوق قبل الدخول"
+
+
+def build_market_mode_reminder_message(reminder_count: int, current_mode: str, snapshot: dict = None) -> str:
+    try:
+        snap = snapshot or load_market_status_snapshot(max_age_seconds=900) or {}
+        btc_mode = str(snap.get("btc_mode", "🟡 BTC Mixed") or "🟡 BTC Mixed")
+        market_info = snap.get("market_info", {}) or {}
+        state = str(market_info.get("market_state_label") or market_info.get("market_state") or "Mixed")
+        mode_label = _market_mode_label(current_mode)
+        exec_line = "Strong Momentum + Whitelist" if normalize_market_mode(current_mode) != MODE_NORMAL_LONG else "Quality Move + Whitelist"
+        return (
+            f"🧭 <b>Reminder #{reminder_count}</b>\n\n"
+            f"{mode_label}\n"
+            f"{html.escape(btc_mode)} | 🟡 {html.escape(state)}\n\n"
+            f"🎯 <b>Execution:</b>\n{html.escape(exec_line)}"
+        )
+    except Exception:
+        return f"🧭 <b>Reminder #{reminder_count}</b>\n\n{_market_mode_label(current_mode)}"
+
 # =========================
 # MARKET MODE ARABIC DESCRIPTION
 # =========================
@@ -2548,6 +2655,7 @@ def build_market_status_message() -> str:
         f"⚙️ <b>المود الحالي:</b> {mode_ar}",
         f"📋 <b>الوصف:</b> {mode_desc}",
         f"🔮 <b>المود المحسوب الآن:</b> {suggested_mode_ar}",
+        f"🧭 <b>Weak Drift:</b> {html.escape(get_weak_trend_drift_status_line({'btc_mode': btc_mode, 'market_info': {'market_state_label': market_state_label, 'market_bias_label': market_bias_label}, 'market_guard': market_guard}))}",
         f"🧠 <b>سبب الحساب:</b> {html.escape(str(suggested_reason))}",
         f"📡 <b>مصدر البيانات:</b> {data_source}",
     ]
@@ -2575,7 +2683,7 @@ def build_market_status_message() -> str:
         f"• Avg 15m: {avg_change:+.2f}%",
         f"• BTC 15m: {btc_change:+.2f}%",
         "",
-        f"🎯 <b>التصرف:</b> {html.escape(action)}",
+        get_mode_execution_rule_text(current_mode),
     ])
     if suggested_mode != current_mode:
         lines.append("")
@@ -2832,6 +2940,8 @@ def is_execution_candidate_trade(trade: dict) -> bool:
 def _execution_report_since_ts(period: str):
     period = str(period or "all").lower()
     now = int(time.time())
+    if period in ("1h", "hour"):
+        return now - 3600
     if period == "today":
         return get_local_day_start_ts()
     if period in ("7d", "week"):
@@ -2844,11 +2954,9 @@ def _execution_report_since_ts(period: str):
 def _format_exec_num(value, decimals=6):
     try:
         v = float(value)
-        if abs(v) >= 100:
-            return f"{v:.2f}"
-        if abs(v) >= 1:
-            return f"{v:.4f}"
-        return f"{v:.{decimals}f}"
+        if v <= 0:
+            return "N/A"
+        return format_price_dynamic(v)
     except Exception:
         return "N/A"
 
@@ -3083,7 +3191,9 @@ def build_execution_report_message(period: str = "all") -> str:
 
         title_map = {
             "all": "منذ البداية",
-            "today": "اليوم",
+            "1h": "آخر ساعة",
+            "hour": "آخر ساعة",
+            "today": "آخر يوم",
             "7d": "آخر 7 أيام",
             "30d": "آخر 30 يوم",
             "month": "آخر 30 يوم",
@@ -3091,22 +3201,26 @@ def build_execution_report_message(period: str = "all") -> str:
         title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
 
         open_sum_pct = sum(open_pnls) if open_pnls else 0.0
-        actual_profit_pct = sum(p for p in closed_pnls if p > 0) + sum(p for p in open_pnls if p > 0)
-        actual_sl_loss_pct = sum(
-            p for t, p in closed_pairs
-            if p < 0 and _execution_close_type_for_trade(t) == "Direct SL"
-        )
-        # Keep the old report philosophy: net = positive open/closed profits + realized SL losses.
-        actual_net_pct = actual_profit_pct + actual_sl_loss_pct
+        realized_profit_pct = sum(p for p in closed_pnls if p > 0)
+        realized_loss_pct = sum(p for p in closed_pnls if p < 0)
+        realized_net_pct = realized_profit_pct + realized_loss_pct
+        floating_profit_pct = sum(p for p in open_pnls if p > 0)
+        floating_loss_pct = sum(p for p in open_pnls if p < 0)
+        floating_net_pct = floating_profit_pct + floating_loss_pct
+        portfolio_net_pct = realized_net_pct + floating_net_pct
 
         # Portfolio reference used by long reports: 1000$ wallet, 35$ estimated margin per candidate.
         wallet_capital_usd = float(os.getenv("EXEC_REPORT_WALLET_USD", "1000") or 1000)
         trade_margin_usd = float(os.getenv("EXEC_REPORT_TRADE_MARGIN_USD", "35") or 35)
         pct_to_usd = trade_margin_usd / 100.0
-        profit_usd = actual_profit_pct * pct_to_usd
-        loss_usd = actual_sl_loss_pct * pct_to_usd
-        net_usd = actual_net_pct * pct_to_usd
-        wallet_pct = (net_usd / wallet_capital_usd * 100.0) if wallet_capital_usd else 0.0
+        realized_profit_usd = realized_profit_pct * pct_to_usd
+        realized_loss_usd = realized_loss_pct * pct_to_usd
+        realized_net_usd = realized_net_pct * pct_to_usd
+        floating_profit_usd = floating_profit_pct * pct_to_usd
+        floating_loss_usd = floating_loss_pct * pct_to_usd
+        floating_net_usd = floating_net_pct * pct_to_usd
+        portfolio_net_usd = portfolio_net_pct * pct_to_usd
+        wallet_pct = (portfolio_net_usd / wallet_capital_usd * 100.0) if wallet_capital_usd else 0.0
 
         def money(v: float) -> str:
             return f"{v:+.2f}$"
@@ -3159,26 +3273,68 @@ def build_execution_report_message(period: str = "all") -> str:
                 f"🧠 {setup} | ⭐ {html.escape(str(score))}",
             ]
 
+        impact_icon = "🟢" if portfolio_net_usd >= 0 else "🔴"
         lines = [
             f"🚀 <b>Execution Candidates Report</b> — {title_period}",
+            "",
             f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
-            f"🟢 مفتوحة: {len(open_trades)} | 🏁 مغلقة: {len(closed_trades)}",
-            f"🟢 رابحة: {len(winners_pairs)} | 🔴 خاسرة: {len(losers_pairs)}",
-            f"🧭 Weak Drift: {html.escape(weak_drift_line())}",
+            f"🟢 مفتوحة: {len(open_trades)}",
+            f"🏁 مغلقة: {len(closed_trades)}",
             "",
+            f"🟢 رابحة: {len(winners_pairs)}",
+            f"🔴 خاسرة: {len(losers_pairs)}",
+            "━━━━━━━━━━━━",
             "💰 <b>Wallet Impact</b>",
-            f"• رأس المال: {wallet_capital_usd:.0f}$",
-            f"• التأثير الحالي: {money(net_usd)} | {wallet_pct:+.2f}% من المحفظة",
-            f"📈 أرباح مفتوحة/محققة: {money(profit_usd)} | {_pct_safe(actual_profit_pct)}",
-            f"📉 خسائر SL: {money(loss_usd)} | {_pct_safe(actual_sl_loss_pct)}",
-            f"⚖️ الصافي: <b>{money(net_usd)} | {_pct_safe(actual_net_pct)}</b>",
             "",
+            "📌 رأس المال:",
+            f"{wallet_capital_usd:.0f}$",
+            "",
+            "✅ <b>المحقق:</b>",
+            "📈 أرباح محققة:",
+            f"{money(realized_profit_usd)} | {_pct_safe(realized_profit_pct)}",
+            "",
+            "📉 خسائر محققة:",
+            f"{money(realized_loss_usd)} | {_pct_safe(realized_loss_pct)}",
+            "",
+            "⚖️ صافي محقق:",
+            f"{money(realized_net_usd)} | {_pct_safe(realized_net_pct)}",
+            "",
+            "━━━━━━━━━━━━",
+            "🔄 <b>العائم:</b>",
+            "",
+            "📈 أرباح عائمة:",
+            f"{money(floating_profit_usd)} | {_pct_safe(floating_profit_pct)}",
+            "",
+            "📉 خسائر عائمة:",
+            f"{money(floating_loss_usd)} | {_pct_safe(floating_loss_pct)}",
+            "",
+            "⚖️ صافي عائم:",
+            f"{money(floating_net_usd)} | {_pct_safe(floating_net_pct)}",
+            "",
+            "━━━━━━━━━━━━",
+            "🏦 <b>التأثير الحالي على المحفظة:</b>",
+            "",
+            f"{impact_icon} {money(portfolio_net_usd)}",
+            f"{wallet_pct:+.2f}%",
+            "",
+            "━━━━━━━━━━━━",
             "🧠 <b>Summary 40/40/20</b>",
-            f"🟢 Open Floating: {_pct_safe(open_sum_pct)} | {money(open_sum_pct * pct_to_usd)}",
-            f"📈 Avg Winner: {_pct_safe(_avg([p for _, p in winners_pairs])) if winners_pairs else '+0.00%'}",
-            f"📉 Avg Loser: {_pct_safe(_avg([p for _, p in losers_pairs])) if losers_pairs else '+0.00%'}",
-            f"🎯 TP1: {tp1_hits / total * 100:.1f}% | 🏁 TP2: {tp2_hits / total * 100:.1f}%",
-            f"🔄 Trail: {trailing_wins / total * 100:.1f}% | 🛑 Direct SL: {direct_sl / total * 100:.1f}%",
+            "",
+            "🟢 Open Floating:",
+            f"{_pct_safe(open_sum_pct)}",
+            f"{money(open_sum_pct * pct_to_usd)}",
+            "",
+            "📈 Avg Winner:",
+            f"{_pct_safe(_avg([p for _, p in winners_pairs])) if winners_pairs else '+0.00%'}",
+            "",
+            "📉 Avg Loser:",
+            f"{_pct_safe(_avg([p for _, p in losers_pairs])) if losers_pairs else '+0.00%'}",
+            "",
+            "━━━━━━━━━━━━",
+            f"🎯 TP1: {tp1_hits / total * 100:.1f}%",
+            f"🏁 TP2: {tp2_hits / total * 100:.1f}%",
+            f"🔄 Trail: {trailing_wins / total * 100:.1f}%",
+            f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
             "",
             "🏆 <b>آخر 5 صفقات رابحة</b>",
         ]
@@ -3457,8 +3613,9 @@ COMMAND_HANDLERS = {
  "/report_deep": lambda chat_id: send_telegram_reply(chat_id, build_deep_report_message()),
  "/report_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
  "/report_execution": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
- "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
  "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
+ "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
+ "/report_execution_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("1h"))),
  "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
@@ -3823,15 +3980,54 @@ def validate_signal_prices(candidate: dict) -> bool:
     return True
 
 
+
+
+def _execution_price_plan_is_effective(candidate: dict) -> tuple:
+    """Execution-only precision safety for micro/zero coins.
+
+    Returns (ok, reason). It does not block normal Telegram signals; it only
+    prevents an alert from becoming an execution candidate when the practical
+    Entry/TP/SL distances collapse because of rounding/noise.
+    """
+    try:
+        planned = _apply_market_execution_fallback(dict(candidate or {}))
+        entry = _safe_trade_float_value(planned.get("execution_entry") or planned.get("entry"), 0.0)
+        sl = _safe_trade_float_value(planned.get("execution_sl") or planned.get("sl"), 0.0)
+        tp1 = _safe_trade_float_value(planned.get("execution_tp1") or planned.get("tp1"), 0.0)
+        tp2 = _safe_trade_float_value(planned.get("execution_tp2") or planned.get("tp2"), 0.0)
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return False, "invalid_execution_prices"
+        if tp1 <= entry or sl >= entry:
+            return False, "invalid_tp_sl_direction"
+        tp1_move_pct = (tp1 - entry) / entry * 100.0
+        sl_move_pct = (entry - sl) / entry * 100.0
+        min_tp_pct = float(os.getenv("EXEC_MIN_TP1_MOVE_PCT", "0.35") or 0.35)
+        min_sl_pct = float(os.getenv("EXEC_MIN_SL_MOVE_PCT", "0.25") or 0.25)
+        # Micro prices need a little extra practical distance from spread/noise.
+        if entry < 0.001:
+            min_tp_pct = max(min_tp_pct, float(os.getenv("EXEC_MICRO_MIN_TP1_MOVE_PCT", "0.45") or 0.45))
+            min_sl_pct = max(min_sl_pct, float(os.getenv("EXEC_MICRO_MIN_SL_MOVE_PCT", "0.30") or 0.30))
+        if tp1_move_pct < min_tp_pct:
+            return False, f"tp1_too_close_{tp1_move_pct:.2f}%"
+        if sl_move_pct < min_sl_pct:
+            return False, f"sl_too_close_{sl_move_pct:.2f}%"
+        # If dynamic display still collapses important prices, the plan is not clear enough.
+        shown_entry = format_price_dynamic(entry)
+        shown_tp1 = format_price_dynamic(tp1)
+        shown_sl = format_price_dynamic(sl)
+        if shown_entry == shown_tp1 or shown_entry == shown_sl:
+            return False, "display_precision_collapse"
+        if tp2 and tp2 > 0 and format_price_dynamic(tp2) == shown_entry:
+            return False, "tp2_precision_collapse"
+        return True, "ok"
+    except Exception as e:
+        return False, f"precision_guard_error:{e}"
+
 def _fmt_price(value) -> str:
     v = _safe_float(value, 0.0)
     if v <= 0:
         return "—"
-    if v >= 100:
-        return f"{v:.4f}"
-    if v >= 1:
-        return f"{v:.6f}"
-    return f"{v:.8f}"
+    return format_price_dynamic(v)
 
 
 # =========================
@@ -6581,7 +6777,12 @@ def rtl_fix(text: str) -> str:
 
 def fmt_num(value, decimals=2) -> str:
  try:
-    return rtl_fix(f"{float(value):.{int(decimals)}f}")
+    v = float(value)
+    # Dynamic precision for micro-price assets (BONK/PEPE/NEIRO...).
+    # This prevents Entry/TP/SL from all displaying as the same rounded number.
+    if abs(v) < 0.01:
+        return rtl_fix(format_price_dynamic(v))
+    return rtl_fix(f"{v:.{int(decimals)}f}")
  except Exception:
     return rtl_fix(str(value))
 
@@ -6670,7 +6871,7 @@ def get_rr_targets_long(signal_type="standard", entry_timing=""):
 
 def calc_tp_long(entry: float, sl: float, rr: float) -> float:
  risk = float(entry) - float(sl)
- return round(float(entry) + (risk * rr), 6)
+ return _round_price_dynamic(float(entry) + (risk * rr))
 
 def _round_price_dynamic(value: float) -> float:
     try:
@@ -6678,12 +6879,14 @@ def _round_price_dynamic(value: float) -> float:
         if value <= 0:
             return 0.0
         if value >= 100:
-            return round(value, 2)
-        if value >= 1:
             return round(value, 4)
-        if value >= 0.01:
+        if value >= 1:
             return round(value, 6)
-        return round(value, 8)
+        if value >= 0.01:
+            return round(value, 8)
+        if value >= 0.0001:
+            return round(value, 10)
+        return round(value, 12)
     except Exception:
         return 0.0
 
@@ -7174,10 +7377,17 @@ def is_candidate_for_execution(candidate: dict) -> bool:
     try:
         planned = _apply_market_execution_fallback(dict(candidate or {}))
         _ensure_execution_setup_tags(planned)
-        return bool(
-            (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
-            and _candidate_has_complete_execution_plan(planned)
-        )
+        if not ((_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned)) and _candidate_has_complete_execution_plan(planned)):
+            return False
+        precision_ok, precision_reason = _execution_price_plan_is_effective(planned)
+        if not precision_ok:
+            logger.info(f"EXEC QUALITY BLOCK: {planned.get('symbol', '?')} | {precision_reason}")
+            return False
+        drift_ok, drift_reason = _candidate_passes_weak_drift_execution_quality(planned)
+        if not drift_ok:
+            logger.info(f"EXEC WEAK DRIFT BLOCK: {planned.get('symbol', '?')} | {drift_reason}")
+            return False
+        return True
     except Exception:
         return False
 
@@ -7871,14 +8081,14 @@ def _market_mode_label(mode: str) -> str:
 def get_market_mode_action_text(mode: str) -> str:
     mode = normalize_market_mode(mode)
     if mode == MODE_NORMAL_LONG:
-        return "✅ مسموح باللونج العادي مع الالتزام بالفلاتر."
+        return "الإشارات العادية مسموحة، والتنفيذ حسب جودة الحركة والـ Whitelist."
     if mode == MODE_STRONG_LONG_ONLY:
-        return "⚠️ الإشارات العادية مقتصرة على أقوى الفرص فقط؛ Execution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
+        return "الإشارات العادية لأقوى الفرص فقط، والتنفيذ يحتاج حركة قوية + Whitelist."
     if mode == MODE_BLOCK_LONGS:
-        return "🛡 الإشارات العادية تحت حماية مشددة، لكن Execution Candidates مسموحة حسب قواعد التنفيذ الجديدة فقط: حد الـ7 + عدم تكرار نفس الزوج + Daily DD + صحة بيانات الأمر."
+        return "متابعة وتحليل فقط غالبًا، والتنفيذ متوقف إلا للحالات الاستثنائية."
     if mode == MODE_RECOVERY_LONG:
-        return "🛟 فرص Recovery فقط وبحذر، وExecution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
-    return "ℹ️ مراقبة السوق قبل الدخول"
+        return "فرص تعافي محدودة، والتنفيذ بحذر وتأكيد قوي."
+    return "مراقبة السوق قبل الدخول"
 
 def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
     old_mode = normalize_market_mode(old_mode)
@@ -7889,7 +8099,8 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "🔁 <b>تغيير المود</b>",
         f"⚙️ <b>المود الحالي:</b> {_market_mode_label(new_mode)}",
         f"📋 <b>الوصف:</b> {get_market_mode_arabic_description(new_mode)}",
-        f"🎯 <b>التصرف:</b> {html.escape(get_market_mode_action_text(new_mode))}",
+        "",
+        get_mode_execution_rule_text(new_mode),
         "",
         f"🔄 <b>الانتقال:</b> {transition}",
     ]
@@ -7901,7 +8112,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
             "✅ <b>المسموح:</b>",
             "• الإشارات العادية: أقوى setups فقط",
             f"• Strong filters: Score ≥ {STRONG_ONLY_MIN_SCORE} و Vol ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
-            "• Execution Candidates: حسب قواعد التنفيذ الجديدة",
+            "• التنفيذ التجريبي: حركة قوية + Whitelist",
         ])
     elif new_mode == MODE_BLOCK_LONGS:
         lines.extend([
@@ -7909,7 +8120,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
             "🛡 <b>حماية:</b>",
             "• حماية الصفقات المفتوحة الرابحة إن وجدت",
             "• Track والتقارير والأوامر مستمرة",
-            "• Execution Candidates لا تُمنع بسبب BLOCK وحده، لكنها تخضع لقواعد التنفيذ",
+            "• التنفيذ التجريبي: متوقف إلا للحالات الاستثنائية",
         ])
     elif new_mode == MODE_RECOVERY_LONG:
         lines.extend([
@@ -8521,7 +8732,7 @@ def run_scanner_loop():
             save_market_status_snapshot(snapshot_data)
 
             # Periodic market mode reminder
-            REMINDER_INTERVAL = 1800  # 30 minutes
+            REMINDER_INTERVAL = 900  # 15 minutes
             now_ts_local = int(time.time())
             if r:
                 try:
@@ -8532,7 +8743,7 @@ def run_scanner_loop():
                         if reminder_mode != current_mode:
                             reminder_count = 0
                         reminder_count += 1
-                        reminder_msg = f"⏱️ <b>Market Mood Reminder #{reminder_count}</b>\n\n" + build_market_status_message()
+                        reminder_msg = build_market_mode_reminder_message(reminder_count, current_mode, snapshot_data)
                         send_telegram_message(reminder_msg)
                         r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
                         r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
@@ -10249,9 +10460,19 @@ def run_scanner_loop():
                         # - relaxed/strong setups use softer hard-reject limits
                         # - ultra-tiny non-structural resistance is treated as noise/warning, not a hard reject
                         _res_source = str(smart_targets_early.get("nearest_resistance_source") or "unknown")
-                        _structural_res_sources = {"swing_high", "previous_rejection", "round_level_confirmed", "bb_upper"}
-                        _weak_micro_res_sources = {"recent_20_high", "unknown", "micro_high", "tiny_wick"}
-                        _res_is_structural = _res_source in _structural_res_sources
+                        # Resistance Quality Relaxation:
+                        # Strong structural resistance still rejects. Medium/weak resistance in an
+                        # improving NORMAL_LONG market becomes warning-only for strong setups.
+                        _strong_res_sources = {"swing_high", "previous_rejection", "multi_touch_resistance", "htf_resistance"}
+                        _medium_res_sources = {"recent_20_high", "recent_close_high", "round_level_confirmed"}
+                        _weak_micro_res_sources = {"bb_upper", "unknown", "micro_high", "tiny_wick"}
+                        if _res_source in _strong_res_sources:
+                            _res_quality = "strong"
+                        elif _res_source in _medium_res_sources:
+                            _res_quality = "medium"
+                        else:
+                            _res_quality = "weak"
+                        _res_is_structural = _res_quality == "strong"
                         _res_is_micro_noise = (_res_source in _weak_micro_res_sources) and (_res_dist_pct < 0.25 or _res_r < 0.20)
 
                         _res_relaxed_setup = is_relaxed_execution_setup(
@@ -10270,6 +10491,14 @@ def run_scanner_loop():
                             and _res_relaxed_setup
                             and not _res_is_structural
                         )
+                        _normal_long_uptrend_relax = (
+                            current_mode == MODE_NORMAL_LONG
+                            and _res_relaxed_setup
+                            and _res_quality in ("medium", "weak")
+                            and float(score_result.get("score", raw_score) or 0.0) >= 7.0
+                            and (bool(mtf_confirmed) or float(vol_ratio or 0.0) >= 1.15 or market_state in ("bull_market", "alt_season"))
+                            and "هابط" not in str(btc_mode)
+                        )
 
                         if _res_is_micro_noise:
                             smart_resistance_warning_only = True
@@ -10277,6 +10506,13 @@ def run_scanner_loop():
                             logger.info(
                                 f"⚪ {symbol} tiny/micro resistance ignored | "
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
+                            )
+                        elif _normal_long_uptrend_relax:
+                            smart_resistance_warning_only = True
+                            early_resistance_warning = ""
+                            logger.info(
+                                f"🟢 {symbol} resistance quality relaxed in NORMAL_LONG | "
+                                f"source={_res_source} | quality={_res_quality} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
                             )
                         else:
                             if _res_relaxed_setup:
@@ -10318,13 +10554,14 @@ def run_scanner_loop():
                                         "resistance_r": _res_r,
                                         "relaxed": _res_relaxed_setup,
                                         "structural": _res_is_structural,
+                                        "resistance_quality": _res_quality,
                                         "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
                                         "category": "trade_quality",
                                     },
                                 )
                                 logger.info(
                                     f"⛔ {symbol} rejected: near_resistance_before_tp1 | "
-                                    f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                    f"source={_res_source} | quality={_res_quality} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
                                     f"relaxed={_res_relaxed_setup} | limits=dist<{_hard_dist_limit}/R<{_hard_r_limit}"
                                 )
                                 continue
