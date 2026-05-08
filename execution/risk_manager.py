@@ -19,11 +19,11 @@ def _safe_float(value, default=0.0) -> float:
 
 
 def _configured_max_positions() -> int:
-    # Final agreed rule: execution active limit is 7. Env can lower/raise if explicitly set later.
+    # Execution active limit follows config default (100). Env can lower/raise if explicitly set later.
     try:
-        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", "7"))
+        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", str(MAX_OPEN_POSITIONS)))
     except Exception:
-        return 7
+        return int(MAX_OPEN_POSITIONS)
 
 
 def _candidate_score(candidate: dict) -> float:
@@ -38,8 +38,8 @@ def can_execute_trade(redis_client, symbol: str, candidate: dict, market_mode: s
     - main.py sends only Execution Candidates.
     - BLOCK_LONGS does not block execution candidates.
     - No setup whitelist here.
-    - Max active execution trades = 7.
-    - A trade above TP1 with SL moved to entry does not count toward the 7.
+    - Max active execution trades = configured MAX_OPEN_POSITIONS / EXECUTION_MAX_ACTIVE_TRADES.
+    - A trade above TP1 with SL moved to entry does not count toward the active limit.
     - Same symbol is blocked only while an active execution trade exists and has not reached TP2.
     - Daily drawdown lock is handled in main.py by setting the same stop-trading pause key.
     """
