@@ -9,7 +9,7 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 OKX_SIMULATED = os.getenv("OKX_SIMULATED", "1").strip()
 
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "15"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "100"))  # TEMP TESTING ONLY - reduce before live trading
 MIN_EXECUTION_SCORE = float(os.getenv("MIN_EXECUTION_SCORE", "7.0"))
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").strip()
 REQUEST_TIMEOUT = 15
