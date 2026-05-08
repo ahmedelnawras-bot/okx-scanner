@@ -1,6 +1,6 @@
-# Version: main_v06_final_full_agreements_ready
+# Version: main_v08_modes_ui_final
 # Date: 2026-05-08
-# Changes: Full agreements restored: execution report final layout, 1h command, resistance/precision refinements, concise 15m reminders, BLOCK exit timing
+# Changes: UI/Text only for Market Mood and Reminder; no logic/filter/execution changes
 
 import os 
 import sys 
@@ -2475,13 +2475,65 @@ def load_market_status_snapshot(max_age_seconds: int = 240):
 # MARKET MODE ARABIC DESCRIPTION
 # =========================
 def get_market_mode_arabic_description(mode: str) -> str:
+    mode = normalize_market_mode(mode)
     mapping = {
-        MODE_NORMAL_LONG: "🟢 الوضع طبيعي: السوق يسمح بإشارات اللونج العادية حسب الفلاتر. أفضل تعامل: متابعة الفرص بدون تهور.",
-        MODE_STRONG_LONG_ONLY: "🟡 وضع حذر: السوق فيه ضعف أو تذبذب، يسمح فقط بأقوى فرص اللونج (إعدادات محددة، سكور ≥ 8.0، فوليوم ≥ 1.2). أفضل تعامل: انتقاء setups قوية فقط وعدم مطاردة الحركة.",
-        MODE_BLOCK_LONGS: "🔴 وضع حماية: السوق في ضغط أو هبوط جماعي. الإشارات العادية يتم تشديدها/منعها حسب الفلاتر، لكن Execution Candidates مسموحة فقط إذا اجتازت قواعد التنفيذ: حد الـ7، عدم تكرار نفس الزوج، Daily DD، وصحة بيانات الأمر.",
-        MODE_RECOVERY_LONG: "🔵 وضع تعافي: السوق يحاول الخروج من هبوط، يسمح بفرص تعافي محدودة وبحذر. أفضل تعامل: حجم أقل وتأكيد أقوى.",
+        MODE_NORMAL_LONG: "السوق طبيعي، الإشارات العادية مسموحة حسب الفلاتر.",
+        MODE_STRONG_LONG_ONLY: "السوق فيه ضعف أو تذبذب نسبي، لذلك يتم التركيز على الفرص الأقوى فقط.",
+        MODE_BLOCK_LONGS: "السوق تحت ضغط أو هبوط جماعي، لذلك يتم تفعيل وضع الحماية وتشديد الدخول.",
+        MODE_RECOVERY_LONG: "السوق يحاول التعافي بعد ضغط، لذلك يسمح بفرص Recovery محدودة وبحذر.",
     }
-    return mapping.get(mode, "ℹ️ وضع غير معروف")
+    return mapping.get(mode, "وضع غير معروف")
+
+
+def get_market_mode_reason_text(mode: str, suggested_reason: str = "") -> str:
+    mode = normalize_market_mode(mode)
+    if suggested_reason:
+        reason = str(suggested_reason)
+        # Keep user-facing text clean while preserving the calculated reason.
+        if reason in ("السوق ضعيف/مختلط لكن ليس كراش", "market weak/mixed but not crash"):
+            return "السوق متماسك لكن الزخم غير كافي لفتح التنفيذ بحرية كاملة."
+        if reason in ("السوق طبيعي", "normal market"):
+            return "السوق مستقر بما يكفي للسماح بالإشارات العادية مع فلاتر الجودة."
+        if "block" in reason.lower() or "كراش" in reason or "ضغط" in reason:
+            return "السوق يظهر ضغط واضح، لذلك يتم تشديد الدخول وحماية الصفقات المفتوحة."
+    mapping = {
+        MODE_NORMAL_LONG: "السوق مستقر بما يكفي للسماح بالإشارات العادية مع فلاتر الجودة.",
+        MODE_STRONG_LONG_ONLY: "السوق متماسك لكن الزخم غير كافي لفتح التنفيذ بحرية كاملة.",
+        MODE_BLOCK_LONGS: "السوق يظهر ضغط واضح، لذلك يتم تشديد الدخول وحماية الصفقات المفتوحة.",
+        MODE_RECOVERY_LONG: "السوق في مرحلة تعافي محتملة بعد ضغط، ويحتاج تأكيد أقوى قبل التنفيذ.",
+    }
+    return mapping.get(mode, str(suggested_reason or "لا يوجد سبب واضح"))
+
+
+def get_market_mode_allowed_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_NORMAL_LONG:
+        return [
+            "• الإشارات العادية مسموحة حسب الفلاتر",
+            "• التنفيذ التجريبي يخضع للـ Whitelist + Quality Filters",
+            "• Weak Drift يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة",
+        ]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return [
+            f"• Score ≥ {STRONG_ONLY_MIN_SCORE}",
+            f"• Volume ≥ {STRONG_ONLY_MIN_VOL_RATIO}",
+            "• تأكيد فريم الساعة مفضل",
+            "• تجنب المطاردة والدخول المتأخر",
+        ]
+    if mode == MODE_BLOCK_LONGS:
+        return [
+            "• الإشارات العادية ممنوعة أو مشددة جدًا",
+            "• التنفيذ فقط لاستثناءات قوية جدًا حسب قواعد التنفيذ",
+            "• حماية الصفقات المفتوحة الرابحة إن وجدت",
+            "• Weak Drift ثانوي لأن BLOCK أصلاً متشدد",
+        ]
+    if mode == MODE_RECOVERY_LONG:
+        return [
+            "• فرص Recovery محدودة وبحذر",
+            "• تأكيد التعافي مطلوب",
+            "• التنفيذ: Recovery confirmed + Whitelist",
+        ]
+    return ["• مراقبة السوق قبل الدخول"]
 
 # =========================
 # MARKET STATUS MESSAGE
@@ -2490,44 +2542,37 @@ def build_market_status_message() -> str:
  try:
     snapshot = load_market_status_snapshot(max_age_seconds=300)
     if snapshot:
-        created_ts = int(snapshot.get("created_ts", 0))
-        age_seconds = max(0, int(time.time()) - created_ts)
-        age_str = f"منذ {age_seconds}s" if age_seconds < 60 else f"منذ {age_seconds // 60}m"
         current_mode = normalize_market_mode(snapshot.get("current_mode", MODE_NORMAL_LONG))
         mode_reason = snapshot.get("mode_reason", "")
         btc_mode = snapshot.get("btc_mode", "🟡 محايد")
-        btc_zone = snapshot.get("btc_zone", {}) or {}
-        alt_snapshot = snapshot.get("alt_snapshot", {})
+        alt_snapshot = snapshot.get("alt_snapshot", {}) or {}
         alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
-        market_info = snapshot.get("market_info", {})
+        market_info = snapshot.get("market_info", {}) or {}
         market_state_label = market_info.get("market_state_label", "Mixed")
         market_bias_label = market_info.get("market_bias_label", "السوق مختلط")
-        market_guard = snapshot.get("market_guard", {})
+        market_guard = snapshot.get("market_guard", {}) or {}
         red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
         avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
-        valid_count = int(market_guard.get("valid_count", 0) or 0)
         guard_level = str(market_guard.get("level", "normal"))
         suggested_mode = normalize_market_mode(snapshot.get("suggested_mode", snapshot.get("current_mode", MODE_NORMAL_LONG)))
         suggested_reason = snapshot.get("suggested_reason", mode_reason)
-        data_source = f"📦 Snapshot ({age_str})"
     else:
         current_mode = normalize_market_mode(r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG)
         if not current_mode:
             current_mode = MODE_NORMAL_LONG
         btc_mode = get_btc_mode()
-        btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
         ranked_pairs = get_ranked_pairs()
         alt_snapshot = get_alt_market_snapshot(ranked_pairs)
         alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
         market_info = get_market_state(btc_mode, alt_snapshot)
         market_state_label = market_info.get("market_state_label", "Mixed")
         market_bias_label = market_info.get("market_bias_label", "السوق مختلط")
+        btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
         market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot, btc_zone=btc_zone)
         red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
         avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
-        valid_count = int(market_guard.get("valid_count", 0) or 0)
         guard_level = str(market_guard.get("level", "normal"))
         mode_result = determine_long_market_mode(
             market_guard=market_guard,
@@ -2539,52 +2584,62 @@ def build_market_status_message() -> str:
         )
         suggested_mode = mode_result.get("mode", current_mode)
         suggested_reason = mode_result.get("reason", "")
-        age_seconds = 0
-        data_source = "⚠️ Live (Snapshot غير متاح)"
-        age_str = ""
 
     mode_ar = _market_mode_label(current_mode)
     suggested_mode_ar = _market_mode_label(suggested_mode)
     mode_desc = get_market_mode_arabic_description(current_mode)
+    reason_text = get_market_mode_reason_text(current_mode, suggested_reason)
     action = get_market_mode_action_text(current_mode)
+    allowed_lines = get_market_mode_allowed_lines(current_mode)
+
+    last_mode = MODE_NORMAL_LONG
+    try:
+        if r:
+            last_mode = normalize_market_mode(r.get(MARKET_MODE_LAST_KEY) or current_mode)
+    except Exception:
+        last_mode = current_mode
+    transition = f"{_market_mode_label(last_mode)} → {mode_ar}" if last_mode != current_mode else f"{mode_ar}"
 
     lines = [
         "🧭 <b>Market Mood - LONG</b>",
+        "",
         f"⚙️ <b>المود الحالي:</b> {mode_ar}",
-        f"📋 <b>الوصف:</b> {mode_desc}",
-        f"🔮 <b>المود المحسوب الآن:</b> {suggested_mode_ar}",
-        f"🧠 <b>سبب الحساب:</b> {html.escape(str(suggested_reason))}",
-        f"📡 <b>مصدر البيانات:</b> {data_source}",
-    ]
-    if age_seconds > 0:
-        lines.append(f"⏱ <b>عمر البيانات:</b> {age_str}")
-    btc_zone_label = str((btc_zone or {}).get("label", "⚪ BTC Zone غير متاح"))
-    btc_zone_pos = (btc_zone or {}).get("position_pct")
-    btc_zone_adj = float((btc_zone or {}).get("score_adjustment", 0.0) or 0.0)
-    btc_zone_extra = f" | Pos {btc_zone_pos}%" if btc_zone_pos is not None else ""
-    btc_zone_extra += f" | Score {btc_zone_adj:+.2f}" if btc_zone_adj else ""
-
-    lines.extend([
+        f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
+        "",
+        f"🔄 <b>الانتقال:</b> {transition}",
+        "",
+        f"🧠 <b>السبب:</b> {html.escape(reason_text)}",
         "",
         "🌍 <b>السوق:</b>",
         f"• BTC: {html.escape(str(btc_mode))}",
-        f"• BTC Zone: {html.escape(btc_zone_label + btc_zone_extra)}",
         f"• Alt Mode: {html.escape(str(alt_mode))}",
         f"• State: {html.escape(str(market_state_label))}",
         f"• Flow: {html.escape(str(market_bias_label))}",
         "",
         "🛡 <b>Market Guard 15m:</b>",
         f"• Level: {html.escape(guard_level)}",
-        f"• Sample: {valid_count}",
         f"• Red Ratio: {red_ratio * 100:.1f}%",
         f"• Avg 15m: {avg_change:+.2f}%",
         f"• BTC 15m: {btc_change:+.2f}%",
         "",
-        f"🎯 <b>التصرف:</b> {html.escape(action)}",
+        "🎯 <b>التصرف:</b>",
+        html.escape(action),
+        "",
+        "✅ <b>المسموح:</b>",
+    ]
+    lines.extend([html.escape(x) for x in allowed_lines])
+    lines.extend([
+        "",
+        "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
     ])
+    if current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
+        lines.append("🧩 <b>Weak Drift:</b> يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة العادية.")
     if suggested_mode != current_mode:
-        lines.append("")
-        lines.append("ℹ️ المود المحسوب يختلف عن المود الحالي، وسيتم تطبيقه مع دورة الفحص القادمة")
+        lines.extend([
+            "",
+            f"🔮 <b>المود المحسوب الآن:</b> {suggested_mode_ar}",
+            "ℹ️ سيتم تطبيقه مع دورة الفحص القادمة إذا استمر الشرط.",
+        ])
     return "\n".join(lines)
  except Exception as e:
     logger.error(f"build_market_status_message error: {e}")
@@ -8092,14 +8147,14 @@ def _market_mode_label(mode: str) -> str:
 def get_market_mode_action_text(mode: str) -> str:
     mode = normalize_market_mode(mode)
     if mode == MODE_NORMAL_LONG:
-        return "✅ مسموح باللونج العادي مع الالتزام بالفلاتر."
+        return "• الإشارات العادية: مسموحة حسب الفلاتر\n• التنفيذ التجريبي: Whitelist + Quality Filters"
     if mode == MODE_STRONG_LONG_ONLY:
-        return "⚠️ الإشارات العادية مقتصرة على أقوى الفرص فقط؛ Execution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
+        return "• الإشارات العادية: أقوى الفرص فقط\n• التنفيذ التجريبي: حركة قوية + Whitelist"
     if mode == MODE_BLOCK_LONGS:
-        return "🛡 الإشارات العادية تحت حماية مشددة، لكن Execution Candidates مسموحة حسب قواعد التنفيذ الجديدة فقط: حد الـ7 + عدم تكرار نفس الزوج + Daily DD + صحة بيانات الأمر."
+        return "• الإشارات العادية: ممنوعة أو مشددة جدًا\n• التنفيذ التجريبي: استثناءات قوية جدًا فقط"
     if mode == MODE_RECOVERY_LONG:
-        return "🛟 فرص Recovery فقط وبحذر، وExecution Candidates تدخل التنفيذ حسب قواعد التنفيذ الجديدة."
-    return "ℹ️ مراقبة السوق قبل الدخول"
+        return "• الإشارات العادية: فرص Recovery محدودة\n• التنفيذ التجريبي: Recovery confirmed + Whitelist"
+    return "• مراقبة السوق قبل الدخول"
 
 
 def get_market_mode_execution_policy_short(mode: str) -> str:
