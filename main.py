@@ -3653,8 +3653,9 @@ def build_execution_report_message(period: str = "all") -> str:
             return f"\u200e{v:+.2f}$"
 
         def exposure(v: float) -> str:
-            # LRM keeps Telegram RTL rendering stable: +0.00% Exposure
-            return f"\u200e{_pct_safe(v)} Exposure"
+            # Compact label keeps Telegram report inside fewer lines.
+            # LRM keeps Telegram RTL rendering stable: +0.00% Exp
+            return f"\u200e{_pct_safe(v)} Exp"
 
         def compact_setup(trade: dict) -> str:
             setup = str(
@@ -3777,12 +3778,12 @@ def build_execution_report_message(period: str = "all") -> str:
             "💰 <b>Wallet Impact</b>",
             f"📌 رأس المال: {wallet_capital_usd:.0f}$",
             "✅ <b>المحقق</b>",
-            f"📈 أرباح محققة: {money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
-            f"📉 خسائر محققة: {money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
-            f"⚖️ صافي محقق: {money(realized_net_usd)} | {exposure(realized_net_pct)}",
+            f"📈 ربح: {money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
+            f"📉 خسارة: {money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
+            f"⚖️ صافي: {money(realized_net_usd)} | {exposure(realized_net_pct)}",
             "🔄 <b>الصفقات المفتوحة</b>",
-            f"📈 أرباح عائمة: {money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
-            f"📉 خسائر عائمة: {money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
+            f"📈 ربح عائم: {money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
+            f"📉 خسارة عائمة: {money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
             f"⚖️ صافي عائم: {money(floating_net_usd)} | {exposure(floating_net_pct)}",
             "🏦 <b>التأثير الحالي على المحفظة:</b>",
             f"{impact_icon} {money(portfolio_net_usd)} | {wallet_pct:+.2f}%",
