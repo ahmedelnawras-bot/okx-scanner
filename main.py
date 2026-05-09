@@ -191,6 +191,10 @@ ALERT_TTL_SECONDS = 14 * 24 * 3600
 EXECUTION_PAUSE_KEY = "execution:paused:long"
 EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT = 35.0
 EXECUTION_DRAWDOWN_LOCK_REASON_KEY = "execution:drawdown_lock_reason:long"
+EXECUTION_DAILY_START_EQUITY_KEY = "execution:daily_start_equity:long"
+EXECUTION_DAILY_START_TS_KEY = "execution:daily_start_ts:long"
+EXECUTION_WALLET_FALLBACK_USD = float(os.getenv("EXECUTION_WALLET_SIZE_USD", os.getenv("EXEC_REPORT_WALLET_USD", "1000")) or 1000)
+EXECUTION_TRADE_MARGIN_USD = float(os.getenv("EXEC_REPORT_TRADE_MARGIN_USD", "35") or 35)
 
 # Track leverage display
 TRACK_LEVERAGE = 15.0
@@ -1710,17 +1714,26 @@ def get_execution_max_active_trades_display() -> int:
 def build_dynamic_help_note() -> str:
     """Dynamic help footer. UI only; does not change any execution rule."""
     max_trades = get_execution_max_active_trades_display()
+    guard = get_execution_daily_guard_snapshot()
+    equity = guard.get("start_equity_usd", EXECUTION_WALLET_FALLBACK_USD)
+    limit_pct = guard.get("limit_pct", EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT)
+    limit_usd = guard.get("limit_usd", 0.0)
+    source = guard.get("equity_source", "config")
+    source_note = "Simulation/config" if source != "okx" else "OKX"
     if is_execution_paused():
         return (
             "ℹ️ <b>التنفيذ الآن:</b> متوقف مؤقتًا ⏸\n"
             "الإشارات ستظهر عادي، لكن التنفيذ لن يقبل صفقات حتى /resume_trading.\n"
+            f"💰 رأس مال بداية اليوم: <b>{equity:.2f}$</b> ({html.escape(source_note)})\n"
+            f"🛑 حد الإيقاف اليومي: <b>-{limit_pct:.0f}%</b> من رأس مال بداية اليوم ≈ <b>-{abs(limit_usd):.2f}$</b>\n"
             f"عدد الصفقات المسموح بها: <b>{max_trades}</b>"
         )
     return (
         "ℹ️ <b>التنفيذ الآن:</b> مفعّل ✅\n"
+        f"💰 رأس مال بداية اليوم: <b>{equity:.2f}$</b> ({html.escape(source_note)})\n"
+        f"🛑 حد الإيقاف اليومي: <b>-{limit_pct:.0f}%</b> من رأس مال بداية اليوم ≈ <b>-{abs(limit_usd):.2f}$</b>\n"
         f"عدد الصفقات المسموح بها: <b>{max_trades}</b>"
     )
-
 
 def build_help_message() -> str:
  return f"""<b>😋 OKX Scanner Bot - LONG</b>
@@ -1744,6 +1757,8 @@ def build_help_message() -> str:
 /report_execution_today — اليوم
 /report_execution_7d — آخر 7 أيام
 /report_execution_30d — آخر 30 يوم
+/report_execution_losses — خسائر صفقات التنفيذ فقط
+/report_execution_guard — حالة Daily DD / Wallet Guard
 
 <b>⚙️ أوامر التنفيذ:</b>
 /exec_status — اختبار OKX
@@ -1829,7 +1844,8 @@ def build_how_it_work_message() -> str:
 🛡️ <b>8) مرحلة التنفيذ والمخاطر:</b>
 Risk Manager يفحص:
 • هل التنفيذ مفعّل أم متوقف؟
-• Daily DD Lock.
+• Daily DD Lock محسوب من Wallet Impact الحقيقي على رأس مال بداية اليوم، وليس من مجموع نسب الصفقات بعد الرافعة.
+• في Simulation يتم استخدام رأس المال من الإعدادات، وفي Live يُقرأ رأس مال بداية اليوم من OKX لاحقًا.
 • عدد الصفقات المسموح بها.
 • نفس الزوج مفتوح أم لا.
 • حدود المخاطرة.
@@ -2722,7 +2738,7 @@ def build_market_status_message() -> str:
         "✅ <b>المسموح:</b>",
     ]
     lines.extend([html.escape(x) for x in allowed_lines])
-    if new_mode == MODE_BLOCK_LONGS:
+    if current_mode == MODE_BLOCK_LONGS:
         lines.extend([
             "",
             "🛡️ <b>حماية BLOCK:</b>",
@@ -3653,6 +3669,143 @@ def build_execution_report_message(period: str = "all") -> str:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
 
+
+def build_execution_guard_report_message() -> str:
+    try:
+        snap = get_execution_daily_guard_snapshot()
+        start_ts = int(snap.get("day_start_ts", get_local_day_start_ts()) or get_local_day_start_ts())
+        start_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(start_ts))
+        locked = bool(snap.get("locked", False))
+        status = "🔒 LOCKED" if locked else "✅ ACTIVE"
+        reason = html.escape(str(snap.get("reason") or "—"))
+        equity = float(snap.get("start_equity_usd", 0.0) or 0.0)
+        net_usd = float(snap.get("daily_net_usd", 0.0) or 0.0)
+        dd_pct = float(snap.get("daily_dd_pct", 0.0) or 0.0)
+        limit_pct = float(snap.get("limit_pct", EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT) or EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT)
+        limit_usd = float(snap.get("limit_usd", 0.0) or 0.0)
+        source = html.escape(str(snap.get("equity_source", "config")))
+        margin = float(snap.get("trade_margin_usd", EXECUTION_TRADE_MARGIN_USD) or EXECUTION_TRADE_MARGIN_USD)
+        return "\n".join([
+            "🛡️ <b>Execution Guard / Daily DD</b>",
+            "━━━━━━━━━━━━",
+            f"📌 الحالة: <b>{status}</b>",
+            f"🕛 بداية اليوم: {html.escape(start_text)}",
+            f"💰 رأس مال بداية اليوم: <b>{equity:.2f}$</b> ({source})",
+            f"📍 Margin لكل صفقة في الحساب: {margin:.2f}$",
+            "",
+            f"📊 صافي تأثير اليوم: <b>{net_usd:+.2f}$</b>",
+            f"📉 Daily DD الحالي: <b>{dd_pct:+.2f}%</b>",
+            f"🛑 حد الإيقاف: <b>-{limit_pct:.0f}%</b> ≈ <b>{limit_usd:.2f}$</b>",
+            f"🧾 سبب القفل: {reason}",
+            "",
+            "ℹ️ الحساب الحالي يعتمد على Wallet Impact الحقيقي وليس مجموع نسب الصفقات بعد الرافعة.",
+            "⚠️ في Simulation الرصيد من الإعدادات، وفي Live سيتم ربط رأس مال بداية اليوم من OKX لاحقًا.",
+        ])
+    except Exception as e:
+        logger.error(f"build_execution_guard_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير Execution Guard: {html.escape(str(e))}"
+
+
+def build_execution_losses_report_message() -> str:
+    try:
+        try:
+            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=None, include_open=True)
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1500)
+        trades = [
+            t for t in trades
+            if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")
+        ]
+        losses = []
+        for t in trades:
+            if _is_execution_trade_open(t):
+                continue
+            pnl = _execution_final_pnl_pct(t)
+            result = str(t.get("result", "") or "").lower()
+            if (pnl is not None and pnl < 0) or result == "loss":
+                losses.append((t, pnl if pnl is not None else 0.0))
+        if not losses:
+            return "📭 لا توجد خسائر لصفقات التنفيذ حتى الآن."
+        from collections import Counter
+        reasons = Counter()
+        setups = Counter()
+        timings = Counter()
+        modes = Counter()
+        scores = Counter()
+        for t, pnl in losses:
+            for key in ("reasons", "warning_reasons"):
+                vals = _trade_field(t, key, []) or []
+                if isinstance(vals, str):
+                    vals = [vals]
+                for reason in vals:
+                    txt = str(reason or "").strip()
+                    if txt:
+                        reasons[txt] += 1
+            setup = str(_trade_field(t, "setup_type", "unknown") or "unknown").strip() or "unknown"
+            setups[setup] += 1
+            timing = str(_trade_field(t, "entry_timing", "unknown") or "unknown").strip() or "unknown"
+            timings[timing] += 1
+            mode = str(_trade_field(t, "market_state_label", _trade_field(t, "market_state", "unknown")) or "unknown").strip() or "unknown"
+            modes[mode] += 1
+            score = _safe_trade_float_value(_trade_field(t, "score", None), None)
+            if score is None:
+                scores["N/A"] += 1
+            elif score < 7:
+                scores["<7"] += 1
+            elif score < 8:
+                scores["7-7.9"] += 1
+            elif score < 9:
+                scores["8-8.9"] += 1
+            else:
+                scores["9+"] += 1
+
+        total_loss_pct = sum(float(p or 0.0) for _, p in losses)
+        avg_loss_pct = total_loss_pct / len(losses) if losses else 0.0
+        pct_to_usd = float(EXECUTION_TRADE_MARGIN_USD or 35.0) / 100.0
+        total_loss_usd = total_loss_pct * pct_to_usd
+
+        def top_lines(counter, limit=8):
+            if not counter:
+                return ["• لا توجد بيانات"]
+            return [f"• {html.escape(str(k))}: {v}" for k, v in counter.most_common(limit)]
+
+        lines = [
+            "📉 <b>Execution Losses Report</b>",
+            "━━━━━━━━━━━━",
+            f"إجمالي صفقات التنفيذ: <b>{len(trades)}</b>",
+            f"الخسائر المغلقة: <b>{len(losses)}</b>",
+            f"متوسط الخسارة بعد الرافعة: <b>{avg_loss_pct:.2f}%</b>",
+            f"تأثير الخسائر التقريبي: <b>{total_loss_usd:.2f}$</b>",
+            "",
+            "🔴 <b>أكثر الأسباب تكرارًا:</b>",
+            *top_lines(reasons, 10),
+            "",
+            "🧩 <b>الخسائر حسب setup:</b>",
+            *top_lines(setups, 8),
+            "",
+            "⏱ <b>الخسائر حسب توقيت الدخول:</b>",
+            *top_lines(timings, 8),
+            "",
+            "🌍 <b>الخسائر حسب السوق:</b>",
+            *top_lines(modes, 6),
+            "",
+            "⭐ <b>الخسائر حسب السكور:</b>",
+            *top_lines(scores, 6),
+            "",
+            "📌 <b>آخر 5 خسائر تنفيذ:</b>",
+        ]
+        for t, pnl in sorted(losses, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]:
+            symbol = html.escape(str(t.get("symbol", "?") or "?"))
+            setup = html.escape(str(_trade_field(t, "setup_type", "") or ""))
+            status = html.escape(_execution_status_for_trade(t))
+            lines.append(f"• 🔴 <b>{symbol}</b> | {pnl:.2f}% | {status}")
+            if setup:
+                lines.append(f"  🧠 {setup[:90]}")
+        return _limit_telegram_message("\n".join(lines))
+    except Exception as e:
+        logger.error(f"build_execution_losses_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير خسائر التنفيذ: {html.escape(str(e))}"
+
 def build_setup_performance_report_message() -> str:
     try:
         trades = _load_long_trades_from_redis(limit=1500)
@@ -3916,6 +4069,8 @@ COMMAND_HANDLERS = {
  "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
  "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
  "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
+ "/report_execution_losses": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_guard": lambda chat_id: send_telegram_reply(chat_id, build_execution_guard_report_message()),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -8856,45 +9011,138 @@ def _is_trade_counted_for_execution_drawdown_guard(trade: dict) -> bool:
         return False
 
 
-def _execution_daily_pnl_pct() -> float:
-    """Calculate today's executed/accepted-preview PnL after leverage from tracked trades."""
+def _execution_day_key() -> str:
     try:
-        since_ts = get_local_day_start_ts()
-        try:
-            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
-        except Exception:
-            trades = _load_long_trades_from_redis(limit=1500)
-            trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
-        trades = [t for t in trades if _is_trade_counted_for_execution_drawdown_guard(t)]
-        total = 0.0
+        return str(int(get_local_day_start_ts()))
+    except Exception:
+        return time.strftime("%Y%m%d", time.localtime())
+
+
+def _get_simulated_start_equity_usd() -> float:
+    try:
+        return float(EXECUTION_WALLET_FALLBACK_USD or 1000.0)
+    except Exception:
+        return 1000.0
+
+
+def get_execution_daily_start_equity_usd() -> tuple:
+    """Return fixed start-of-day equity for Daily DD.
+
+    Current safe mode uses config/simulation value. Live OKX equity sync can be
+    connected later without changing the Daily DD math.
+    """
+    day_key = _execution_day_key()
+    fallback = _get_simulated_start_equity_usd()
+    if not r:
+        return fallback, "config"
+    try:
+        stored_day = str(r.get(EXECUTION_DAILY_START_TS_KEY) or "")
+        stored_equity = r.get(EXECUTION_DAILY_START_EQUITY_KEY)
+        if stored_day == day_key and stored_equity not in (None, ""):
+            equity = float(stored_equity)
+            if equity > 0:
+                return equity, "redis"
+        r.set(EXECUTION_DAILY_START_TS_KEY, day_key)
+        r.set(EXECUTION_DAILY_START_EQUITY_KEY, str(fallback))
+        return fallback, "config"
+    except Exception as e:
+        logger.warning(f"get_execution_daily_start_equity_usd error: {e}")
+        return fallback, "config"
+
+
+def _load_daily_execution_guard_trades() -> list:
+    since_ts = get_local_day_start_ts()
+    try:
+        trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
+    except Exception:
+        trades = _load_long_trades_from_redis(limit=1500)
+        trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+    return [t for t in trades if _is_trade_counted_for_execution_drawdown_guard(t)]
+
+
+def _execution_daily_wallet_net_usd() -> float:
+    """Today's execution Wallet Impact in USD, using 40/40/20 PnL helpers."""
+    try:
+        trades = _load_daily_execution_guard_trades()
+        net_pct = 0.0
         for t in trades:
             pnl = _execution_floating_pnl_pct(t) if _is_execution_trade_open(t) else _execution_final_pnl_pct(t)
             if pnl is not None:
-                total += float(pnl)
-        return float(total)
+                net_pct += float(pnl)
+        return float(net_pct) * (float(EXECUTION_TRADE_MARGIN_USD or 35.0) / 100.0)
     except Exception as e:
-        logger.warning(f"_execution_daily_pnl_pct error: {e}")
+        logger.warning(f"_execution_daily_wallet_net_usd error: {e}")
         return 0.0
 
 
-def enforce_execution_daily_drawdown_guard() -> dict:
-    """Stop execution like /stop_trading when daily execution drawdown reaches -35%."""
-    if not r:
-        return {"locked": False, "pnl": 0.0}
+def get_execution_daily_guard_snapshot() -> dict:
+    """Current Daily DD status based on Wallet Impact / start-of-day equity."""
     try:
+        equity, source = get_execution_daily_start_equity_usd()
+        net_usd = _execution_daily_wallet_net_usd()
+        dd_pct = (net_usd / equity * 100.0) if equity else 0.0
+        limit_pct = float(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT or 35.0)
+        limit_usd = -abs(equity * limit_pct / 100.0) if equity else 0.0
+        locked = bool(is_execution_paused())
+        reason = ""
+        if r:
+            try:
+                reason = str(r.get(EXECUTION_DRAWDOWN_LOCK_REASON_KEY) or "")
+            except Exception:
+                reason = ""
+        return {
+            "start_equity_usd": float(equity or 0.0),
+            "equity_source": source,
+            "daily_net_usd": float(net_usd or 0.0),
+            "daily_dd_pct": float(dd_pct or 0.0),
+            "limit_pct": limit_pct,
+            "limit_usd": float(limit_usd or 0.0),
+            "locked": locked,
+            "reason": reason,
+            "day_start_ts": get_local_day_start_ts(),
+            "trade_margin_usd": float(EXECUTION_TRADE_MARGIN_USD or 35.0),
+        }
+    except Exception as e:
+        logger.warning(f"get_execution_daily_guard_snapshot error: {e}")
+        return {
+            "start_equity_usd": _get_simulated_start_equity_usd(),
+            "equity_source": "config",
+            "daily_net_usd": 0.0,
+            "daily_dd_pct": 0.0,
+            "limit_pct": float(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT or 35.0),
+            "limit_usd": -abs(_get_simulated_start_equity_usd() * float(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT or 35.0) / 100.0),
+            "locked": bool(is_execution_paused()),
+            "reason": "snapshot_error",
+            "day_start_ts": get_local_day_start_ts(),
+            "trade_margin_usd": float(EXECUTION_TRADE_MARGIN_USD or 35.0),
+        }
+
+
+def _execution_daily_pnl_pct() -> float:
+    """Compatibility: Daily DD % based on Wallet Impact, not summed leveraged trade percentages."""
+    return float(get_execution_daily_guard_snapshot().get("daily_dd_pct", 0.0) or 0.0)
+
+
+def enforce_execution_daily_drawdown_guard() -> dict:
+    """Stop execution when daily Wallet Impact drawdown reaches configured limit."""
+    if not r:
+        return {"locked": False, "pnl": 0.0, "wallet_net_usd": 0.0}
+    try:
+        snapshot = get_execution_daily_guard_snapshot()
+        daily_dd_pct = float(snapshot.get("daily_dd_pct", 0.0) or 0.0)
+        daily_net_usd = float(snapshot.get("daily_net_usd", 0.0) or 0.0)
         if is_execution_paused():
-            return {"locked": True, "pnl": _execution_daily_pnl_pct(), "reason": "execution_paused"}
-        daily_pnl = _execution_daily_pnl_pct()
-        if daily_pnl <= -abs(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT):
-            reason = f"daily_drawdown_{daily_pnl:.2f}%"
+            return {"locked": True, "pnl": daily_dd_pct, "wallet_net_usd": daily_net_usd, "reason": "execution_paused"}
+        if daily_dd_pct <= -abs(EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT):
+            reason = f"daily_wallet_drawdown_{daily_dd_pct:.2f}%_{daily_net_usd:.2f}$"
             r.set(EXECUTION_PAUSE_KEY, "1")
             r.set(EXECUTION_DRAWDOWN_LOCK_REASON_KEY, reason)
-            logger.warning(f"EXECUTION DAILY DRAWDOWN LOCK: {reason}")
-            return {"locked": True, "pnl": daily_pnl, "reason": reason}
-        return {"locked": False, "pnl": daily_pnl}
+            logger.warning(f"EXECUTION DAILY WALLET DRAWDOWN LOCK: {reason}")
+            return {"locked": True, "pnl": daily_dd_pct, "wallet_net_usd": daily_net_usd, "reason": reason}
+        return {"locked": False, "pnl": daily_dd_pct, "wallet_net_usd": daily_net_usd}
     except Exception as e:
         logger.warning(f"enforce_execution_daily_drawdown_guard error: {e}")
-        return {"locked": False, "pnl": 0.0}
+        return {"locked": False, "pnl": 0.0, "wallet_net_usd": 0.0}
 
 
 def _normalize_execution_status(status: str, reason: str = "") -> str:
