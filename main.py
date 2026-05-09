@@ -2938,10 +2938,48 @@ def _ensure_execution_setup_tags(candidate: dict) -> dict:
 
 
 def _has_strict_execution_setup(data: dict) -> bool:
-    """Execution whitelist: only agreed setup tags become Execution Candidates."""
+    """Execution whitelist: only detector-approved setup tags become Execution Candidates.
+
+    Keep execution matching intentionally strict:
+    - Use primary_extra_setup / extra_setup_names from detect_extra_strong_long_setups().
+    - Allow relative_strength_vs_btc only when the explicit bool flag is True.
+    - Do not whitelist based on setup_type, wave_context, wave_label, wave_estimate,
+      entry_maturity, or other descriptive/context fields.
+    """
     try:
-        tags = set(_collect_execution_setup_tags(data))
-        return any(_normalize_execution_tag(k) in tags for k in EXECUTION_WHITELIST_KEYWORDS)
+        if not isinstance(data, dict):
+            return False
+        diagnostics = data.get("diagnostics", {}) or {}
+        allowed = {_normalize_execution_tag(k) for k in EXECUTION_WHITELIST_KEYWORDS}
+        tags = set()
+
+        def add_detector_value(value):
+            if value is None or value == "":
+                return
+            if isinstance(value, dict):
+                for v in value.values():
+                    add_detector_value(v)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_detector_value(item)
+                return
+            if isinstance(value, bool):
+                return
+            for part in str(value).replace(",", "|").replace(";", "|").split("|"):
+                tag = _normalize_execution_tag(part)
+                if tag:
+                    tags.add(tag)
+
+        for key in ("primary_extra_setup", "extra_setup_names"):
+            add_detector_value(data.get(key))
+            add_detector_value(diagnostics.get(key))
+
+        rel_strength = bool(data.get("relative_strength_vs_btc")) or bool(diagnostics.get("relative_strength_vs_btc"))
+        if rel_strength:
+            tags.add("relative_strength_vs_btc")
+
+        return any(tag in allowed for tag in tags)
     except Exception:
         return False
 
@@ -3046,10 +3084,64 @@ def get_weak_trend_drift_status(candidate: dict) -> dict:
         return result
 
 
-def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
-    """Allow execution during Weak Drift only for strong whitelist momentum.
+def _get_strict_execution_setup_weight(data: dict) -> int:
+    """Return setup strength using only strict detector-approved execution sources.
 
-    Signals remain allowed; this gate only affects execution badge / preview.
+    This intentionally ignores setup_type / wave_context / wave_label / wave_estimate
+    so descriptive analysis cannot accidentally relax Weak Drift.
+    """
+    weights = {
+        "vwap_reclaim": 3,
+        "retest_breakout_confirmed": 3,
+        "liquidity_sweep_reclaim": 2,
+        "relative_strength_vs_btc": 2,
+        "wave_3": 2,
+        "support_bounce_confirmed": 2,
+        "failed_breakdown_trap": 2,
+        "higher_low_continuation": 2,
+    }
+    try:
+        if not isinstance(data, dict):
+            return 0
+        diagnostics = data.get("diagnostics", {}) or {}
+        tags = set()
+
+        def add_detector_value(value):
+            if value is None or value == "":
+                return
+            if isinstance(value, dict):
+                for v in value.values():
+                    add_detector_value(v)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_detector_value(item)
+                return
+            if isinstance(value, bool):
+                return
+            for part in str(value).replace(",", "|").replace(";", "|").split("|"):
+                tag = _normalize_execution_tag(part)
+                if tag:
+                    tags.add(tag)
+
+        for key in ("primary_extra_setup", "extra_setup_names"):
+            add_detector_value(data.get(key))
+            add_detector_value(diagnostics.get(key))
+
+        rel_strength = bool(data.get("relative_strength_vs_btc")) or bool(diagnostics.get("relative_strength_vs_btc"))
+        if rel_strength:
+            tags.add("relative_strength_vs_btc")
+
+        return max((weights.get(tag, 0) for tag in tags), default=0)
+    except Exception:
+        return 0
+
+
+def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
+    """Smart Weak Drift gate for execution only.
+
+    Normal Telegram signals remain allowed. Execution gets a controlled relaxation only
+    when the candidate has a strict detector-approved setup plus enough score/volume/MTF.
     """
     try:
         drift = get_weak_trend_drift_status(candidate)
@@ -3064,7 +3156,10 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
         ) or 0.0
         vol_ratio = _safe_trade_float_value(_trade_field(data, "vol_ratio", 0.0), 0.0) or 0.0
         mtf_confirmed = bool(_trade_field(data, "mtf_confirmed", False))
+        breakout_quality = str(_trade_field(data, "breakout_quality", "") or "").strip().lower()
+        resistance_warning = bool(_trade_field(data, "resistance_warning", ""))
         has_whitelist = _has_strict_execution_setup(data)
+        setup_weight = _get_strict_execution_setup_weight(data)
 
         entry_text = "|".join([
             str(_trade_field(data, "entry_timing", "") or ""),
@@ -3076,22 +3171,67 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             "danger", "hard_late", "overextended", "امتداد سعري", "متأخر جدًا", "نهاية موجة", "موجة خامسة"
         ))
 
-        allowed = bool(
-            has_whitelist
-            and score >= 7.5
-            and (mtf_confirmed or vol_ratio >= 1.15)
-            and not late_or_danger
-        )
-        if not allowed:
+        allowed = False
+        allow_reason = ""
+
+        if has_whitelist and not late_or_danger:
+            if breakout_quality == "strong" and mtf_confirmed and vol_ratio >= 1.10 and score >= 7.2:
+                allowed = True
+                allow_reason = "strong_breakout_mtf"
+            elif setup_weight >= 3 and score >= 7.3 and mtf_confirmed and vol_ratio >= 1.10:
+                allowed = True
+                allow_reason = "tier3_setup_mtf"
+            elif setup_weight >= 3 and score >= 7.7 and vol_ratio >= 1.25:
+                allowed = True
+                allow_reason = "tier3_setup_force"
+            elif setup_weight >= 2 and score >= 7.5 and mtf_confirmed and vol_ratio >= 1.15:
+                allowed = True
+                allow_reason = "tier2_setup_mtf"
+            elif setup_weight >= 2 and score >= 7.9 and vol_ratio >= 1.30:
+                allowed = True
+                allow_reason = "tier2_setup_force"
+            else:
+                dynamic_score = 0
+                if mtf_confirmed:
+                    dynamic_score += 2
+                if vol_ratio >= 1.50:
+                    dynamic_score += 3
+                elif vol_ratio >= 1.25:
+                    dynamic_score += 2
+                elif vol_ratio >= 1.15:
+                    dynamic_score += 1
+                if breakout_quality == "strong":
+                    dynamic_score += 2
+                elif breakout_quality in ("ok", "good"):
+                    dynamic_score += 1
+                dynamic_score += setup_weight
+                if "late" in entry_text or "متأخر" in entry_text:
+                    dynamic_score -= 1
+                if resistance_warning:
+                    dynamic_score -= 1
+
+                if dynamic_score >= 5 and score >= 7.6 and vol_ratio >= 1.15:
+                    allowed = True
+                    allow_reason = f"dynamic_{dynamic_score}"
+
+        if allowed:
             logger.info(
-                "WEAK DRIFT EXEC BLOCK | "
-                f"symbol={data.get('symbol', '?')} | reason={drift.get('reason')} | "
-                f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | whitelist={has_whitelist}"
+                "WEAK DRIFT EXEC ALLOW | "
+                f"symbol={data.get('symbol', '?')} | allow_reason={allow_reason} | drift={drift.get('reason')} | "
+                f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | setup_weight={setup_weight}"
             )
-        return allowed
+            return True
+
+        logger.info(
+            "WEAK DRIFT EXEC BLOCK | "
+            f"symbol={data.get('symbol', '?')} | reason={drift.get('reason')} | "
+            f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | "
+            f"whitelist={has_whitelist} | setup_weight={setup_weight}"
+        )
+        return False
     except Exception as e:
         logger.warning(f"_candidate_passes_weak_drift_execution_quality error: {e}")
-        return True
+        return False
 
 
 def _is_block_mode_execution_candidate(data: dict) -> bool:
