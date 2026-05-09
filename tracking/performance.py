@@ -1709,6 +1709,137 @@ def evaluate_trade_on_candle(trade: dict, candle: dict):
     return result, tp1_now, trade
 
 
+
+
+def _is_execution_managed_trade_for_block_protection(trade: dict) -> bool:
+    """Return True only for trades that reached the execution-candidate layer.
+
+    BLOCK_LONGS protection is intended for execution-managed/candidate trades only,
+    not for normal tracking-only Telegram signals.
+    """
+    if not isinstance(trade, dict):
+        return False
+
+    diagnostics = trade.get("diagnostics", {}) or {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+
+    for key in (
+        "execution_candidate",
+        "is_execution_candidate",
+        "execution_preview",
+        "execution_message_sent",
+    ):
+        if normalize_bool(trade.get(key, False)) or normalize_bool(diagnostics.get(key, False)):
+            return True
+
+    non_candidate_values = {"", "none", "null", "false", "0", "not_candidate", "not candidate"}
+    for key in (
+        "execution_status",
+        "execution_result_status",
+        "execution_order_id",
+        "execution_id",
+        "execution_preview_id",
+        "execution_reject_reason",
+    ):
+        for source in (trade, diagnostics):
+            value = str(source.get(key, "") or "").strip().lower()
+            if value and value not in non_candidate_values:
+                return True
+
+    return False
+
+
+def _new_block_protection_summary(market_mode: str = "", reason: str = "") -> dict:
+    return {
+        "enabled": False,
+        "mode": str(market_mode or ""),
+        "reason": str(reason or ""),
+        "open_seen": 0,
+        "execution_seen": 0,
+        "ignored_tracking_only": 0,
+        "protected_winners": 0,
+        "risk_compressed": 0,
+        "monitoring_only": 0,
+        "already_protected": 0,
+        "skipped_close_to_sl": 0,
+        "skipped_not_eligible": 0,
+        "updated_symbols": [],
+        "tracking_only": True,
+    }
+
+
+def _sl_is_better(side: str, new_sl: float, current_sl: float) -> bool:
+    side = normalize_side(side)
+    new_sl = safe_float(new_sl, 0.0)
+    current_sl = safe_float(current_sl, 0.0)
+    if new_sl <= 0:
+        return False
+    if current_sl <= 0:
+        return True
+    if side == "short":
+        return new_sl < current_sl
+    return new_sl > current_sl
+
+
+def _entry_buffer_sl(entry_price: float, side: str, buffer_pct: float) -> float:
+    entry_price = safe_float(entry_price, 0.0)
+    buffer_pct = max(0.0, safe_float(buffer_pct, 0.0))
+    if entry_price <= 0:
+        return 0.0
+    if normalize_side(side) == "short":
+        return entry_price * (1.0 - buffer_pct / 100.0)
+    return entry_price * (1.0 + buffer_pct / 100.0)
+
+
+def _is_severe_block_pressure(kwargs: dict) -> bool:
+    try:
+        level = str(kwargs.get("block_pressure_level", "") or kwargs.get("market_guard_level", "") or "").lower()
+        red_ratio = safe_float(kwargs.get("block_red_ratio", kwargs.get("red_ratio", 0.0)), 0.0)
+        avg_change = safe_float(kwargs.get("block_avg_change", kwargs.get("avg_change", 0.0)), 0.0)
+        btc_change = safe_float(kwargs.get("block_btc_change", kwargs.get("btc_change", 0.0)), 0.0)
+        if any(x in level for x in ("danger", "block", "panic", "crash", "hard")):
+            return True
+        if red_ratio >= 0.65:
+            return True
+        if avg_change <= -0.50:
+            return True
+        if btc_change <= -0.80:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _set_block_protection_fields(trade: dict, diagnostics: dict, *, now_ts: int, new_sl: float, old_sl: float,
+                                 reason: str, protection_type: str, note: str = "") -> None:
+    trade["protected_on_block"] = True
+    trade["protected_sl"] = new_sl
+    trade["block_protection_type"] = protection_type
+    trade["block_protection_reason"] = reason or "market_mode_block_longs"
+    trade["block_protection_ts"] = now_ts
+    trade["block_protection_tracking_only"] = True
+    trade["platform_sl_update_status"] = "tracking_only"
+    trade["platform_sl_update_required"] = True
+    if note:
+        trade["block_protection_note"] = note
+    if trade.get("original_sl_before_block_protection") is None:
+        trade["original_sl_before_block_protection"] = old_sl
+
+    diagnostics["protected_on_block"] = True
+    diagnostics["protected_sl"] = new_sl
+    diagnostics["block_protection_type"] = protection_type
+    diagnostics["block_protection_reason"] = reason or "market_mode_block_longs"
+    diagnostics["block_protection_ts"] = now_ts
+    diagnostics["block_protection_tracking_only"] = True
+    diagnostics["platform_sl_update_status"] = "tracking_only"
+    diagnostics["platform_sl_update_required"] = True
+    if note:
+        diagnostics["block_protection_note"] = note
+    if diagnostics.get("original_sl_before_block_protection") is None:
+        diagnostics["original_sl_before_block_protection"] = old_sl
+
+
 # ------------------------------------------------------------
 # UPDATE OPEN TRADES
 # ------------------------------------------------------------
@@ -1724,8 +1855,11 @@ def update_open_trades(
     reason: str = "",
     **kwargs,
 ):
+    block_protection_summary = _new_block_protection_summary(market_mode, reason)
+    block_protection_summary["enabled"] = bool(protect_breakeven_on_block)
+
     if redis_client is None:
-        return
+        return block_protection_summary
 
     market_type = normalize_market_type(market_type)
     side = normalize_side(side)
@@ -1735,10 +1869,13 @@ def update_open_trades(
         trade_keys = list(redis_client.smembers(open_set_key))
     except Exception as e:
         logger.error(f"update_open_trades set read error: {e}")
-        return
+        return block_protection_summary
 
     now_ts = int(time.time())
     max_age_seconds = max_age_hours * 3600
+    breakeven_buffer_pct = max(0.0, safe_float(kwargs.get("breakeven_buffer_pct", 0.0), 0.0))
+    loss_compression_buffer_pct = max(0.05, safe_float(kwargs.get("block_loss_compression_buffer_pct", 0.30), 0.30))
+    severe_block_pressure = _is_severe_block_pressure(kwargs)
 
     for trade_key in trade_keys:
         try:
@@ -1893,44 +2030,106 @@ def update_open_trades(
 
                 if protect_breakeven_on_block and block_this_side:
                     try:
-                        entry_price = get_trade_effective_entry(trade)
-                        if entry_price > 0:
-                            if trade_side == "long":
-                                current_profit_pct = ((current_price - entry_price) / entry_price) * 100
-                            else:
-                                current_profit_pct = ((entry_price - current_price) / entry_price) * 100
+                        block_protection_summary["open_seen"] += 1
 
-                            if current_profit_pct >= breakeven_min_profit_pct:
-                                if not trade.get("protected_breakeven"):
-                                    current_sl = safe_float(trade.get("sl"), 0.0)
-                                    need_move = True
-                                    if trade_side == "long" and current_sl >= entry_price:
-                                        need_move = False
-                                    elif trade_side == "short" and current_sl <= entry_price:
-                                        need_move = False
+                        if not _is_execution_managed_trade_for_block_protection(trade):
+                            block_protection_summary["ignored_tracking_only"] += 1
+                        else:
+                            block_protection_summary["execution_seen"] += 1
+                            entry_price = get_trade_effective_entry(trade)
+                            if entry_price > 0 and current_price > 0:
+                                if trade_side == "long":
+                                    current_profit_pct = ((current_price - entry_price) / entry_price) * 100
+                                else:
+                                    current_profit_pct = ((entry_price - current_price) / entry_price) * 100
 
-                                    if need_move:
+                                current_sl = safe_float(trade.get("sl"), 0.0)
+                                diagnostics = trade.get("diagnostics", {}) or {}
+                                if not isinstance(diagnostics, dict):
+                                    diagnostics = {}
+
+                                # Winners / TP1 / protected trades: move protection to Entry + buffer.
+                                if current_profit_pct >= breakeven_min_profit_pct or normalize_bool(trade.get("tp1_hit", False)):
+                                    target_sl = _entry_buffer_sl(entry_price, trade_side, breakeven_buffer_pct)
+                                    moved_anything = False
+
+                                    if _sl_is_better(trade_side, target_sl, current_sl):
                                         if trade.get("original_sl_before_breakeven") is None:
                                             trade["original_sl_before_breakeven"] = current_sl
-                                        trade["sl"] = entry_price
+                                        trade["sl"] = target_sl
                                         trade["protected_breakeven"] = True
                                         trade["breakeven_protection_reason"] = reason or "market_block_protection"
                                         trade["breakeven_protected_ts"] = now_ts
                                         trade["sl_moved_to_entry"] = True
                                         trade["sl_move_reason"] = reason or "market_block_protection"
-
-                                        diagnostics = trade.get("diagnostics", {}) or {}
                                         diagnostics["protected_breakeven"] = True
                                         diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
                                         diagnostics["breakeven_protected_ts"] = now_ts
                                         diagnostics["original_sl_before_breakeven"] = current_sl
                                         diagnostics["sl_moved_to_entry"] = True
                                         diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                        moved_anything = True
+
+                                    # After TP2, keep trailing active but never below Entry + buffer.
+                                    if normalize_bool(trade.get("tp2_hit", False)) and normalize_bool(trade.get("trailing_active", False)):
+                                        trailing_sl = safe_float(trade.get("trailing_sl"), 0.0)
+                                        if _sl_is_better(trade_side, target_sl, trailing_sl):
+                                            trade["trailing_sl"] = target_sl
+                                            diagnostics["trailing_sl_floor_on_block"] = target_sl
+                                            moved_anything = True
+
+                                    if moved_anything:
+                                        _set_block_protection_fields(
+                                            trade, diagnostics, now_ts=now_ts, new_sl=target_sl, old_sl=current_sl,
+                                            reason=reason or "market_block_protection",
+                                            protection_type="winner_entry_buffer",
+                                            note=f"Tracking only: SL protected at Entry + {breakeven_buffer_pct:.2f}%",
+                                        )
                                         trade["diagnostics"] = diagnostics
                                         state_changed = True
-                                        logger.info(f"{symbol} → breakeven protected")
+                                        block_protection_summary["protected_winners"] += 1
+                                        block_protection_summary["updated_symbols"].append(str(symbol))
+                                        logger.info(f"{symbol} → BLOCK protection applied at Entry + buffer")
+                                    else:
+                                        block_protection_summary["already_protected"] += 1
+
+                                # Losing trades: reduce damage only under clear pressure, never widen SL.
+                                elif current_profit_pct < 0:
+                                    loss_abs = abs(current_profit_pct)
+                                    if 0.30 <= loss_abs <= 0.80 and severe_block_pressure:
+                                        if current_sl > 0:
+                                            if trade_side == "long":
+                                                distance_to_sl_pct = ((current_price - current_sl) / entry_price) * 100
+                                                compression_sl = current_price * (1.0 - loss_compression_buffer_pct / 100.0)
+                                            else:
+                                                distance_to_sl_pct = ((current_sl - current_price) / entry_price) * 100
+                                                compression_sl = current_price * (1.0 + loss_compression_buffer_pct / 100.0)
+
+                                            if distance_to_sl_pct <= 0.25:
+                                                block_protection_summary["skipped_close_to_sl"] += 1
+                                            elif _sl_is_better(trade_side, compression_sl, current_sl):
+                                                trade["sl"] = compression_sl
+                                                _set_block_protection_fields(
+                                                    trade, diagnostics, now_ts=now_ts, new_sl=compression_sl, old_sl=current_sl,
+                                                    reason=reason or "market_block_risk_compression",
+                                                    protection_type="risk_compression",
+                                                    note="Tracking only: loser risk compressed because BLOCK pressure is severe",
+                                                )
+                                                trade["diagnostics"] = diagnostics
+                                                state_changed = True
+                                                block_protection_summary["risk_compressed"] += 1
+                                                block_protection_summary["updated_symbols"].append(str(symbol))
+                                                logger.info(f"{symbol} → BLOCK risk compression applied")
+                                            else:
+                                                block_protection_summary["monitoring_only"] += 1
+                                        else:
+                                            block_protection_summary["monitoring_only"] += 1
+                                    else:
+                                        block_protection_summary["monitoring_only"] += 1
+                                else:
+                                    block_protection_summary["skipped_not_eligible"] += 1
                     except Exception as e:
-                        logger.warning(f"Breakeven protection check failed for {symbol}: {e}")
+                        logger.warning(f"BLOCK protection check failed for {symbol}: {e}")
 
             # حفظ التغييرات النهائية
             if state_changed and trade.get("status") not in ("closed",):
@@ -1955,6 +2154,8 @@ def update_open_trades(
 
         except Exception as _trade_exc:
             logger.error(f"update_open_trades: exception processing {trade_key}: {_trade_exc}", exc_info=True)
+
+    return block_protection_summary
 
 
 # ------------------------------------------------------------
