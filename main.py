@@ -249,6 +249,21 @@ STRONG_ONLY_ALLOWED_SETUPS = {
 STRONG_ONLY_MIN_SCORE = 7.5
 STRONG_ONLY_MIN_VOL_RATIO = 1.05
 
+# Extra setup groups used only to decide whether a signal may pass the
+# STRONG_LONG_ONLY signal gate. NORMAL_LONG is not affected.
+STRONG_SIGNAL_TIER_A_SETUPS = {
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "wave_3",
+    "higher_low_continuation",
+}
+STRONG_SIGNAL_TIER_B_SETUPS = {
+    "support_bounce_confirmed",
+    "relative_strength_vs_btc",
+    "compression_before_expansion",
+    "golden_pullback",
+}
+
 MODE_TRANSITION_MIN_INTERVAL = 480
 RECOVERY_CHECK_INTERVAL = 120
 NORMAL_CANDIDATE_DURATION = 480
@@ -8517,6 +8532,41 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
  except Exception:
     return False
 
+def is_selective_market_normal_ready(
+ red_ratio,
+ avg_change,
+ btc_change,
+ btc_mode: str = "",
+ alt_snapshot: dict | None = None,
+ market_state: str = "",
+) -> bool:
+ """
+ Allow STRONG_LONG_ONLY to return to NORMAL when the market is rotational,
+ not genuinely weak: BTC is strong/stable, Market Guard is normal, and
+ enough alts show constructive breadth. This does not affect BLOCK logic.
+ """
+ try:
+    alt_snapshot = alt_snapshot or {}
+    red_ratio = float(red_ratio or 0.0)
+    avg_change = float(avg_change or 0.0)
+    btc_change = float(btc_change or 0.0)
+    btc_text = str(btc_mode or "")
+    alt_strength = float(alt_snapshot.get("alt_strength_score", 0.0) or 0.0)
+    positive_24h_ratio = float(alt_snapshot.get("positive_24h_ratio", 0.0) or 0.0)
+    above_ma_ratio = float(alt_snapshot.get("above_ma_ratio", 0.0) or 0.0)
+
+    btc_supportive = ("صاعد" in btc_text) or btc_change >= 0.0
+    market_guard_ok = red_ratio < 0.50 and avg_change > -0.20 and btc_change > -0.20
+    breadth_constructive = (
+        alt_strength >= 0.42
+        or positive_24h_ratio >= 0.45
+        or above_ma_ratio >= 0.42
+        or market_state in ("bull_market", "alt_season")
+    )
+    return btc_supportive and market_guard_ok and breadth_constructive
+ except Exception:
+    return False
+
 # =========================
 # DETERMINE LONG MARKET MODE
 # =========================
@@ -8580,6 +8630,22 @@ def determine_long_market_mode(
     return {"mode": MODE_BLOCK_LONGS, "reason": f"كراش: {crash_reason}"}
  
  if alt_weak_cautious:
+    selective_normal_ready = is_selective_market_normal_ready(
+        red_ratio=red_ratio,
+        avg_change=avg_change,
+        btc_change=btc_change,
+        btc_mode=btc_mode,
+        alt_snapshot=alt_snapshot,
+        market_state=market_state,
+    )
+    if selective_normal_ready and time_since_last_transition >= MODE_TRANSITION_MIN_INTERVAL:
+        if allow_state_writes and r:
+            try:
+                r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+            except Exception:
+                pass
+        return {"mode": MODE_NORMAL_LONG, "reason": "BTC قوي والسوق انتقائي قابل للتداول → NORMAL_LONG"}
     if allow_state_writes and r:
         try:
             r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
@@ -8631,7 +8697,17 @@ def determine_long_market_mode(
             pass
     return {"mode": MODE_BLOCK_LONGS, "reason": "ما زلنا داخل BLOCK"}
  if current_mode == MODE_STRONG_LONG_ONLY:
-    if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
+    if (
+        is_market_normal_ready(red_ratio, avg_change, btc_change, market_state)
+        or is_selective_market_normal_ready(
+            red_ratio=red_ratio,
+            avg_change=avg_change,
+            btc_change=btc_change,
+            btc_mode=btc_mode,
+            alt_snapshot=alt_snapshot,
+            market_state=market_state,
+        )
+    ):
         if normal_candidate_since == 0:
             if allow_state_writes and r:
                 try:
@@ -8692,13 +8768,23 @@ def determine_long_market_mode(
             pass
     return {"mode": MODE_RECOVERY_LONG, "reason": "ما زلنا في وضع الريكافري"}
 
- if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
+ if (
+    is_market_normal_ready(red_ratio, avg_change, btc_change, market_state)
+    or is_selective_market_normal_ready(
+        red_ratio=red_ratio,
+        avg_change=avg_change,
+        btc_change=btc_change,
+        btc_mode=btc_mode,
+        alt_snapshot=alt_snapshot,
+        market_state=market_state,
+    )
+ ):
     if allow_state_writes and r:
         try:
             r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
         except Exception:
             pass
-    return {"mode": MODE_NORMAL_LONG, "reason": "السوق طبيعي"}
+    return {"mode": MODE_NORMAL_LONG, "reason": "السوق طبيعي/انتقائي قابل للتداول"}
  weak_market = (
     market_state in ("mixed", "btc_leading", "risk_off")
     or (0.52 <= red_ratio < 0.68)
@@ -10837,6 +10923,24 @@ def run_scanner_loop():
                 execution_tp2 = None
                 execution_risk = None
 
+                _strong_signal_tags = set()
+                for _tag in (extra_setup_names or []):
+                    if _tag:
+                        _strong_signal_tags.add(str(_tag))
+                for _tag in (primary_extra_setup, setup_type, setup_type_base if 'setup_type_base' in locals() else ''):
+                    if _tag:
+                        _strong_signal_tags.add(str(_tag))
+                _tier_a_strong_setup = bool(_strong_signal_tags & STRONG_SIGNAL_TIER_A_SETUPS)
+                _tier_b_strong_setup = bool(_strong_signal_tags & STRONG_SIGNAL_TIER_B_SETUPS)
+                _tier_b_quality_ok = (
+                    _tier_b_strong_setup
+                    and vol_ratio >= 1.25
+                    and rsi_now >= 48
+                    and dist_ma <= 3.8
+                    and (mtf_confirmed or candle_strength >= 0.45 or gaining_strength)
+                )
+                _additional_valid_strong_setup = _tier_a_strong_setup or _tier_b_quality_ok
+
                 if current_mode == MODE_STRONG_LONG_ONLY:
                     if "هابط" in btc_mode and "ضعيف" in alt_mode:
                         final_threshold_min = 7.4
@@ -10847,6 +10951,7 @@ def run_scanner_loop():
                         breakout or pre_breakout or early_priority == "strong"
                         or strong_bull_pullback or strong_breakout_exception
                         or has_extra_strong_setup
+                        or _additional_valid_strong_setup
                         or (is_reverse and reversal_4h_result.get("confirmed"))
                     ):
                         log_long_rejection(
@@ -10869,6 +10974,8 @@ def run_scanner_loop():
                                 "early_priority: " + early_priority,
                                 "breakout_quality: " + breakout_quality,
                                 "has_extra_strong_setup: " + str(has_extra_strong_setup),
+                                "additional_valid_strong_setup: " + str(_additional_valid_strong_setup),
+                                "strong_signal_tags: " + ",".join(sorted(_strong_signal_tags)),
                                 "strong_bull_pullback: " + str(strong_bull_pullback),
                             ],
                             extra={
@@ -10890,8 +10997,8 @@ def run_scanner_loop():
                     )
                     if not setup_match:
                         logger.info(
-                            f"{symbol} --> STRONG_LONG_ONLY: setup not in allowed execution list; "
-                            "signal remains allowed, execution gate will decide"
+                            f"{symbol} --> tracking only: setup not in execution whitelist; "
+                            "gate will check elite"
                         )
 
                     if vol_ratio < STRONG_ONLY_MIN_VOL_RATIO and not has_extra_strong_setup:
