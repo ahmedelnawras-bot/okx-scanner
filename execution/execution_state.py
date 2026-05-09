@@ -96,6 +96,18 @@ def _has_reached_tp2(trade: dict) -> bool:
     )
 
 
+def _is_runner_only_after_tp2(trade: dict) -> bool:
+    """Return True when only the protected 20% runner remains after TP2.
+
+    Business rule:
+    - Do not change the 2.5% trailing logic.
+    - Do not close/delete the old trade from tracking.
+    - Allow a new execution candidate on the same symbol once the old trade
+      reached TP2 and only the trailing runner is left.
+    """
+    return _has_reached_tp2(trade)
+
+
 def _is_execution_trade_active(trade: dict) -> bool:
     status = str(trade.get("status", "") or "").lower()
     result = str(trade.get("result", "") or "").lower()
@@ -146,7 +158,11 @@ def count_active_execution_trades(redis_client) -> int:
 
 
 def is_symbol_blocking_execution(redis_client, symbol: str) -> bool:
-    """Block same symbol only while an active execution trade exists and has not reached TP2."""
+    """Block same symbol only before TP2.
+
+    Once an existing trade reaches TP2, the remaining 20% runner keeps trailing
+    normally but no longer blocks a fresh execution candidate for the same symbol.
+    """
     symbol = str(symbol or "").strip()
     if not symbol:
         return False
@@ -155,7 +171,7 @@ def is_symbol_blocking_execution(redis_client, symbol: str) -> bool:
             continue
         if not _is_execution_trade_active(trade):
             continue
-        if _has_reached_tp2(trade):
+        if _is_runner_only_after_tp2(trade):
             continue
         return True
 
@@ -163,7 +179,7 @@ def is_symbol_blocking_execution(redis_client, symbol: str) -> bool:
     state = get_active_trade(redis_client, symbol)
     if not state:
         return False
-    if _has_reached_tp2(state):
+    if _is_runner_only_after_tp2(state):
         return False
     status = str(state.get("status", "") or "").lower()
     return status in ("accepted_preview", "pending_pullback_preview", "open", "partial", "pending_pullback")
