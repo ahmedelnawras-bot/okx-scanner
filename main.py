@@ -3653,9 +3653,8 @@ def build_execution_report_message(period: str = "all") -> str:
             return f"\u200e{v:+.2f}$"
 
         def exposure(v: float) -> str:
-            # Compact label keeps Telegram report inside fewer lines.
-            # LRM keeps Telegram RTL rendering stable: +0.00% Exp
-            return f"\u200e{_pct_safe(v)} Exp"
+            # LRM keeps Telegram RTL rendering stable: +0.00% Exposure
+            return f"\u200e{_pct_safe(v)} Exposure"
 
         def compact_setup(trade: dict) -> str:
             setup = str(
@@ -3765,40 +3764,29 @@ def build_execution_report_message(period: str = "all") -> str:
         rr_quality = "إيجابي ✔️" if winners_pairs and abs(avg_winner) >= abs(avg_loser) else "يحتاج متابعة ⚠️"
         impact_icon = "🟢" if portfolio_net_usd >= 0 else "🔴"
 
+        # Compact report UI: keep this block short so Wallet Impact + Behavior Summary
+        # usually fit in the same Telegram page. Formatting only; no calculation changes.
         lines = [
             f"🚀 <b>Execution Candidates Report</b> — {title_period}",
-            "",
-            f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
-            f"🟢 مفتوحة: {len(open_trades)}",
-            f"🏁 مغلقة: {len(closed_trades)}",
-            "",
-            f"🟢 رابحة: {len(winners_pairs)}",
-            f"🔴 خاسرة: {len(losers_pairs)}",
+            f"✅ إجمالي المرشحين: <b>{len(trades)}</b> | 🟢 مفتوحة: {len(open_trades)} | 🏁 مغلقة: {len(closed_trades)}",
+            f"🟢 رابحة: {len(winners_pairs)} | 🔴 خاسرة: {len(losers_pairs)}",
             "━━━━━━━━━━━━",
             "💰 <b>Wallet Impact</b>",
             f"📌 رأس المال: {wallet_capital_usd:.0f}$",
-            "✅ <b>المحقق</b>",
-            f"📈 ربح: {money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
-            f"📉 خسارة: {money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
-            f"⚖️ صافي: {money(realized_net_usd)} | {exposure(realized_net_pct)}",
-            "🔄 <b>الصفقات المفتوحة</b>",
-            f"📈 ربح عائم: {money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
-            f"📉 خسارة عائمة: {money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
-            f"⚖️ صافي عائم: {money(floating_net_usd)} | {exposure(floating_net_pct)}",
+            f"✅ المحقق | 📈 {money(realized_profit_usd)} | {_pct_safe(realized_profit_pct)}",
+            f"📉 {money(realized_loss_usd)} | {_pct_safe(realized_loss_pct)}",
+            f"⚖️ {money(realized_net_usd)} | {_pct_safe(realized_net_pct)}",
+            f"🔄 المفتوحة | 📈 {money(floating_profit_usd)} | {_pct_safe(floating_profit_pct)}",
+            f"📉 {money(floating_loss_usd)} | {_pct_safe(floating_loss_pct)}",
+            f"⚖️ {money(floating_net_usd)} | {_pct_safe(floating_net_pct)}",
             "🏦 <b>التأثير الحالي على المحفظة:</b>",
             f"{impact_icon} {money(portfolio_net_usd)} | {wallet_pct:+.2f}%",
             "━━━━━━━━━━━━",
             "🧠 <b>Execution Behavior Summary (40/40/20)</b>",
-            f"📈 متوسط الصفقات الرابحة: {_pct_safe(avg_winner)}",
-            f"📉 متوسط الصفقات الخاسرة: {_pct_safe(avg_loser)}",
-            f"🎯 معدل وصول TP1: {tp1_hits / total * 100:.1f}%",
-            f"🏁 معدل وصول TP2: {tp2_hits / total * 100:.1f}%",
-            f"🔁 التحول من TP1 → TP2: {tp1_to_tp2_pct:.1f}%",
-            f"🔄 الخروج بالتريل: {trailing_wins / total * 100:.1f}%",
-            f"🔒 الخروج على Breakeven: {breakeven_exits / total * 100:.1f}%",
-            f"🛑 وقف خسارة مباشر: {direct_sl / total * 100:.1f}%",
-            f"⚡ متوسط الربح العائم: {exposure(avg_open_floating)}",
-            f"💡 جودة العائد مقابل المخاطرة: {rr_quality}",
+            f"📈 Avg Win {_pct_safe(avg_winner)} | 📉 Avg Loss {_pct_safe(avg_loser)}",
+            f"🎯 TP1 {tp1_hits / total * 100:.1f}% | 🏁 TP2 {tp2_hits / total * 100:.1f}% | 🔁 {tp1_to_tp2_pct:.1f}%",
+            f"🔄 Trail {trailing_wins / total * 100:.1f}% | 🔒 BE {breakeven_exits / total * 100:.1f}% | 🛑 SL {direct_sl / total * 100:.1f}%",
+            f"⚡ عائم {exposure(avg_open_floating)} | 💡 {rr_quality}",
             "━━━━━━━━━━━━",
             "🟢 <b>آخر 5 صفقات مفتوحة</b>",
         ]
