@@ -213,6 +213,7 @@ MARKET_MODE_LAST_SAFE_SEEN_KEY = "market_mode:long:last_safe_seen_ts"
 MARKET_MODE_LAST_REMINDER_KEY = "market_mode:long:last_reminder_ts"
 MARKET_MODE_REMINDER_COUNT_KEY = "market_mode:long:reminder_count"
 MARKET_MODE_REMINDER_MODE_KEY = "market_mode:long:reminder_mode"
+MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY = "market_mode:long:block_protection_applied_ts"
 
 MODE_NORMAL_LONG = "NORMAL_LONG"
 MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
@@ -1841,6 +1842,11 @@ Risk Manager يفحص:
 • pending_pullback_preview = انتظار Pullback.
 • execution_paused = التنفيذ متوقف، لكن الإشارة محفوظة للتقرير.
 
+🛡️ <b>حماية BLOCK_LONGS:</b>
+عند دخول السوق وضع BLOCK_LONGS لا يتم تحريك الصفقات فورًا.
+يتم تقييم <b>صفقات التنفيذ فقط</b> عند أول Market Reminder داخل BLOCK.
+الحماية الحالية <b>Tracking فقط</b> ولا ترسل أمر SL مباشر إلى OKX حتى تفعيل ربط Live SL لاحقًا.
+
 📈 <b>Track:</b>
 يعرض لاحقًا حالة الصفقة، المرحلة، أقصى صعود/هبوط، ونتيجة TP/SL."""
 
@@ -2716,6 +2722,13 @@ def build_market_status_message() -> str:
         "✅ <b>المسموح:</b>",
     ]
     lines.extend([html.escape(x) for x in allowed_lines])
+    if new_mode == MODE_BLOCK_LONGS:
+        lines.extend([
+            "",
+            "🛡️ <b>حماية BLOCK:</b>",
+            "السوق دخل وضع حماية. سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
+            "⚠️ الحماية الحالية Tracking فقط وليست أمر SL مباشر على OKX.",
+        ])
     lines.extend([
         "",
         "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
@@ -4696,6 +4709,23 @@ def build_track_message(alert: dict) -> str:
                 f"• أعلى سعر وصله: {_fmt_price(t_high)} (+{gain_from_entry:.2f}%)\n"
                 f"• Trailing SL الحالي: {_fmt_price(t_sl)} ({t_pct:.1f}% تحت الـ High)"
             )
+    if trade and bool(trade.get("protected_on_block", False)):
+        protected_sl = _safe_float(trade.get("protected_sl") or trade.get("sl"), 0.0)
+        protection_type = str(trade.get("block_protection_type", "") or "")
+        if protection_type == "risk_compression":
+            msg += (
+                f"\n\n🛡️ <b>حماية BLOCK مفعّلة</b>\n"
+                f"🟡 تم تقليل المخاطرة بسبب ضغط السوق\n"
+                f"🔒 SL الحالي: {_fmt_price(protected_sl)}\n"
+                f"⚠️ Tracking فقط، لم يتم تحديث OKX مباشرة."
+            )
+        else:
+            msg += (
+                f"\n\n🛡️ <b>حماية BLOCK مفعّلة</b>\n"
+                f"🔒 SL الحالي: {_fmt_price(protected_sl)} | Entry +{PROTECT_ON_BLOCK_BUFFER_PCT:.2f}%\n"
+                f"⚠️ Tracking فقط، لم يتم تحديث OKX مباشرة."
+            )
+
     if not track_trade_closed:
         msg += (
             f"\n💵 السعر الحالي: {current_price:.6f}\n"
@@ -8473,6 +8503,32 @@ def build_compact_market_mode_reminder(
         f"🎯 <b>Execution:</b>\n"
         f"{html.escape(policy)}"
     )
+
+
+def format_block_protection_summary_message(summary: dict) -> str:
+    """Format one compact Telegram message after first BLOCK_LONGS reminder protection."""
+    summary = summary or {}
+    protected = int(summary.get("protected_winners") or 0)
+    compressed = int(summary.get("risk_compressed") or 0)
+    monitoring = int(summary.get("monitoring_only") or 0)
+    ignored = int(summary.get("ignored_tracking_only") or 0)
+    already = int(summary.get("already_protected") or 0)
+    close_to_sl = int(summary.get("skipped_close_to_sl") or 0)
+    execution_seen = int(summary.get("execution_seen") or 0)
+
+    return (
+        "🛡️ <b>BLOCK Protection Applied</b>\n\n"
+        "تم تنفيذ تقييم حماية صفقات التنفيذ المفتوحة بسبب استمرار BLOCK_LONGS حتى أول Reminder.\n\n"
+        f"✅ <b>Protected winners:</b> {protected}\n"
+        f"🟡 <b>Risk compressed:</b> {compressed}\n"
+        f"⏸ <b>Monitoring only:</b> {monitoring}\n"
+        f"🔒 <b>Already protected:</b> {already}\n"
+        f"📍 <b>Close to SL skipped:</b> {close_to_sl}\n"
+        f"🚫 <b>Ignored tracking-only:</b> {ignored}\n"
+        f"📊 <b>Execution trades checked:</b> {execution_seen}\n\n"
+        "⚠️ <b>Tracking فقط</b> — لم يتم إرسال أمر تعديل SL مباشر إلى OKX حاليًا."
+    )
+
 def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
     old_mode = normalize_market_mode(old_mode)
     new_mode = normalize_market_mode(new_mode)
@@ -8506,6 +8562,13 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "✅ <b>المسموح:</b>",
     ])
     lines.extend([html.escape(x) for x in allowed_lines])
+    if new_mode == MODE_BLOCK_LONGS:
+        lines.extend([
+            "",
+            "🛡️ <b>حماية BLOCK:</b>",
+            "السوق دخل وضع حماية. سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
+            "⚠️ الحماية الحالية Tracking فقط وليست أمر SL مباشر على OKX.",
+        ])
     lines.extend([
         "",
         "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
@@ -8527,11 +8590,13 @@ def handle_market_mode_transition(mode_result: dict) -> str:
         if new_mode == MODE_BLOCK_LONGS and last_mode != MODE_BLOCK_LONGS:
             try:
                 r.set(MARKET_MODE_BLOCK_STARTED_KEY, str(now_ts))
+                r.delete(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY)
             except Exception:
                 pass
         if new_mode != MODE_BLOCK_LONGS:
             try:
                 r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                r.delete(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY)
             except Exception:
                 pass
         r.set(MARKET_MODE_LAST_KEY, new_mode)
@@ -9052,7 +9117,7 @@ def run_scanner_loop():
                     side="long",
                     timeframe=TIMEFRAME,
                     market_mode=current_mode,
-                    protect_breakeven_on_block=True,
+                    protect_breakeven_on_block=False,
                     breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
                     breakeven_buffer_pct=PROTECT_ON_BLOCK_BUFFER_PCT,
                     reason=f"market_mode={current_mode}",
@@ -9066,7 +9131,7 @@ def run_scanner_loop():
                         side="long",
                         timeframe=TIMEFRAME,
                         market_mode=current_mode,
-                        protect_breakeven_on_block=True,
+                        protect_breakeven_on_block=False,
                         breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
                         reason=f"market_mode={current_mode}",
                     )
@@ -9144,6 +9209,31 @@ def run_scanner_loop():
                             alt_mode=alt_snapshot.get("alt_mode", ""),
                         )
                         send_telegram_message(reminder_msg)
+
+                        if current_mode == MODE_BLOCK_LONGS and reminder_count == 1:
+                            try:
+                                already_applied = bool(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY))
+                                if not already_applied:
+                                    protection_summary = update_open_trades(
+                                        r,
+                                        market_type="futures",
+                                        side="long",
+                                        timeframe=TIMEFRAME,
+                                        market_mode=current_mode,
+                                        protect_breakeven_on_block=True,
+                                        breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
+                                        breakeven_buffer_pct=PROTECT_ON_BLOCK_BUFFER_PCT,
+                                        block_pressure_level=market_guard.get("level", ""),
+                                        block_red_ratio=market_guard.get("red_ratio_15m", 0),
+                                        block_avg_change=market_guard.get("avg_change_15m", 0),
+                                        block_btc_change=market_guard.get("btc_change_15m", 0),
+                                        reason="market_mode=BLOCK_LONGS:first_reminder",
+                                    )
+                                    send_telegram_message(format_block_protection_summary_message(protection_summary))
+                                    r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, str(now_ts_local))
+                            except Exception as _protect_exc:
+                                logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
+
                         r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
                         r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
                         r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
