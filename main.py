@@ -49,15 +49,26 @@ try:
         build_exec_status_message,
         build_exec_mode_message,
     )
+    from execution.long_execution_gate import decide_long_execution_gate
+    EXECUTION_GATE_AVAILABLE = True
     EXECUTION_AVAILABLE = True
 except ImportError:
     EXECUTION_AVAILABLE = False
+    EXECUTION_GATE_AVAILABLE = False
     def process_trade_candidate(*args, **kwargs):
         return {"status": "unavailable", "reason": "execution_module_not_found"}
     def build_exec_status_message(*args, **kwargs):
         return "⚠️ وحدة التنفيذ غير متاحة"
     def build_exec_mode_message(*args, **kwargs):
         return "⚠️ وحدة التنفيذ غير متاحة"
+    def decide_long_execution_gate(candidate, market_mode, **kwargs):
+        allowed = bool(kwargs.get("base_execution_allowed", False))
+        return {
+            "allowed": allowed,
+            "path": "fallback" if allowed else "blocked",
+            "reason": "fallback_base_execution_allowed" if allowed else "fallback_base_execution_rejected",
+            "elite": {"passed": False, "score": 0.0, "level": "none", "reasons": [], "warnings": []},
+        }
 
 # محاولة استيراد دالة تقدير تأثير المحفظة 
 try: 
@@ -235,8 +246,8 @@ STRONG_ONLY_ALLOWED_SETUPS = {
     "relative_strength_vs_btc",
     "failed_breakdown_trap",
 }
-STRONG_ONLY_MIN_SCORE = 8.0
-STRONG_ONLY_MIN_VOL_RATIO = 1.2
+STRONG_ONLY_MIN_SCORE = 7.5
+STRONG_ONLY_MIN_VOL_RATIO = 1.05
 
 MODE_TRANSITION_MIN_INTERVAL = 480
 RECOVERY_CHECK_INTERVAL = 120
@@ -7946,27 +7957,77 @@ def _apply_market_execution_fallback(candidate: dict) -> dict:
         return candidate
 
 
-def is_candidate_for_execution(candidate: dict) -> bool:
-    """True only for alerts that match execution eligibility plus a complete plan.
 
-    Final rule:
-    - whitelist setup from execution/config.py, OR
-    - an alert that passed in BLOCK_LONGS,
-    plus valid entry/sl/tp1.
+def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> dict:
+    """Central long execution gate.
 
-    Late/danger context is warning-only at this stage.
+    NORMAL_LONG intentionally preserves the previous behaviour:
+    strict execution whitelist/block exception + complete plan + Weak Drift quality.
+    STRONG_LONG_ONLY can additionally pass through the Elite path in
+    execution.long_execution_gate.
     """
     try:
-        planned = _apply_market_execution_fallback(dict(candidate or {}))
+        if not isinstance(candidate, dict):
+            return {"allowed": False, "path": "blocked", "reason": "invalid_candidate"}
+        planned = candidate if mutate else dict(candidate or {})
+        planned = _apply_market_execution_fallback(planned)
         _ensure_execution_setup_tags(planned)
-        return bool(
-            (_has_strict_execution_setup(planned) or _is_block_mode_execution_candidate(planned))
-            and _candidate_has_complete_execution_plan(planned)
-            and _candidate_passes_weak_drift_execution_quality(planned)
+        mode = normalize_market_mode(
+            _trade_field(planned, "current_mode", "")
+            or _trade_field(planned, "market_mode", "")
+            or _trade_field(planned, "mode", "")
+            or MODE_NORMAL_LONG
         )
+        strict_setup_allowed = _has_strict_execution_setup(planned)
+        block_mode_allowed = _is_block_mode_execution_candidate(planned)
+        has_complete_plan = _candidate_has_complete_execution_plan(planned)
+        weak_drift_passed = _candidate_passes_weak_drift_execution_quality(planned)
+        base_execution_allowed = bool(
+            (strict_setup_allowed or block_mode_allowed)
+            and has_complete_plan
+            and weak_drift_passed
+        )
+        gate = decide_long_execution_gate(
+            planned,
+            mode,
+            base_execution_allowed=base_execution_allowed,
+            strict_setup_allowed=strict_setup_allowed,
+            block_mode_allowed=block_mode_allowed,
+            has_complete_plan=has_complete_plan,
+            weak_drift_passed=weak_drift_passed,
+            mutate=mutate,
+        )
+        if mutate:
+            candidate.update(planned)
+            candidate["execution_gate_path"] = gate.get("path")
+            candidate["execution_gate_reason"] = gate.get("reason")
+            elite = gate.get("elite") or {}
+            candidate["elite_execution_passed"] = bool(elite.get("passed") or candidate.get("elite_execution_passed"))
+            if elite.get("score") is not None:
+                candidate["elite_execution_score"] = elite.get("score")
+            if elite.get("level"):
+                candidate["elite_execution_level"] = elite.get("level")
+            if elite.get("reasons"):
+                candidate["elite_execution_reasons"] = elite.get("reasons")
+            if elite.get("warnings"):
+                candidate["elite_execution_warnings"] = elite.get("warnings")
+        return gate
+    except Exception as e:
+        logger.warning(f"_decide_long_execution_candidate error: {e}")
+        return {"allowed": False, "path": "blocked", "reason": "execution_gate_error"}
+
+
+def is_candidate_for_execution(candidate: dict) -> bool:
+    """True only for alerts that pass the long execution gate plus a complete plan.
+
+    NORMAL_LONG keeps the previous execution behaviour.
+    STRONG_LONG_ONLY may pass through whitelist OR Elite.
+    """
+    try:
+        gate = _decide_long_execution_candidate(candidate, mutate=False)
+        return bool(gate.get("allowed"))
     except Exception:
         return False
-
 
 def build_execution_badge_line(candidate: dict) -> str:
     _ensure_execution_setup_tags(candidate)
@@ -10828,26 +10889,10 @@ def run_scanner_loop():
                         for s in STRONG_ONLY_ALLOWED_SETUPS
                     )
                     if not setup_match:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="strong_only_not_allowed_setup",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            entry_timing=entry_timing_temp,
-                            opportunity_type=temp_opportunity_type,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"allowed": list(STRONG_ONLY_ALLOWED_SETUPS), "setup_type": setup_type, "extra": extra_setup_names, "primary": primary_extra_setup},
+                        logger.info(
+                            f"{symbol} --> STRONG_LONG_ONLY: setup not in allowed execution list; "
+                            "signal remains allowed, execution gate will decide"
                         )
-                        logger.info(f"{symbol} --> skipped by STRONG_LONG_ONLY allowed setups filter")
-                        continue
 
                     if vol_ratio < STRONG_ONLY_MIN_VOL_RATIO and not has_extra_strong_setup:
                         log_long_rejection(
@@ -10882,25 +10927,10 @@ def run_scanner_loop():
                         and dist_ma <= 3.2
                     )
                     if not mtf_confirmed and not extra_setup_can_bypass_mtf and not (is_reverse and reversal_4h_result.get("confirmed")):
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="strong_only_mtf_not_confirmed",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            entry_timing=entry_timing_temp,
-                            opportunity_type=temp_opportunity_type,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
+                        logger.info(
+                            f"{symbol} --> STRONG_LONG_ONLY: MTF not confirmed; "
+                            "signal remains allowed, execution gate will decide"
                         )
-                        logger.info(f"{symbol} --> skipped (STRONG_LONG_ONLY: mtf not confirmed)")
-                        continue
 
                 signal_idx = signal_row.name
                 lookback_start = max(0, signal_idx - 20)
@@ -11634,14 +11664,14 @@ def run_scanner_loop():
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
                 if current_mode == MODE_STRONG_LONG_ONLY:
-                    effective_score -= 0.35
+                    effective_score -= 0.15
                     score_result["score"] = round(effective_score, 2)
                     adjustments_log.append({
                         "name": "strong_mode_penalty",
-                        "value": -0.35,
+                        "value": -0.15,
                         "reason": "strong_mode"
                     })
-                    dynamic_threshold += 0.25
+                    dynamic_threshold += 0.10
                     dynamic_threshold = round(dynamic_threshold, 2)
                     if score_result["score"] < STRONG_ONLY_MIN_SCORE:
                         log_long_rejection(
@@ -12569,9 +12599,14 @@ def run_scanner_loop():
                         )
 
                     try:
-                        if not is_candidate_for_execution(candidate):
-                            update_execution_status_for_candidate(candidate, "not_candidate", "not_execution_candidate", message_sent=False)
-                            logger.info(f"EXEC SKIP: {symbol} is not an execution candidate")
+                        gate_decision = _decide_long_execution_candidate(candidate, mutate=True)
+                        if not gate_decision.get("allowed"):
+                            gate_reason = gate_decision.get("reason", "not_execution_candidate")
+                            update_execution_status_for_candidate(candidate, "not_candidate", gate_reason, message_sent=False)
+                            logger.info(
+                                f"EXEC SKIP: {symbol} is not an execution candidate | "
+                                f"gate_path={gate_decision.get('path')} | reason={gate_reason}"
+                            )
                         elif is_execution_paused():
                             exec_status = "execution_paused"
                             exec_reason = "execution_paused_manual_or_daily_dd"
