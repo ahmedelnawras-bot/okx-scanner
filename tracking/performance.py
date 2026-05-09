@@ -2936,6 +2936,12 @@ def build_trade_summary_from_trades(
     ]:
         summary[key] = plan[key]
 
+    summary["recent_winning_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
+        key=lambda t: safe_timestamp(t.get("closed_at") or t.get("updated_at") or t.get("created_at"), 0),
+        reverse=True,
+    )[:5]
+
     return summary
 
 
@@ -3048,6 +3054,12 @@ def get_trade_summary(
         "total_notional_exposure_usd",
     ]:
         summary[key] = plan[key]
+
+    summary["recent_winning_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
+        key=lambda t: safe_timestamp(t.get("closed_at") or t.get("updated_at") or t.get("created_at"), 0),
+        reverse=True,
+    )[:5]
 
     return summary
 
@@ -3520,6 +3532,60 @@ def format_winrate_summary(summary: dict) -> str:
     )
 
 
+def _format_recent_report_trade_lines(trade: dict) -> list:
+    """Compact lines for recent trades inside period reports. UI only; no calculations changed."""
+    try:
+        symbol = str(trade.get("symbol", "?") or "?")
+        pnl_data = calculate_trade_pnl(trade)
+        pnl_pct = safe_float(pnl_data.get("pnl_leveraged", 0.0), 0.0)
+        result = str(trade.get("result", "") or "")
+        if result == "trailing_win":
+            result_label = "TP2 + Trail Win"
+        elif result == "tp2_win":
+            result_label = "TP2 Win"
+        elif result == "tp1_win":
+            result_label = "TP1 Only"
+        elif result == "breakeven":
+            result_label = "Breakeven"
+        else:
+            result_label = result or "Closed"
+
+        current = safe_float(trade.get("current_price") or trade.get("exit_price") or trade.get("trailing_exit_price"), 0.0)
+        tp1 = safe_float(trade.get("tp1"), 0.0)
+        tp2 = safe_float(trade.get("tp2"), 0.0)
+        sl = safe_float(trade.get("sl"), 0.0)
+        mode = str(trade.get("market_mode") or trade.get("current_mode") or trade.get("mode") or "").strip()
+        btc_mode = str(trade.get("btc_mode") or "").strip()
+        market_state = str(trade.get("market_state") or trade.get("market_state_label") or "").strip()
+        reason = str(trade.get("primary_extra_setup") or trade.get("setup_type") or "").strip()
+        score = safe_float(trade.get("score"), 0.0)
+
+        tv_link = ""
+        try:
+            clean_sym = symbol.replace("-SWAP", "").replace("-USDT", "USDT")
+            tv_link = f"https://www.tradingview.com/chart/?symbol=OKX:{clean_sym}.P&interval=15"
+        except Exception:
+            tv_link = ""
+
+        lines = [
+            f"🟢 <b>{html.escape(symbol)}</b>",
+            f"{pnl_pct:+.2f}% Exposure | {html.escape(result_label)}",
+            f"TP1: {_fmt_price_perf(tp1)} | 🎯 الحالي: {_fmt_price_perf(current)}",
+            f"🏁 TP2: {_fmt_price_perf(tp2)} | 🛑 SL: {_fmt_price_perf(sl)}",
+        ]
+        context_parts = [x for x in (mode, btc_mode, market_state) if x]
+        if context_parts:
+            lines.append("🌍 " + " | ".join(html.escape(x) for x in context_parts))
+        if reason:
+            lines.append("⚡ " + html.escape(reason))
+        if score > 0:
+            tv = f' | <a href="{html.escape(tv_link, quote=True)}">TradingView</a>' if tv_link else ""
+            lines.append(f"⭐ {score:g}{tv}")
+        return lines
+    except Exception as e:
+        return [f"🟢 <b>{html.escape(str(trade.get('symbol', '?')))}</b>", f"⚠️ تعذر تنسيق الصفقة: {html.escape(str(e))}"]
+
+
 def format_period_summary(title: str, summary: dict) -> str:
     """Format period summary in a cleaner Arabic-first layout.
 
@@ -3670,10 +3736,23 @@ def format_period_summary(title: str, summary: dict) -> str:
         "<b>إدارة المخاطرة</b>",
         *risk_lines,
         sep,
+    ]
+
+    recent_winning_trades = summary.get("recent_winning_trades") or []
+    if recent_winning_trades:
+        trade_separator = "- - - - - - - -"
+        lines.append("🏆 <b>آخر 5 صفقات رابحة</b>")
+        for idx, trade in enumerate(recent_winning_trades[:5]):
+            lines.extend(_format_recent_report_trade_lines(trade))
+            if idx < len(recent_winning_trades[:5]) - 1:
+                lines.append(trade_separator)
+        lines.append(sep)
+
+    lines.extend([
         f"🧠 <b>تشخيص الأداء:</b> {diagnosis['emoji']} <b>{diagnosis['problem_label']}</b>",
         f"• السبب: {diagnosis['explanation']}",
         f"• الإجراء المقترح: {diagnosis['action']}",
-    ]
+    ])
     return "\n".join(lines)
 
 
