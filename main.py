@@ -2678,7 +2678,7 @@ def build_market_status_message() -> str:
         mode_reason = snapshot.get("mode_reason", "")
         btc_mode = snapshot.get("btc_mode", "🟡 محايد")
         alt_snapshot = snapshot.get("alt_snapshot", {}) or {}
-        alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+        alt_mode = alt_snapshot.get("alt_mode", "🟡 محايد")
         market_info = snapshot.get("market_info", {}) or {}
         market_state_label = market_info.get("market_state_label", "Mixed")
         market_bias_label = market_info.get("market_bias_label", "السوق مختلط")
@@ -2696,7 +2696,7 @@ def build_market_status_message() -> str:
         btc_mode = get_btc_mode()
         ranked_pairs = get_ranked_pairs()
         alt_snapshot = get_alt_market_snapshot(ranked_pairs)
-        alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+        alt_mode = alt_snapshot.get("alt_mode", "🟡 محايد")
         market_info = get_market_state(btc_mode, alt_snapshot)
         market_state_label = market_info.get("market_state_label", "Mixed")
         market_bias_label = market_info.get("market_bias_label", "السوق مختلط")
@@ -6492,10 +6492,15 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
         alt_mode = "🔴 ضعيف"
     elif alt_strength_score >= 0.68 and above_ma_ratio >= 0.58 and rsi_support_ratio >= 0.50:
         alt_mode = "🟢 قوي"
-    elif alt_strength_score >= 0.50:
-        alt_mode = "🟡 متماسك"
-    else:
+    elif (
+        alt_strength_score < 0.38
+        and above_ma_ratio < 0.38
+        and rsi_support_ratio < 0.38
+        and positive_24h_ratio < 0.42
+    ):
         alt_mode = "🔴 ضعيف"
+    else:
+        alt_mode = "🟡 محايد"
     snapshot = {
         "sample_size": len(sampled),
         "valid_count": valid,
@@ -6521,11 +6526,11 @@ def get_alt_market_snapshot(ranked_pairs, sample_size=ALT_MARKET_SAMPLE_SIZE):
         "rsi_support_ratio": 0.0,
         "positive_24h_ratio": 0.0,
         "alt_strength_score": 0.0,
-        "alt_mode": "تماسك",
+        "alt_mode": "🟡 محايد",
     }
 
 def get_market_state(btc_mode: str, alt_snapshot: dict):
- alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+ alt_mode = alt_snapshot.get("alt_mode", "🟡 محايد")
  if "هابط" in btc_mode and "ضعيف" in alt_mode:
     return {
         "market_state": "risk_off",
@@ -6540,7 +6545,7 @@ def get_market_state(btc_mode: str, alt_snapshot: dict):
         "market_bias_label": "🟠 BTC يصعد والألت ضعيفة",
         "btc_dominance_proxy": "🟠 ضغط على الألت",
     }
- if "صاعد" in btc_mode and ("قوي" in alt_mode or "متماسك" in alt_mode):
+ if "صاعد" in btc_mode and ("قوي" in alt_mode or "متماسك" in alt_mode or "محايد" in alt_mode):
     return {
         "market_state": "bull_market",
         "market_state_label": "🟢 Bull Market",
@@ -8814,7 +8819,7 @@ def get_market_mode_action_text(mode: str) -> str:
     if mode == MODE_NORMAL_LONG:
         return "• الإشارات العادية: مسموحة حسب الفلاتر\n• التنفيذ التجريبي: Whitelist + Quality Filters"
     if mode == MODE_STRONG_LONG_ONLY:
-        return "• الإشارات العادية: أقوى الفرص فقط\n• التنفيذ التجريبي: حركة قوية + Whitelist"
+        return "• الإشارات العادية: أقوى الفرص فقط\n• التنفيذ التجريبي: حركة قوية + Whitelist\n🎯 التنفيذ التجريبي: Whitelist أو Elite عالي الجودة فقط"
     if mode == MODE_BLOCK_LONGS:
         return "• الإشارات العادية: ممنوعة أو مشددة جدًا\n• التنفيذ التجريبي: استثناءات قوية جدًا فقط"
     if mode == MODE_RECOVERY_LONG:
@@ -9641,7 +9646,7 @@ def run_scanner_loop():
             market_state_label = market_info["market_state_label"]
             market_bias_label = market_info["market_bias_label"]
             btc_dominance_proxy = market_info["btc_dominance_proxy"]
-            alt_mode = alt_snapshot.get("alt_mode", "🟡 متماسك")
+            alt_mode = alt_snapshot.get("alt_mode", "🟡 محايد")
             market_guard = get_market_guard_snapshot(
                 ranked_pairs=ranked_pairs,
                 btc_mode=btc_mode,
