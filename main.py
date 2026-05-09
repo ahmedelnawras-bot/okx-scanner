@@ -3860,7 +3860,8 @@ def build_execution_guard_report_message() -> str:
         start_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(start_ts))
         locked = bool(snap.get("locked", False))
         status = "🔒 LOCKED" if locked else "✅ ACTIVE"
-        reason = html.escape(str(snap.get("reason") or "—"))
+        raw_reason = str(snap.get("reason") or "").strip()
+        reason = html.escape(raw_reason if raw_reason and raw_reason not in ("—", "-") else "لا يوجد")
         equity = float(snap.get("start_equity_usd", 0.0) or 0.0)
         net_usd = float(snap.get("daily_net_usd", 0.0) or 0.0)
         dd_pct = float(snap.get("daily_dd_pct", 0.0) or 0.0)
@@ -3877,7 +3878,7 @@ def build_execution_guard_report_message() -> str:
             f"📍 Margin لكل صفقة في الحساب: {margin:.2f}$",
             "",
             f"📊 صافي تأثير اليوم: <b>{net_usd:+.2f}$</b>",
-            f"📉 Daily DD الحالي: <b>{dd_pct:+.2f}%</b>",
+            f"📉 Daily DD الحالي: {'🔻' if dd_pct < 0 else '🟢'} <b>{dd_pct:+.2f}%</b>",
             f"🛑 حد الإيقاف: <b>-{limit_pct:.0f}%</b> ≈ <b>{limit_usd:.2f}$</b>",
             f"🧾 سبب القفل: {reason}",
             "",
@@ -8819,7 +8820,7 @@ def get_market_mode_action_text(mode: str) -> str:
     if mode == MODE_NORMAL_LONG:
         return "• الإشارات العادية: مسموحة حسب الفلاتر\n• التنفيذ التجريبي: Whitelist + Quality Filters"
     if mode == MODE_STRONG_LONG_ONLY:
-        return "• الإشارات العادية: أقوى الفرص فقط\n• التنفيذ التجريبي: حركة قوية + Whitelist\n🎯 التنفيذ التجريبي: Whitelist أو Elite عالي الجودة فقط"
+        return "• الإشارات العادية: أقوى الفرص فقط\n🎯 التنفيذ التجريبي: Whitelist أو Elite عالي الجودة فقط"
     if mode == MODE_BLOCK_LONGS:
         return "• الإشارات العادية: ممنوعة أو مشددة جدًا\n• التنفيذ التجريبي: استثناءات قوية جدًا فقط"
     if mode == MODE_RECOVERY_LONG:
