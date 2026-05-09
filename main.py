@@ -246,7 +246,7 @@ STRONG_ONLY_ALLOWED_SETUPS = {
     "relative_strength_vs_btc",
     "failed_breakdown_trap",
 }
-STRONG_ONLY_MIN_SCORE = 7.5
+STRONG_ONLY_MIN_SCORE = 7.3
 STRONG_ONLY_MIN_VOL_RATIO = 1.05
 
 # Extra setup groups used only to decide whether a signal may pass the
@@ -11777,11 +11777,11 @@ def run_scanner_loop():
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
                 if current_mode == MODE_STRONG_LONG_ONLY:
-                    effective_score -= 0.15
+                    effective_score -= 0.10
                     score_result["score"] = round(effective_score, 2)
                     adjustments_log.append({
                         "name": "strong_mode_penalty",
-                        "value": -0.15,
+                        "value": -0.10,
                         "reason": "strong_mode"
                     })
                     dynamic_threshold += 0.10
