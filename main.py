@@ -382,7 +382,9 @@ def clear_stale_scan_locks_on_startup() -> None:
  if not r:
     return
  try:
-    # legacy/general lock from older versions
+    # Startup safety: after Railway redeploy/restart, any existing scan lock is
+    # treated as stale because it belongs to an old process. This prevents the
+    # bot from hanging for the remaining TTL before the first scan.
     try:
         if r.exists("scan:running"):
             r.delete("scan:running")
@@ -390,15 +392,13 @@ def clear_stale_scan_locks_on_startup() -> None:
     except Exception:
         pass
 
-    ttl = r.ttl(SCAN_LOCK_KEY)
-    if ttl == -1:
-        r.delete(SCAN_LOCK_KEY)
-        logger.warning(f"🧹 Cleared stale scan lock without TTL: {SCAN_LOCK_KEY}")
-    elif ttl and ttl > 300:
-        r.delete(SCAN_LOCK_KEY)
-        logger.warning(f"🧹 Cleared stale scan lock with too-long ttl={ttl}s: {SCAN_LOCK_KEY}")
-    elif ttl and ttl > 0:
-        logger.info(f"⏳ Existing scan lock found on startup: {SCAN_LOCK_KEY} ttl={ttl}s")
+    try:
+        ttl = r.ttl(SCAN_LOCK_KEY)
+        if ttl is not None and ttl != -2:
+            r.delete(SCAN_LOCK_KEY)
+            logger.warning(f"🧹 Cleared startup scan lock: {SCAN_LOCK_KEY} previous_ttl={ttl}s")
+    except Exception:
+        pass
  except Exception as e:
     logger.warning(f"Failed to inspect/clear scan lock on startup: {e}")
 
@@ -10760,12 +10760,28 @@ def run_scanner_loop():
                             score=score_result.get("score", raw_score),
                         )
 
-                        _bull_mtf_flex = (
+                        # Market Adaptive Resistance:
+                        # In bull/alt-season conditions, a minor swing_high / bb_upper should not
+                        # behave like a major supply wall when the signal itself has MTF + volume
+                        # + strong setup support. Keep truly close/low-R resistance protected.
+                        _score_for_resistance = float(score_result.get("score", raw_score) or 0.0)
+                        _strong_market_for_resistance = (
                             market_state in ("bull_market", "alt_season")
+                            or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
+                        )
+                        _major_structural_sources = {"previous_rejection", "round_level_confirmed"}
+                        _minor_structural_sources = {"swing_high", "bb_upper"}
+                        _res_is_major_structural = _res_source in _major_structural_sources
+                        _res_is_minor_structural = _res_source in _minor_structural_sources
+                        _res_is_ultra_close = (_res_dist_pct < 0.10 or _res_r < 0.15)
+                        _bull_mtf_flex = (
+                            _strong_market_for_resistance
                             and bool(mtf_confirmed)
                             and float(vol_ratio or 0.0) >= 1.15
-                            and _res_relaxed_setup
-                            and not _res_is_structural
+                            and _score_for_resistance >= 7.0
+                            and (_res_relaxed_setup or breakout or pre_breakout)
+                            and not _res_is_major_structural
+                            and not _res_is_ultra_close
                         )
 
                         if _res_is_micro_noise:
@@ -10784,8 +10800,11 @@ def run_scanner_loop():
                                 _hard_r_limit = 0.70
 
                             _should_hard_reject_resistance = (
-                                (_res_dist_pct < _hard_dist_limit or _res_r < _hard_r_limit)
-                                and not _bull_mtf_flex
+                                _res_is_ultra_close
+                                or (
+                                    (_res_dist_pct < _hard_dist_limit or _res_r < _hard_r_limit)
+                                    and not _bull_mtf_flex
+                                )
                             )
 
                             if _should_hard_reject_resistance:
@@ -10815,6 +10834,10 @@ def run_scanner_loop():
                                         "resistance_r": _res_r,
                                         "relaxed": _res_relaxed_setup,
                                         "structural": _res_is_structural,
+                                        "major_structural": _res_is_major_structural,
+                                        "minor_structural": _res_is_minor_structural,
+                                        "bull_flex": _bull_mtf_flex,
+                                        "ultra_close": _res_is_ultra_close,
                                         "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
                                         "category": "trade_quality",
                                     },
@@ -10822,7 +10845,8 @@ def run_scanner_loop():
                                 logger.info(
                                     f"⛔ {symbol} rejected: near_resistance_before_tp1 | "
                                     f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
-                                    f"relaxed={_res_relaxed_setup} | limits=dist<{_hard_dist_limit}/R<{_hard_r_limit}"
+                                    f"relaxed={_res_relaxed_setup} | bull_flex={_bull_mtf_flex} | ultra={_res_is_ultra_close} | "
+                                    f"limits=dist<{_hard_dist_limit}/R<{_hard_r_limit}"
                                 )
                                 continue
 
