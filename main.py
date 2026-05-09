@@ -3371,17 +3371,34 @@ def _execution_status_for_trade(trade: dict) -> str:
     return "not_candidate"
 
 
+def _execution_trade_reached_tp1_for_display(trade: dict) -> bool:
+    """Conservative TP1 phase proof for execution reports.
+
+    Do not trust status == "partial" alone because legacy/stale status can mark
+    a trade as partial before the actual TP1 flags are updated.
+    """
+    status = str(trade.get("status", "") or "").lower()
+    return bool(
+        trade.get("tp1_hit", False)
+        or trade.get("sl_moved_to_entry", False)
+        or trade.get("protected_breakeven", False)
+        or trade.get("tp2_hit", False)
+        or trade.get("trailing_active", False)
+        or status in ("trailing", "trailing_open", "tp2_partial")
+    )
+
+
 def _execution_phase_for_trade(trade: dict) -> str:
     status = str(trade.get("status", "") or "").lower()
     result = str(trade.get("result", "") or "").lower()
-    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp1_hit = _execution_trade_reached_tp1_for_display(trade)
     tp2_hit = bool(trade.get("tp2_hit", False))
     trailing_active = bool(trade.get("trailing_active", False)) or status in ("trailing", "trailing_open", "tp2_partial")
     if status == "pending_pullback":
         return "Pending Pullback"
     if trailing_active or tp2_hit:
         return "Trailing Active" if status not in ("closed", "expired") else "TP2 Hit"
-    if tp1_hit or status == "partial":
+    if tp1_hit:
         return "TP1 Hit"
     return "Before TP1"
 
@@ -3686,13 +3703,13 @@ def build_execution_report_message(period: str = "all") -> str:
             if compact_open:
                 status = str(trade.get("status", "") or "").lower()
                 phase_text = str(result_label or "")
-                tp1_hit = bool(trade.get("tp1_hit", False)) or status == "partial"
+                tp1_hit = _execution_trade_reached_tp1_for_display(trade)
                 tp2_hit = bool(trade.get("tp2_hit", False)) or status in ("tp2_partial", "trailing_open", "trailing")
                 trailing_active = bool(trade.get("trailing_active", False)) or status in ("tp2_partial", "trailing_open", "trailing")
                 sl_entry = bool(trade.get("sl_moved_to_entry", False)) or bool(trade.get("protected_breakeven", False))
                 if trailing_active or tp2_hit or "tp2" in phase_text.lower() or "trailing" in phase_text.lower():
                     status_line = "🔵 قرب TP2"
-                elif tp1_hit or "tp1" in phase_text.lower():
+                elif tp1_hit:
                     status_line = "🟡 جزئية | بعد TP1"
                 else:
                     status_line = "🟢 مفتوحة | قبل TP1"
