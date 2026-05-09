@@ -3753,10 +3753,8 @@ def build_execution_report_message(period: str = "all") -> str:
                 f"{icon} <b>{symbol}</b>",
                 f"{exposure(pnl)} | {html.escape(str(result_label))}",
                 _execution_prices_line(trade),
-                "",
                 market_context_line(trade),
                 concise_trade_reason(trade, is_win=is_win),
-                "",
                 f"⭐ {html.escape(str(score))}{tv}",
             ]
 
@@ -3807,16 +3805,18 @@ def build_execution_report_message(period: str = "all") -> str:
             "🟢 <b>آخر 5 صفقات مفتوحة</b>",
         ]
 
+        trade_separator = "- - - - - - - -"
         latest_open = sorted(open_trades, key=_trade_created_ts_for_exec, reverse=True)[:5]
         if latest_open:
-            for trade in latest_open:
+            for idx, trade in enumerate(latest_open):
                 pnl = _execution_floating_pnl_pct(trade)
                 if pnl is None:
                     pnl = 0.0
                 phase = _execution_phase_for_trade(trade)
                 icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
                 lines.extend(short_trade_line(trade, pnl, icon, is_win=(pnl >= 0), label=phase, compact_open=True))
-                lines.append("")
+                if idx < len(latest_open) - 1:
+                    lines.append(trade_separator)
         else:
             lines.append("لا توجد صفقات مفتوحة حاليًا.")
             lines.append("")
@@ -3828,9 +3828,10 @@ def build_execution_report_message(period: str = "all") -> str:
 
         latest_winners = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]
         if latest_winners:
-            for trade, pnl in latest_winners:
+            for idx, (trade, pnl) in enumerate(latest_winners):
                 lines.extend(short_trade_line(trade, pnl, "🟢", is_win=True))
-                lines.append("")
+                if idx < len(latest_winners) - 1:
+                    lines.append(trade_separator)
         else:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
             lines.append("")
@@ -3838,9 +3839,10 @@ def build_execution_report_message(period: str = "all") -> str:
         lines.append("📉 <b>آخر 5 صفقات خاسرة</b>")
         latest_losers = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]
         if latest_losers:
-            for trade, pnl in latest_losers:
+            for idx, (trade, pnl) in enumerate(latest_losers):
                 lines.extend(short_trade_line(trade, pnl, "🔴", is_win=False))
-                lines.append("")
+                if idx < len(latest_losers) - 1:
+                    lines.append(trade_separator)
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
 
@@ -10945,7 +10947,47 @@ def run_scanner_loop():
                     and dist_ma <= 3.8
                     and (mtf_confirmed or candle_strength >= 0.45 or gaining_strength)
                 )
-                _additional_valid_strong_setup = _tier_a_strong_setup or _tier_b_quality_ok
+
+                # STRONG_LONG_ONLY soft admission: allow high-quality continuation /
+                # healthy pullback signals to pass the signal gate without changing
+                # the execution whitelist / Elite path.
+                _entry_timing_text = str(entry_timing_temp or "")
+                _setup_text_for_continuation = "|".join(str(x) for x in _strong_signal_tags).lower()
+                _opportunity_text = str(temp_opportunity_type or "").lower()
+                _continuation_context_ok = (
+                    "continuation" in _setup_text_for_continuation
+                    or "استمرار" in _opportunity_text
+                    or "continuation" in _opportunity_text
+                    or "higher_low_continuation" in _strong_signal_tags
+                )
+                _not_chasing_late = not (
+                    "مطاردة" in _entry_timing_text
+                    or "متأخر جدًا" in _entry_timing_text
+                    or "late_pump" in _entry_timing_text.lower()
+                )
+                _strong_continuation_quality_ok = (
+                    _continuation_context_ok
+                    and _not_chasing_late
+                    and vol_ratio >= 1.15
+                    and rsi_now >= 47
+                    and dist_ma <= 4.5
+                    and (mtf_confirmed or candle_strength >= 0.42 or gaining_strength)
+                )
+                _healthy_pullback_quality_ok = (
+                    entry_maturity_status == "healthy"
+                    and had_pullback
+                    and _not_chasing_late
+                    and vol_ratio >= 1.10
+                    and rsi_now >= 45
+                    and dist_ma <= 4.8
+                    and (mtf_confirmed or candle_strength >= 0.40 or gaining_strength)
+                )
+                _additional_valid_strong_setup = (
+                    _tier_a_strong_setup
+                    or _tier_b_quality_ok
+                    or _strong_continuation_quality_ok
+                    or _healthy_pullback_quality_ok
+                )
 
                 if current_mode == MODE_STRONG_LONG_ONLY:
                     if "هابط" in btc_mode and "ضعيف" in alt_mode:
@@ -10981,6 +11023,8 @@ def run_scanner_loop():
                                 "breakout_quality: " + breakout_quality,
                                 "has_extra_strong_setup: " + str(has_extra_strong_setup),
                                 "additional_valid_strong_setup: " + str(_additional_valid_strong_setup),
+                                "strong_continuation_quality_ok: " + str(_strong_continuation_quality_ok),
+                                "healthy_pullback_quality_ok: " + str(_healthy_pullback_quality_ok),
                                 "strong_signal_tags: " + ",".join(sorted(_strong_signal_tags)),
                                 "strong_bull_pullback: " + str(strong_bull_pullback),
                             ],
