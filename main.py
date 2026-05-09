@@ -1688,8 +1688,41 @@ def build_deep_report_message() -> str:
         )
 
 
+def get_execution_max_active_trades_display() -> int:
+    """Display helper only: show the effective configured execution active-trade limit."""
+    try:
+        from execution.risk_manager import _configured_max_positions
+        return int(_configured_max_positions())
+    except Exception:
+        pass
+    try:
+        from execution.config import MAX_OPEN_POSITIONS
+        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", str(MAX_OPEN_POSITIONS)))
+    except Exception:
+        pass
+    try:
+        return int(os.getenv("EXECUTION_MAX_ACTIVE_TRADES", os.getenv("MAX_OPEN_POSITIONS", "100")))
+    except Exception:
+        return 100
+
+
+def build_dynamic_help_note() -> str:
+    """Dynamic help footer. UI only; does not change any execution rule."""
+    max_trades = get_execution_max_active_trades_display()
+    if is_execution_paused():
+        return (
+            "ℹ️ <b>التنفيذ الآن:</b> متوقف مؤقتًا ⏸\n"
+            "الإشارات ستظهر عادي، لكن التنفيذ لن يقبل صفقات حتى /resume_trading.\n"
+            f"عدد الصفقات المسموح بها: <b>{max_trades}</b>"
+        )
+    return (
+        "ℹ️ <b>التنفيذ الآن:</b> مفعّل ✅\n"
+        f"عدد الصفقات المسموح بها: <b>{max_trades}</b>"
+    )
+
+
 def build_help_message() -> str:
- return """<b>😋 OKX Scanner Bot - LONG</b>
+ return f"""<b>😋 OKX Scanner Bot - LONG</b>
 
 <b>⚡ أساسي:</b>
 /mood — حالة السوق
@@ -1734,32 +1767,82 @@ def build_help_message() -> str:
 /how_it_work — شرح البوت
 
 <b>ℹ️ ملاحظة:</b>
-التنفيذ الآن لأي Execution Candidate، مع حماية 7 صفقات، نفس الزوج، وDaily Drawdown."""
+{build_dynamic_help_note()}"""
 
 def build_how_it_work_message() -> str:
  return """📘 <b>كيف يعمل بوت اللونج؟</b>
 
-🧠 <b>فكرة البوت:</b>
-البوت يبحث عن فرص <b>Long Futures</b> على OKX - بفترة متوازنة حتى لا يخنق الإشارات الجيدة.
+🧠 <b>الفكرة العامة:</b>
+البوت يبحث عن فرص <b>Long Futures</b> على OKX، ويرسل إشارات متابعة عادية، ثم يرشّح جزءًا منها فقط للتنفيذ التجريبي حسب جودة إضافية ومخاطر التنفيذ.
 
-🔍 <b>منطق العمل:</b>
-1. اختيار العملات الأعلى سيولة وحجم تداول
-2. تحليل فريم 15m
-3. قياس قوة الزخم الصاعد
-4. تقييم:
-• الفوليوم
-• RSI
-• موقع السعر من المتوسط
-• Breakout / Pre-Breakout
-• تأكيد فريم 1H
-• حالة السوق العامة
-• Entry Maturity (موجات وبولباك)
-5. Smart Early Priority للإشارات المبكرة
-6. إعطاء Score من 10
-7. إرسال فقط الفرص المقبولة نهائيًا
+📡 <b>1) مرحلة البحث والفلترة الأولية:</b>
+• جلب أزواج USDT-SWAP النشطة.
+• استبعاد الأزواج الضعيفة أو قليلة السيولة.
+• تحليل فريم 15m مع سياق BTC والسوق العام.
+• استخدام حالة السوق: NORMAL_LONG / STRONG_LONG_ONLY / BLOCK_LONGS / RECOVERY_LONG.
+
+📊 <b>2) مرحلة جودة الإشارة العادية:</b>
+كل عملة تحصل على Score من 10 بناءً على:
+• Trend / Breakout / Reclaim / Continuation.
+• Volume وCandle Strength.
+• RSI وMACD.
+• موقع السعر من المتوسط.
+• تأكيد فريم 1H.
+• قوة السوق وBTC.
+
+🧠 <b>3) Entry Maturity — منع المطاردة:</b>
+يفحص هل الدخول مناسب أم متأخر جدًا:
+• هل السعر ممتد؟
+• هل الحركة قرب موجة خامسة؟
+• هل يوجد Pullback صحي؟
+• هل الدخول مطاردة بعد Pump؟
+النتيجة قد تكون: Reject أو Penalty أو Warning فقط لو السوق/setup قويين.
+
+🎯 <b>4) Smart TP/SL:</b>
+يبني خطة الصفقة منطقياً:
+• Entry.
+• TP1 / TP2.
+• SL.
+• RR.
+• دعم/مقاومة/ATR.
+لو الهدف غير مجزٍ أو الوقف غير منطقي، الإشارة قد ترفض قبل Telegram.
+
+🧱 <b>5) near_resistance_before_tp1:</b>
+يفحص هل توجد مقاومة قريبة قبل TP1.
+• في السوق الضعيف: التشدد أعلى.
+• في السوق القوي: بعض مقاومات swing_high أو bb_upper تتحول إلى Warning فقط.
+• المقاومة المؤكدة جدًا أو القريبة جدًا تظل سبب رفض.
+
+📩 <b>6) إرسال الإشارة العادية:</b>
+لو الإشارة عدّت الفلاتر السابقة، تصل Telegram كإشارة متابعة.
+مهم: الإشارة العادية لا تعني تنفيذ تلقائي.
+
+🚀 <b>7) مرحلة الترشيح للتنفيذ:</b>
+بعد وصول الإشارة، يتم فحصها مرة أخرى للتنفيذ:
+• هل setup ضمن Execution Tags / Whitelist؟
+• هل خطة Entry/SL/TP كاملة؟
+• هل Weak Drift يسمح؟
+• هل السعر لم يبتعد بشكل غير مناسب؟
+لو نجحت، تظهر علامة <b>Execution Candidate</b>.
+
+🛡️ <b>8) مرحلة التنفيذ والمخاطر:</b>
+Risk Manager يفحص:
+• هل التنفيذ مفعّل أم متوقف؟
+• Daily DD Lock.
+• عدد الصفقات المسموح بها.
+• نفس الزوج مفتوح أم لا.
+• حدود المخاطرة.
+ثم تكون النتيجة: accepted_preview / pending_pullback_preview / rejected_limit / rejected_risk / execution_paused.
+
+📌 <b>معنى الحالات:</b>
+• Signal = إشارة متابعة فقط.
+• Execution Candidate = مؤهلة للتنفيذ بعد فلاتر إضافية.
+• accepted_preview = مقبولة للتنفيذ التجريبي.
+• pending_pullback_preview = انتظار Pullback.
+• execution_paused = التنفيذ متوقف، لكن الإشارة محفوظة للتقرير.
 
 📈 <b>Track:</b>
-يعرض الحقًا أداء الصفقة بعد إرسالها"""
+يعرض لاحقًا حالة الصفقة، المرحلة، أقصى صعود/هبوط، ونتيجة TP/SL."""
 
 def reset_stats(chat_id: str):
  if not r:
@@ -3068,6 +3151,34 @@ def _format_exec_num(value, decimals=6):
         return "N/A"
 
 
+def _execution_current_price_for_trade(trade: dict):
+    for key in ("current_price", "last_price", "market_price", "last_tracked_price", "price"):
+        current = _safe_trade_float_value(_trade_field(trade, key), None)
+        if current and current > 0:
+            return current
+    try:
+        current = _safe_trade_float_value(get_last_price(str(trade.get("symbol") or "")), None)
+        if current and current > 0:
+            return current
+    except Exception:
+        pass
+    return None
+
+
+def _execution_prices_line(trade: dict) -> str:
+    plan = _execution_plan_for_trade(trade)
+    current = _execution_current_price_for_trade(trade)
+    tp1 = _safe_trade_float_value(plan.get("tp1") or trade.get("tp1"), None)
+    tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), None)
+    sl = _safe_trade_float_value(plan.get("sl") or trade.get("sl"), None)
+    return (
+        f"💰 الحالي: {_format_exec_num(current)} | "
+        f"🎯 TP1: {_format_exec_num(tp1)} | "
+        f"🏁 TP2: {_format_exec_num(tp2)} | "
+        f"🛑 SL: {_format_exec_num(sl)}"
+    )
+
+
 def _trade_created_ts_for_exec(trade: dict) -> int:
     for key in ("created_ts", "created_at", "candle_time"):
         try:
@@ -3420,6 +3531,7 @@ def build_execution_report_message(period: str = "all") -> str:
                     status_line += " | 🔒 SL Entry"
                 return [
                     f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
+                    _execution_prices_line(trade),
                     f"📌 الحالة: {html.escape(status_line)}",
                     market_context_line(trade),
                     concise_trade_reason(trade, is_win=is_win),
@@ -3428,6 +3540,7 @@ def build_execution_report_message(period: str = "all") -> str:
             return [
                 f"{icon} <b>{symbol}</b>",
                 f"{exposure(pnl)} | {html.escape(str(result_label))}",
+                _execution_prices_line(trade),
                 "",
                 market_context_line(trade),
                 concise_trade_reason(trade, is_win=is_win),
