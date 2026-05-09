@@ -3906,13 +3906,18 @@ def get_open_trades_summary(
         entry_mode     = str(trade.get("entry_mode", "market"))
 
         # ── Phase detection (محسّن) ─────────────────────────────
-        if status in ("tp2_partial", "trailing_open", "trailing"):
+        # لا نعتمد على status == "partial" وحده لأن بعض الصفقات قد تحمل status
+        # قديم/مضلل بدون أن يكون TP1 قد تحقق فعليًا. مرحلة "بعد TP1" تثبت فقط
+        # من flags حقيقية مثل tp1_hit أو تحريك SL إلى Entry أو TP2/Trailing.
+        real_tp1_phase = bool(tp1_hit or sl_moved or tp2_hit or trailing_active)
+
+        if status in ("tp2_partial", "trailing_open", "trailing") and real_tp1_phase:
             phase = "trailing"
         elif trailing_active and tp2_hit:
             phase = "trailing"
         elif tp2_hit:
             phase = "tp2_hit"
-        elif tp1_hit or status == "partial":
+        elif real_tp1_phase:
             phase = "tp1_hit"
         elif status == "pending_pullback":
             phase = "pending_pullback"
