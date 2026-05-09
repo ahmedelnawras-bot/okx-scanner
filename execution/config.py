@@ -43,6 +43,7 @@ EXECUTION_SETUP_WHITELIST = {
     "retest_breakout_confirmed",
     "wave_3",
     "relative_strength_vs_btc",
+    "elite_long_opportunity",
 }
 
 # Backward-compatible names used by older execution files.
