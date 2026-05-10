@@ -1281,6 +1281,7 @@ def is_relaxed_execution_setup(
     setup_type: str = "",
     extra_setup_names=None,
     primary_extra_setup: str = "",
+    execution_setup_tags=None,
     mtf_confirmed: bool = False,
     vol_ratio: float = 0.0,
     score: float = 0.0,
@@ -1300,6 +1301,10 @@ def is_relaxed_execution_setup(
             names.extend([str(x) for x in extra_setup_names if x])
         elif extra_setup_names:
             names.append(str(extra_setup_names))
+        if isinstance(execution_setup_tags, (list, tuple, set)):
+            names.extend([str(x) for x in execution_setup_tags if x])
+        elif execution_setup_tags:
+            names.append(str(execution_setup_tags))
 
         blob = "|".join(names).lower()
         strong_tokens = {
@@ -3274,14 +3279,23 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             str(_trade_field(data, "wave_label", "") or ""),
             str(_trade_field(data, "fib_position", "") or ""),
         ]).lower()
-        late_or_danger = any(token in entry_text for token in (
-            "danger", "hard_late", "overextended", "امتداد سعري", "متأخر جدًا", "نهاية موجة", "موجة خامسة"
+        # NORMAL_LONG execution quality relaxation:
+        # - Keep true danger / hard-late / overextended / wave-5 entries blocked.
+        # - Do not let ordinary late wording (for example extension/near end of wave)
+        #   automatically kill a detector-approved whitelist setup when score, MTF and
+        #   volume are supportive. Normal alerts are unaffected; this is execution-only.
+        hard_late_or_danger = any(token in entry_text for token in (
+            "danger", "danger_late", "hard_late", "overextended", "متأخر جدًا", "موجة خامسة"
         ))
+        soft_late_warning = any(token in entry_text for token in (
+            "late", "متأخر", "امتداد سعري", "نهاية موجة"
+        ))
+        late_or_danger = hard_late_or_danger or (soft_late_warning and mode != MODE_NORMAL_LONG)
 
         allowed = False
         allow_reason = ""
 
-        if has_whitelist and not late_or_danger:
+        if has_whitelist and not hard_late_or_danger:
             if breakout_quality == "strong" and mtf_confirmed and vol_ratio >= 1.10 and score >= 7.2:
                 allowed = True
                 allow_reason = "strong_breakout_mtf"
@@ -3297,6 +3311,17 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             elif setup_weight >= 2 and score >= 7.9 and vol_ratio >= 1.30:
                 allowed = True
                 allow_reason = "tier2_setup_force"
+            elif (
+                mode == MODE_NORMAL_LONG
+                and soft_late_warning
+                and setup_weight >= 3
+                and score >= 7.0
+                and mtf_confirmed
+                and vol_ratio >= 1.10
+                and breakout_quality in ("strong", "good", "ok", "")
+            ):
+                allowed = True
+                allow_reason = "normal_whitelist_soft_late_allowed"
             else:
                 dynamic_score = 0
                 if mtf_confirmed:
@@ -3312,7 +3337,7 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
                 elif breakout_quality in ("ok", "good"):
                     dynamic_score += 1
                 dynamic_score += setup_weight
-                if "late" in entry_text or "متأخر" in entry_text:
+                if soft_late_warning:
                     dynamic_score -= 1
                 if resistance_warning:
                     dynamic_score -= 1
@@ -3333,7 +3358,7 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             "WEAK DRIFT EXEC BLOCK | "
             f"symbol={data.get('symbol', '?')} | reason={drift.get('reason')} | "
             f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | "
-            f"whitelist={has_whitelist} | setup_weight={setup_weight}"
+            f"whitelist={has_whitelist} | setup_weight={setup_weight} | hard_late={hard_late_or_danger} | soft_late={soft_late_warning}"
         )
         return False
     except Exception as e:
@@ -11950,6 +11975,14 @@ def run_scanner_loop():
                             setup_type=setup_type,
                             extra_setup_names=extra_setup_names,
                             primary_extra_setup=primary_extra_setup,
+                            execution_setup_tags=_collect_execution_setup_tags({
+                                "setup_type": setup_type,
+                                "primary_extra_setup": primary_extra_setup,
+                                "extra_setup_names": extra_setup_names,
+                                "execution_setup_tags": locals().get("execution_setup_tags", []),
+                                "relative_strength_vs_btc": locals().get("relative_strength_vs_btc", False),
+                                "wave_estimate": locals().get("wave_estimate", None),
+                            }),
                             mtf_confirmed=mtf_confirmed,
                             vol_ratio=vol_ratio,
                             score=score_result.get("score", raw_score),
