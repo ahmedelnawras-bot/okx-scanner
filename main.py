@@ -11852,9 +11852,18 @@ def run_scanner_loop():
                         # - relaxed/strong setups use softer hard-reject limits
                         # - ultra-tiny non-structural resistance is treated as noise/warning, not a hard reject
                         _res_source = str(smart_targets_early.get("nearest_resistance_source") or "unknown")
-                        _structural_res_sources = {"swing_high", "previous_rejection", "round_level_confirmed", "bb_upper"}
-                        _weak_micro_res_sources = {"recent_20_high", "unknown", "micro_high", "tiny_wick"}
-                        _res_is_structural = _res_source in _structural_res_sources
+                        # Resistance source quality:
+                        # - previous_rejection / confirmed round levels are real structural resistance.
+                        # - swing_high is still structural, but softer than major rejection levels.
+                        # - bb_upper / recent_20_high are dynamic hints in NORMAL_LONG, not hard walls by themselves.
+                        _major_structural_sources = {"previous_rejection", "round_level_confirmed"}
+                        _minor_structural_sources = {"swing_high"}
+                        _dynamic_hint_sources = {"bb_upper", "recent_20_high"}
+                        _weak_micro_res_sources = {"unknown", "micro_high", "tiny_wick"}
+                        _res_is_major_structural = _res_source in _major_structural_sources
+                        _res_is_minor_structural = _res_source in _minor_structural_sources
+                        _res_is_dynamic_hint = _res_source in _dynamic_hint_sources
+                        _res_is_structural = _res_is_major_structural or _res_is_minor_structural
                         _res_is_micro_noise = (_res_source in _weak_micro_res_sources) and (_res_dist_pct < 0.25 or _res_r < 0.20)
 
                         _res_relaxed_setup = is_relaxed_execution_setup(
@@ -11875,11 +11884,12 @@ def run_scanner_loop():
                             market_state in ("bull_market", "alt_season")
                             or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
                         )
-                        _major_structural_sources = {"previous_rejection", "round_level_confirmed"}
-                        _minor_structural_sources = {"swing_high", "bb_upper"}
-                        _res_is_major_structural = _res_source in _major_structural_sources
-                        _res_is_minor_structural = _res_source in _minor_structural_sources
                         _res_is_ultra_close = (_res_dist_pct < 0.10 or _res_r < 0.15)
+                        _normal_dynamic_hint_warning_only = (
+                            current_mode == MODE_NORMAL_LONG
+                            and _res_is_dynamic_hint
+                            and not _res_is_ultra_close
+                        )
                         _bull_mtf_flex = (
                             _strong_market_for_resistance
                             and bool(mtf_confirmed)
@@ -11890,11 +11900,12 @@ def run_scanner_loop():
                             and not _res_is_ultra_close
                         )
 
-                        if _res_is_micro_noise:
+                        if _res_is_micro_noise or _normal_dynamic_hint_warning_only:
                             smart_resistance_warning_only = True
                             early_resistance_warning = ""
+                            _res_note = "normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored"
                             logger.info(
-                                f"⚪ {symbol} tiny/micro resistance ignored | "
+                                f"⚪ {symbol} {_res_note} | "
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
                             )
                         else:
