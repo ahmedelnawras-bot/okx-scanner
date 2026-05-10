@@ -1,4 +1,4 @@
-# Version: main_v126_momentum_filter_balance
+# Version: main_v127_rsi_momentum_soft_balance
 # UI PATCH VERIFIED 2026-05-08: mood transition/reminder titles + compact open execution report formatting.
 # Version: main_v08_modes_ui_final
 # Date: 2026-05-08
@@ -11117,17 +11117,22 @@ def run_scanner_loop():
                         )
                         continue
                 if not is_reverse:
-                    bull_mtf_strong_soften = (
+                    # v127: keep RSI momentum/slope weakness as a hard block only for weak setups.
+                    # Strong, unified setup tags in NORMAL/STRONG modes should not be silenced by
+                    # rsi_momentum_weak when the broader market context or MTF is supportive.
+                    _pre_score_market_supportive = (
                         market_state in ("bull_market", "alt_season")
+                        or "صاعد" in str(btc_mode or "")
+                        or "قوي" in str(alt_mode or "")
+                        or "🟢" in str(btc_mode or "")
+                        or "🟢" in str(alt_mode or "")
+                        or current_mode == MODE_STRONG_LONG_ONLY
+                    )
+                    bull_mtf_strong_soften = (
+                        current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
                         and relaxed_pre_score_setup
-                        and (
-                            (mtf_confirmed and vol_ratio >= 1.15)
-                            or (
-                                current_mode == MODE_STRONG_LONG_ONLY
-                                and vol_ratio >= 1.05
-                                and (mtf_confirmed or "صاعد" in str(btc_mode or "") or "قوي" in str(alt_mode or ""))
-                            )
-                        )
+                        and vol_ratio >= (1.00 if current_mode == MODE_STRONG_LONG_ONLY else 1.05)
+                        and (mtf_confirmed or _pre_score_market_supportive)
                     )
 
                     if (
@@ -11166,6 +11171,8 @@ def run_scanner_loop():
                                        "extra_setup_names": extra_setup_names,
                                        "primary_extra_setup": primary_extra_setup,
                                        "extra_setup_bonus": extra_setup_bonus,
+                                       "execution_setup_tags": early_execution_setup_tags,
+                                       "pre_score_market_supportive": locals().get("_pre_score_market_supportive", False),
                                        "soften_allowed": False},
                             )
                             continue
@@ -11199,6 +11206,8 @@ def run_scanner_loop():
                                        "extra_setup_names": extra_setup_names,
                                        "primary_extra_setup": primary_extra_setup,
                                        "extra_setup_bonus": extra_setup_bonus,
+                                       "execution_setup_tags": early_execution_setup_tags,
+                                       "pre_score_market_supportive": locals().get("_pre_score_market_supportive", False),
                                        "soften_allowed": False},
                             )
                             continue
