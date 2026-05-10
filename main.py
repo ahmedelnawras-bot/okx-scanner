@@ -1,4 +1,4 @@
-# Version: main_v127_rsi_momentum_soft_balance
+# Version: main_v128_resistance_relax_balance
 # UI PATCH VERIFIED 2026-05-08: mood transition/reminder titles + compact open execution report formatting.
 # Version: main_v08_modes_ui_final
 # Date: 2026-05-08
@@ -1357,9 +1357,11 @@ def is_relaxed_execution_setup(
             sc = 0.0
 
         # Before final scoring, score may be 0; allow only if MTF or volume supports it.
+        # v128: for resistance softening only, strong canonical setups should not lose
+        # relaxed status just because score was already penalized by late/resistance.
         if sc <= 0:
-            return bool(mtf_confirmed or v >= 1.15)
-        return bool(sc >= 7.0 and (mtf_confirmed or v >= 1.15))
+            return bool(mtf_confirmed or v >= 1.10)
+        return bool(sc >= 6.5 and (mtf_confirmed or v >= 1.00))
     except Exception:
         return False
 
@@ -12219,11 +12221,12 @@ def run_scanner_loop():
                             setup_type=setup_type,
                             extra_setup_names=extra_setup_names,
                             primary_extra_setup=primary_extra_setup,
-                            execution_setup_tags=_collect_execution_setup_tags({
+                            execution_setup_tags=build_execution_setup_tags({
                                 "setup_type": setup_type,
                                 "primary_extra_setup": primary_extra_setup,
                                 "extra_setup_names": extra_setup_names,
-                                "execution_setup_tags": locals().get("execution_setup_tags", []),
+                                "execution_setup_tags": locals().get("early_execution_setup_tags", []),
+                                "early_execution_setup_tags": locals().get("early_execution_setup_tags", []),
                                 "relative_strength_vs_btc": locals().get("relative_strength_vs_btc", False),
                                 "wave_estimate": locals().get("wave_estimate", None),
                             }),
@@ -12233,38 +12236,45 @@ def run_scanner_loop():
                         )
 
                         # Market Adaptive Resistance:
-                        # In bull/alt-season conditions, a minor swing_high / bb_upper should not
-                        # behave like a major supply wall when the signal itself has MTF + volume
-                        # + strong setup support. Keep truly close/low-R resistance protected.
+                        # v128: only soften dynamic/noise resistance for strong canonical setups.
+                        # Keep real structure protected: swing_high / previous_rejection /
+                        # confirmed round levels still hard-reject when they are too close or low-R.
                         _score_for_resistance = float(score_result.get("score", raw_score) or 0.0)
-                        _strong_market_for_resistance = (
-                            market_state in ("bull_market", "alt_season")
+                        _strong_market_for_resistance = market_state in ("bull_market", "alt_season")
+                        _market_supportive_for_resistance = (
+                            _strong_market_for_resistance
                             or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
+                            or "صاعد" in str(btc_mode or "")
+                            or "قوي" in str(alt_mode or "")
                         )
                         _res_is_ultra_close = (_res_dist_pct < 0.10 or _res_r < 0.15)
+                        _res_flex_source_allowed = (_res_is_dynamic_hint or _res_is_micro_noise)
                         _normal_dynamic_hint_warning_only = (
                             current_mode == MODE_NORMAL_LONG
                             and _res_is_dynamic_hint
                             and not _res_is_ultra_close
                         )
                         _bull_mtf_flex = (
-                            current_mode == MODE_NORMAL_LONG
-                            and _strong_market_for_resistance
-                            and bool(mtf_confirmed)
-                            and float(vol_ratio or 0.0) >= 1.05
+                            current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
+                            and _market_supportive_for_resistance
+                            and (bool(mtf_confirmed) or bool(breakout) or bool(pre_breakout))
+                            and float(vol_ratio or 0.0) >= 1.00
                             and _score_for_resistance >= 6.5
                             and (_res_relaxed_setup or breakout or pre_breakout)
-                            and not _res_is_major_structural
+                            and _res_flex_source_allowed
+                            and not _res_is_structural
                             and not _res_is_ultra_close
+                            and _res_r >= 0.20
                         )
 
                         if _res_is_micro_noise or _normal_dynamic_hint_warning_only or _bull_mtf_flex:
                             smart_resistance_warning_only = True
                             early_resistance_warning = ""
-                            _res_note = "normal_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
+                            _res_note = "strong_setup_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
                             logger.info(
                                 f"⚪ {symbol} {_res_note} | "
-                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
+                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                f"relaxed={_res_relaxed_setup} | bull_flex={_bull_mtf_flex}"
                             )
                         else:
                             if _res_relaxed_setup:
@@ -12314,6 +12324,7 @@ def run_scanner_loop():
                                         "bull_flex": _bull_mtf_flex,
                                         "ultra_close": _res_is_ultra_close,
                                         "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
+                                        "resistance_relaxed_reason": "strong_setup_bull_flex" if _bull_mtf_flex else "not_relaxed_or_real_resistance",
                                         "category": "trade_quality",
                                     },
                                 )
