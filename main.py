@@ -2736,7 +2736,7 @@ def build_market_status_message() -> str:
     transition = f"{_market_mode_label(last_mode)} → {mode_ar}" if last_mode != current_mode else f"{mode_ar}"
 
     lines = [
-        f"{mode_icon} <b>Market Mood - LONG</b>",
+        f"{mode_icon} <b>Market Mood - {current_mode}</b>",
         "",
         f"⚙️ <b>المود الحالي:</b> {mode_ar}",
         f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
@@ -7511,7 +7511,7 @@ SMART_TP1_ROUND_LEVELS_ENABLED = True
 SMART_SL_ENABLED = True
 SMART_SL_SUPPORT_LOOKBACK = 50
 SMART_SL_ATR_BUFFER = 0.35
-SMART_SL_MIN_PCT = 1.50
+SMART_SL_MIN_PCT = 1.85
 SMART_SL_MAX_PCT = 3.50
 SMART_SL_FALLBACK_ATR_MULT = 2.8
 
@@ -9261,7 +9261,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
     allowed_lines = get_market_mode_allowed_lines(new_mode)
 
     lines = [
-        f"{mode_icon} <b>Market Mood - LONG</b>",
+        f"{mode_icon} <b>Market Mood - {new_mode}</b>",
         "",
         "🔁 <b>تغيير المود</b>",
         "",
