@@ -2101,7 +2101,9 @@ def build_trade_registration_payload(candidate: dict) -> dict:
         "execution_sl": candidate.get("execution_sl"),
         "execution_tp1": candidate.get("execution_tp1"),
         "execution_tp2": candidate.get("execution_tp2"),
-        "execution_status": candidate.get("execution_status", "candidate_only"),
+        "execution_candidate_badged": bool(candidate.get("execution_candidate_badged", False)),
+        "execution_candidate_badge_sent": bool(candidate.get("execution_candidate_badge_sent", candidate.get("execution_candidate_badged", False))),
+        "execution_status": candidate.get("execution_status", "candidate_only" if candidate.get("execution_candidate_badged") else "not_candidate"),
         "execution_reject_reason": candidate.get("execution_reject_reason", ""),
         "execution_message_sent": candidate.get("execution_message_sent", False),
         "execution_result_status": candidate.get("execution_result_status", ""),
@@ -3305,18 +3307,37 @@ def _execution_plan_for_trade(trade: dict) -> dict:
 
 
 def is_execution_candidate_trade(trade: dict) -> bool:
-    """Report/analytics classification for true execution candidates.
+    """Report/analytics classification for execution candidates.
 
-    Final rule: any alert that passed the normal signal filters becomes an
-    Execution Candidate if it either matches the execution whitelist or passed
-    while BLOCK_LONGS was active. Late/danger context is kept as warning data
-    only and must not block candidate classification here.
+    Badge-only rule:
+    - New trades are counted in /report_execution only when the main signal
+      message actually displayed the execution badge.
+    - This prevents whitelist-like normal alerts (for example vwap_reclaim)
+      from entering the execution report without a visible badge.
+    - Legacy trades that do not yet have the badge flag can still be counted
+      only if they already have a real execution status/message from the
+      execution flow, not merely a whitelist setup.
     """
     try:
-        if not (_has_strict_execution_setup(trade) or _is_block_mode_execution_candidate(trade)):
+        badged_value = _trade_field(trade, "execution_candidate_badged", None)
+        if isinstance(badged_value, str):
+            badged_value = badged_value.strip().lower() in ("1", "true", "yes", "y", "on")
+        if badged_value is True:
+            plan = _execution_plan_for_trade(trade)
+            return bool(plan.get("complete"))
+        if badged_value is False:
             return False
-        plan = _execution_plan_for_trade(trade)
-        return bool(plan.get("complete"))
+
+        # Legacy fallback: before this flag existed, the safest proof that a
+        # trade really passed the execution path is a concrete execution status
+        # or an execution message. Do not count candidate_only/not_candidate.
+        status = str(_trade_field(trade, "execution_status", "") or _trade_field(trade, "execution_result_status", "") or "").strip()
+        if status in ("", "not_candidate", "candidate_only"):
+            return False
+        if bool(_trade_field(trade, "execution_message_sent", False)) or status not in ("preview_rejected",):
+            plan = _execution_plan_for_trade(trade)
+            return bool(plan.get("complete"))
+        return False
     except Exception:
         return False
 
@@ -3585,7 +3606,7 @@ def build_execution_report_message(period: str = "all") -> str:
 
         trades = [
             t for t in trades
-            if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")
+            if is_execution_candidate_trade(t)
         ]
         trades.sort(key=_trade_created_ts_for_exec, reverse=True)
         if not trades:
@@ -3889,7 +3910,7 @@ def build_execution_losses_report_message() -> str:
             trades = _load_long_trades_from_redis(limit=1500)
         trades = [
             t for t in trades
-            if is_execution_candidate_trade(t) or _execution_status_for_trade(t) not in ("", "not_candidate")
+            if is_execution_candidate_trade(t)
         ]
         losses = []
         for t in trades:
@@ -9544,6 +9565,9 @@ def update_execution_status_for_candidate(candidate: dict, status: str, reason: 
             "execution_message_sent": bool(message_sent),
             "execution_updated_ts": int(time.time()),
         }
+        if "execution_candidate_badged" in candidate:
+            updates["execution_candidate_badged"] = bool(candidate.get("execution_candidate_badged"))
+            updates["execution_candidate_badge_sent"] = bool(candidate.get("execution_candidate_badge_sent", candidate.get("execution_candidate_badged")))
         for key in (f"trade:futures:long:{symbol}:{candle_time}", f"trade_history:futures:long:{symbol}:{candle_time}"):
             raw = r.get(key)
             if not raw:
@@ -12609,6 +12633,11 @@ def run_scanner_loop():
                     message = "🔥 <b>استثناء BLOCK_LONGS:</b> العملة أقوى من BTC أو Setup قوي جدًا\n\n" + message
 
                 badge = build_execution_badge_line(candidate)
+                candidate["execution_candidate_badged"] = bool(badge)
+                candidate["execution_candidate_badge_sent"] = bool(badge)
+                if not badge:
+                    candidate["execution_status"] = "not_candidate"
+                    candidate.setdefault("execution_reject_reason", "no_execution_badge")
                 if badge:
                     message = badge + "\n\n" + message
 
@@ -12729,9 +12758,15 @@ def run_scanner_loop():
                         "relative_strength_24": candidate.get("relative_strength_24"),
                         "relative_strength_vs_btc": candidate.get("relative_strength_vs_btc"),
                         "execution_setup_tags": candidate.get("execution_setup_tags", []),
+                        "execution_candidate_badged": bool(candidate.get("execution_candidate_badged", False)),
+                        "execution_candidate_badge_sent": bool(candidate.get("execution_candidate_badge_sent", candidate.get("execution_candidate_badged", False))),
                     }
                     save_alert_snapshot(alert_snapshot, message_id=message_id)
-                    candidate.setdefault("execution_status", "candidate_only")
+                    if candidate.get("execution_candidate_badged"):
+                        candidate.setdefault("execution_status", "candidate_only")
+                    else:
+                        candidate["execution_status"] = "not_candidate"
+                        candidate.setdefault("execution_reject_reason", "no_execution_badge")
                     candidate_alert_id = candidate["alert_id"]
                     register_ok = register_trade_from_candidate(candidate)
                     set_alert_registration_status(candidate_alert_id, register_ok)
