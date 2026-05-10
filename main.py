@@ -9226,6 +9226,88 @@ def build_compact_market_mode_reminder(
 
     return "\n".join(lines)
 
+
+def maybe_send_market_mode_reminder(
+    current_mode: str,
+    btc_mode: str = "",
+    market_info: dict = None,
+    alt_snapshot: dict = None,
+    ranked_pairs: list = None,
+    market_guard: dict = None,
+) -> bool:
+    """Send the periodic Market Reminder when due.
+
+    Kept separate so cooldown exits can check reminders before `continue`.
+    Returns True only when a reminder is sent.
+    """
+    if not r:
+        return False
+    REMINDER_INTERVAL = 1200  # 20 minutes
+    now_ts_local = int(time.time())
+    market_info = market_info or {}
+    alt_snapshot = alt_snapshot or {}
+    ranked_pairs = ranked_pairs or []
+    market_guard = market_guard or {}
+    try:
+        last_reminder = int(r.get(MARKET_MODE_LAST_REMINDER_KEY) or 0)
+        if now_ts_local - last_reminder < REMINDER_INTERVAL:
+            return False
+
+        reminder_mode = r.get(MARKET_MODE_REMINDER_MODE_KEY) or current_mode
+        reminder_count = int(r.get(MARKET_MODE_REMINDER_COUNT_KEY) or 0)
+        if reminder_mode != current_mode:
+            reminder_count = 0
+        reminder_count += 1
+
+        protection_summary = None
+        block_protection_active = False
+        if current_mode == MODE_BLOCK_LONGS:
+            try:
+                already_applied = bool(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY))
+                block_protection_active = already_applied
+                if reminder_count == 1 and not already_applied:
+                    protection_summary = update_open_trades(
+                        r,
+                        market_type="futures",
+                        side="long",
+                        timeframe=TIMEFRAME,
+                        market_mode=current_mode,
+                        protect_breakeven_on_block=True,
+                        breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
+                        breakeven_buffer_pct=PROTECT_ON_BLOCK_BUFFER_PCT,
+                        block_pressure_level=market_guard.get("level", ""),
+                        block_red_ratio=market_guard.get("red_ratio_15m", 0),
+                        block_avg_change=market_guard.get("avg_change_15m", 0),
+                        block_btc_change=market_guard.get("btc_change_15m", 0),
+                        reason="market_mode=BLOCK_LONGS:first_reminder",
+                    )
+                    r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, str(now_ts_local))
+                    block_protection_active = True
+            except Exception as _protect_exc:
+                logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
+
+        strong_coins_count = _estimate_strong_coins_for_reminder(alt_snapshot, len(ranked_pairs))
+        reminder_msg = build_compact_market_mode_reminder(
+            reminder_count=reminder_count,
+            current_mode=current_mode,
+            btc_mode=btc_mode,
+            market_state_label=market_info.get("market_state_label", ""),
+            alt_mode=alt_snapshot.get("alt_mode", ""),
+            strong_coins_count=strong_coins_count,
+            ranked_pairs_count=len(ranked_pairs),
+            block_protection_active=block_protection_active,
+            protection_summary=protection_summary,
+        )
+        send_telegram_message(reminder_msg)
+
+        r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
+        r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
+        r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
+        return True
+    except Exception as e:
+        logger.warning(f"Market mode reminder error: {e}")
+        return False
+
 def format_block_protection_summary_message(summary: dict) -> str:
     """Format one compact Telegram message after first BLOCK_LONGS reminder protection."""
     summary = summary or {}
@@ -10011,66 +10093,25 @@ def run_scanner_loop():
             save_market_status_snapshot(snapshot_data)
 
             # Periodic compact market mode reminder (every 20 minutes)
-            REMINDER_INTERVAL = 1200  # 20 minutes
-            now_ts_local = int(time.time())
-            if r:
-                try:
-                    last_reminder = int(r.get(MARKET_MODE_LAST_REMINDER_KEY) or 0)
-                    if now_ts_local - last_reminder >= REMINDER_INTERVAL:
-                        reminder_mode = r.get(MARKET_MODE_REMINDER_MODE_KEY) or current_mode
-                        reminder_count = int(r.get(MARKET_MODE_REMINDER_COUNT_KEY) or 0)
-                        if reminder_mode != current_mode:
-                            reminder_count = 0
-                        reminder_count += 1
-                        protection_summary = None
-                        block_protection_active = False
-                        if current_mode == MODE_BLOCK_LONGS:
-                            try:
-                                already_applied = bool(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY))
-                                block_protection_active = already_applied
-                                if reminder_count == 1 and not already_applied:
-                                    protection_summary = update_open_trades(
-                                        r,
-                                        market_type="futures",
-                                        side="long",
-                                        timeframe=TIMEFRAME,
-                                        market_mode=current_mode,
-                                        protect_breakeven_on_block=True,
-                                        breakeven_min_profit_pct=PROTECT_ON_BLOCK_MIN_PROFIT_PCT,
-                                        breakeven_buffer_pct=PROTECT_ON_BLOCK_BUFFER_PCT,
-                                        block_pressure_level=market_guard.get("level", ""),
-                                        block_red_ratio=market_guard.get("red_ratio_15m", 0),
-                                        block_avg_change=market_guard.get("avg_change_15m", 0),
-                                        block_btc_change=market_guard.get("btc_change_15m", 0),
-                                        reason="market_mode=BLOCK_LONGS:first_reminder",
-                                    )
-                                    r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, str(now_ts_local))
-                                    block_protection_active = True
-                            except Exception as _protect_exc:
-                                logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
-
-                        strong_coins_count = _estimate_strong_coins_for_reminder(alt_snapshot, len(ranked_pairs))
-                        reminder_msg = build_compact_market_mode_reminder(
-                            reminder_count=reminder_count,
-                            current_mode=current_mode,
-                            btc_mode=btc_mode,
-                            market_state_label=market_info.get("market_state_label", ""),
-                            alt_mode=alt_snapshot.get("alt_mode", ""),
-                            strong_coins_count=strong_coins_count,
-                            ranked_pairs_count=len(ranked_pairs),
-                            block_protection_active=block_protection_active,
-                            protection_summary=protection_summary,
-                        )
-                        send_telegram_message(reminder_msg)
-
-                        r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
-                        r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
-                        r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
-                except Exception as e:
-                    logger.warning(f"Market mode reminder error: {e}")
+            maybe_send_market_mode_reminder(
+                current_mode=current_mode,
+                btc_mode=btc_mode,
+                market_info=market_info,
+                alt_snapshot=alt_snapshot,
+                ranked_pairs=ranked_pairs,
+                market_guard=market_guard,
+            )
 
             global_cooldown_active = is_global_cooldown_active()
             if global_cooldown_active and current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY):
+                maybe_send_market_mode_reminder(
+                    current_mode=current_mode,
+                    btc_mode=btc_mode,
+                    market_info=market_info,
+                    alt_snapshot=alt_snapshot,
+                    ranked_pairs=ranked_pairs,
+                    market_guard=market_guard,
+                )
                 logger.info(
                     f"GLOBAL COOLDOWN active - market mode checked, skipping normal/strong signal sending | mode={current_mode}"
                 )
