@@ -268,7 +268,7 @@ MODE_TRANSITION_MIN_INTERVAL = 480
 RECOVERY_CHECK_INTERVAL = 120
 NORMAL_CANDIDATE_DURATION = 480
 BLOCK_EXIT_CONFIRM_DURATION = 900   # 15 minutes: BLOCK → STRONG confirmation
-STRONG_TO_NORMAL_CONFIRM_DURATION = 480  # 8 minutes: STRONG → NORMAL confirmation
+STRONG_TO_NORMAL_CONFIRM_DURATION = 300  # 5 minutes: STRONG → NORMAL confirmation
 
 # Market Crash Guard
 MARKET_GUARD_ENABLED = True
@@ -3844,10 +3844,10 @@ def build_execution_report_message(period: str = "all") -> str:
 
         lines.extend([
             "━━━━━━━━━━━━",
-            "🏆 <b>آخر 5 صفقات رابحة</b>",
+            "🏆 <b>آخر 3 صفقات رابحة</b>",
         ])
 
-        latest_winners = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]
+        latest_winners = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:3]
         if latest_winners:
             for idx, (trade, pnl) in enumerate(latest_winners):
                 lines.extend(short_trade_line(trade, pnl, "🟢", is_win=True))
@@ -3857,8 +3857,8 @@ def build_execution_report_message(period: str = "all") -> str:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
             lines.append("")
 
-        lines.append("📉 <b>آخر 5 صفقات خاسرة</b>")
-        latest_losers = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:5]
+        lines.append("📉 <b>آخر 3 صفقات خاسرة</b>")
+        latest_losers = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:3]
         if latest_losers:
             for idx, (trade, pnl) in enumerate(latest_losers):
                 lines.extend(short_trade_line(trade, pnl, "🔴", is_win=False))
@@ -8545,16 +8545,16 @@ def is_market_normal_ready(red_ratio, avg_change, btc_change, market_state) -> b
 
     if market_state in ("bull_market", "alt_season"):
         return (
-            red_ratio < 0.58
-            and avg_change > -0.35
-            and btc_change > -0.20
+            red_ratio < 0.62
+            and avg_change > -0.50
+            and btc_change > -0.30
         )
 
     if market_state == "mixed":
         return (
-            red_ratio < 0.52
-            and avg_change > -0.25
-            and btc_change > -0.15
+            red_ratio < 0.56
+            and avg_change > -0.40
+            and btc_change > -0.25
         )
 
     return False
@@ -8585,11 +8585,11 @@ def is_selective_market_normal_ready(
     above_ma_ratio = float(alt_snapshot.get("above_ma_ratio", 0.0) or 0.0)
 
     btc_supportive = ("صاعد" in btc_text) or btc_change >= 0.0
-    market_guard_ok = red_ratio < 0.50 and avg_change > -0.20 and btc_change > -0.20
+    market_guard_ok = red_ratio < 0.58 and avg_change > -0.35 and btc_change > -0.25
     breadth_constructive = (
-        alt_strength >= 0.42
-        or positive_24h_ratio >= 0.45
-        or above_ma_ratio >= 0.42
+        alt_strength >= 0.38
+        or positive_24h_ratio >= 0.42
+        or above_ma_ratio >= 0.38
         or market_state in ("bull_market", "alt_season")
     )
     return btc_supportive and market_guard_ok and breadth_constructive
@@ -8750,9 +8750,9 @@ def determine_long_market_mode(
                     r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
                 except Exception:
                     pass
-            if time_since_last_transition < MODE_TRANSITION_MIN_INTERVAL:
+            if time_since_last_transition < STRONG_TO_NORMAL_CONFIRM_DURATION:
                 return {"mode": MODE_STRONG_LONG_ONLY, "reason": "تأكيد طبيعي لكن أقل مدة انتقال لم تمر"}
-            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 8 دقائق، رجوع للوضع الطبيعي"}
+            return {"mode": MODE_NORMAL_LONG, "reason": "استقرار 5 دقائق، رجوع للوضع الطبيعي"}
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"جاري التأكد من الاستقرار... ({now_ts - normal_candidate_since}s/{STRONG_TO_NORMAL_CONFIRM_DURATION}s)"}
     if allow_state_writes and r:
         try:
