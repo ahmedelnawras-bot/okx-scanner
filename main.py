@@ -590,6 +590,30 @@ def record_candle_fetch_failure(symbol: str, timeframe: str = TIMEFRAME) -> int:
 # =========================
 # NEW HELPER: consolidated rejection logging
 # =========================
+LONG_REJECTION_REASON_COUNTER = {}
+
+def _reset_long_run_counters():
+    try:
+        LONG_REJECTION_REASON_COUNTER.clear()
+    except Exception:
+        pass
+
+def _bump_long_rejection_reason(reason: str):
+    try:
+        key = str(reason or "unknown")
+        LONG_REJECTION_REASON_COUNTER[key] = int(LONG_REJECTION_REASON_COUNTER.get(key, 0) or 0) + 1
+    except Exception:
+        pass
+
+def _format_long_run_rejection_top(limit: int = 5) -> str:
+    try:
+        if not LONG_REJECTION_REASON_COUNTER:
+            return "none"
+        items = sorted(LONG_REJECTION_REASON_COUNTER.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return ", ".join(f"{k}:{v}" for k, v in items)
+    except Exception:
+        return "unavailable"
+
 def log_long_rejection(
     symbol,
     reason,
@@ -614,6 +638,7 @@ def log_long_rejection(
     secondary_reasons=None,
 ):
     try:
+        _bump_long_rejection_reason(reason)
         extra_dict = extra if isinstance(extra, dict) else {}
         if secondary_reasons:
             extra_dict["secondary_reasons"] = secondary_reasons
@@ -3321,9 +3346,9 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             if breakout_quality == "strong" and mtf_confirmed and vol_ratio >= 1.10 and score >= 7.2:
                 allowed = True
                 allow_reason = "strong_breakout_mtf"
-            elif setup_weight >= 3 and score >= (7.0 if mode == MODE_NORMAL_LONG else 7.3) and mtf_confirmed and vol_ratio >= 1.10:
+            elif setup_weight >= 3 and score >= (6.5 if mode == MODE_NORMAL_LONG else 7.3) and mtf_confirmed and vol_ratio >= (1.05 if mode == MODE_NORMAL_LONG else 1.10):
                 allowed = True
-                allow_reason = "tier3_setup_mtf_normal" if mode == MODE_NORMAL_LONG and score < 7.3 else "tier3_setup_mtf"
+                allow_reason = "normal_whitelist_flow_weak_drift_warning" if mode == MODE_NORMAL_LONG and score < 7.3 else "tier3_setup_mtf"
             elif setup_weight >= 3 and score >= 7.7 and vol_ratio >= 1.25:
                 allowed = True
                 allow_reason = "tier3_setup_force"
@@ -3337,9 +3362,9 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
                 mode == MODE_NORMAL_LONG
                 and soft_late_warning
                 and setup_weight >= 3
-                and score >= 7.0
+                and score >= 6.5
                 and mtf_confirmed
-                and vol_ratio >= 1.10
+                and vol_ratio >= 1.05
                 and breakout_quality in ("strong", "good", "ok", "")
             ):
                 allowed = True
@@ -8751,6 +8776,29 @@ def is_selective_market_normal_ready(
  except Exception:
     return False
 
+def is_supportive_bull_flow(red_ratio, avg_change, btc_change, btc_mode: str = "", alt_snapshot: dict | None = None, market_state: str = "") -> bool:
+ try:
+    alt_snapshot = alt_snapshot or {}
+    red_ratio = float(red_ratio or 0.0)
+    avg_change = float(avg_change or 0.0)
+    btc_change = float(btc_change or 0.0)
+    btc_text = str(btc_mode or "")
+    alt_mode_text = str(alt_snapshot.get("alt_mode", "") or "")
+    btc_supportive = ("صاعد" in btc_text) or btc_change >= 0.0
+    alt_supportive = ("قوي" in alt_mode_text) or market_state in ("bull_market", "alt_season")
+    danger_count = 0
+    if red_ratio >= 0.68:
+        danger_count += 1
+    if avg_change <= -0.30:
+        danger_count += 1
+    if btc_change <= -0.25:
+        danger_count += 1
+    if "🔴" in alt_mode_text or "ضعيف جدًا" in alt_mode_text:
+        danger_count += 1
+    return bool(btc_supportive and alt_supportive and danger_count < 2)
+ except Exception:
+    return False
+
 # =========================
 # DETERMINE LONG MARKET MODE
 # =========================
@@ -8920,6 +8968,8 @@ def determine_long_market_mode(
         or (avg_change < -0.30)
         or (btc_mode in ("🔴 هابط", "🟡 محايد") and alt_mode != "🟢 قوي")
     )
+    if weak_market and is_supportive_bull_flow(red_ratio, avg_change, btc_change, btc_mode, alt_snapshot, market_state):
+        weak_market = False
     if weak_market:
         if allow_state_writes and r:
             try:
@@ -8975,6 +9025,8 @@ def determine_long_market_mode(
     or (avg_change < -0.30)
     or (btc_mode in ("🔴 هابط", "🟡 محايد") and alt_mode != "🟢 قوي")
  )
+ if weak_market and is_supportive_bull_flow(red_ratio, avg_change, btc_change, btc_mode, alt_snapshot, market_state):
+    weak_market = False
  if weak_market and time_since_last_transition >= MODE_TRANSITION_MIN_INTERVAL:
     if allow_state_writes and r:
         try:
@@ -10570,6 +10622,7 @@ def run_scanner_loop():
             sent_symbols_this_run = set()
             candidates = []
             candidates_symbols = set()
+            _reset_long_run_counters()
             no_candles_symbols_this_run = set()
             no_candles_cooldown_symbols_this_run = set()
             for pair_data in filtered_scan_pairs:
@@ -10785,30 +10838,56 @@ def run_scanner_loop():
                     alt_mode=alt_mode,
                 )
                 if late_guard.get("should_block") and not is_reverse:
-                    log_long_rejection(
-                        symbol=symbol,
-                        reason="late_guard_should_block",
-                        candle_time=candle_time,
-                        market_state=market_state,
-                        current_mode=current_mode,
-                        entry_timing="",
-                        opportunity_type=temp_opportunity_type,
-                        dist_ma=dist_ma,
-                        rsi_now=rsi_now,
-                        vol_ratio=vol_ratio,
-                        vwap_distance=vwap_distance,
-                        mtf_confirmed=mtf_confirmed,
-                        breakout=breakout,
-                        pre_breakout=pre_breakout,
-                        is_reverse=is_reverse,
-                        extra={"late_guard_reasons": late_guard.get("reasons", []),
-                               "has_extra_strong_setup": has_extra_strong_setup,
-                               "extra_setup_names": extra_setup_names,
-                               "primary_extra_setup": primary_extra_setup,
-                               "extra_setup_bonus": extra_setup_bonus},
+                    _late_reasons_text = "|".join(str(x) for x in (late_guard.get("reasons", []) or [])).lower()
+                    _hard_late_block = any(token in _late_reasons_text for token in (
+                        "danger", "hard_late", "extreme", "wave_5", "موجة 5", "موجة خامسة",
+                        "متأخر جدًا", "very_late", "overextended", "crash", "dump"
+                    ))
+                    _normal_flow_late_warning_only = (
+                        current_mode == MODE_NORMAL_LONG
+                        and relaxed_pre_score_setup
+                        and mtf_confirmed
+                        and float(vol_ratio or 0.0) >= 1.05
+                        and market_state in ("bull_market", "alt_season")
+                        and "صاعد" in str(btc_mode or "")
+                        and not _hard_late_block
                     )
-                    logger.info(f"{symbol} --> skipped by late_guard should_block: {late_guard.get('reasons', [])}")
-                    continue
+                    if _normal_flow_late_warning_only:
+                        late_guard["should_block"] = False
+                        late_guard.setdefault("warnings", [])
+                        if isinstance(late_guard.get("warnings"), list):
+                            late_guard["warnings"].append("normal_flow_late_warning_only")
+                        logger.info(
+                            f"⚠️ {symbol} late_guard warning only | normal_flow=True | "
+                            f"reasons={late_guard.get('reasons', [])}"
+                        )
+                    else:
+                        log_long_rejection(
+                            symbol=symbol,
+                            reason="late_guard_should_block",
+                            candle_time=candle_time,
+                            market_state=market_state,
+                            current_mode=current_mode,
+                            entry_timing="",
+                            opportunity_type=temp_opportunity_type,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            is_reverse=is_reverse,
+                            extra={
+                                "late_guard_reasons": late_guard.get("reasons", []),
+                                "has_extra_strong_setup": has_extra_strong_setup,
+                                "extra_setup_names": extra_setup_names,
+                                "primary_extra_setup": primary_extra_setup,
+                                "extra_setup_bonus": extra_setup_bonus,
+                            },
+                        )
+                        logger.info(f"{symbol} --> skipped by late_guard should_block: {late_guard.get('reasons', [])}")
+                        continue
                 entry_maturity_data = {
                     "fib_position": "unknown",
                     "fib_position_ratio": 0.0,
@@ -10834,18 +10913,33 @@ def run_scanner_loop():
                     # Final softening for strong continuation in bullish/MTF context.
                     # This prevents good continuation setups from being killed early as danger_late,
                     # while keeping true wave-5/overextended weak setups blocked.
+                    _maturity_text = "|".join(str(entry_maturity_data.get(k, "") or "") for k in ("entry_maturity", "fib_label", "pullback_label", "wave_label"))
+                    _maturity_text_l = _maturity_text.lower()
+                    _maturity_wave = int(float(entry_maturity_data.get("wave_estimate", 0) or 0))
+                    _maturity_had_pullback = bool(entry_maturity_data.get("had_pullback", False))
+                    _hard_maturity_block = (
+                        _maturity_wave >= 5
+                        or "موجة 5" in _maturity_text
+                        or "موجة خامسة" in _maturity_text
+                        or "danger" in _maturity_text_l
+                        or "hard_late" in _maturity_text_l
+                        or "متأخر جدًا" in _maturity_text
+                    ) and not _maturity_had_pullback
                     late_strong_continuation_soften = (
-                        not is_reverse
+                        current_mode == MODE_NORMAL_LONG
+                        and not is_reverse
                         and market_state in ("bull_market", "alt_season")
                         and mtf_confirmed
-                        and vol_ratio >= 1.8
-                        and dist_ma < 3.5
+                        and vol_ratio >= 1.05
+                        and dist_ma < 3.8
                         and (
                             breakout
                             or pre_breakout
-                            or breakout_quality == "strong"
+                            or breakout_quality in ("strong", "good", "ok")
+                            or relaxed_pre_score_setup
                             or has_extra_strong_setup
                         )
+                        and not _hard_maturity_block
                     )
 
                     if late_strong_continuation_soften:
@@ -12059,19 +12153,20 @@ def run_scanner_loop():
                             and not _res_is_ultra_close
                         )
                         _bull_mtf_flex = (
-                            _strong_market_for_resistance
+                            current_mode == MODE_NORMAL_LONG
+                            and _strong_market_for_resistance
                             and bool(mtf_confirmed)
-                            and float(vol_ratio or 0.0) >= 1.15
-                            and _score_for_resistance >= 7.0
+                            and float(vol_ratio or 0.0) >= 1.05
+                            and _score_for_resistance >= 6.5
                             and (_res_relaxed_setup or breakout or pre_breakout)
                             and not _res_is_major_structural
                             and not _res_is_ultra_close
                         )
 
-                        if _res_is_micro_noise or _normal_dynamic_hint_warning_only:
+                        if _res_is_micro_noise or _normal_dynamic_hint_warning_only or _bull_mtf_flex:
                             smart_resistance_warning_only = True
                             early_resistance_warning = ""
-                            _res_note = "normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored"
+                            _res_note = "normal_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
                             logger.info(
                                 f"⚪ {symbol} {_res_note} | "
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
@@ -13025,10 +13120,13 @@ def run_scanner_loop():
                     f"DATA ERROR SUMMARY | no_candles cooldown unique={len(no_candles_cooldown_symbols_this_run)} "
                     f"sample=[{sample}]"
                 )
-            logger.info(f"Long candidates found before momentum filter: {len(candidates)}")
+            candidates_before_momentum = len(candidates)
+            logger.info(f"Long candidates found before momentum filter: {candidates_before_momentum}")
             candidates = apply_top_momentum_filter(candidates)
-            logger.info(f"Long candidates found after momentum filter: {len(candidates)}")
+            candidates_after_momentum = len(candidates)
+            logger.info(f"Long candidates found after momentum filter: {candidates_after_momentum}")
             top_candidates = diversify_candidates(candidates, min(max_alerts, len(candidates)))
+            top_candidates_count = len(top_candidates)
             for candidate in top_candidates:
                 if sent_count >= max_alerts:
                     logger.info(f"Reached max alerts: {sent_count}/{max_alerts}, stopping send")
@@ -13328,7 +13426,20 @@ def run_scanner_loop():
             if sent_count > 0:
                 set_global_cooldown()
                 logger.info(f"Global long cooldown set for {GLOBAL_COOLDOWN_SECONDS}s after {sent_count} alert(s)")
+            exec_candidates_this_run = 0
+            try:
+                exec_candidates_this_run = sum(1 for c in top_candidates if bool(c.get("execution_candidate_badged")))
+            except Exception:
+                exec_candidates_this_run = 0
             logger.info(f"Sent long alerts this run: {sent_count}")
+            logger.info(
+                "LONG RUN SUMMARY | "
+                f"scanned={tested} | rejected={sum(LONG_REJECTION_REASON_COUNTER.values())} | "
+                f"candidates_before_momentum={locals().get('candidates_before_momentum', 0)} | "
+                f"candidates_after_momentum={locals().get('candidates_after_momentum', 0)} | "
+                f"top_candidates={locals().get('top_candidates_count', 0)} | sent={sent_count} | "
+                f"exec_candidates={exec_candidates_this_run} | top_reject={_format_long_run_rejection_top(5)}"
+            )
             logger.info(f"Tested {tested} pairs")
             logger.info(f"Scan complete. Sleeping {SCAN_LOOP_SLEEP_SECONDS}s before next run...")
             time.sleep(SCAN_LOOP_SLEEP_SECONDS)
