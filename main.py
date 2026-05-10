@@ -3356,13 +3356,28 @@ def _execution_report_since_ts(period: str):
     return None
 
 def _format_exec_num(value, decimals=6):
+    """Format execution-report prices without hiding micro-price differences.
+
+    Very small coins such as PEPE can have entry/TP/SL values that look
+    identical when rounded to 6 decimals. Keep the classic report layout,
+    but use more decimals only when the price is tiny.
+    """
     try:
         v = float(value)
-        if abs(v) >= 100:
+        av = abs(v)
+        if av <= 0:
             return f"{v:.2f}"
-        if abs(v) >= 1:
+        if av >= 100:
+            return f"{v:.2f}"
+        if av >= 1:
             return f"{v:.4f}"
-        return f"{v:.{decimals}f}"
+        if av >= 0.01:
+            return f"{v:.5f}"
+        if av >= 0.001:
+            return f"{v:.6f}"
+        # Micro-price assets: show enough precision so TP1/TP2/SL do not
+        # collapse visually into the same displayed number.
+        return f"{v:.8f}"
     except Exception:
         return "N/A"
 
@@ -3857,7 +3872,10 @@ def build_execution_report_message(period: str = "all") -> str:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
             lines.append("")
 
-        lines.append("📉 <b>آخر 3 صفقات خاسرة</b>")
+        lines.extend([
+            "━━━━━━━━━━━━",
+            "📉 <b>آخر 3 صفقات خاسرة</b>",
+        ])
         latest_losers = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:3]
         if latest_losers:
             for idx, (trade, pnl) in enumerate(latest_losers):
