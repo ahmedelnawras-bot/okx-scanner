@@ -9102,24 +9102,45 @@ def _market_reminder_collect_stats(window_seconds: int = 1200) -> dict:
 
 def _market_reminder_execution_line(mode: str, drift_label: str) -> str:
     mode = normalize_market_mode(mode)
+    drift_clean = str(drift_label or "Weak Drift: OFF").replace("🔴 ", "").replace("🟢 ", "")
     if mode == MODE_BLOCK_LONGS:
-        return "New entries BLOCKED | Protection ACTIVE"
+        return f"PAUSED | {drift_clean}"
     if mode == MODE_STRONG_LONG_ONLY:
-        return f"Whitelist/Elite ACTIVE | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
+        return f"Whitelist/Elite ACTIVE | {drift_clean}"
     if mode == MODE_RECOVERY_LONG:
-        return f"Recovery Confirmed Only | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
-    return f"Whitelist ACTIVE | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
+        return f"Whitelist ACTIVE | Recovery Filter ON"
+    return f"Whitelist ACTIVE | {drift_clean}"
 
 
-def _market_reminder_flow_line(mode: str) -> str:
+def _estimate_strong_coins_for_reminder(alt_snapshot: dict, ranked_pairs_count: int) -> int:
+    """Small display-only estimate for reminder heartbeat.
+
+    It is intentionally conservative and defensive; it must never affect trading.
+    """
+    try:
+        ranked_pairs_count = max(0, int(ranked_pairs_count or 0))
+        if ranked_pairs_count <= 0:
+            return 0
+        score = float((alt_snapshot or {}).get("alt_strength_score") or 0.0)
+        # Keep the displayed number conservative: weak/neutral markets stay low,
+        # strong broad markets gradually show more strong coins.
+        estimated = int(round(max(0.0, score - 0.45) * 50.0))
+        return max(0, min(ranked_pairs_count, estimated))
+    except Exception:
+        return 0
+
+
+def _market_reminder_mode_icon(mode: str) -> str:
     mode = normalize_market_mode(mode)
-    if mode == MODE_BLOCK_LONGS:
-        return "No new longs | Protect winners only"
+    if mode == MODE_NORMAL_LONG:
+        return "🟢"
     if mode == MODE_STRONG_LONG_ONLY:
-        return "Strong setups only | Avoid weak continuation"
+        return "🟡"
     if mode == MODE_RECOVERY_LONG:
-        return "Recovery watch | Confirm before entry"
-    return "Normal scanning active | Momentum allowed"
+        return "🔵"
+    if mode == MODE_BLOCK_LONGS:
+        return "🔴"
+    return "🧭"
 
 
 def build_compact_market_mode_reminder(
@@ -9129,18 +9150,19 @@ def build_compact_market_mode_reminder(
     market_state_label: str = "",
     alt_mode: str = "",
     market_bias_label: str = "",
+    strong_coins_count: int = 0,
+    ranked_pairs_count: int = 0,
+    block_protection_active: bool = False,
+    protection_summary: dict = None,
 ) -> str:
-    """Short unified Market Reminder for all modes.
+    """Agreed compact Market Reminder template for all modes.
 
-    Keep this message intentionally compact:
-    - no signal/rejection analytics
-    - no open-trade counters
-    - no long sections
-    It is only a quick heartbeat/status reminder every 20 minutes.
+    Includes only the useful short monitoring fields:
+    Signals/Exec/Reject, Strong Coins, Top Reject, Open summary, Execution status.
+    BLOCK_LONGS has a special Protection Triggered section when protection is active.
     """
     normalized_mode = normalize_market_mode(current_mode)
-    mode_label = _market_mode_label(normalized_mode)
-    mode_icon = str(mode_label).split(" ", 1)[0] if mode_label else "🧭"
+    mode_icon = _market_reminder_mode_icon(normalized_mode)
     btc_short = _btc_short_label(btc_mode)
     market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
     duration_text = get_market_mode_duration_text(normalized_mode)
@@ -9148,38 +9170,59 @@ def build_compact_market_mode_reminder(
         normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label
     )
     drift_label = str(drift.get("label", "🟢 Weak Drift: OFF"))
-    drift_clean = drift_label.replace("🔴 ", "").replace("🟢 ", "")
+    stats = _market_reminder_collect_stats(window_seconds=1200)
 
-    if normalized_mode == MODE_BLOCK_LONGS:
-        execution_line = "New entries BLOCKED"
-        flow_title = "🛡 Protection:"
-        flow_line = "Protect winners only"
-    elif normalized_mode == MODE_STRONG_LONG_ONLY:
-        execution_line = f"Whitelist/Elite ACTIVE | {drift_clean}"
-        flow_title = "✅ Flow:"
-        flow_line = "Strong setups only"
-    elif normalized_mode == MODE_RECOVERY_LONG:
-        execution_line = f"Recovery Confirmed Only | {drift_clean}"
-        flow_title = "✅ Flow:"
-        flow_line = "Confirm before entry"
-    else:
-        execution_line = f"Whitelist ACTIVE | {drift_clean}"
-        flow_title = "✅ Flow:"
-        flow_line = "Normal scanning active"
+    try:
+        strong_coins_count = max(0, int(strong_coins_count or 0))
+    except Exception:
+        strong_coins_count = 0
+    try:
+        ranked_pairs_count = max(0, int(ranked_pairs_count or 0))
+    except Exception:
+        ranked_pairs_count = 0
 
     lines = [
         f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b>",
         "",
-        f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)}",
-        "",
+        f"🕒 {html.escape(duration_text)} in {html.escape(normalized_mode)}",
         f"{btc_short} | {market_short}",
         "",
-        "🧠 <b>Execution:</b>",
-        html.escape(execution_line),
+        f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
+        f"⚡ Strong Coins: {strong_coins_count} / {ranked_pairs_count}",
         "",
-        flow_title,
-        html.escape(flow_line),
+        "❌ <b>Top Reject:</b>",
+        html.escape(str(stats.get("top_reject") or "N/A")),
+        "",
     ]
+
+    if normalized_mode == MODE_BLOCK_LONGS and (block_protection_active or protection_summary):
+        summary = protection_summary or {}
+        protected = int(summary.get("protected_winners") or stats.get("protected_on_block") or 0)
+        tp1_protected = int(stats.get("open_tp1_protected") or 0)
+        danger = int(stats.get("open_danger") or 0)
+        lines.extend([
+            "🛡 <b>Protection Triggered</b>",
+            f"🔒 {protected} SL moved to Entry",
+            f"🟡 {tp1_protected} TP1 Protected",
+            f"🔴 {danger} High Risk Open",
+            "",
+            "💼 <b>Open:</b>",
+            f"🟢 {int(stats.get('open_winners', 0))} Winners",
+            f"🔴 {danger} Danger",
+            "",
+            "🧠 <b>Execution:</b>",
+            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
+        ])
+    else:
+        lines.extend([
+            "💼 <b>Open:</b>",
+            f"🟢 {int(stats.get('open_winners', 0))} Winners",
+            f"🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected",
+            f"🔴 {int(stats.get('open_danger', 0))} Danger",
+            "",
+            "🧠 <b>Execution:</b>",
+            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
+        ])
 
     return "\n".join(lines)
 
@@ -9975,19 +10018,13 @@ def run_scanner_loop():
                         if reminder_mode != current_mode:
                             reminder_count = 0
                         reminder_count += 1
-                        reminder_msg = build_compact_market_mode_reminder(
-                            reminder_count=reminder_count,
-                            current_mode=current_mode,
-                            btc_mode=btc_mode,
-                            market_state_label=market_info.get("market_state_label", ""),
-                            alt_mode=alt_snapshot.get("alt_mode", ""),
-                        )
-                        send_telegram_message(reminder_msg)
-
-                        if current_mode == MODE_BLOCK_LONGS and reminder_count == 1:
+                        protection_summary = None
+                        block_protection_active = False
+                        if current_mode == MODE_BLOCK_LONGS:
                             try:
                                 already_applied = bool(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY))
-                                if not already_applied:
+                                block_protection_active = already_applied
+                                if reminder_count == 1 and not already_applied:
                                     protection_summary = update_open_trades(
                                         r,
                                         market_type="futures",
@@ -10003,10 +10040,24 @@ def run_scanner_loop():
                                         block_btc_change=market_guard.get("btc_change_15m", 0),
                                         reason="market_mode=BLOCK_LONGS:first_reminder",
                                     )
-                                    send_telegram_message(format_block_protection_summary_message(protection_summary))
                                     r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, str(now_ts_local))
+                                    block_protection_active = True
                             except Exception as _protect_exc:
                                 logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
+
+                        strong_coins_count = _estimate_strong_coins_for_reminder(alt_snapshot, len(ranked_pairs))
+                        reminder_msg = build_compact_market_mode_reminder(
+                            reminder_count=reminder_count,
+                            current_mode=current_mode,
+                            btc_mode=btc_mode,
+                            market_state_label=market_info.get("market_state_label", ""),
+                            alt_mode=alt_snapshot.get("alt_mode", ""),
+                            strong_coins_count=strong_coins_count,
+                            ranked_pairs_count=len(ranked_pairs),
+                            block_protection_active=block_protection_active,
+                            protection_summary=protection_summary,
+                        )
+                        send_telegram_message(reminder_msg)
 
                         r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
                         r.set(MARKET_MODE_REMINDER_COUNT_KEY, str(reminder_count))
