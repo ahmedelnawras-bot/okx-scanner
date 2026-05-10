@@ -9158,7 +9158,7 @@ def build_compact_market_mode_reminder(
     """Agreed compact Market Reminder template for all modes.
 
     Includes only the useful short monitoring fields:
-    Signals/Exec/Reject, Strong Coins, Top Reject, Open summary, Execution status.
+    Signals/Exec/Reject, Strong Setups, Top Reject, Open Candidates summary, Execution status.
     BLOCK_LONGS has a special Protection Triggered section when protection is active.
     """
     normalized_mode = normalize_market_mode(current_mode)
@@ -9188,7 +9188,7 @@ def build_compact_market_mode_reminder(
         f"{btc_short} | {market_short}",
         "",
         f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
-        f"⚡ Strong Coins: {strong_coins_count} / {ranked_pairs_count}",
+        f"⚡ Strong Setups: {strong_coins_count} / {ranked_pairs_count}",
         "",
         "❌ <b>Top Reject:</b>",
         html.escape(str(stats.get("top_reject") or "N/A")),
@@ -9206,7 +9206,7 @@ def build_compact_market_mode_reminder(
             f"🟡 {tp1_protected} TP1 Protected",
             f"🔴 {danger} High Risk Open",
             "",
-            "💼 <b>Open:</b>",
+            "💼 <b>Open Candidates:</b>",
             f"🟢 {int(stats.get('open_winners', 0))} Winners",
             f"🔴 {danger} Danger",
             "",
@@ -9215,7 +9215,7 @@ def build_compact_market_mode_reminder(
         ])
     else:
         lines.extend([
-            "💼 <b>Open:</b>",
+            "💼 <b>Open Candidates:</b>",
             f"🟢 {int(stats.get('open_winners', 0))} Winners",
             f"🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected",
             f"🔴 {int(stats.get('open_danger', 0))} Danger",
