@@ -8984,6 +8984,144 @@ def get_weak_drift_display_status(
         return {"active": False, "label": "🟢 Weak Drift: OFF", "note": "التنفيذ يعمل طبيعيًا."}
 
 
+
+def _safe_json_loads_for_reminder(raw):
+    try:
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _market_reminder_collect_stats(window_seconds: int = 1200) -> dict:
+    """Collect lightweight display-only stats for Market Reminder.
+
+    This function is intentionally defensive: if Redis/key formats differ, it
+    returns safe zeros instead of affecting scanning, alerts, or execution.
+    """
+    now_ts = int(time.time())
+    since_ts = now_ts - int(window_seconds or 1200)
+    stats = {
+        "signals": 0,
+        "exec_candidates": 0,
+        "rejections": 0,
+        "top_reject": "N/A",
+        "open_winners": 0,
+        "open_tp1_protected": 0,
+        "open_danger": 0,
+        "protected_on_block": 0,
+    }
+    if not r:
+        return stats
+
+    try:
+        try:
+            trades = load_all_trades_for_report(
+                r, market_type="futures", side="long", since_ts=None, include_open=True
+            )
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1200)
+
+        recent_trades = []
+        open_trades = []
+        for t in trades or []:
+            if not isinstance(t, dict):
+                continue
+            created = _trade_created_ts_for_exec(t)
+            if created >= since_ts:
+                recent_trades.append(t)
+            if _is_execution_trade_open(t):
+                open_trades.append(t)
+
+        stats["signals"] = len(recent_trades)
+        stats["exec_candidates"] = sum(1 for t in recent_trades if is_execution_candidate_trade(t))
+
+        for t in open_trades:
+            pnl = _execution_floating_pnl_pct(t)
+            if pnl is not None and pnl > 0:
+                stats["open_winners"] += 1
+            if bool(t.get("tp1_hit")) or bool(t.get("sl_moved_to_entry")) or bool(t.get("protected_breakeven")):
+                stats["open_tp1_protected"] += 1
+            if bool(t.get("protected_on_block")) or str(t.get("protected_reason", "")) == "market_mode_block_longs":
+                stats["protected_on_block"] += 1
+            # Danger means open and currently losing before any protection/TP1.
+            if pnl is not None and pnl < 0 and not bool(t.get("tp1_hit")) and not bool(t.get("sl_moved_to_entry")):
+                stats["open_danger"] += 1
+    except Exception as exc:
+        logger.debug(f"market reminder trade stats skipped: {exc}")
+
+    try:
+        from collections import Counter
+        reason_counter = Counter()
+        reject_count = 0
+        patterns = (
+            "rejected_candidate:*",
+            "rejection:long:*",
+            "rejected:long:*",
+            "rejected:futures:long:*",
+            "rejection:futures:long:*",
+        )
+        seen_keys = set()
+        for pattern in patterns:
+            try:
+                for key in r.scan_iter(pattern):
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    data = _safe_json_loads_for_reminder(r.get(key))
+                    if not data:
+                        continue
+                    ts = 0
+                    for ts_key in ("created_ts", "ts", "timestamp", "candle_time"):
+                        try:
+                            ts = int(float(data.get(ts_key) or 0))
+                            if ts > 0:
+                                break
+                        except Exception:
+                            pass
+                    if ts and ts < since_ts:
+                        continue
+                    reject_count += 1
+                    reason = str(data.get("reason") or data.get("reject_reason") or data.get("category") or "unknown")
+                    if reason:
+                        reason_counter[reason] += 1
+            except Exception:
+                continue
+        stats["rejections"] = reject_count
+        if reason_counter:
+            stats["top_reject"] = reason_counter.most_common(1)[0][0]
+    except Exception as exc:
+        logger.debug(f"market reminder rejection stats skipped: {exc}")
+
+    return stats
+
+
+def _market_reminder_execution_line(mode: str, drift_label: str) -> str:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return "New entries BLOCKED | Protection ACTIVE"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return f"Whitelist/Elite ACTIVE | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
+    if mode == MODE_RECOVERY_LONG:
+        return f"Recovery Confirmed Only | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
+    return f"Whitelist ACTIVE | {drift_label.replace('🔴 ', '').replace('🟢 ', '')}"
+
+
+def _market_reminder_flow_line(mode: str) -> str:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return "No new longs | Protect winners only"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "Strong setups only | Avoid weak continuation"
+    if mode == MODE_RECOVERY_LONG:
+        return "Recovery watch | Confirm before entry"
+    return "Normal scanning active | Momentum allowed"
+
+
 def build_compact_market_mode_reminder(
     reminder_count: int,
     current_mode: str,
@@ -8992,23 +9130,58 @@ def build_compact_market_mode_reminder(
     alt_mode: str = "",
     market_bias_label: str = "",
 ) -> str:
-    """Very short Market Mood reminder, optimized for Telegram mobile."""
+    """Compact but useful Market Reminder for all modes."""
     normalized_mode = normalize_market_mode(current_mode)
     mode_label = _market_mode_label(normalized_mode)
     mode_icon = str(mode_label).split(" ", 1)[0] if mode_label else "🧭"
     btc_short = _btc_short_label(btc_mode)
     market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
-    policy = get_market_mode_execution_policy_short(normalized_mode)
     duration_text = get_market_mode_duration_text(normalized_mode)
     drift = get_weak_drift_display_status(normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
-    return (
-        f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b> | {html.escape(normalized_mode)}\n"
-        f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)} | {html.escape(drift.get('label', '🟢 Weak Drift: OFF'))}\n\n"
-        f"{mode_label}\n"
-        f"{btc_short} | {market_short}\n\n"
-        f"🎯 <b>Execution:</b>\n"
-        f"{html.escape(policy)}"
-    )
+    drift_label = str(drift.get("label", "🟢 Weak Drift: OFF"))
+    stats = _market_reminder_collect_stats(window_seconds=1200)
+
+    lines = [
+        f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b>",
+        "",
+        f"🕒 {html.escape(duration_text)} in {html.escape(normalized_mode)}",
+        "",
+        f"{btc_short} | {market_short}",
+        "",
+        f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
+        "",
+        f"❌ Top Reject:\n{html.escape(str(stats.get('top_reject') or 'N/A'))}",
+        "",
+    ]
+
+    if normalized_mode == MODE_BLOCK_LONGS:
+        lines += [
+            "💼 Open:",
+            f"🟢 {int(stats.get('open_winners', 0))} Winners",
+            f"🛡️ {int(stats.get('protected_on_block', 0))} Protected",
+            f"🔴 {int(stats.get('open_danger', 0))} Danger",
+            "",
+            "🧠 Execution:",
+            _market_reminder_execution_line(normalized_mode, drift_label),
+            "",
+            "🎯 Action:",
+            _market_reminder_flow_line(normalized_mode),
+        ]
+    else:
+        lines += [
+            "💼 Open:",
+            f"🟢 {int(stats.get('open_winners', 0))} Winners",
+            f"🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected",
+            f"🔴 {int(stats.get('open_danger', 0))} Danger",
+            "",
+            "🧠 Execution:",
+            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
+            "",
+            "✅ Flow:",
+            html.escape(_market_reminder_flow_line(normalized_mode)),
+        ]
+
+    return "\n".join(lines)
 
 
 def format_block_protection_summary_message(summary: dict) -> str:
@@ -9791,8 +9964,8 @@ def run_scanner_loop():
             }
             save_market_status_snapshot(snapshot_data)
 
-            # Periodic compact market mode reminder (every 15 minutes)
-            REMINDER_INTERVAL = 900  # 15 minutes
+            # Periodic compact market mode reminder (every 20 minutes)
+            REMINDER_INTERVAL = 1200  # 20 minutes
             now_ts_local = int(time.time())
             if r:
                 try:
