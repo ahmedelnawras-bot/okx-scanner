@@ -1,4 +1,6 @@
 # tracking/performance.py
+# Version: performance_v49_report_command_html_fix
+# Fix: import html for recent trade formatting used by /report_all and period reports.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
 
@@ -65,6 +67,7 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 """
 
 import json
+import html
 import time
 import logging
 import requests
