@@ -2935,6 +2935,8 @@ def _collect_execution_setup_tags(data: dict) -> list:
         "wave_estimate",
         "wave_label",
         "wave",
+        "execution_setup_tags",
+        "early_execution_setup_tags",
         "entry_maturity",
         "entry_maturity_label",
         "relative_strength_vs_btc",
@@ -2970,12 +2972,32 @@ def _collect_execution_setup_tags(data: dict) -> list:
     return sorted(tags)
 
 
+def build_execution_setup_tags(data: dict = None, **sources) -> list:
+    """Build canonical execution setup tags from early or final scan data.
+
+    Use this once early after detect_extra_strong_long_setups() and again on the
+    final candidate.  The goal is to keep whitelist matching, Weak Drift weight,
+    Smart Resistance relaxation, and execution badge decisions reading the same
+    normalized setup source without changing strategy rules.
+    """
+    try:
+        merged = {}
+        if isinstance(data, dict):
+            merged.update(data)
+        for key, value in (sources or {}).items():
+            if value is not None:
+                merged[key] = value
+        return _collect_execution_setup_tags(merged)
+    except Exception:
+        return []
+
+
 def _ensure_execution_setup_tags(candidate: dict) -> dict:
     """Attach canonical execution_setup_tags to candidate in-place."""
     try:
         if not isinstance(candidate, dict):
             return candidate
-        candidate["execution_setup_tags"] = _collect_execution_setup_tags(candidate)
+        candidate["execution_setup_tags"] = build_execution_setup_tags(candidate)
         return candidate
     except Exception:
         return candidate
@@ -3015,7 +3037,7 @@ def _has_strict_execution_setup(data: dict) -> bool:
                 if tag:
                     tags.add(tag)
 
-        for key in ("primary_extra_setup", "extra_setup_names"):
+        for key in ("primary_extra_setup", "extra_setup_names", "execution_setup_tags", "early_execution_setup_tags"):
             add_detector_value(data.get(key))
             add_detector_value(diagnostics.get(key))
 
@@ -3061,7 +3083,7 @@ def _has_normal_long_execution_setup(data: dict) -> bool:
                 if tag:
                     tags.add(tag)
 
-        for key in ("primary_extra_setup", "extra_setup_names"):
+        for key in ("primary_extra_setup", "extra_setup_names", "execution_setup_tags", "early_execution_setup_tags"):
             add_detector_value(data.get(key))
             add_detector_value(diagnostics.get(key))
 
@@ -3226,7 +3248,7 @@ def _get_strict_execution_setup_weight(data: dict) -> int:
                 if tag:
                     tags.add(tag)
 
-        for key in ("primary_extra_setup", "extra_setup_names"):
+        for key in ("primary_extra_setup", "extra_setup_names", "execution_setup_tags", "early_execution_setup_tags"):
             add_detector_value(data.get(key))
             add_detector_value(diagnostics.get(key))
 
@@ -3354,12 +3376,14 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             )
             return True
 
-        logger.info(
-            "WEAK DRIFT EXEC BLOCK | "
-            f"symbol={data.get('symbol', '?')} | reason={drift.get('reason')} | "
-            f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | "
-            f"whitelist={has_whitelist} | setup_weight={setup_weight} | hard_late={hard_late_or_danger} | soft_late={soft_late_warning}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "WEAK DRIFT EXEC BLOCK | "
+                f"symbol={data.get('symbol', '?')} | reason={drift.get('reason')} | "
+                f"score={score:.2f} | vol={vol_ratio:.2f} | mtf={mtf_confirmed} | "
+                f"whitelist={has_whitelist} | setup_weight={setup_weight} | hard_late={hard_late_or_danger} | soft_late={soft_late_warning} | "
+                f"tags={data.get('execution_setup_tags', [])}"
+            )
         return False
     except Exception as e:
         logger.warning(f"_candidate_passes_weak_drift_execution_quality error: {e}")
@@ -8165,6 +8189,13 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             weak_drift_passed=weak_drift_passed,
             mutate=mutate,
         )
+        if (not gate.get("allowed")) and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "EXEC REJECT | "
+                f"symbol={planned.get('symbol', '?')} | mode={mode} | reason={gate.get('reason')} | "
+                f"path={gate.get('path')} | tags={planned.get('execution_setup_tags', [])} | "
+                f"strict={strict_setup_allowed} | block={block_mode_allowed} | plan={has_complete_plan} | weak_drift={weak_drift_passed}"
+            )
         if mutate:
             candidate.update(planned)
             candidate["execution_gate_path"] = gate.get("path")
@@ -10681,6 +10712,29 @@ def run_scanner_loop():
                 extra_setup_bonus = float(extra_setups.get("score_bonus", 0.0) or 0.0)
                 primary_extra_setup = extra_setups.get("primary_setup", "")
                 context_setups = extra_setups.get("context_setups", [])
+                # Canonical execution tags are built early so pre-score guards and
+                # final execution gates read the same setup source.
+                early_execution_setup_tags = build_execution_setup_tags(
+                    symbol=symbol,
+                    setup_type=temp_opportunity_type,
+                    primary_extra_setup=primary_extra_setup,
+                    extra_setup_names=extra_setup_names,
+                    extra_setups=extra_setup_names,
+                    extra_setups_details=extra_setups.get("details", {}),
+                    context_setups=context_setups,
+                    wave_context="",
+                    wave_estimate=0,
+                    relative_strength_vs_btc=(
+                        "relative_strength_vs_btc" in [str(x) for x in (extra_setup_names or [])]
+                        or str(primary_extra_setup or "") == "relative_strength_vs_btc"
+                    ),
+                )
+
+                if logger.isEnabledFor(logging.DEBUG) and (primary_extra_setup or extra_setup_names):
+                    for _must_tag in (primary_extra_setup, *(extra_setup_names or [])):
+                        _must_norm = _normalize_execution_tag(_must_tag)
+                        if _must_norm and _must_norm not in set(early_execution_setup_tags):
+                            logger.debug(f"EXEC TAG MISS | {symbol} | missing={_must_norm} | early_tags={early_execution_setup_tags}")
 
                 # SAFE DEFAULTS for softening / warning blocks.
                 # These variables are used only as local flags before score_result exists.
@@ -10697,6 +10751,7 @@ def run_scanner_loop():
                     setup_type=temp_opportunity_type,
                     extra_setup_names=extra_setup_names,
                     primary_extra_setup=primary_extra_setup,
+                    execution_setup_tags=early_execution_setup_tags,
                     mtf_confirmed=mtf_confirmed,
                     vol_ratio=vol_ratio,
                     score=0.0,
@@ -12878,6 +12933,7 @@ def run_scanner_loop():
                     "relative_strength_vs_btc": (round(get_change_8(df) - get_change_8(btc_15m_df if 'btc_15m_df' in locals() else None), 4) >= 1.5 or round(float(change_24h or 0.0) - float(btc_change_24h or 0.0), 4) >= 2.0),
                     "block_exception": False,
                     "block_longs_execution_candidate": False,
+                    "early_execution_setup_tags": early_execution_setup_tags,
                     "current_mode": current_mode,
                     "market_mode": current_mode,
                     "btc_zone": btc_zone if isinstance(btc_zone, dict) else {},
@@ -12913,6 +12969,13 @@ def run_scanner_loop():
                     "execution_tp1": execution_tp1,
                     "execution_tp2": execution_tp2,
                 }
+                candidate["execution_setup_tags"] = build_execution_setup_tags(candidate)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "EXEC TAGS | "
+                        f"symbol={symbol} | tags={candidate.get('execution_setup_tags', [])} | "
+                        f"primary={primary_extra_setup} | extras={extra_setup_names} | wave={candidate.get('wave_estimate')}"
+                    )
                 if current_mode == MODE_BLOCK_LONGS:
                     if not is_strong_exception(candidate):
                         log_long_rejection(
