@@ -9130,59 +9130,58 @@ def build_compact_market_mode_reminder(
     alt_mode: str = "",
     market_bias_label: str = "",
 ) -> str:
-    """Compact but useful Market Reminder for all modes."""
+    """Short unified Market Reminder for all modes.
+
+    Keep this message intentionally compact:
+    - no signal/rejection analytics
+    - no open-trade counters
+    - no long sections
+    It is only a quick heartbeat/status reminder every 20 minutes.
+    """
     normalized_mode = normalize_market_mode(current_mode)
     mode_label = _market_mode_label(normalized_mode)
     mode_icon = str(mode_label).split(" ", 1)[0] if mode_label else "🧭"
     btc_short = _btc_short_label(btc_mode)
     market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
     duration_text = get_market_mode_duration_text(normalized_mode)
-    drift = get_weak_drift_display_status(normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
+    drift = get_weak_drift_display_status(
+        normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label
+    )
     drift_label = str(drift.get("label", "🟢 Weak Drift: OFF"))
-    stats = _market_reminder_collect_stats(window_seconds=1200)
+    drift_clean = drift_label.replace("🔴 ", "").replace("🟢 ", "")
+
+    if normalized_mode == MODE_BLOCK_LONGS:
+        execution_line = "New entries BLOCKED"
+        flow_title = "🛡 Protection:"
+        flow_line = "Protect winners only"
+    elif normalized_mode == MODE_STRONG_LONG_ONLY:
+        execution_line = f"Whitelist/Elite ACTIVE | {drift_clean}"
+        flow_title = "✅ Flow:"
+        flow_line = "Strong setups only"
+    elif normalized_mode == MODE_RECOVERY_LONG:
+        execution_line = f"Recovery Confirmed Only | {drift_clean}"
+        flow_title = "✅ Flow:"
+        flow_line = "Confirm before entry"
+    else:
+        execution_line = f"Whitelist ACTIVE | {drift_clean}"
+        flow_title = "✅ Flow:"
+        flow_line = "Normal scanning active"
 
     lines = [
         f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b>",
         "",
-        f"🕒 {html.escape(duration_text)} in {html.escape(normalized_mode)}",
+        f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)}",
         "",
         f"{btc_short} | {market_short}",
         "",
-        f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
+        "🧠 <b>Execution:</b>",
+        html.escape(execution_line),
         "",
-        f"❌ Top Reject:\n{html.escape(str(stats.get('top_reject') or 'N/A'))}",
-        "",
+        flow_title,
+        html.escape(flow_line),
     ]
 
-    if normalized_mode == MODE_BLOCK_LONGS:
-        lines += [
-            "💼 Open:",
-            f"🟢 {int(stats.get('open_winners', 0))} Winners",
-            f"🛡️ {int(stats.get('protected_on_block', 0))} Protected",
-            f"🔴 {int(stats.get('open_danger', 0))} Danger",
-            "",
-            "🧠 Execution:",
-            _market_reminder_execution_line(normalized_mode, drift_label),
-            "",
-            "🎯 Action:",
-            _market_reminder_flow_line(normalized_mode),
-        ]
-    else:
-        lines += [
-            "💼 Open:",
-            f"🟢 {int(stats.get('open_winners', 0))} Winners",
-            f"🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected",
-            f"🔴 {int(stats.get('open_danger', 0))} Danger",
-            "",
-            "🧠 Execution:",
-            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
-            "",
-            "✅ Flow:",
-            html.escape(_market_reminder_flow_line(normalized_mode)),
-        ]
-
     return "\n".join(lines)
-
 
 def format_block_protection_summary_message(summary: dict) -> str:
     """Format one compact Telegram message after first BLOCK_LONGS reminder protection."""
