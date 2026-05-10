@@ -1,8 +1,9 @@
-# Version: main_v128_resistance_relax_balance
-# UI PATCH VERIFIED 2026-05-08: mood transition/reminder titles + compact open execution report formatting.
-# Version: main_v08_modes_ui_final
-# Date: 2026-05-08
-# Changes: UI/Text only for Market Mood and Reminder; no logic/filter/execution changes
+# Version: main_v201_v200_architecture_cleaned.py
+# Date: 2026-05-11
+# Base: main_v200_architecture_rebuild.py
+# Changes: Cleanup + safer v200 decision balance.
+# Preserved: Telegram UI/contracts, market modes, reports, tracking/performance integration, execution modules.
+# Fixed: removed old v08/UI-only header residue; softened normal VWAP/RSI/MACD/near-resistance rejections unless true danger.
 
 import os 
 import sys 
@@ -592,10 +593,15 @@ def record_candle_fetch_failure(symbol: str, timeframe: str = TIMEFRAME) -> int:
 # NEW HELPER: consolidated rejection logging
 # =========================
 LONG_REJECTION_REASON_COUNTER = {}
+LONG_SOFT_WARNING_COUNTER = {}
+LONG_LAYER_COUNTER = {"hard_reject": 0, "soft_penalty_only": 0, "candidate_built": 0}
 
 def _reset_long_run_counters():
     try:
         LONG_REJECTION_REASON_COUNTER.clear()
+        LONG_SOFT_WARNING_COUNTER.clear()
+        LONG_LAYER_COUNTER.clear()
+        LONG_LAYER_COUNTER.update({"hard_reject": 0, "soft_penalty_only": 0, "candidate_built": 0})
     except Exception:
         pass
 
@@ -603,6 +609,14 @@ def _bump_long_rejection_reason(reason: str):
     try:
         key = str(reason or "unknown")
         LONG_REJECTION_REASON_COUNTER[key] = int(LONG_REJECTION_REASON_COUNTER.get(key, 0) or 0) + 1
+        LONG_LAYER_COUNTER["hard_reject"] = int(LONG_LAYER_COUNTER.get("hard_reject", 0) or 0) + 1
+    except Exception:
+        pass
+
+def _bump_long_soft_warning(reason: str):
+    try:
+        key = str(reason or "unknown")
+        LONG_SOFT_WARNING_COUNTER[key] = int(LONG_SOFT_WARNING_COUNTER.get(key, 0) or 0) + 1
     except Exception:
         pass
 
@@ -611,6 +625,15 @@ def _format_long_run_rejection_top(limit: int = 5) -> str:
         if not LONG_REJECTION_REASON_COUNTER:
             return "none"
         items = sorted(LONG_REJECTION_REASON_COUNTER.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return ", ".join(f"{k}:{v}" for k, v in items)
+    except Exception:
+        return "unavailable"
+
+def _format_long_run_soft_warning_top(limit: int = 5) -> str:
+    try:
+        if not LONG_SOFT_WARNING_COUNTER:
+            return "none"
+        items = sorted(LONG_SOFT_WARNING_COUNTER.items(), key=lambda x: x[1], reverse=True)[:limit]
         return ", ".join(f"{k}:{v}" for k, v in items)
     except Exception:
         return "unavailable"
@@ -1357,11 +1380,9 @@ def is_relaxed_execution_setup(
             sc = 0.0
 
         # Before final scoring, score may be 0; allow only if MTF or volume supports it.
-        # v128: for resistance softening only, strong canonical setups should not lose
-        # relaxed status just because score was already penalized by late/resistance.
         if sc <= 0:
-            return bool(mtf_confirmed or v >= 1.10)
-        return bool(sc >= 6.5 and (mtf_confirmed or v >= 1.00))
+            return bool(mtf_confirmed or v >= 1.15)
+        return bool(sc >= 7.0 and (mtf_confirmed or v >= 1.15))
     except Exception:
         return False
 
@@ -9690,6 +9711,278 @@ def handle_market_mode_transition(mode_result: dict) -> str:
     logger.error(f"handle_market_mode_transition error: {e}")
  return new_mode
 
+
+# =========================
+# v200 ARCHITECTURE LAYER HELPERS
+# =========================
+FAST_INTRADAY_RED_RATIO = 0.85
+FAST_INTRADAY_AVG15M = -0.70
+FAST_INTRADAY_BTC15M = -0.35
+FAST_INTRADAY_BLOCK_AVG15M = -1.10
+FAST_INTRADAY_BLOCK_BTC15M = -0.55
+FAST_INTRADAY_BLOCK_RED_RATIO = 0.92
+
+HARD_RESISTANCE_SOURCES = {"previous_rejection", "swing_high_confirmed", "round_level_confirmed"}
+SOFT_RESISTANCE_SOURCES = {"bb_upper", "recent_high", "recent_20_high", "minor_round", "dynamic_resistance", "bb_upper_hint"}
+
+
+def _arch_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _arch_add_warning(candidate: dict, warning: str) -> None:
+    if not candidate or not warning:
+        return
+    candidate.setdefault("warning_reasons", [])
+    if not isinstance(candidate.get("warning_reasons"), list):
+        candidate["warning_reasons"] = [str(candidate.get("warning_reasons"))]
+    if warning not in candidate["warning_reasons"]:
+        candidate["warning_reasons"].append(warning)
+    candidate.setdefault("soft_warning_reasons", [])
+    if warning not in candidate["soft_warning_reasons"]:
+        candidate["soft_warning_reasons"].append(warning)
+    _bump_long_soft_warning(warning)
+
+
+def _arch_add_adjustment(candidate: dict, name: str, value: float, reason: str) -> None:
+    if not candidate:
+        return
+    candidate.setdefault("adjustments_log", [])
+    if not isinstance(candidate.get("adjustments_log"), list):
+        candidate["adjustments_log"] = []
+    candidate["adjustments_log"].append({"name": name, "value": value, "reason": reason})
+
+
+def build_market_engine_context(market_guard: dict, market_state: str, btc_mode: str, alt_snapshot: dict) -> dict:
+    """Separates slow trend context from 15m intraday stress for v200 decisions."""
+    market_guard = market_guard or {}
+    alt_snapshot = alt_snapshot or {}
+    red_ratio = _arch_float(market_guard.get("red_ratio_15m"), 0.0)
+    avg15m = _arch_float(market_guard.get("avg_change_15m"), 0.0)
+    btc15m = _arch_float(market_guard.get("btc_change_15m"), 0.0)
+    guard_level = str(market_guard.get("level") or "normal")
+    danger = guard_level == "danger" or red_ratio >= FAST_INTRADAY_RED_RATIO or avg15m <= FAST_INTRADAY_AVG15M or btc15m <= FAST_INTRADAY_BTC15M
+    severe = guard_level in ("danger", "block") or red_ratio >= FAST_INTRADAY_BLOCK_RED_RATIO or avg15m <= FAST_INTRADAY_BLOCK_AVG15M or btc15m <= FAST_INTRADAY_BLOCK_BTC15M
+    return {
+        "overall_trend": market_state or "unknown",
+        "btc_mode": btc_mode or "unknown",
+        "alt_mode": alt_snapshot.get("alt_mode", "unknown"),
+        "intraday_stress": "severe" if severe else ("danger" if danger else "normal"),
+        "fast_intraday_override": bool(danger),
+        "fast_intraday_severe": bool(severe),
+        "red_ratio_15m": red_ratio,
+        "avg_change_15m": avg15m,
+        "btc_change_15m": btc15m,
+        "market_guard_level": guard_level,
+        "fast_intraday_reason": (
+            f"red_ratio={red_ratio:.2f}, avg15m={avg15m:.2f}, btc15m={btc15m:.2f}, guard={guard_level}"
+        ),
+    }
+
+
+def apply_fast_intraday_override(mode_result: dict, market_engine: dict, current_mode: str) -> dict:
+    """Fast 15m stress cannot leave the bot in NORMAL_LONG."""
+    result = dict(mode_result or {})
+    if not market_engine.get("fast_intraday_override"):
+        result.setdefault("architecture_layer", "market_engine")
+        return result
+    old_mode = result.get("mode", current_mode or MODE_NORMAL_LONG)
+    reason = result.get("reason", "")
+    override_reason = "fast_intraday_override: " + market_engine.get("fast_intraday_reason", "")
+    if market_engine.get("fast_intraday_severe"):
+        result["mode"] = MODE_BLOCK_LONGS
+    elif old_mode == MODE_NORMAL_LONG:
+        result["mode"] = MODE_STRONG_LONG_ONLY
+    result["reason"] = (str(reason) + " | " if reason else "") + override_reason
+    result["fast_intraday_override"] = True
+    result["intraday_stress"] = market_engine.get("intraday_stress")
+    logger.info(
+        "MARKET ENGINE FAST OVERRIDE | "
+        f"old={old_mode} -> new={result.get('mode')} | {override_reason}"
+    )
+    return result
+
+
+def _v200_collect_setup_tags(candidate: dict) -> list:
+    """Unified tag source for whitelist, weak drift, resistance relaxation, badge, and diagnostics."""
+    if not candidate:
+        return []
+    try:
+        tags = set(build_execution_setup_tags(candidate))
+    except Exception:
+        tags = set()
+    fields = [
+        "primary_extra_setup", "extra_setup", "extra_setup_name", "setup_type", "setup_type_base",
+        "context_setup", "wave_label", "wave_estimate", "entry_maturity", "opportunity_type",
+    ]
+    for field in fields:
+        value = candidate.get(field)
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if item:
+                    tags.add(str(item).strip())
+        elif value not in (None, ""):
+            tags.add(str(value).strip())
+    for field in ("extra_setup_names", "extra_setups", "context_setups", "early_execution_setup_tags"):
+        value = candidate.get(field)
+        if isinstance(value, dict):
+            value = list(value.keys()) + list(value.values())
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if item:
+                    tags.add(str(item).strip())
+        elif value not in (None, ""):
+            tags.add(str(value).strip())
+    diagnostics = candidate.get("diagnostics") or {}
+    if isinstance(diagnostics, dict):
+        for key in ("setup_tags", "execution_setup_tags", "wave_context", "context_setups"):
+            value = diagnostics.get(key)
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    if item:
+                        tags.add(str(item).strip())
+            elif value not in (None, ""):
+                tags.add(str(value).strip())
+    if candidate.get("relative_strength_vs_btc"):
+        tags.add("relative_strength_vs_btc")
+    try:
+        if int(candidate.get("wave_estimate") or 0) == 3:
+            tags.add("wave_3")
+    except Exception:
+        pass
+    return sorted({t for t in tags if t and t.lower() not in ("none", "unknown", "false")})
+
+
+def v200_score_candidate(candidate: dict) -> dict:
+    """Centralized final score snapshot. Does not duplicate existing penalties."""
+    if not candidate:
+        return candidate
+    raw = _arch_float(candidate.get("raw_score", candidate.get("score", 0.0)), 0.0)
+    effective = _arch_float(candidate.get("effective_score", candidate.get("score", raw)), raw)
+    candidate["raw_score"] = round(raw, 2)
+    candidate["effective_score"] = round(effective, 2)
+    candidate["score"] = round(effective, 2)
+    candidate.setdefault("final_threshold", FINAL_MIN_SCORE)
+    candidate.setdefault("adjustments_log", [])
+    candidate.setdefault("warnings", candidate.get("warning_reasons", []))
+    return candidate
+
+
+def v200_smart_resistance_classification(candidate: dict) -> dict:
+    """Classifies resistance after candidate build for diagnostics and later ranking."""
+    if not candidate:
+        return candidate
+    source = str(candidate.get("nearest_resistance_source") or candidate.get("resistance_source") or "unknown")
+    entry = _arch_float(candidate.get("entry") or candidate.get("recommended_entry") or candidate.get("market_entry"), 0.0)
+    resistance = _arch_float(candidate.get("nearest_resistance"), 0.0)
+    sl = _arch_float(candidate.get("sl"), 0.0)
+    dist_pct = ((resistance - entry) / entry * 100.0) if entry > 0 and resistance > entry else None
+    risk = entry - sl if entry > 0 and sl > 0 else 0.0
+    resistance_r = ((resistance - entry) / risk) if risk > 0 and resistance > entry else None
+    tags = set(candidate.get("execution_setup_tags") or [])
+    strong_setup = bool(tags.intersection(set(STRONG_ONLY_ALLOWED_SETUPS))) or bool(candidate.get("has_extra_strong_setup")) or bool(candidate.get("mtf_confirmed"))
+    vol_ok = _arch_float(candidate.get("vol_ratio"), 0.0) >= 1.05
+    source_soft = source in SOFT_RESISTANCE_SOURCES or source in ("unknown", "micro_high", "tiny_wick")
+    source_hard = source in HARD_RESISTANCE_SOURCES or "previous_rejection" in source or "confirmed" in source
+    ultra_close = bool(dist_pct is not None and dist_pct <= 0.12) or bool(resistance_r is not None and resistance_r <= 0.15)
+    classification = "resistance_none"
+    if resistance > entry > 0:
+        if ultra_close or source_hard:
+            classification = "resistance_hard_reject" if ultra_close else "resistance_structural_hard"
+        elif source_soft and strong_setup and vol_ok:
+            classification = "resistance_warning_only"
+            _arch_add_warning(candidate, "resistance_warning_only")
+            candidate["resistance_relaxed_reason"] = "soft_source_with_strong_setup_volume_or_mtf"
+        else:
+            classification = "resistance_penalty_only"
+            _arch_add_warning(candidate, "resistance_penalty_only")
+    candidate["resistance_classification"] = classification
+    candidate["resistance_distance_pct"] = round(dist_pct, 4) if dist_pct is not None else None
+    candidate["resistance_r"] = round(resistance_r, 4) if resistance_r is not None else None
+    return candidate
+
+
+def v200_finalize_candidate(candidate: dict, market_engine: dict) -> dict:
+    """Final candidate normalization before ranking/messaging."""
+    if not candidate:
+        return candidate
+    candidate["architecture_version"] = "v200"
+    candidate["decision_path"] = "signal_engine>setup_tags>quality_engine>scoring_engine>smart_resistance>ranking>messaging>execution_optional"
+    candidate["market_engine"] = market_engine or {}
+    candidate["execution_setup_tags"] = _v200_collect_setup_tags(candidate)
+    candidate = v200_score_candidate(candidate)
+    candidate = v200_smart_resistance_classification(candidate)
+    warnings = candidate.get("warning_reasons") or []
+    if warnings:
+        LONG_LAYER_COUNTER["soft_penalty_only"] = int(LONG_LAYER_COUNTER.get("soft_penalty_only", 0) or 0) + 1
+        for warning in warnings:
+            _bump_long_soft_warning(str(warning))
+    LONG_LAYER_COUNTER["candidate_built"] = int(LONG_LAYER_COUNTER.get("candidate_built", 0) or 0) + 1
+    return candidate
+
+
+def v200_rank_candidates(candidates: list, current_mode: str) -> list:
+    """Ranking engine: rank after hard danger rejection, not reject-first."""
+    def _rank(c):
+        tags = set(c.get("execution_setup_tags") or [])
+        setup_bonus = 0.45 if tags.intersection(set(STRONG_ONLY_ALLOWED_SETUPS)) else 0.0
+        mtf_bonus = 0.25 if c.get("mtf_confirmed") else 0.0
+        volume_bonus = min(max(_arch_float(c.get("vol_ratio"), 0.0) - 1.0, 0.0), 1.2) * 0.20
+        resistance_room = _arch_float(c.get("resistance_r"), 1.0) if c.get("resistance_r") is not None else 1.0
+        resistance_bonus = min(max(resistance_room, 0.0), 2.0) * 0.10
+        ma_dist = abs(_arch_float(c.get("dist_ma"), 0.0))
+        distance_penalty = min(ma_dist / 20.0, 0.45)
+        mode_bonus = 0.15 if current_mode == MODE_STRONG_LONG_ONLY and setup_bonus else 0.0
+        return (
+            _arch_float(c.get("effective_score", c.get("score", 0.0)), 0.0)
+            + setup_bonus + mtf_bonus + volume_bonus + resistance_bonus + mode_bonus - distance_penalty,
+            _arch_float(c.get("momentum_priority"), 0.0),
+            _arch_float(c.get("change_24h"), 0.0),
+        )
+    try:
+        for c in candidates or []:
+            c["v200_rank_score"] = round(_rank(c)[0], 4)
+        return sorted(candidates or [], key=_rank, reverse=True)
+    except Exception:
+        return candidates or []
+
+
+def v200_momentum_zero_fallback(before_filter: list, after_filter: list, current_mode: str) -> list:
+    """Prevents total silence when the momentum filter removes every viable non-block candidate."""
+    if after_filter or not before_filter or current_mode == MODE_BLOCK_LONGS:
+        return after_filter
+    strong = []
+    for c in before_filter:
+        tags = set(c.get("execution_setup_tags") or [])
+        score = _arch_float(c.get("effective_score", c.get("score", 0.0)), 0.0)
+        vol_ratio = _arch_float(c.get("vol_ratio"), 0.0)
+        if score >= FINAL_MIN_SCORE and vol_ratio >= 1.05 and (tags.intersection(set(STRONG_ONLY_ALLOWED_SETUPS)) or c.get("has_extra_strong_setup") or c.get("mtf_confirmed")):
+            _arch_add_warning(c, "top_momentum_zero_fallback_allowed")
+            strong.append(c)
+    fallback = v200_rank_candidates(strong, current_mode)[:3]
+    if fallback:
+        logger.warning(
+            f"V200 MOMENTUM FALLBACK | before={len(before_filter)} after=0 restored={len(fallback)} | mode={current_mode}"
+        )
+    return fallback
+
+
+def v200_log_candidate_diagnostics(candidate: dict, layer: str = "candidate") -> None:
+    try:
+        logger.info(
+            "V200 DIAGNOSTICS | "
+            f"layer={layer} | symbol={candidate.get('symbol')} | mode={candidate.get('market_mode')} | "
+            f"score={candidate.get('score')} | raw={candidate.get('raw_score')} | eff={candidate.get('effective_score')} | "
+            f"tags={candidate.get('execution_setup_tags')} | res={candidate.get('resistance_classification')} | "
+            f"warnings={candidate.get('warning_reasons', [])[:4]}"
+        )
+    except Exception:
+        pass
+
+
 # =========================
 # TELEGRAM LOOP
 # =========================
@@ -10274,6 +10567,12 @@ def run_scanner_loop():
             current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
             if not current_mode:
                 current_mode = MODE_NORMAL_LONG
+            market_engine_context = build_market_engine_context(
+                market_guard=market_guard,
+                market_state=market_state,
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+            )
             mode_result = determine_long_market_mode(
                 market_guard=market_guard,
                 market_state=market_state,
@@ -10282,6 +10581,7 @@ def run_scanner_loop():
                 current_mode=current_mode,
                 allow_state_writes=True,
             )
+            mode_result = apply_fast_intraday_override(mode_result, market_engine_context, current_mode)
             current_mode = handle_market_mode_transition(mode_result)
 
             try:
@@ -10357,6 +10657,7 @@ def run_scanner_loop():
                 "alt_snapshot": alt_snapshot,
                 "market_info": market_info,
                 "market_guard": market_guard,
+                "market_engine_context": market_engine_context,
                 "ranked_pairs_count": len(ranked_pairs),
                 "suggested_mode": mode_result.get("mode", current_mode),
                 "suggested_reason": mode_result.get("reason", ""),
@@ -11073,7 +11374,16 @@ def run_scanner_loop():
                         logger.info(f"{symbol} → skipped by entry maturity guard: {entry_maturity_data}")
                         continue
                 if market_state == "bull_market" and not is_reverse:
-                    if vwap_distance >= 2.4 and not breakout and not pre_breakout:
+                    # v201: VWAP extension in bull market is normally a warning/score issue.
+                    # Hard reject only when there is no strong/whitelisted context to justify continuation.
+                    _vwap_soft_context = bool(
+                        relaxed_pre_score_setup
+                        or has_extra_strong_setup
+                        or mtf_confirmed
+                        or primary_extra_setup
+                        or extra_setup_names
+                    )
+                    if vwap_distance >= 2.4 and not breakout and not pre_breakout and not _vwap_soft_context:
                         log_long_rejection(
                             symbol=symbol,
                             reason="vwap_overextended_bull_market",
@@ -11096,7 +11406,7 @@ def run_scanner_loop():
                             },
                         )
                         continue
-                    if vwap_distance >= 2.8 and breakout_quality != "strong" and not pre_breakout:
+                    if vwap_distance >= 2.8 and breakout_quality != "strong" and not pre_breakout and not _vwap_soft_context:
                         log_long_rejection(
                             symbol=symbol,
                             reason="vwap_overextended_bull_market",
@@ -11132,10 +11442,25 @@ def run_scanner_loop():
                     )
                     bull_mtf_strong_soften = (
                         current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
-                        and relaxed_pre_score_setup
+                        and (
+                            relaxed_pre_score_setup
+                            or has_extra_strong_setup
+                            or breakout
+                            or primary_extra_setup
+                            or bool(extra_setup_names)
+                        )
                         and vol_ratio >= (1.00 if current_mode == MODE_STRONG_LONG_ONLY else 1.05)
                         and (mtf_confirmed or _pre_score_market_supportive)
                     )
+                    _normal_momentum_soften = (
+                        current_mode == MODE_NORMAL_LONG
+                        and _pre_score_market_supportive
+                        and vol_ratio >= 1.10
+                        and dist_ma < 4.6
+                        and not late_guard.get("extreme_late_pump", False)
+                    )
+                    if _normal_momentum_soften and not bull_mtf_strong_soften:
+                        bull_mtf_strong_soften = True
 
                     if (
                         rsi_now >= 67
@@ -11216,10 +11541,21 @@ def run_scanner_loop():
                 if not is_reverse:
                     if macd_hist < 0 and not breakout and not pre_breakout:
                         if (
-                            market_state in ("bull_market", "alt_season")
-                            and mtf_confirmed
-                            and relaxed_pre_score_setup
-                            and vol_ratio >= 1.15
+                            (
+                                market_state in ("bull_market", "alt_season")
+                                or "صاعد" in str(btc_mode or "")
+                                or "قوي" in str(alt_mode or "")
+                                or current_mode == MODE_STRONG_LONG_ONLY
+                            )
+                            and (
+                                mtf_confirmed
+                                or relaxed_pre_score_setup
+                                or has_extra_strong_setup
+                                or primary_extra_setup
+                                or bool(extra_setup_names)
+                            )
+                            and vol_ratio >= 1.05
+                            and dist_ma < 4.8
                         ):
                             logger.info(
                                 f"{symbol} --> MACD negative softened to warning "
@@ -11259,27 +11595,41 @@ def run_scanner_loop():
                         and not pre_breakout
                         and breakout_quality != "strong"
                     ):
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="macd_momentum_falling",
-                            candle_time=candle_time,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={"macd_hist_slope": macd_hist_slope, "macd_hist": macd_hist,
-                                   "has_extra_strong_setup": has_extra_strong_setup,
-                                   "extra_setup_names": extra_setup_names,
-                                   "primary_extra_setup": primary_extra_setup,
-                                   "extra_setup_bonus": extra_setup_bonus},
+                        # v201: falling MACD after a move is a hard reject only for real chase danger.
+                        _macd_hard_danger = (
+                            dist_ma >= 5.0
+                            and rsi_now >= 70
+                            and vol_ratio >= 1.80
+                            and not mtf_confirmed
+                            and not relaxed_pre_score_setup
+                            and not has_extra_strong_setup
                         )
-                        continue
+                        if _macd_hard_danger:
+                            log_long_rejection(
+                                symbol=symbol,
+                                reason="macd_momentum_falling",
+                                candle_time=candle_time,
+                                market_state=market_state,
+                                current_mode=current_mode,
+                                dist_ma=dist_ma,
+                                rsi_now=rsi_now,
+                                vol_ratio=vol_ratio,
+                                vwap_distance=vwap_distance,
+                                mtf_confirmed=mtf_confirmed,
+                                breakout=breakout,
+                                pre_breakout=pre_breakout,
+                                is_reverse=is_reverse,
+                                extra={"macd_hist_slope": macd_hist_slope, "macd_hist": macd_hist,
+                                       "has_extra_strong_setup": has_extra_strong_setup,
+                                       "extra_setup_names": extra_setup_names,
+                                       "primary_extra_setup": primary_extra_setup,
+                                       "extra_setup_bonus": extra_setup_bonus},
+                            )
+                            continue
+                        entry_warning = True
+                        softening_applied = True
+                        soft_warning = True
+                        warning_reasons.append("MACD momentum falling؛ تحذير بدل رفض إلا في المطاردة الخطرة")
                 trap_check = is_momentum_exhaustion_trap(
                     market_state=market_state,
                     opportunity_type=temp_opportunity_type,
@@ -12221,12 +12571,11 @@ def run_scanner_loop():
                             setup_type=setup_type,
                             extra_setup_names=extra_setup_names,
                             primary_extra_setup=primary_extra_setup,
-                            execution_setup_tags=build_execution_setup_tags({
+                            execution_setup_tags=_collect_execution_setup_tags({
                                 "setup_type": setup_type,
                                 "primary_extra_setup": primary_extra_setup,
                                 "extra_setup_names": extra_setup_names,
-                                "execution_setup_tags": locals().get("early_execution_setup_tags", []),
-                                "early_execution_setup_tags": locals().get("early_execution_setup_tags", []),
+                                "execution_setup_tags": locals().get("execution_setup_tags", []),
                                 "relative_strength_vs_btc": locals().get("relative_strength_vs_btc", False),
                                 "wave_estimate": locals().get("wave_estimate", None),
                             }),
@@ -12236,45 +12585,38 @@ def run_scanner_loop():
                         )
 
                         # Market Adaptive Resistance:
-                        # v128: only soften dynamic/noise resistance for strong canonical setups.
-                        # Keep real structure protected: swing_high / previous_rejection /
-                        # confirmed round levels still hard-reject when they are too close or low-R.
+                        # In bull/alt-season conditions, a minor swing_high / bb_upper should not
+                        # behave like a major supply wall when the signal itself has MTF + volume
+                        # + strong setup support. Keep truly close/low-R resistance protected.
                         _score_for_resistance = float(score_result.get("score", raw_score) or 0.0)
-                        _strong_market_for_resistance = market_state in ("bull_market", "alt_season")
-                        _market_supportive_for_resistance = (
-                            _strong_market_for_resistance
+                        _strong_market_for_resistance = (
+                            market_state in ("bull_market", "alt_season")
                             or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
-                            or "صاعد" in str(btc_mode or "")
-                            or "قوي" in str(alt_mode or "")
                         )
                         _res_is_ultra_close = (_res_dist_pct < 0.10 or _res_r < 0.15)
-                        _res_flex_source_allowed = (_res_is_dynamic_hint or _res_is_micro_noise)
                         _normal_dynamic_hint_warning_only = (
                             current_mode == MODE_NORMAL_LONG
                             and _res_is_dynamic_hint
                             and not _res_is_ultra_close
                         )
                         _bull_mtf_flex = (
-                            current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
-                            and _market_supportive_for_resistance
-                            and (bool(mtf_confirmed) or bool(breakout) or bool(pre_breakout))
-                            and float(vol_ratio or 0.0) >= 1.00
+                            current_mode == MODE_NORMAL_LONG
+                            and _strong_market_for_resistance
+                            and bool(mtf_confirmed)
+                            and float(vol_ratio or 0.0) >= 1.05
                             and _score_for_resistance >= 6.5
                             and (_res_relaxed_setup or breakout or pre_breakout)
-                            and _res_flex_source_allowed
-                            and not _res_is_structural
+                            and not _res_is_major_structural
                             and not _res_is_ultra_close
-                            and _res_r >= 0.20
                         )
 
                         if _res_is_micro_noise or _normal_dynamic_hint_warning_only or _bull_mtf_flex:
                             smart_resistance_warning_only = True
                             early_resistance_warning = ""
-                            _res_note = "strong_setup_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
+                            _res_note = "normal_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
                             logger.info(
                                 f"⚪ {symbol} {_res_note} | "
-                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
-                                f"relaxed={_res_relaxed_setup} | bull_flex={_bull_mtf_flex}"
+                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
                             )
                         else:
                             if _res_relaxed_setup:
@@ -12324,7 +12666,6 @@ def run_scanner_loop():
                                         "bull_flex": _bull_mtf_flex,
                                         "ultra_close": _res_is_ultra_close,
                                         "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
-                                        "resistance_relaxed_reason": "strong_setup_bull_flex" if _bull_mtf_flex else "not_relaxed_or_real_resistance",
                                         "category": "trade_quality",
                                     },
                                 )
@@ -12425,6 +12766,29 @@ def run_scanner_loop():
                     vwap_distance=vwap_distance,
                     score_after_penalties=score_result["score"],
                 )
+                # v201: avoid double-killing by near_resistance after Smart TP/Resistance already evaluated.
+                # Keep hard reject only for weak/danger context; otherwise convert to warning + capped penalty.
+                _near_resistance_soft_context = bool(
+                    relaxed_pre_score_setup
+                    or has_extra_strong_setup
+                    or primary_extra_setup
+                    or extra_setup_names
+                    or (mtf_confirmed and (breakout or pre_breakout) and vol_ratio >= 1.05)
+                    or (market_state in ("bull_market", "alt_season") and mtf_confirmed and vol_ratio >= 1.15)
+                )
+                _near_resistance_true_danger = bool(
+                    late_guard.get("extreme_late_pump", False)
+                    or ("مرتفع" in str(display_risk_early) and upper_wick_ratio >= 0.45)
+                    or (market_state == "risk_off" and not mtf_confirmed)
+                    or (dist_ma >= 5.2 and rsi_now >= 70 and vol_ratio >= 1.8)
+                )
+                if should_reject_near_resistance and _near_resistance_soft_context and not _near_resistance_true_danger:
+                    should_reject_near_resistance = False
+                    res_dynamic_penalty = min(float(res_dynamic_penalty or 0.0) + 0.15, 0.35)
+                    soft_warning = True
+                    entry_warning = True
+                    warning_reasons.append("قرب مقاومة لكن setup/MTF داعم؛ تحذير بدل رفض")
+                    logger.info(f"{symbol} --> near resistance softened to warning (v201)")
                 if should_reject_near_resistance:
                     log_long_rejection(
                         symbol=symbol,
@@ -13171,6 +13535,8 @@ def run_scanner_loop():
                     "execution_tp2": execution_tp2,
                 }
                 candidate["execution_setup_tags"] = build_execution_setup_tags(candidate)
+                candidate = v200_finalize_candidate(candidate, market_engine_context)
+                v200_log_candidate_diagnostics(candidate, layer="candidate_built")
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "EXEC TAGS | "
@@ -13228,9 +13594,12 @@ def run_scanner_loop():
                 )
             candidates_before_momentum = len(candidates)
             logger.info(f"Long candidates found before momentum filter: {candidates_before_momentum}")
-            candidates = apply_top_momentum_filter(candidates)
+            candidates_ranked_before_momentum = v200_rank_candidates(candidates, current_mode)
+            candidates = apply_top_momentum_filter(candidates_ranked_before_momentum)
+            candidates = v200_momentum_zero_fallback(candidates_ranked_before_momentum, candidates, current_mode)
+            candidates = v200_rank_candidates(candidates, current_mode)
             candidates_after_momentum = len(candidates)
-            logger.info(f"Long candidates found after momentum filter: {candidates_after_momentum}")
+            logger.info(f"Long candidates found after momentum/ranking engine: {candidates_after_momentum}")
             top_candidates = diversify_candidates(candidates, min(max_alerts, len(candidates)))
             top_candidates_count = len(top_candidates)
             for candidate in top_candidates:
@@ -13539,12 +13908,16 @@ def run_scanner_loop():
                 exec_candidates_this_run = 0
             logger.info(f"Sent long alerts this run: {sent_count}")
             logger.info(
-                "LONG RUN SUMMARY | "
-                f"scanned={tested} | rejected={sum(LONG_REJECTION_REASON_COUNTER.values())} | "
+                "LONG RUN SUMMARY v201 | "
+                f"scanned={tested} | "
+                f"rejected_hard={sum(LONG_REJECTION_REASON_COUNTER.values())} | "
+                f"soft_penalty_only={LONG_LAYER_COUNTER.get('soft_penalty_only', 0)} | "
                 f"candidates_before_momentum={locals().get('candidates_before_momentum', 0)} | "
-                f"candidates_after_momentum={locals().get('candidates_after_momentum', 0)} | "
+                f"candidates_after_ranking={locals().get('candidates_after_momentum', 0)} | "
                 f"top_candidates={locals().get('top_candidates_count', 0)} | sent={sent_count} | "
-                f"exec_candidates={exec_candidates_this_run} | top_reject={_format_long_run_rejection_top(5)}"
+                f"exec_candidates={exec_candidates_this_run} | "
+                f"top_reject={_format_long_run_rejection_top(5)} | "
+                f"top_soft_warning={_format_long_run_soft_warning_top(5)}"
             )
             logger.info(f"Tested {tested} pairs")
             logger.info(f"Scan complete. Sleeping {SCAN_LOOP_SLEEP_SECONDS}s before next run...")
