@@ -3051,7 +3051,8 @@ def get_weak_trend_drift_status(candidate: dict) -> dict:
             str(_trade_field(data, "fib_position", "") or ""),
         ]).lower()
         late_or_danger = any(token in entry_text for token in (
-            "late", "danger", "overextended", "متأخر", "امتداد", "نهاية موجة", "موجة خامسة"
+            "danger", "danger_late", "hard_late", "overextended",
+            "متأخر جدًا", "امتداد سعري", "نهاية موجة", "موجة خامسة"
         ))
 
         btc_mode = str(_trade_field(data, "btc_mode", "") or "")
