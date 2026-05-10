@@ -9034,7 +9034,7 @@ def _market_reminder_collect_stats(window_seconds: int = 1200) -> dict:
             created = _trade_created_ts_for_exec(t)
             if created >= since_ts:
                 recent_trades.append(t)
-            if _is_execution_trade_open(t):
+            if _is_execution_trade_open(t) and is_execution_candidate_trade(t):
                 open_trades.append(t)
 
         stats["signals"] = len(recent_trades)
@@ -9323,8 +9323,12 @@ def handle_market_mode_transition(mode_result: dict) -> str:
         r.set(MARKET_MODE_LAST_KEY, new_mode)
         r.set(MARKET_MODE_LAST_TRANSITION_KEY, str(now_ts))
         try:
+            # Reset reminder state on mode transition so the first reminder for
+            # the new mode is scheduled from the transition time, not from an
+            # old timestamp belonging to the previous mode.
             r.delete(MARKET_MODE_REMINDER_COUNT_KEY)
             r.set(MARKET_MODE_REMINDER_MODE_KEY, new_mode)
+            r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts))
         except Exception:
             pass
         logger.info(f"MODE TRANSITION: {last_mode} → {new_mode} | reason: {mode_result.get('reason')}")
