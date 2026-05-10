@@ -1,3 +1,4 @@
+# Version: main_v126_momentum_filter_balance
 # UI PATCH VERIFIED 2026-05-08: mood transition/reminder titles + compact open execution report formatting.
 # Version: main_v08_modes_ui_final
 # Date: 2026-05-08
@@ -7207,10 +7208,71 @@ def apply_top_momentum_filter(candidates):
                 "rank_volume_24h": c.get("rank_volume_24h"),
                 "extra_setup_names": c.get("extra_setup_names"),
                 "setup_type_base": c.get("setup_type_base"),
+                "execution_setup_tags": c.get("execution_setup_tags", []),
             },
         )
     except Exception:
         pass
+
+ def _is_top_momentum_soft_exception(c):
+    """Keep strong detector-approved setups from being silenced by rank/momentum filters.
+
+    This is alert-flow only. It does not bypass TP/SL, execution limits, late danger,
+    or true near-resistance blocks. It mainly prevents STRONG_LONG_ONLY from producing
+    zero normal messages when the market is selective but a whitelisted setup is present.
+    """
+    try:
+        if not isinstance(c, dict):
+            return False
+        mode = normalize_market_mode(c.get("current_mode") or c.get("market_mode") or MODE_NORMAL_LONG)
+        if mode not in (MODE_STRONG_LONG_ONLY, MODE_NORMAL_LONG):
+            return False
+
+        tags = set(_collect_execution_setup_tags(c))
+        strong_tags = {
+            "retest_breakout_confirmed",
+            "vwap_reclaim",
+            "wave_3",
+            "higher_low_continuation",
+            "relative_strength_vs_btc",
+            "liquidity_sweep_reclaim",
+            "support_bounce_confirmed",
+            "failed_breakdown_trap",
+        }
+        has_strong_setup = bool(tags & strong_tags) or _has_strict_execution_setup(c)
+        if mode == MODE_NORMAL_LONG and not has_strong_setup:
+            has_strong_setup = _has_normal_long_execution_setup(c)
+        if not has_strong_setup:
+            return False
+
+        entry_text = "|".join(str(c.get(k, "") or "") for k in (
+            "entry_timing", "entry_maturity", "entry_maturity_label", "wave_label", "fib_position"
+        )).lower()
+        hard_late_or_danger = any(token in entry_text for token in (
+            "danger", "danger_late", "hard_late", "overextended", "wave_5",
+            "متأخر جدًا", "موجة خامسة", "نهاية الحركة"
+        ))
+        if hard_late_or_danger:
+            return False
+
+        score = _safe_float(c.get("score", c.get("effective_score", 0.0)), 0.0)
+        vol_ratio = _safe_float(c.get("vol_ratio", 0.0), 0.0)
+        mtf_confirmed = bool(c.get("mtf_confirmed"))
+        market_state = str(c.get("market_state", "") or "").lower()
+        btc_mode = str(c.get("btc_mode", "") or "")
+        alt_mode = str(c.get("alt_mode", "") or "")
+        market_supportive = (
+            market_state in ("bull_market", "alt_season")
+            or "صاعد" in btc_mode
+            or "قوي" in alt_mode
+            or "🟢" in btc_mode
+            or "🟢" in alt_mode
+        )
+
+        min_score = 6.7 if mode == MODE_STRONG_LONG_ONLY else 6.4
+        return bool(score >= min_score and vol_ratio >= 1.0 and (mtf_confirmed or market_supportive))
+    except Exception:
+        return False
 
  strong_candidates = []
 
@@ -7228,6 +7290,13 @@ def apply_top_momentum_filter(candidates):
 
         if c["score"] >= min_sc:
             strong_candidates.append(c)
+        elif _is_top_momentum_soft_exception(c):
+            c.setdefault("warning_reasons", [])
+            if isinstance(c.get("warning_reasons"), list):
+                c["warning_reasons"].append("Top momentum ضعيف لكن setup قوي/موحد؛ تم السماح كتحذير")
+            c["top_momentum_soft_exception"] = True
+            strong_candidates.append(c)
+            logger.info(f"TOP MOMENTUM SOFT ALLOW | {c.get('symbol')} | score={c.get('score')} | tags={c.get('execution_setup_tags', [])}")
         else:
             _log_top_momentum_rejection(c, reason="top_momentum_min_score")
 
@@ -7240,12 +7309,19 @@ def apply_top_momentum_filter(candidates):
 
  min_score = get_effective_min_score(False, False)
  for c in candidates:
-    if c["score"] >= min_score:
+    soft_exception = _is_top_momentum_soft_exception(c)
+    if c["score"] >= min_score or soft_exception:
         if not (c.get("breakout") or c.get("pre_breakout") or c.get("early_priority") == "strong"
                 or c.get("strong_bull_pullback") or c.get("strong_breakout_exception") or c.get("is_reverse")):
-            if c["score"] < 6.8:
+            if c["score"] < 6.8 and not soft_exception:
                 _log_top_momentum_rejection(c, reason="top_momentum_plain_continuation_score")
                 continue
+        if soft_exception and c["score"] < min_score:
+            c.setdefault("warning_reasons", [])
+            if isinstance(c.get("warning_reasons"), list):
+                c["warning_reasons"].append("Top momentum أقل من الحد لكن setup قوي/موحد؛ تم السماح كتحذير")
+            c["top_momentum_soft_exception"] = True
+            logger.info(f"TOP MOMENTUM SOFT ALLOW | {c.get('symbol')} | score={c.get('score')} | min={min_score} | tags={c.get('execution_setup_tags', [])}")
         strong_candidates.append(c)
     else:
         _log_top_momentum_rejection(c, reason="top_momentum_min_score")
@@ -7266,6 +7342,10 @@ def apply_top_momentum_filter(candidates):
 
  top_n = max(4, int(len(strong_candidates) * TOP_MOMENTUM_PERCENT))
  filtered = strong_candidates[:top_n]
+ soft_rank_exceptions = [c for c in strong_candidates[top_n:] if c.get("top_momentum_soft_exception")]
+ if soft_rank_exceptions:
+    # Keep at most two soft exceptions so STRONG mode does not go silent, without flooding alerts.
+    filtered.extend(soft_rank_exceptions[:2])
  filtered_ids = set(id(x) for x in filtered)
 
  for c in strong_candidates:
@@ -11039,9 +11119,15 @@ def run_scanner_loop():
                 if not is_reverse:
                     bull_mtf_strong_soften = (
                         market_state in ("bull_market", "alt_season")
-                        and mtf_confirmed
                         and relaxed_pre_score_setup
-                        and vol_ratio >= 1.15
+                        and (
+                            (mtf_confirmed and vol_ratio >= 1.15)
+                            or (
+                                current_mode == MODE_STRONG_LONG_ONLY
+                                and vol_ratio >= 1.05
+                                and (mtf_confirmed or "صاعد" in str(btc_mode or "") or "قوي" in str(alt_mode or ""))
+                            )
+                        )
                     )
 
                     if (
