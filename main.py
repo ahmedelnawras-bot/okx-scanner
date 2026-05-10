@@ -2879,6 +2879,17 @@ except Exception:
 
 EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
+# NORMAL_LONG-only execution gate expansion.
+# These tags are produced by detect_extra_strong_long_setups(), but may not exist
+# in the global execution config whitelist yet. Keep them local to NORMAL_LONG so
+# STRONG/BLOCK/RECOVERY behaviour stays unchanged.
+NORMAL_LONG_EXECUTION_EXTRA_WHITELIST = {
+    "failed_breakdown_trap",
+    "higher_low_continuation",
+    "support_bounce_confirmed",
+    "liquidity_sweep_reclaim",
+}
+
 
 def _normalize_execution_tag(value) -> str:
     """Normalize setup/context tags for execution whitelist matching."""
@@ -3008,6 +3019,63 @@ def _has_strict_execution_setup(data: dict) -> bool:
             tags.add("relative_strength_vs_btc")
 
         return any(tag in allowed for tag in tags)
+    except Exception:
+        return False
+
+
+def _has_normal_long_execution_setup(data: dict) -> bool:
+    """NORMAL_LONG-only extension for execution candidate detection.
+
+    This deliberately does not alter the global strict whitelist used by other
+    market modes. It only accepts detector-produced extra setups that are
+    already calculated by detect_extra_strong_long_setups(), plus wave_3 when
+    entry_maturity explicitly estimates wave 3.
+    """
+    try:
+        if not isinstance(data, dict):
+            return False
+        diagnostics = data.get("diagnostics", {}) or {}
+        allowed = {_normalize_execution_tag(k) for k in NORMAL_LONG_EXECUTION_EXTRA_WHITELIST}
+        tags = set()
+
+        def add_detector_value(value):
+            if value is None or value == "":
+                return
+            if isinstance(value, dict):
+                for v in value.values():
+                    add_detector_value(v)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_detector_value(item)
+                return
+            if isinstance(value, bool):
+                return
+            for part in str(value).replace(",", "|").replace(";", "|").split("|"):
+                tag = _normalize_execution_tag(part)
+                if tag:
+                    tags.add(tag)
+
+        for key in ("primary_extra_setup", "extra_setup_names"):
+            add_detector_value(data.get(key))
+            add_detector_value(diagnostics.get(key))
+
+        if any(tag in allowed for tag in tags):
+            return True
+
+        # Allow wave_3 only from the explicit numeric wave estimate, not from
+        # descriptive setup_type/wave_context text.
+        wave_values = (
+            data.get("wave_estimate"),
+            diagnostics.get("wave_estimate"),
+        )
+        for value in wave_values:
+            try:
+                if int(value or 0) == 3:
+                    return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
 
@@ -3187,8 +3255,18 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
         mtf_confirmed = bool(_trade_field(data, "mtf_confirmed", False))
         breakout_quality = str(_trade_field(data, "breakout_quality", "") or "").strip().lower()
         resistance_warning = bool(_trade_field(data, "resistance_warning", ""))
+        mode = normalize_market_mode(
+            _trade_field(data, "current_mode", "")
+            or _trade_field(data, "market_mode", "")
+            or _trade_field(data, "mode", "")
+            or MODE_NORMAL_LONG
+        )
         has_whitelist = _has_strict_execution_setup(data)
+        if mode == MODE_NORMAL_LONG and not has_whitelist:
+            has_whitelist = _has_normal_long_execution_setup(data)
         setup_weight = _get_strict_execution_setup_weight(data)
+        if mode == MODE_NORMAL_LONG and setup_weight <= 0 and _has_normal_long_execution_setup(data):
+            setup_weight = 2
 
         entry_text = "|".join([
             str(_trade_field(data, "entry_timing", "") or ""),
@@ -3207,9 +3285,9 @@ def _candidate_passes_weak_drift_execution_quality(candidate: dict) -> bool:
             if breakout_quality == "strong" and mtf_confirmed and vol_ratio >= 1.10 and score >= 7.2:
                 allowed = True
                 allow_reason = "strong_breakout_mtf"
-            elif setup_weight >= 3 and score >= 7.3 and mtf_confirmed and vol_ratio >= 1.10:
+            elif setup_weight >= 3 and score >= (7.0 if mode == MODE_NORMAL_LONG else 7.3) and mtf_confirmed and vol_ratio >= 1.10:
                 allowed = True
-                allow_reason = "tier3_setup_mtf"
+                allow_reason = "tier3_setup_mtf_normal" if mode == MODE_NORMAL_LONG and score < 7.3 else "tier3_setup_mtf"
             elif setup_weight >= 3 and score >= 7.7 and vol_ratio >= 1.25:
                 allowed = True
                 allow_reason = "tier3_setup_force"
@@ -8042,6 +8120,8 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             or MODE_NORMAL_LONG
         )
         strict_setup_allowed = _has_strict_execution_setup(planned)
+        if mode == MODE_NORMAL_LONG and not strict_setup_allowed:
+            strict_setup_allowed = _has_normal_long_execution_setup(planned)
         block_mode_allowed = _is_block_mode_execution_candidate(planned)
         has_complete_plan = _candidate_has_complete_execution_plan(planned)
         weak_drift_passed = _candidate_passes_weak_drift_execution_quality(planned)
