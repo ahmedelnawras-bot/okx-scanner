@@ -246,8 +246,8 @@ STRONG_ONLY_ALLOWED_SETUPS = {
     "relative_strength_vs_btc",
     "failed_breakdown_trap",
 }
-STRONG_ONLY_MIN_SCORE = 7.3
-STRONG_ONLY_MIN_VOL_RATIO = 1.05
+STRONG_ONLY_MIN_SCORE = 7.0
+STRONG_ONLY_MIN_VOL_RATIO = 1.00
 
 # Extra setup groups used only to decide whether a signal may pass the
 # STRONG_LONG_ONLY signal gate. NORMAL_LONG is not affected.
@@ -10966,10 +10966,10 @@ def run_scanner_loop():
                 _tier_b_strong_setup = bool(_strong_signal_tags & STRONG_SIGNAL_TIER_B_SETUPS)
                 _tier_b_quality_ok = (
                     _tier_b_strong_setup
-                    and vol_ratio >= 1.25
-                    and rsi_now >= 48
-                    and dist_ma <= 3.8
-                    and (mtf_confirmed or candle_strength >= 0.45 or gaining_strength)
+                    and vol_ratio >= 1.10
+                    and rsi_now >= 47
+                    and dist_ma <= 4.2
+                    and (mtf_confirmed or candle_strength >= 0.42 or gaining_strength)
                 )
 
                 # STRONG_LONG_ONLY soft admission: allow high-quality continuation /
@@ -11845,11 +11845,11 @@ def run_scanner_loop():
                 dynamic_threshold += get_early_priority_threshold_adjustment(early_priority)
                 dynamic_threshold = round(dynamic_threshold, 2)
                 if current_mode == MODE_STRONG_LONG_ONLY:
-                    effective_score -= 0.10
+                    effective_score -= 0.08
                     score_result["score"] = round(effective_score, 2)
                     adjustments_log.append({
                         "name": "strong_mode_penalty",
-                        "value": -0.10,
+                        "value": -0.08,
                         "reason": "strong_mode"
                     })
                     dynamic_threshold += 0.10
