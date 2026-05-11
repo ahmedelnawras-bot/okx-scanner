@@ -1,5 +1,5 @@
 # tracking/performance.py
-# Version: performance_v56_intelligence_open_dashboard
+# Version: performance_v57_ui_intelligence_open_polish
 # Base: performance_v49_report_command_html_fix
 # Changes: UI/reporting only: stronger open-trades dashboard summary, compact spacing, smart sampling.
 # Fix: header/version corrected; dashboard context fields are displayed in the report.
@@ -4279,13 +4279,20 @@ def format_open_trades_message(
         "━━━━━━━━━━━━",
         "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
         "📊 <b>Quick Stats</b>",
-        f"• Open: {total} | Winners: {len(winners)} | Losers: {len(losers)}",
-        f"• Win Rate: <b>{win_rate:.1f}%</b> | Net Floating: <b>{net_pnl:+.2f}%</b>",
-        f"• TP1: {tp1_hit_count} | TP2 Active: {tp2_hit_count} | Trailing: {trailing_count}",
-        f"• Protected: {protected_count} | Danger: {danger_count}",
-        f"• Avg Time: {_avg_age(trades)} | Avg Score: {avg_score:.2f}",
-        f"• Best: <b>{html.escape(best_text)}</b>",
-        f"• Worst: <b>{html.escape(worst_text)}</b>",
+        f"• Open: {total}",
+        f"• Winners: {len(winners)}",
+        f"• Losers: {len(losers)}",
+        f"• Win Rate: <b>{win_rate:.1f}%</b>",
+        f"• Net Floating: <b>{net_pnl:+.2f}%</b>",
+        f"🎯 TP1: {tp1_hit_count}",
+        f"🏁 TP2: {tp2_hit_count}",
+        f"📍 Trailing: {trailing_count}",
+        f"🛡 Protected: {protected_count}",
+        f"⚠️ Danger: {danger_count}",
+        f"⏱ Avg Time: {_avg_age(trades)}",
+        f"⭐ Avg Score: {avg_score:.2f}",
+        f"🔥 Best: <b>{html.escape(best_text)}</b>",
+        f"⚠️ Worst: <b>{html.escape(worst_text)}</b>",
         "━━━━━━━━━━━━",
         "💰 <b>Open Portfolio</b>",
         f"⚖️ Net: <b>{net_pnl:+.2f}%</b> | <b>{net_lev:+.1f}% Exposure</b>",
@@ -4333,7 +4340,7 @@ def format_open_trades_message(
         if len(pending_s) > 5:
             lines.append(f"📂 +{len(pending_s) - 5} صفقات Pending أخرى")
 
-    lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
+    lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
 
     return "\n".join(lines)
 
