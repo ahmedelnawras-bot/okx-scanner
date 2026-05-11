@@ -1,4 +1,4 @@
-# Version: main_v205_execution_help_signal_ui_whitelist.py
+# Version: main_v206_signal_help_ui_cleanup.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
 # Changes: Help UI + open-trades integration fix; dashboard splitter; strong-exception reads unified execution_setup_tags.
@@ -1952,64 +1952,51 @@ def build_help_execution_message() -> str:
  return """🚀 <b>صفقات التنفيذ</b>
 <code>/help_execution</code>
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
 📊 <b>التقرير العام</b>
-يعرض كل صفقات التنفيذ:
-المفتوحة + المغلقة + الأداء العام
-
 /report_execution
 /report_execution_1h
 /report_execution_today
 /report_execution_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📂 <b>الصفقات المفتوحة فقط</b>
-يعرض الصفقات النشطة الحالية فقط
-
+📂 <b>الصفقات المفتوحة</b>
 /report_execution_open
 /report_execution_open_1h
 /report_execution_open_today
 /report_execution_open_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📈 <b>تحليل الأرباح</b>
-تحليل أسباب وأفضل عوامل الربح
-
+📈 <b>تحليل أسباب الأرباح</b>
 /report_execution_profit_analysis
 /report_execution_profit_analysis_1h
 /report_execution_profit_analysis_today
 /report_execution_profit_analysis_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📉 <b>تحليل الخسائر</b>
-تحليل أسباب الخسائر والمشاكل المتكررة
-
+📉 <b>تحليل أسباب الخسائر</b>
 /report_execution_losses_analysis
 /report_execution_losses_analysis_1h
 /report_execution_losses_analysis_today
 /report_execution_losses_analysis_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-⚙️ <b>أداء التنفيذ</b>
-
+🎯 <b>أداء التنفيذ</b>
 /report_execution_analysis
 ↳ قراءة عامة لأداء المرشحين
-
 /report_execution_setups
 ↳ مقارنة أداء أنواع الفرص
-
 /report_execution_exits
 ↳ تحليل TP1 / TP2 / SL / Trailing
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-🧠 <b>تشخيص التنفيذ</b>
-
+🩺 <b>تشخيص التنفيذ</b>
 /report_execution_diagnostics
 ↳ تشخيص شامل للتنفيذ والفلترة"""
 
@@ -2017,76 +2004,59 @@ def build_help_normal_message() -> str:
  return """📊 <b>الصفقات العادية</b>
 <code>/help_normal</code>
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
 📊 <b>التقرير العام</b>
-يعرض كل الصفقات:
-المفتوحة + المغلقة + الأداء العام
-
 /report_all
 /report_1h
 /report_today
 /report_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📂 <b>الصفقات المفتوحة فقط</b>
-يعرض الصفقات النشطة الحالية فقط
-
+📂 <b>الصفقات المفتوحة</b>
 /open_trades
 /open_trades_1h
 /open_trades_today
 /open_trades_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📈 <b>تحليل الأرباح</b>
-تحليل أسباب وأفضل عوامل الربح
-
+📈 <b>تحليل أسباب الأرباح</b>
 /report_profit_analysis
 /report_profit_analysis_1h
 /report_profit_analysis_today
 /report_profit_analysis_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-📉 <b>تحليل الخسائر</b>
-تحليل أسباب الخسائر والمشاكل المتكررة
-
+📉 <b>تحليل أسباب الخسائر</b>
 /report_losses_analysis
 /report_losses_analysis_1h
 /report_losses_analysis_today
 /report_losses_analysis_7d
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-⚙️ <b>أداء الصفقات</b>
-
+🎯 <b>أداء الصفقات</b>
 /report_setups
 ↳ مقارنة أداء أنواع الفرص
-
 /report_scores
 ↳ تحليل السكور وجودة الإشارات
-
 /report_exits
 ↳ تحليل TP1 / TP2 / SL / Trailing
-
 /report_market
 ↳ أداء السوق وتأثير المودات
 
-━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄
 
-🧠 <b>التشخيص والتحليل</b>
-
+🩺 <b>التشخيص والتحليل</b>
 /report_deep
 ↳ تحليل شامل للبوت والسوق
-
 /report_diagnostics
 ↳ تشخيص كامل للإشارات والتتبع
-
 /report_rejections
 ↳ تحليل أسباب رفض الإشارات
-
 /report_filters
 ↳ تأثير الفلاتر والخصومات"""
 
@@ -8809,11 +8779,11 @@ def build_execution_badge_line(candidate: dict) -> str:
         return ""
     return (
         "🚀🔥 <b>EXECUTION PRIORITY</b>\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "🔥 <b>فرصة مرشحة للتنفيذ التجريبي</b>\n"
+        "══════════════\n\n"
+        "🔥 <b>مرشحة للتنفيذ التجريبي</b>\n"
         "✅ <b>Whitelist ACTIVE</b>\n"
         "🧠 <b>Quality Filters: PASS</b>\n"
-        "⚡ <b>جاهزة لمعاينة التنفيذ</b>"
+        "⚡ <b>Preview Ready</b>"
     )
 
 
@@ -8994,9 +8964,9 @@ def build_message(
     price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
 
  return f"""{header_block}📈 <b>LONG SIGNAL</b>
-━━━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄┄┄┄
 
-🚀 <b>لونج فيوتشر | {safe_symbol}</b>
+📊 <b>لونج فيوتشر | {safe_symbol}</b>
 {price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
@@ -14289,7 +14259,7 @@ def run_scanner_loop():
                 if badge:
                     # Execution candidates have their own premium hero header;
                     # remove the calmer normal-signal header to avoid visual duplication.
-                    message = message.replace("📈 <b>LONG SIGNAL</b>\n━━━━━━━━━━━━━━━━\n\n", "", 1)
+                    message = message.replace("📈 <b>LONG SIGNAL</b>\n┄┄┄┄┄┄┄┄┄┄┄┄\n\n", "", 1)
                     message = badge + "\n\n" + message
 
                 sent_data = send_telegram_message(
