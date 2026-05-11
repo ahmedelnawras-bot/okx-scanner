@@ -4302,90 +4302,226 @@ def build_execution_report_message(period: str = "all") -> str:
         rr_quality = "إيجابي ✔️" if winners_pairs and abs(avg_winner) >= abs(avg_loser) else "يحتاج متابعة ⚠️"
         impact_icon = "🟢" if portfolio_net_usd >= 0 else "🔴"
 
-        # Classic report UI: restore the older readable Telegram layout while keeping
-        # the v107 badge-only execution-report filtering unchanged.
+        # Official compact Telegram report UI style.
+        # Replaces the older execution-report block to avoid duplicate/noisy UI sections.
+        def _duration_from_ts(ts: int) -> str:
+            try:
+                age = max(0, int(time.time()) - int(ts or 0))
+            except Exception:
+                age = 0
+            mins = age // 60
+            if mins < 60:
+                return f"{mins}m"
+            if mins < 1440:
+                return f"{mins // 60}h {mins % 60}m"
+            return f"{mins // 1440}d {(mins % 1440) // 60}h"
+
+        def _avg_open_age(open_items: list) -> str:
+            if not open_items:
+                return "0m"
+            now = int(time.time())
+            ages = []
+            for item in open_items:
+                ts = _trade_created_ts_for_exec(item)
+                if ts > 0:
+                    ages.append(max(0, now - ts))
+            if not ages:
+                return "0m"
+            avg = int(sum(ages) / len(ages))
+            mins = avg // 60
+            if mins < 60:
+                return f"{mins}m"
+            if mins < 1440:
+                return f"{mins // 60}h {mins % 60}m"
+            return f"{mins // 1440}d {(mins % 1440) // 60}h"
+
+        def _clean_setup_name(trade: dict) -> str:
+            setup = compact_setup(trade)
+            mapping = {
+                "vwap_reclaim": "VWAP Reclaim",
+                "retest_breakout_confirmed": "Retest Breakout Confirmed",
+                "higher_low_continuation": "Higher Low Continuation",
+                "relative_strength_vs_btc": "Relative Strength vs BTC",
+                "wave_3": "Wave 3",
+                "support_bounce_confirmed": "Support Bounce Confirmed",
+                "failed_breakdown_trap": "Failed Breakdown Trap",
+                "liquidity_sweep_reclaim": "Liquidity Sweep Reclaim",
+            }
+            return mapping.get(str(setup), str(setup).replace("_", " ").title())
+
+        def _trade_prices_for_card(trade: dict) -> tuple:
+            plan = _execution_plan_for_trade(trade)
+            tp1 = _safe_trade_float_value(plan.get("tp1") or trade.get("tp1"), None)
+            tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), None)
+            sl = _safe_trade_float_value(plan.get("sl") or trade.get("sl"), None)
+            return (_format_exec_num(tp1), _format_exec_num(tp2), _format_exec_num(sl))
+
+        def _trade_card_lines(trade: dict, pnl: float, icon: str, status_text: str = None) -> list:
+            raw_symbol = str(trade.get("symbol", "?") or "?")
+            symbol = html.escape(raw_symbol)
+            try:
+                tv_link = build_tradingview_link(raw_symbol)
+            except Exception:
+                tv_link = ""
+            tv = f'<a href="{html.escape(tv_link, quote=True)}">TradingView</a>' if tv_link else "TradingView"
+            score = _trade_field(trade, "score", "N/A")
+            age = _duration_from_ts(_trade_created_ts_for_exec(trade))
+            phase = status_text or _execution_phase_for_trade(trade)
+            tp1, tp2, sl = _trade_prices_for_card(trade)
+            setup = html.escape(_clean_setup_name(trade))
+            return [
+                f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
+                f"⏱️ {html.escape(age)} | 📍 {html.escape(str(phase))}",
+                f"🎯 TP1: {tp1} | 🏁 TP2: {tp2}",
+                f"🛡 SL: {sl} | ⭐ Score: {html.escape(str(score))}",
+                f"🧠 {setup}",
+                f"🔗 {tv}",
+            ]
+
+        closed_decisions = len(winners_pairs) + len(losers_pairs)
+        win_rate = (len(winners_pairs) / closed_decisions * 100.0) if closed_decisions else 0.0
+        open_pairs = []
+        for t in open_trades:
+            p = _execution_floating_pnl_pct(t)
+            if p is None:
+                p = 0.0
+            open_pairs.append((t, p))
+        open_winners = [(t, p) for t, p in open_pairs if p >= 0]
+        open_losers = [(t, p) for t, p in open_pairs if p < 0]
+        avg_trade_time = _avg_open_age(open_trades)
+
+        impact_icon = "🟢" if portfolio_net_usd >= 0 else "🔴"
+        net_icon = "🟢" if realized_net_usd >= 0 else "🔴"
+        floating_icon = "🟢" if floating_net_usd >= 0 else "🔴"
+
         lines = [
-            f"🚀 <b>Execution Candidates Report</b> — {title_period}",
+            "🚀 <b>تقرير أداء صفقات التنفيذ</b>",
+            f"📅 {html.escape(title_period)}",
+            "┄┄┄┄┄┄┄┄┄┄",
             "",
-            f"✅ إجمالي المرشحين: <b>{len(trades)}</b>",
-            f"🟢 مفتوحة: {len(open_trades)}",
-            f"🏁 مغلقة: {len(closed_trades)}",
+            "📊 <b>Quick Stats</b>",
+            f"• Candidates: {len(trades)}",
+            f"• Open: {len(open_trades)}",
+            f"• Closed: {len(closed_trades)}",
             "",
-            f"🟢 رابحة: {len(winners_pairs)}",
-            f"🔴 خاسرة: {len(losers_pairs)}",
+            "🏆 <b>Win Rate</b>",
+            f"<b>{win_rate:.1f}%</b>",
+            "",
+            f"🟢 Winners: {len(winners_pairs)}",
+            f"🔴 Losers: {len(losers_pairs)}",
             "━━━━━━━━━━━━",
             "💰 <b>Wallet Impact</b>",
             f"📌 رأس المال: {wallet_capital_usd:.0f}$",
-            "✅ <b>المحقق</b>",
-            f"📈 أرباح محققة: {money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
-            f"📉 خسائر محققة: {money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
-            f"⚖️ صافي محقق: {money(realized_net_usd)} | {exposure(realized_net_pct)}",
+            "",
+            "✅ <b>الصفقات المغلقة</b>",
+            "📈 الأرباح",
+            f"{money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
+            "📉 الخسائر",
+            f"{money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
+            "⚖️ الصافي",
+            f"<b>{net_icon} {money(realized_net_usd)} | {exposure(realized_net_pct)}</b>",
+            "",
             "🔄 <b>الصفقات المفتوحة</b>",
-            f"📈 أرباح عائمة: {money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
-            f"📉 خسائر عائمة: {money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
-            f"⚖️ صافي عائم: {money(floating_net_usd)} | {exposure(floating_net_pct)}",
-            "🏦 <b>التأثير الحالي على المحفظة:</b>",
-            f"{impact_icon} {money(portfolio_net_usd)} | {wallet_pct:+.2f}%",
+            "📈 الأرباح العائمة",
+            f"{money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
+            "📉 الخسائر العائمة",
+            f"{money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
+            "⚖️ الصافي العائم",
+            f"<b>{floating_icon} {money(floating_net_usd)} | {exposure(floating_net_pct)}</b>",
+            "",
+            "🏦 <b>التأثير الحالي على المحفظة</b>",
+            f"<b>{impact_icon} {money(portfolio_net_usd)}</b>",
             "━━━━━━━━━━━━",
             "🧠 <b>Execution Behavior Summary</b>",
-            "<b>(40/40/20)</b>",
-            f"📈 متوسط الصفقات الرابحة: {_pct_safe(avg_winner)}",
-            f"📉 متوسط الصفقات الخاسرة: {_pct_safe(avg_loser)}",
-            f"🎯 معدل وصول TP1: {tp1_hits / total * 100:.1f}%",
-            f"🏁 معدل وصول TP2: {tp2_hits / total * 100:.1f}%",
-            f"🔁 التحول من TP1 → TP2: {tp1_to_tp2_pct:.1f}%",
-            f"🔄 الخروج بالتريل: {trailing_wins / total * 100:.1f}%",
-            f"🔒 الخروج على Breakeven: {breakeven_exits / total * 100:.1f}%",
-            f"🛑 وقف خسارة مباشر: {direct_sl / total * 100:.1f}%",
-            f"⚡ متوسط الربح العائم: {exposure(avg_open_floating)}",
-            f"💡 جودة العائد مقابل المخاطرة: {rr_quality}",
+            "📦 Model: 40/40/20",
+            f"📈 Avg Winner: {_pct_safe(avg_winner)}",
+            f"📉 Avg Loser: {_pct_safe(avg_loser)}",
+            f"🎯 TP1 Rate: {tp1_hits / total * 100:.1f}%",
+            f"🏁 TP2 Rate: {tp2_hits / total * 100:.1f}%",
+            f"🔁 TP1 → TP2: {tp1_to_tp2_pct:.1f}%",
+            f"🔄 Trailing Exit: {trailing_wins / total * 100:.1f}%",
+            f"🔒 Breakeven Exit: {breakeven_exits / total * 100:.1f}%",
+            f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
+            f"⚡ Avg Floating Profit: {exposure(avg_open_floating)}",
+            f"💡 Risk / Reward Quality: {html.escape(rr_quality)}",
             "━━━━━━━━━━━━",
-            "🟢 <b>آخر 5 صفقات مفتوحة</b>",
+            "📂 <b>Open Trades</b>",
+            f"🟢 Open Winners: {len(open_winners)}",
+            f"🔴 Open Losers: {len(open_losers)}",
+            f"⏱️ Avg Trade Time: {html.escape(avg_trade_time)}",
         ]
 
-        trade_separator = "- - - - - - - -"
-        latest_open = sorted(open_trades, key=_trade_created_ts_for_exec, reverse=True)[:5]
-        if latest_open:
-            for idx, trade in enumerate(latest_open):
-                pnl = _execution_floating_pnl_pct(trade)
-                if pnl is None:
-                    pnl = 0.0
-                phase = _execution_phase_for_trade(trade)
-                icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
-                lines.extend(short_trade_line(trade, pnl, icon, is_win=(pnl >= 0), label=phase, compact_open=True))
-                if idx < len(latest_open) - 1:
+        trade_separator = "┄┄┄┄┄┄"
+
+        def _append_trade_group(title: str, pairs: list, icon: str, more_label: str, limit: int, reverse: bool = True, status_override: str = None):
+            lines.extend(["", "━━━━━━━━━━━━" if title.startswith(("🔴", "🏆", "🛑")) else "", title])
+            # Remove accidental blank separator line for the first embedded title under Open Trades.
+            while "" in lines[-3:-2]:
+                break
+            selected = pairs[:limit]
+            if not selected:
+                lines.append("لا توجد بيانات حاليًا.")
+                return
+            for idx, (trade, pnl) in enumerate(selected):
+                if idx > 0:
                     lines.append(trade_separator)
-        else:
-            lines.append("لا توجد صفقات مفتوحة حاليًا.")
+                lines.extend(_trade_card_lines(trade, pnl, icon, status_text=status_override))
+            if len(pairs) > limit:
+                lines.append(f"📂 +{len(pairs) - limit} {more_label}")
+
+        # Open winners: highest floating PnL first. Open losers: worst floating PnL first.
+        open_winners_sorted = sorted(open_winners, key=lambda x: x[1], reverse=True)
+        open_losers_sorted = sorted(open_losers, key=lambda x: x[1])
+        closed_winners_sorted = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
+        closed_losers_sorted = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
+
+        # Keep winners immediately under the Open Trades header without an additional section break.
+        if open_winners_sorted:
             lines.append("")
-
-        lines.extend([
-            "━━━━━━━━━━━━",
-            "🏆 <b>آخر 3 صفقات رابحة</b>",
-        ])
-
-        latest_winners = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:3]
-        if latest_winners:
-            for idx, (trade, pnl) in enumerate(latest_winners):
-                lines.extend(short_trade_line(trade, pnl, "🟢", is_win=True))
-                if idx < len(latest_winners) - 1:
+            for idx, (trade, pnl) in enumerate(open_winners_sorted[:3]):
+                if idx > 0:
                     lines.append(trade_separator)
+                icon = "🟡" if _execution_trade_reached_tp1_for_display(trade) else "🟢"
+                lines.extend(_trade_card_lines(trade, pnl, icon))
+            if len(open_winners_sorted) > 3:
+                lines.append(f"📂 +{len(open_winners_sorted) - 3} more winning trades...")
+        else:
+            lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
+
+        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
+        if open_losers_sorted:
+            for idx, (trade, pnl) in enumerate(open_losers_sorted[:2]):
+                if idx > 0:
+                    lines.append(trade_separator)
+                lines.extend(_trade_card_lines(trade, pnl, "🔴"))
+            if len(open_losers_sorted) > 2:
+                lines.append(f"📂 +{len(open_losers_sorted) - 2} more losing trades...")
+        else:
+            lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
+
+        lines.extend(["━━━━━━━━━━━━", "🏆 <b>Closed Winners</b>"])
+        if closed_winners_sorted:
+            for idx, (trade, pnl) in enumerate(closed_winners_sorted[:2]):
+                if idx > 0:
+                    lines.append(trade_separator)
+                lines.extend(_trade_card_lines(trade, pnl, "🏆", status_text=_execution_close_type_for_trade(trade)))
+            if len(closed_winners_sorted) > 2:
+                lines.append(f"📂 +{len(closed_winners_sorted) - 2} more closed winners...")
         else:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
-            lines.append("")
 
-        lines.extend([
-            "━━━━━━━━━━━━",
-            "📉 <b>آخر 3 صفقات خاسرة</b>",
-        ])
-        latest_losers = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)[:3]
-        if latest_losers:
-            for idx, (trade, pnl) in enumerate(latest_losers):
-                lines.extend(short_trade_line(trade, pnl, "🔴", is_win=False))
-                if idx < len(latest_losers) - 1:
+        lines.extend(["━━━━━━━━━━━━", "🛑 <b>Closed Losers</b>"])
+        if closed_losers_sorted:
+            for idx, (trade, pnl) in enumerate(closed_losers_sorted[:2]):
+                if idx > 0:
                     lines.append(trade_separator)
+                lines.extend(_trade_card_lines(trade, pnl, "🛑", status_text=_execution_close_type_for_trade(trade)))
+            if len(closed_losers_sorted) > 2:
+                lines.append(f"📂 +{len(closed_losers_sorted) - 2} more closed losers...")
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
+
+        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
 
         msg = "\n".join(lines).strip()
         if len(msg) > 7600:
