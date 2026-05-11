@@ -1,7 +1,7 @@
-# Version: main_v212_ui_intelligence_open_polish.py
+# Version: main_v301_full_live_protection.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: UI/reporting only: Intelligence UI polish, execution rejection UI polish, compact open dashboard polish.
+# Changes: live risk sizing, TP lifecycle, dynamic slots, BLOCK_LONGS live protection integration.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -70,6 +70,18 @@ except ImportError:
             "path": "fallback" if allowed else "blocked",
             "reason": "fallback_base_execution_allowed" if allowed else "fallback_base_execution_rejected",
             "elite": {"passed": False, "score": 0.0, "level": "none", "reasons": [], "warnings": []},
+        }
+
+# BLOCK_LONGS live protection bridge
+try:
+    from execution.position_manager import apply_block_protection_to_okx
+except Exception:
+    def apply_block_protection_to_okx(trade, protection, okx_client=None):
+        return {
+            "ok": False,
+            "mode": "unavailable",
+            "status": "position_manager_unavailable",
+            "reason": "execution.position_manager.apply_block_protection_to_okx unavailable",
         }
 
 # محاولة استيراد دالة تقدير تأثير المحفظة 
@@ -217,7 +229,8 @@ TP1_CLOSE_PCT = 40           # إغلاق 40% عند TP1
 TP2_CLOSE_PCT = 40           # إغلاق 40% عند TP2
 TRAILING_POSITION_PCT = 20   # 20% تجري مع السوق بعد TP2
 TRAILING_PCT = 2.5           # trailing stop: 2.5% تحت أعلى سعر
-MOVE_SL_TO_ENTRY_AFTER_TP1 = True
+MOVE_SL_TO_ENTRY_AFTER_TP1 = False  # TP1 closes 40% only; SL protection starts after TP2
+TP2_PROTECTED_SL_BUFFER_PCT = float(os.getenv("TP2_PROTECTED_SL_BUFFER_PCT", "0.00"))
 
 # Market Guard / Modes
 MARKET_MODE_KEY = "market_mode:long:current"
@@ -1831,7 +1844,7 @@ def get_execution_max_active_trades_display() -> int:
     """Display helper only: show the effective configured execution active-trade limit."""
     try:
         from execution.risk_manager import _configured_max_positions
-        return int(_configured_max_positions())
+        return int(_configured_max_positions(r))
     except Exception:
         pass
     try:
@@ -2196,7 +2209,7 @@ Risk Manager يفحص:
 
 🛡️ <b>حماية BLOCK_LONGS:</b>
 عند دخول السوق وضع BLOCK_LONGS لا يتم تحريك الصفقات فورًا.
-يتم تقييم <b>صفقات التنفيذ فقط</b> عند أول Market Reminder داخل BLOCK.
+Reminder #1 مراقبة فقط، وبدء الحماية يكون من Reminder #2 للـ TP2 runners.
 الحماية الحالية <b>Tracking فقط</b> ولا ترسل أمر SL مباشر إلى OKX حتى تفعيل ربط Live SL لاحقًا.
 
 📈 <b>Track:</b>
@@ -3079,9 +3092,10 @@ def build_market_status_message() -> str:
     if current_mode == MODE_BLOCK_LONGS:
         lines.extend([
             "",
-            "🛡️ <b>حماية BLOCK:</b>",
-            "السوق دخل وضع حماية. سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
-            "⚠️ الحماية الحالية Tracking فقط وليست أمر SL مباشر على OKX.",
+            "🛡 <b>Protection Plan</b>",
+            "• Reminder #1 → Monitor",
+            "• Reminder #2 → Soft Protection",
+            "• Reminder #3 → Defensive Protection",
         ])
     lines.extend([
         "",
@@ -10417,11 +10431,12 @@ def build_compact_market_mode_reminder(
 
     if normalized_mode == MODE_BLOCK_LONGS:
         status_text = "📉 السوق مازال تحت ضغط جماعي."
-        action_lines = [
-            "• تجنب المطاردة",
-            "• السماح فقط بالإشارات القوية جدًا",
-            "• متابعة حماية الصفقات المفتوحة",
-        ]
+        if int(reminder_count or 0) <= 1:
+            action_lines = ["• Protection → Monitor only", "• لا تعديل SL / Trailing"]
+        elif int(reminder_count or 0) == 2:
+            action_lines = ["• Protection → Soft Protection", "• TP2 runners: tighten / lock TP1", "• لا Panic close للخاسرين"]
+        else:
+            action_lines = ["• Protection → Defensive", "• تشديد حماية الأرباح", "• Emergency compression للخطر الشديد فقط"]
     elif normalized_mode == MODE_STRONG_LONG_ONLY:
         status_text = "⚠️ السوق انتقائي حاليًا؛ نركز على الجودة فقط."
         action_lines = [
@@ -10475,7 +10490,7 @@ def build_compact_market_mode_reminder(
             "",
             "🛡 <b>Protection Check:</b>",
             f"🔒 Protected winners: {protected}",
-            "⚠️ Tracking فقط — لا يوجد أمر SL مباشر إلى OKX من هذا الريمايندر.",
+            ("🧪 Protection: Simulation / Tracking only" if bool(summary.get("tracking_only", True)) else f"⚙️ OKX Protection: sent {int(summary.get('platform_updates_sent') or 0)} | failed {int(summary.get('platform_updates_failed') or 0)}"),
         ])
 
     return "\n".join(lines)
@@ -10523,9 +10538,14 @@ def maybe_send_market_mode_reminder(
         block_protection_active = False
         if current_mode == MODE_BLOCK_LONGS:
             try:
-                already_applied = bool(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY))
-                block_protection_active = already_applied
-                if reminder_count == 1 and not already_applied:
+                _applied_raw = str(r.get(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY) or "")
+                try:
+                    _applied_reminder = int(_applied_raw.split(":", 1)[0]) if ":" in _applied_raw else 0
+                except Exception:
+                    _applied_reminder = 0
+                already_applied = _applied_reminder >= reminder_count
+                block_protection_active = _applied_reminder > 0
+                if reminder_count >= 2 and not already_applied:
                     protection_summary = update_open_trades(
                         r,
                         market_type="futures",
@@ -10539,9 +10559,10 @@ def maybe_send_market_mode_reminder(
                         block_red_ratio=market_guard.get("red_ratio_15m", 0),
                         block_avg_change=market_guard.get("avg_change_15m", 0),
                         block_btc_change=market_guard.get("btc_change_15m", 0),
-                        reason="market_mode=BLOCK_LONGS:first_reminder",
+                        block_live_protection_callback=apply_block_protection_to_okx,
+                        reason=f"market_mode=BLOCK_LONGS:reminder_{reminder_count}",
                     )
-                    r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, str(now_ts_local))
+                    r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, f"{reminder_count}:{now_ts_local}")
                     block_protection_active = True
             except Exception as _protect_exc:
                 logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
@@ -10570,7 +10591,7 @@ def maybe_send_market_mode_reminder(
         return False
 
 def format_block_protection_summary_message(summary: dict) -> str:
-    """Format one compact Telegram message after first BLOCK_LONGS reminder protection."""
+    """Format one compact Telegram message after BLOCK_LONGS reminder protection."""
     summary = summary or {}
     protected = int(summary.get("protected_winners") or 0)
     compressed = int(summary.get("risk_compressed") or 0)
@@ -10579,19 +10600,27 @@ def format_block_protection_summary_message(summary: dict) -> str:
     already = int(summary.get("already_protected") or 0)
     close_to_sl = int(summary.get("skipped_close_to_sl") or 0)
     execution_seen = int(summary.get("execution_seen") or 0)
-
-    return (
-        "🛡️ <b>BLOCK Protection Applied</b>\n\n"
-        "تم تنفيذ تقييم حماية صفقات التنفيذ المفتوحة بسبب استمرار BLOCK_LONGS حتى أول Reminder.\n\n"
-        f"✅ <b>Protected winners:</b> {protected}\n"
-        f"🟡 <b>Risk compressed:</b> {compressed}\n"
-        f"⏸ <b>Monitoring only:</b> {monitoring}\n"
-        f"🔒 <b>Already protected:</b> {already}\n"
-        f"📍 <b>Close to SL skipped:</b> {close_to_sl}\n"
-        f"🚫 <b>Ignored tracking-only:</b> {ignored}\n"
-        f"📊 <b>Execution trades checked:</b> {execution_seen}\n\n"
-        "⚠️ <b>Tracking فقط</b> — لم يتم إرسال أمر تعديل SL مباشر إلى OKX حاليًا."
+    okx_line = (
+        "🧪 <b>Protection:</b> Simulation / Tracking only"
+        if int(summary.get("platform_updates_sent") or 0) == 0 and bool(summary.get("tracking_only", True))
+        else f"⚙️ <b>OKX Protection:</b> sent={int(summary.get('platform_updates_sent') or 0)} | failed={int(summary.get('platform_updates_failed') or 0)}"
     )
+
+    return "\n".join([
+        "🛡️ <b>BLOCK Protection Applied</b>",
+        "",
+        "تم تنفيذ تقييم حماية صفقات التنفيذ المفتوحة بسبب استمرار BLOCK_LONGS.",
+        "",
+        f"✅ <b>Protected winners:</b> {protected}",
+        f"🟡 <b>Risk compressed:</b> {compressed}",
+        f"⏸ <b>Monitoring only:</b> {monitoring}",
+        f"🔒 <b>Already protected:</b> {already}",
+        f"📍 <b>Close to SL skipped:</b> {close_to_sl}",
+        f"🚫 <b>Ignored tracking-only:</b> {ignored}",
+        f"📊 <b>Execution trades checked:</b> {execution_seen}",
+        "",
+        okx_line,
+    ])
 
 def format_market_mode_reason_for_message(reason: str = "", metrics: dict = None) -> str:
     """Turn internal mode reasons into human Telegram text."""
@@ -10673,9 +10702,10 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
     if new_mode == MODE_BLOCK_LONGS:
         lines.extend([
             "",
-            "🛡️ <b>حماية BLOCK:</b>",
-            "سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
-            "⚠️ الحماية الحالية Tracking فقط وليست أمر SL مباشر على OKX.",
+            "🛡 <b>Protection Plan</b>",
+            "• Reminder #1 → Monitor",
+            "• Reminder #2 → Soft Protection",
+            "• Reminder #3 → Defensive Protection",
         ])
     lines.extend([
         "",
