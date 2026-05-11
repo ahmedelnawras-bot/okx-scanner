@@ -1950,9 +1950,8 @@ def _get_protection_status_for_help() -> str:
 
 def build_help_execution_message() -> str:
  return """🚀 <b>صفقات التنفيذ</b>
-<code>/help_execution</code>
-
-┄┄┄┄┄┄┄┄┄
+📘 <code>/help_execution</code>
+┄┄┄┄┄┄┄┄
 
 📊 <b>التقرير العام</b>
 /report_execution
@@ -1960,51 +1959,32 @@ def build_help_execution_message() -> str:
 /report_execution_today
 /report_execution_7d
 
-┄┄┄┄┄┄┄┄┄
-
 📂 <b>الصفقات المفتوحة</b>
 /report_execution_open
 /report_execution_open_1h
 /report_execution_open_today
 /report_execution_open_7d
 
-┄┄┄┄┄┄┄┄┄
-
-📈 <b>تحليل أسباب الأرباح</b>
+📈 <b>تحليل الأرباح</b>
 /report_execution_profit_analysis
-/report_execution_profit_analysis_1h
 /report_execution_profit_analysis_today
-/report_execution_profit_analysis_7d
 
-┄┄┄┄┄┄┄┄┄
-
-📉 <b>تحليل أسباب الخسائر</b>
+📉 <b>تحليل الخسائر</b>
 /report_execution_losses_analysis
-/report_execution_losses_analysis_1h
 /report_execution_losses_analysis_today
-/report_execution_losses_analysis_7d
 
-┄┄┄┄┄┄┄┄┄
-
-🎯 <b>أداء التنفيذ</b>
+⚙️ <b>أداء التنفيذ</b>
 /report_execution_analysis
-↳ قراءة عامة لأداء المرشحين
 /report_execution_setups
-↳ مقارنة أداء أنواع الفرص
 /report_execution_exits
-↳ تحليل TP1 / TP2 / SL / Trailing
 
-┄┄┄┄┄┄┄┄┄
-
-🩺 <b>تشخيص التنفيذ</b>
-/report_execution_diagnostics
-↳ تشخيص شامل للتنفيذ والفلترة"""
+🧠 <b>تشخيص التنفيذ</b>
+/report_execution_diagnostics"""
 
 def build_help_normal_message() -> str:
  return """📊 <b>الصفقات العادية</b>
-<code>/help_normal</code>
-
-┄┄┄┄┄┄┄┄┄
+📘 <code>/help_normal</code>
+┄┄┄┄┄┄┄┄
 
 📊 <b>التقرير العام</b>
 /report_all
@@ -2012,53 +1992,31 @@ def build_help_normal_message() -> str:
 /report_today
 /report_7d
 
-┄┄┄┄┄┄┄┄┄
-
 📂 <b>الصفقات المفتوحة</b>
 /open_trades
 /open_trades_1h
 /open_trades_today
 /open_trades_7d
 
-┄┄┄┄┄┄┄┄┄
-
-📈 <b>تحليل أسباب الأرباح</b>
+📈 <b>تحليل الأرباح</b>
 /report_profit_analysis
-/report_profit_analysis_1h
 /report_profit_analysis_today
-/report_profit_analysis_7d
 
-┄┄┄┄┄┄┄┄┄
-
-📉 <b>تحليل أسباب الخسائر</b>
+📉 <b>تحليل الخسائر</b>
 /report_losses_analysis
-/report_losses_analysis_1h
 /report_losses_analysis_today
-/report_losses_analysis_7d
 
-┄┄┄┄┄┄┄┄┄
-
-🎯 <b>أداء الصفقات</b>
+⚙️ <b>أداء الصفقات</b>
 /report_setups
-↳ مقارنة أداء أنواع الفرص
 /report_scores
-↳ تحليل السكور وجودة الإشارات
 /report_exits
-↳ تحليل TP1 / TP2 / SL / Trailing
 /report_market
-↳ أداء السوق وتأثير المودات
 
-┄┄┄┄┄┄┄┄┄
-
-🩺 <b>التشخيص والتحليل</b>
+🧠 <b>التشخيص والتحليل</b>
 /report_deep
-↳ تحليل شامل للبوت والسوق
 /report_diagnostics
-↳ تشخيص كامل للإشارات والتتبع
 /report_rejections
-↳ تحليل أسباب رفض الإشارات
-/report_filters
-↳ تأثير الفلاتر والخصومات"""
+/report_filters"""
 
 def build_help_diagnostics_message() -> str:
  return """🧠 <b>التشخيص والتحليل</b>
@@ -4010,6 +3968,7 @@ def _is_execution_trade_open(trade: dict) -> bool:
 
 
 def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
+    """Compact execution trade card aligned with the official report UI style."""
     plan = _execution_plan_for_trade(trade)
     raw_symbol = str(trade.get("symbol", "?") or "?")
     symbol = html.escape(raw_symbol)
@@ -4017,48 +3976,54 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
         tv_link = build_tradingview_link(raw_symbol)
     except Exception:
         tv_link = ""
-    setup_type = html.escape(str(_trade_field(trade, "setup_type", "") or ""))
-    score = _trade_field(trade, "score", "N/A")
-    entry_mode = html.escape(str(plan.get("entry_mode") or _trade_field(trade, "entry_mode", "market") or "market"))
-    exec_status = html.escape(_execution_status_for_trade(trade))
-    reject_reason = html.escape(str(_trade_field(trade, "execution_reject_reason", "") or ""))
-    duration = _execution_duration_text(trade)
-    pnl_for_icon = _execution_floating_pnl_pct(trade) if is_open else _execution_final_pnl_pct(trade)
-    if pnl_for_icon is None:
+
+    def _compact_setup() -> str:
+        setup_raw = str(
+            _trade_field(trade, "primary_extra_setup")
+            or _trade_field(trade, "extra_setup")
+            or _trade_field(trade, "setup_type")
+            or "Setup N/A"
+        )
+        parts = [p.strip() for p in setup_raw.replace(",", "|").split("|") if p.strip()]
+        preferred = [
+            "vwap_reclaim", "retest_breakout_confirmed", "higher_low_continuation",
+            "relative_strength_vs_btc", "wave_3", "support_bounce_confirmed",
+            "failed_breakdown_trap", "liquidity_sweep_reclaim",
+        ]
+        setup = next((p for p in preferred if p in parts), parts[-1] if parts else setup_raw[:40])
+        return html.escape(str(setup or "Setup N/A").replace("_", " ").title())
+
+    score = html.escape(str(_trade_field(trade, "score", "N/A")))
+    duration = html.escape(_execution_duration_text(trade))
+    phase = html.escape(_execution_phase_for_trade(trade) if is_open else _execution_close_type_for_trade(trade))
+    pnl = _execution_floating_pnl_pct(trade) if is_open else _execution_final_pnl_pct(trade)
+    pnl_txt = _pct_safe(pnl) if pnl is not None else "N/A"
+    if pnl is None:
         result_for_icon = str(trade.get("result", "") or "").lower()
         icon = "🟢" if result_for_icon in ("tp1_win", "tp2_win", "trailing_win") else ("🔴" if result_for_icon == "loss" else "⚪")
-    elif pnl_for_icon > 0:
+    elif pnl > 0:
         icon = "🟢"
-    elif pnl_for_icon < 0:
+    elif pnl < 0:
         icon = "🔴"
     else:
-        icon = "⚪"
-    lines = [f"• {icon} <b>{symbol}</b>"]
+        icon = "🟡"
+    if _execution_trade_reached_tp1_for_display(trade) and is_open and (pnl or 0) >= 0:
+        icon = "🟡"
+
+    sl_text = "SL Entry" if bool(trade.get("sl_moved_to_entry", False)) or bool(trade.get("sl_is_entry", False)) else f"SL: {_format_exec_num(plan.get('sl'))}"
+    lines = [
+        f"{icon} <b>{symbol}</b> | {pnl_txt}",
+        f"⏱️ {duration} | 📍 {phase}",
+        f"🎯 TP1: {_format_exec_num(plan.get('tp1'))} | 🏁 TP2: {_format_exec_num(plan.get('tp2'))}",
+        f"🛡 {html.escape(sl_text)} | ⭐ Score: {score}",
+        f"🧠 {_compact_setup()}",
+    ]
     if tv_link:
-        lines.append(f'  🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView - 15m / 1H</a>')
-    if is_open:
-        pnl = _execution_floating_pnl_pct(trade)
-        lines.append(f"  📌 Phase: {_execution_phase_for_trade(trade)} | ⏱ {duration}")
-        lines.append(f"  💰 Floating PnL 40/40/20: {_pct_safe(pnl) if pnl is not None else 'N/A'}")
-    else:
-        pnl = _execution_final_pnl_pct(trade)
-        lines.append(f"  📌 Close Type: {_execution_close_type_for_trade(trade)} | ⏱ {duration}")
-        lines.append(f"  💰 Final Result 40/40/20: {_pct_safe(pnl) if pnl is not None else 'N/A'}")
-    lines.extend([
-        f"  ⚙️ Execution Status: {exec_status}{(' | reason: ' + reject_reason) if reject_reason else ''}",
-        f"  🧠 setup: {setup_type}",
-        f"  ⭐ score: {score} | entry_mode: {entry_mode}",
-        f"  📍 Entry: {_format_exec_num(plan.get('entry'))} | 🛡 SL: {_format_exec_num(plan.get('sl'))}",
-        f"  🎯 TP1: {_format_exec_num(plan.get('tp1'))} | 🏁 TP2: {_format_exec_num(plan.get('tp2'))}",
-    ])
+        lines.append(f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>')
     return lines
 
-
 def build_execution_open_report_message(period: str = "all") -> str:
-    """Open-only report for execution-candidate trades.
-
-    This is a UI/report helper only; it does not alter tracking or execution logic.
-    """
+    """Open-only report for execution-candidate trades using the official compact UI style."""
     try:
         since_ts = _execution_report_since_ts(period)
         try:
@@ -4070,7 +4035,6 @@ def build_execution_open_report_message(period: str = "all") -> str:
             if since_ts:
                 trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
         trades = [t for t in trades if is_execution_candidate_trade(t) and _is_execution_trade_open(t)]
-        trades.sort(key=_trade_created_ts_for_exec, reverse=True)
         title_map = {
             "all": "منذ البداية",
             "1h": "آخر ساعة",
@@ -4083,26 +4047,57 @@ def build_execution_open_report_message(period: str = "all") -> str:
         title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
         if not trades:
             return f"📭 لا توجد صفقات تنفيذ مفتوحة ({html.escape(title_period)})."
-        pnls = [p for p in (_execution_floating_pnl_pct(t) for t in trades) if p is not None]
-        winners = sum(1 for p in pnls if p > 0)
-        losers = sum(1 for p in pnls if p < 0)
-        net = sum(pnls) if pnls else 0.0
+
+        pairs = []
+        for t in trades:
+            p = _execution_floating_pnl_pct(t)
+            pairs.append((t, 0.0 if p is None else float(p)))
+        winners = [(t, p) for t, p in pairs if p >= 0]
+        losers = [(t, p) for t, p in pairs if p < 0]
+        avg_trade_time = _avg_open_age(trades)
+        net = sum(p for _, p in pairs)
+        win_rate = (len(winners) / len(pairs) * 100.0) if pairs else 0.0
+
         lines = [
-            f"🚀 <b>صفقات التنفيذ المفتوحة</b> — {html.escape(title_period)}",
+            "🚀 <b>صفقات التنفيذ المفتوحة</b>",
+            f"📅 {html.escape(title_period)}",
+            "┄┄┄┄┄┄┄┄┄┄",
             "",
-            "📌 <b>Executive Summary</b>",
-            f"• المفتوحة: {len(trades)}",
-            f"• الرابحة الآن: {winners} | الخاسرة الآن: {losers}",
-            f"• Net Floating PnL 40/40/20: {_pct_safe(net)}",
+            "📊 <b>Quick Stats</b>",
+            f"• Open: {len(trades)}",
+            f"• Winners: {len(winners)}",
+            f"• Losers: {len(losers)}",
+            f"• Net Floating: {_pct_safe(net)}",
             "",
-            "━━━━━━━━━━━━━━",
+            "🏆 <b>Win Rate</b>",
+            f"<b>{win_rate:.1f}%</b>",
+            "━━━━━━━━━━━━",
+            "📂 <b>Open Trades</b>",
+            f"🟢 Open Winners: {len(winners)}",
+            f"🔴 Open Losers: {len(losers)}",
+            f"⏱️ Avg Trade Time: {html.escape(avg_trade_time)}",
         ]
-        for trade in trades[:12]:
-            lines.extend(_format_execution_trade_card(trade, is_open=True))
-            lines.append("━━━━━━━━━━━━━━")
-        if len(trades) > 12:
-            lines.append(f"… وتم إخفاء {len(trades) - 12} صفقة لتقليل طول التقرير")
-        return "\n".join(lines)
+        sep = "┄┄┄┄┄┄"
+        winners_sorted = sorted(winners, key=lambda x: x[1], reverse=True)
+        losers_sorted = sorted(losers, key=lambda x: x[1])
+        if winners_sorted:
+            lines.append("")
+            for idx, (trade, _) in enumerate(winners_sorted):
+                if idx > 0:
+                    lines.append(sep)
+                lines.extend(_format_execution_trade_card(trade, is_open=True))
+        else:
+            lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
+        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
+        if losers_sorted:
+            for idx, (trade, _) in enumerate(losers_sorted):
+                if idx > 0:
+                    lines.append(sep)
+                lines.extend(_format_execution_trade_card(trade, is_open=True))
+        else:
+            lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
+        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
+        return "\n".join(lines).strip()
     except Exception as e:
         logger.error(f"build_execution_open_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير صفقات التنفيذ المفتوحة: {html.escape(str(e))}"
@@ -4429,7 +4424,7 @@ def build_execution_report_message(period: str = "all") -> str:
             "⚖️ الصافي العائم",
             f"<b>{floating_icon} {money(floating_net_usd)} | {exposure(floating_net_pct)}</b>",
             "",
-            "🏦 <b>التأثير الحالي على المحفظة</b>",
+            "💼 <b>التأثير الحالي على المحفظة</b>",
             f"<b>{impact_icon} {money(portfolio_net_usd)}</b>",
             "━━━━━━━━━━━━",
             "🧠 <b>Execution Behavior Summary</b>",
