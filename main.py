@@ -1,7 +1,7 @@
-# Version: main_v211_intelligence_open_dashboard.py
+# Version: main_v212_ui_intelligence_open_polish.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: UI/reporting only: Exec/Market Intelligence buttons+reports; stronger open-report dashboard; compact sampling.
+# Changes: UI/reporting only: Intelligence UI polish, execution rejection UI polish, compact open dashboard polish.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -4211,13 +4211,20 @@ def build_execution_open_report_message(period: str = "all") -> str:
             "━━━━━━━━━━━━",
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
             "📊 <b>Quick Stats</b>",
-            f"• Open: {len(trades)} | Winners: {len(winners)} | Losers: {len(losers)}",
-            f"• Win Rate: <b>{win_rate:.1f}%</b> | Net Floating: <b>{_pct_safe(net)}</b>",
-            f"• TP1: {tp1_hit_count} | TP2 Active: {tp2_active_count} | Trailing: {trailing_count}",
-            f"• Protected: {protected_count} | Danger: {danger_count}",
-            f"• Avg Time: {html.escape(avg_trade_time)} | Avg Score: {avg_score:.2f}",
-            f"• Best: <b>{html.escape(best_txt)}</b>",
-            f"• Worst: <b>{html.escape(worst_txt)}</b>",
+            f"• Open: {len(trades)}",
+            f"• Winners: {len(winners)}",
+            f"• Losers: {len(losers)}",
+            f"• Win Rate: <b>{win_rate:.1f}%</b>",
+            f"• Net Floating: <b>{_pct_safe(net)}</b>",
+            f"🎯 TP1: {tp1_hit_count}",
+            f"🏁 TP2: {tp2_active_count}",
+            f"📍 Trailing: {trailing_count}",
+            f"🛡 Protected: {protected_count}",
+            f"⚠️ Danger: {danger_count}",
+            f"⏱ Avg Time: {html.escape(avg_trade_time)}",
+            f"⭐ Avg Score: {avg_score:.2f}",
+            f"🔥 Best: <b>{html.escape(best_txt)}</b>",
+            f"⚠️ Worst: <b>{html.escape(worst_txt)}</b>",
             "━━━━━━━━━━━━",
             "📂 <b>Open Trades</b>",
             f"🟢 Open Winners: {len(winners)}",
@@ -4246,7 +4253,7 @@ def build_execution_open_report_message(period: str = "all") -> str:
                 lines.append(f"📂 +{len(losers_sorted) - 5} صفقات خاسرة مفتوحة أخرى")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
-        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
+        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
         return "\n".join(lines).strip()
     except Exception as e:
         logger.error(f"build_execution_open_report_message error: {e}", exc_info=True)
@@ -4666,7 +4673,7 @@ def build_execution_report_message(period: str = "all") -> str:
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
 
-        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
+        lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
 
         msg = "\n".join(lines).strip()
         return msg
@@ -4717,6 +4724,26 @@ def _intelligence_exit_stats(trades: list) -> dict:
     }
 
 
+
+
+def _intelligence_quality_icon(row: dict) -> str:
+    """Visual quality marker for Intelligence rows. UI/reporting only."""
+    try:
+        wr = float(row.get("wr", 0.0) or 0.0)
+        avg = float(row.get("avg", 0.0) or 0.0)
+        direct_sl = float(row.get("direct_sl_rate", 0.0) or 0.0)
+        closed = int(row.get("closed", 0) or 0)
+        n = int(row.get("n", 0) or 0)
+    except Exception:
+        return "🟡"
+    if closed < 2 and n < 4:
+        return "🟡"
+    if wr >= 55.0 and avg >= 0 and direct_sl <= 40.0:
+        return "🟢"
+    if wr < 42.0 or avg < 0 or direct_sl >= 50.0:
+        return "🔴"
+    return "🟡"
+
 def build_intelligence_report_message(kind: str = "execution", period: str = "all") -> str:
     """Data-backed Intelligence report. Reporting/UI only; does not change strategy."""
     try:
@@ -4732,7 +4759,7 @@ def build_intelligence_report_message(kind: str = "execution", period: str = "al
                 trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
         if kind == "execution":
             trades = [t for t in trades if is_execution_candidate_trade(t)]
-            title = "🧠 <b>Exec Intelligence</b>"
+            title = "🧠 <b>Execution Intelligence</b>"
         else:
             trades = [t for t in trades if not is_execution_candidate_trade(t)]
             title = "🧠 <b>Market Intelligence</b>"
@@ -4811,7 +4838,7 @@ def build_intelligence_report_message(kind: str = "execution", period: str = "al
         if strongest:
             for row in strongest:
                 lines.append(
-                    f"• {html.escape(row['name'])} — WR {row['wr']:.1f}% | TP1 {row['tp1_rate']:.1f}% | TP2 {row['tp2_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
+                    f"• {_intelligence_quality_icon(row)} {html.escape(row['name'])} — WR {row['wr']:.1f}% | TP1 {row['tp1_rate']:.1f}% | TP2 {row['tp2_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
                 )
         else:
             lines.append("• لا توجد عينة كافية لتحديد أقوى Setup.")
@@ -4819,7 +4846,7 @@ def build_intelligence_report_message(kind: str = "execution", period: str = "al
         if caution:
             for row in caution:
                 lines.append(
-                    f"• {html.escape(row['name'])} — WR {row['wr']:.1f}% | Direct SL {row['direct_sl_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
+                    f"• {_intelligence_quality_icon(row)} {html.escape(row['name'])} — WR {row['wr']:.1f}% | Direct SL {row['direct_sl_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
                 )
         else:
             lines.append("• لا توجد عينة كافية للتحذير.")
@@ -11441,21 +11468,25 @@ def _execution_rejection_reason_ar(status: str, reason: str = "") -> str:
 
 def build_execution_rejection_message(symbol: str, status: str, reason: str = "") -> str:
     return (
-        "⚠️ <b>Execution Candidate لم يتم تنفيذه</b>\n\n"
-        f"🪙 <b>Symbol:</b> {html.escape(str(symbol or '?'))}\n"
-        f"📌 <b>Status:</b> {html.escape(str(status or 'preview_rejected'))}\n"
-        f"❌ <b>السبب:</b> {html.escape(_execution_rejection_reason_ar(status, reason))}\n\n"
-        "📊 ستظل الصفقة موجودة في /report_execution للمتابعة والتحليل."
+        "⚠️ <b>Execution Candidate Rejected</b>\n"
+        "━━━━━━━━━━━━\n"
+        f"🪙 <b>{html.escape(str(symbol or '?'))}</b>\n"
+        f"📌 Status: <code>{html.escape(str(status or 'preview_rejected'))}</code>\n"
+        f"❌ {html.escape(_execution_rejection_reason_ar(status, reason))}\n"
+        "━━━━━━━━━━━━\n"
+        "📊 تابعها من: /report_execution"
     )
 
 
 def build_execution_paused_message(symbol: str) -> str:
     return (
-        "⚠️ <b>Execution Candidate لم يتم تنفيذه</b>\n\n"
-        f"🪙 <b>Symbol:</b> {html.escape(str(symbol or '?'))}\n"
-        "📌 <b>Status:</b> execution_paused\n"
-        "❌ <b>السبب:</b> التنفيذ متوقف يدويًا أو بسبب Daily DD\n\n"
-        "📊 ستظل الصفقة موجودة في /report_execution للمتابعة والتحليل."
+        "⚠️ <b>Execution Candidate Rejected</b>\n"
+        "━━━━━━━━━━━━\n"
+        f"🪙 <b>{html.escape(str(symbol or '?'))}</b>\n"
+        "📌 Status: <code>execution_paused</code>\n"
+        "❌ التنفيذ متوقف يدويًا أو بسبب Daily DD\n"
+        "━━━━━━━━━━━━\n"
+        "📊 تابعها من: /report_execution"
     )
 
 
