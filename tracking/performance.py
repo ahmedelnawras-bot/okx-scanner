@@ -4226,11 +4226,11 @@ def _format_open_trades_section(title: str, items: List[dict], start_index: int 
     lines = []
     if not items:
         return lines
-    lines.extend(["", f"{title}", "────────────"])
+    lines.extend(["", f"{title}", "┄┄┄┄┄┄"])
     for offset, trade in enumerate(items[:limit], start=start_index):
         lines.extend(_format_open_trade_compact_card(trade, index=offset))
         if offset < start_index + min(len(items), limit) - 1:
-            lines.append("- - - - - - - -")
+            lines.append("┄┄┄┄┄┄")
     if len(items) > limit:
         lines.append(f"… +{len(items) - limit} صفقات أخرى")
     return lines
@@ -4328,41 +4328,35 @@ def format_open_trades_message(
 
     if winners_s:
         lines.append("")
-        for idx, trade in enumerate(winners_s[:3]):
+        for idx, trade in enumerate(winners_s):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(winners_s) > 3:
-            lines.append(f"📂 +{len(winners_s) - 3} more winning trades...")
+        
     else:
         lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
     lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
     if losers_s:
-        for idx, trade in enumerate(losers_s[:2]):
+        for idx, trade in enumerate(losers_s):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(losers_s) > 2:
-            lines.append(f"📂 +{len(losers_s) - 2} more losing trades...")
+        
     else:
         lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
     if pending_s:
         lines.extend(["━━━━━━━━━━━━", "⏳ <b>Pending Pullback</b>"])
-        for idx, trade in enumerate(pending_s[:2]):
+        for idx, trade in enumerate(pending_s):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(pending_s) > 2:
-            lines.append(f"📂 +{len(pending_s) - 2} more pending trades...")
+        
 
     lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
 
-    msg = "\n".join(lines)
-    if len(msg) > 7600:
-        msg = msg[:7400].rsplit("\n", 1)[0] + "\n\n⚠️ تم اختصار التقرير للحفاظ على طول مناسب."
-    return msg
+    return "\n".join(lines)
 
 
 def _fmt_price_perf(value) -> str:
