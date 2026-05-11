@@ -1,6 +1,8 @@
 # tracking/performance.py
-# Version: performance_v49_report_command_html_fix
-# Fix: import html for recent trade formatting used by /report_all and period reports.
+# Version: performance_v51_open_trades_dashboard_header_fix
+# Base: performance_v49_report_command_html_fix
+# Changes: Professional /open_trades dashboard with executive summary and grouped sections.
+# Fix: header/version corrected; dashboard context fields are displayed in the report.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
 
@@ -4145,161 +4147,190 @@ def get_open_trades_summary(
     return open_trades
 
 
-def _format_open_trade_lifecycle_pnl_block(t: dict) -> List[str]:
-    """بلوك مختصر وواضح يوضح المرحلة والربح الفعلي لخطة 40/40/20 في /open_trades."""
+def _format_open_trade_compact_card(t: dict, index: int = 0) -> List[str]:
+    """Compact professional open-trade card for Telegram dashboards."""
     phase = str(t.get("phase", "open") or "open")
+    sym = str(t.get("symbol", "?")).replace("-SWAP", "")
+    score = safe_float(t.get("score", 0.0), 0.0)
+    age = str(t.get("age_str", "") or "")
+    entry = safe_float(t.get("effective_entry", t.get("entry", 0.0)), 0.0)
     current_price = safe_float(t.get("current_price", 0.0), 0.0)
-    w_pnl = safe_float(t.get("weighted_pnl_pct", 0.0), 0.0)
-    w_lev = safe_float(t.get("weighted_pnl_leveraged", 0.0), 0.0)
+    sl = safe_float(t.get("sl", 0.0), 0.0)
+    tp1 = safe_float(t.get("tp1", 0.0), 0.0)
+    tp2 = safe_float(t.get("tp2", 0.0), 0.0)
+    sl_pct = safe_float(t.get("sl_pct", 0.0), 0.0)
+    tp1_pct = safe_float(t.get("tp1_pct", 0.0), 0.0)
+    tp2_pct = safe_float(t.get("tp2_pct", 0.0), 0.0)
+    pnl = safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0)
+    lev = safe_float(t.get("weighted_pnl_leveraged", t.get("current_pnl_leveraged", 0.0)), 0.0)
     cur_pnl = safe_float(t.get("current_pnl_pct", 0.0), 0.0)
-    cur_lev = safe_float(t.get("current_pnl_leveraged", 0.0), 0.0)
-    tp1_hit = bool(t.get("tp1_hit", False)) or phase in ("tp1_hit", "tp2_hit", "trailing")
-    tp2_hit = bool(t.get("tp2_hit", False)) or phase in ("tp2_hit", "trailing")
-    trailing_active = bool(t.get("trailing_active", False)) or phase == "trailing"
     sl_is_entry = bool(t.get("sl_is_entry", False))
+    tv_link = str(t.get("tv_link", "") or "")
 
-    if phase == "pending_pullback":
-        return [
-            "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
-            "   • حالة الصفقة: ⏳ Pending Pullback — لم يتفعل الدخول",
-            "   💰 الربح الفعلي: —",
-            "   ⚡ بعد الرافعة: —",
-        ]
-
-    if cur_pnl > 0.05:
-        price_state = "🟢 فوق سعر الدخول"
-    elif cur_pnl < -0.05:
-        price_state = "🔴 تحت سعر الدخول"
+    if phase == "trailing":
+        phase_line = "🔄 Trailing | 20% متبقي"
+    elif phase == "tp2_hit":
+        phase_line = "🏁 بعد TP2"
+    elif phase == "tp1_hit":
+        phase_line = "🎯 بعد TP1 | 🔒 SL Entry"
+    elif phase == "pending_pullback":
+        phase_line = "⏳ Pending Pullback"
     else:
-        price_state = "⚪ حول سعر الدخول"
+        phase_line = "🟢 قبل TP1"
 
-    if trailing_active:
-        stage = "Trailing مفعل | يتبقى 20%"
-    elif tp2_hit:
-        stage = "بعد TP2 | يتبقى 20% Trailing"
-    elif tp1_hit:
-        stage = "بعد TP1 | 40% اتقفل | SL Entry"
-    else:
-        stage = "قبل TP1"
-
-    tp1_text = "✅ اتضرب" if tp1_hit else "⏳ لم يضرب"
-    tp2_text = "✅ اتضرب" if tp2_hit else "⏳ لم يضرب"
-    trailing_text = "🔄 شغال" if trailing_active else ("🔄 بدأ" if tp2_hit else "⏳ لم يبدأ")
-    sl_text = "🔒 على Entry" if sl_is_entry else "لم يتفعل"
-
-    return [
-        "   📊 <b>الربح الحالي الفعلي (40/40/20)</b>",
-        f"   • حالة الصفقة: {price_state}",
-        f"   • المرحلة: {stage}",
-        f"   • 🎯 TP1: {tp1_text}",
-        f"   • 🏁 TP2: {tp2_text}",
-        f"   • 🔄 20%: {trailing_text}",
-        f"   • 🛡️ وقف الخسارة: {sl_text}",
-        f"   💰 الربح الفعلي: <code>{w_pnl:+.2f}%</code>",
-        f"   ⚡ بعد الرافعة: <code>{w_lev:+.1f}%</code>",
-        f"   📈 حركة السعر الحالية: <code>{cur_pnl:+.2f}%</code> | بعد الرافعة: <code>{cur_lev:+.1f}%</code>",
+    pnl_icon = "🟢" if pnl > 0.05 else "🔴" if pnl < -0.05 else "🟡"
+    header = f"{index}️⃣ <b>{sym}</b> | ⭐ {score:.1f} | ⏱ {age}" if index else f"<b>{sym}</b> | ⭐ {score:.1f} | ⏱ {age}"
+    lines = [
+        header,
+        f"   📌 {phase_line}",
+        f"   💰 PnL: <code>{pnl:+.2f}%</code> | ⚡ Lev: <code>{lev:+.1f}%</code> | 📈 Move: <code>{cur_pnl:+.2f}%</code>",
+        f"   💵 Entry: {_fmt_price_perf(entry)} | Now: {_fmt_price_perf(current_price)}",
     ]
+    if sl_is_entry:
+        lines.append(f"   🔒 SL: Entry ({_fmt_price_perf(sl)})")
+    else:
+        lines.append(f"   🛑 SL: {_fmt_price_perf(sl)} ({sl_pct:+.2f}%)")
+    if phase in ("open", "pending_pullback"):
+        lines.append(f"   🎯 TP1: {_fmt_price_perf(tp1)} (+{tp1_pct:.2f}%) | 🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
+    elif phase == "tp1_hit":
+        lines.append(f"   🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
+    elif phase == "trailing":
+        trailing_high = safe_float(t.get("trailing_high", 0.0), 0.0)
+        trailing_sl = safe_float(t.get("trailing_sl", 0.0), 0.0)
+        if trailing_high > 0 or trailing_sl > 0:
+            lines.append(f"   🔄 High: {_fmt_price_perf(trailing_high)} | Trail SL: {_fmt_price_perf(trailing_sl)}")
+    if tv_link:
+        lines.append(f'   📊 <a href="{tv_link}">TradingView</a>')
+    return lines
 
 
-def format_open_trades_message(trades: List[dict], side: str = "long") -> str:
-    """
-    تنسيق رسالة /open_trades بالعربي مع ملخص واضح لكل صفقة.
-    """
+def _open_trade_near_tp1(t: dict) -> bool:
+    try:
+        if t.get("phase") != "open":
+            return False
+        tp1_pct = abs(safe_float(t.get("tp1_pct", 0.0), 0.0))
+        cur = safe_float(t.get("current_pnl_pct", 0.0), 0.0)
+        return tp1_pct > 0 and cur >= max(0.5, tp1_pct * 0.75)
+    except Exception:
+        return False
+
+
+def _open_trade_is_danger(t: dict) -> bool:
+    try:
+        phase = str(t.get("phase", "open") or "open")
+        if phase == "pending_pullback":
+            return False
+        pnl = safe_float(t.get("current_pnl_pct", 0.0), 0.0)
+        sl_pct = safe_float(t.get("sl_pct", 0.0), 0.0)
+        return pnl <= -0.75 or (sl_pct < 0 and pnl <= abs(sl_pct) * -0.70)
+    except Exception:
+        return False
+
+
+def _format_open_trades_section(title: str, items: List[dict], start_index: int = 1, limit: int = 8) -> List[str]:
+    lines = []
+    if not items:
+        return lines
+    lines.extend(["", f"{title}", "────────────"])
+    for offset, trade in enumerate(items[:limit], start=start_index):
+        lines.extend(_format_open_trade_compact_card(trade, index=offset))
+        if offset < start_index + min(len(items), limit) - 1:
+            lines.append("- - - - - - - -")
+    if len(items) > limit:
+        lines.append(f"… +{len(items) - limit} صفقات أخرى")
+    return lines
+
+
+def format_open_trades_message(
+    trades: List[dict],
+    side: str = "long",
+    market_mode: str = None,
+    weak_drift: str = None,
+    execution_status: str = None,
+) -> str:
+    """Professional /open_trades dashboard with executive summary + grouped sections."""
     if not trades:
         return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
 
-    total           = len(trades)
-    trailing_count  = sum(1 for t in trades if t.get("phase") == "trailing")
-    tp1_hit_count   = sum(1 for t in trades if t.get("phase") == "tp1_hit")
-    pending_count   = sum(1 for t in trades if t.get("phase") == "pending_pullback")
-    winning_count   = sum(1 for t in trades if t.get("current_pnl_pct", 0) > 0.3)
-    losing_count    = sum(1 for t in trades if t.get("current_pnl_pct", 0) < -0.3)
+    total = len(trades)
+    winners = [t for t in trades if safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0) > 0.05]
+    losers = [t for t in trades if safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0) < -0.05]
+    pending = [t for t in trades if t.get("phase") == "pending_pullback"]
+    tp1_protected = [t for t in trades if t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("sl_is_entry", False))]
+    tp1_hit_count = sum(1 for t in trades if t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("tp1_hit", False)))
+    tp2_hit_count = sum(1 for t in trades if t.get("phase") in ("tp2_hit", "trailing") or bool(t.get("tp2_hit", False)))
+    trailing_count = sum(1 for t in trades if t.get("phase") == "trailing")
+    near_tp1 = [t for t in trades if _open_trade_near_tp1(t)]
+    danger = [t for t in trades if _open_trade_is_danger(t)]
+
+    def _wp(t):
+        return safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0)
+
+    def _wl(t):
+        return safe_float(t.get("weighted_pnl_leveraged", t.get("current_pnl_leveraged", 0.0)), 0.0)
+
+    net_pnl = sum(_wp(t) for t in trades)
+    net_lev = sum(_wl(t) for t in trades)
+    best = max(trades, key=_wp) if trades else None
+    worst = min(trades, key=_wp) if trades else None
+    best_text = f"{str(best.get('symbol','?')).replace('-SWAP','')} {_wp(best):+.2f}%" if best else "—"
+    worst_text = f"{str(worst.get('symbol','?')).replace('-SWAP','')} {_wp(worst):+.2f}%" if worst else "—"
+
+    mode_text = market_mode or "N/A"
+    drift_text = (weak_drift or "N/A").replace("🔴 ", "").replace("🟢 ", "")
+    exec_text = execution_status or "N/A"
 
     lines = [
-        f"📋 <b>الصفقات المفتوحة ({total} صفقة)</b>",
-        "────────────",
+        "📋 <b>Open Trades Dashboard</b>",
+        "━━━━━━━━━━━━",
+        "🧾 <b>Executive Summary</b>",
+        f"📌 الإجمالي: <b>{total}</b> | 🟢 رابحة: <b>{len(winners)}</b> | 🔴 خاسرة: <b>{len(losers)}</b>",
+        f"🎯 قرب TP1: <b>{len(near_tp1)}</b> | ✅ TP1: <b>{tp1_hit_count}</b> | 🏁 TP2: <b>{tp2_hit_count}</b>",
+        f"🔒 Protected: <b>{len(tp1_protected)}</b> | 🔄 Trailing: <b>{trailing_count}</b> | ⚠️ Danger: <b>{len(danger)}</b>",
+        f"💰 Net PnL: <code>{net_pnl:+.2f}%</code> | ⚡ Lev: <code>{net_lev:+.1f}%</code>",
+        f"📈 Best: <b>{best_text}</b>",
+        f"📉 Worst: <b>{worst_text}</b>",
+        "",
+        "🧠 <b>Context</b>",
+        f"• Mode: <code>{mode_text}</code>",
+        f"• Weak Drift: <code>{drift_text}</code>",
+        f"• Execution: <code>{exec_text}</code>",
     ]
 
-    for i, t in enumerate(trades, 1):
-        sym             = t["symbol"].replace("-SWAP", "")
-        phase           = t.get("phase", "open")
-        score           = t.get("score", 0.0)
-        age             = t.get("age_str", "")
-        sl_pct          = t.get("sl_pct", 0.0)
-        sl_is_entry     = t.get("sl_is_entry", False)
-        tp1_pct         = t.get("tp1_pct", 0.0)
-        tp2_pct         = t.get("tp2_pct", 0.0)
-        entry           = t.get("effective_entry", t.get("entry", 0.0))
-        sl              = t.get("sl", 0.0)
-        tp1             = t.get("tp1", 0.0)
-        tp2             = t.get("tp2", 0.0)
-        current_price   = t.get("current_price", 0.0)
-        pnl_pct         = t.get("current_pnl_pct", 0.0)
-        pnl_lev         = t.get("current_pnl_leveraged", 0.0)
-        pnl_emoji       = t.get("pnl_emoji", "🟡")
-        pnl_label       = t.get("pnl_label", "تعادل")
-        trailing_high   = t.get("trailing_high", 0.0)
-        trailing_sl_v   = t.get("trailing_sl", 0.0)
+    # Grouping: danger first, then protected, then winners, then pending, then other losers/neutral.
+    used_ids = set()
+    def _mark(items):
+        out = []
+        for item in items:
+            ident = id(item)
+            if ident not in used_ids:
+                used_ids.add(ident)
+                out.append(item)
+        return out
 
-        # ── أيقونة المرحلة ──────────────────────────────────────
-        if phase == "trailing":
-            phase_line = "🔄 <b>Trailing شغال</b> (20% متبقي)"
-        elif phase == "tp2_hit":
-            phase_line = "🏁 بعد TP2"
-        elif phase == "tp1_hit":
-            phase_line = "🎯 بعد TP1 | 🔒 SL محمي على Entry"
-        elif phase == "pending_pullback":
-            phase_line = "⏳ انتظار Pullback"
-        else:
-            phase_line = "🟢 مفتوحة"
+    danger_s = _mark(sorted(danger, key=_wp))
+    protected_s = _mark(sorted(tp1_protected, key=_wp, reverse=True))
+    winners_s = _mark(sorted(winners, key=_wp, reverse=True))
+    pending_s = _mark(sorted(pending, key=lambda t: safe_timestamp(t.get("created_at", 0), 0), reverse=True))
+    others_s = _mark(sorted([t for t in trades if id(t) not in used_ids], key=_wp, reverse=True))
 
-        # ── سطر العملة والأساسيات ───────────────────────────────
-        lines.append(f"\n{i}️⃣ <b>{sym}</b> | نقاط: {score:.1f} | ⏱ {age}")
-        lines.append(f"   {phase_line}")
+    idx = 1
+    for title, items, limit in [
+        ("⚠️ <b>Danger / تحتاج متابعة</b>", danger_s, 6),
+        ("🔒 <b>TP1 Protected</b>", protected_s, 6),
+        ("🟢 <b>Winners</b>", winners_s, 8),
+        ("⏳ <b>Pending Pullback</b>", pending_s, 5),
+        ("📌 <b>Other Open Trades</b>", others_s, 8),
+    ]:
+        section = _format_open_trades_section(title, items, start_index=idx, limit=limit)
+        if section:
+            lines.extend(section)
+            idx += min(len(items), limit)
 
-        # ── أسعار الدخول ثم الربح الفعلي 40/40/20 بوضوح ─────────
-        lines.append(f"   💰 دخول: {_fmt_price_perf(entry)}")
-        lines.append(f"   💵 السعر الحالي: {_fmt_price_perf(current_price)}")
-        lines.extend(_format_open_trade_lifecycle_pnl_block(t))
-        
-        # ── الـ SL ───────────────────────────────────────────────
-        if sl_is_entry:
-            lines.append(f"   🔒 SL: محمي على Entry ({_fmt_price_perf(sl)})")
-        else:
-            lines.append(f"   🛑 SL: {_fmt_price_perf(sl)} ({sl_pct:+.2f}%)")
-
-        # ── الأهداف حسب المرحلة ─────────────────────────────────
-        if phase == "trailing":
-            if trailing_high > 0 and trailing_sl_v > 0:
-                lines.append(f"   📈 أعلى سعر: {_fmt_price_perf(trailing_high)}")
-                lines.append(f"   🔄 Trailing SL: {_fmt_price_perf(trailing_sl_v)}")
-            else:
-                lines.append(f"   🔄 Trailing | جاري التهيئة...")
-        elif phase in ("open", "pending_pullback"):
-            lines.append(f"   🎯 TP1: {_fmt_price_perf(tp1)} (+{tp1_pct:.2f}%)")
-            lines.append(f"   🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
-        elif phase == "tp1_hit":
-            lines.append(f"   🏁 TP2: {_fmt_price_perf(tp2)} (+{tp2_pct:.2f}%)")
-
-        # ── رابط TradingView ─────────────────────────────────────
-        lines.append(f'   📊 <a href="{t["tv_link"]}">TradingView</a>')
-
-    # ── ملخص ─────────────────────────────────────────────────────
-    lines.append("\n────────────")
-    lines.append(f"📊 <b>ملخص:</b> {total} صفقة مفتوحة")
-    if winning_count:
-        lines.append(f"🟢 رابحة الآن: {winning_count}")
-    if losing_count:
-        lines.append(f"🔴 خاسرة الآن: {losing_count}")
-    if trailing_count:
-        lines.append(f"🔄 في مرحلة Trailing: {trailing_count}")
-    if tp1_hit_count:
-        lines.append(f"🎯 بعد TP1: {tp1_hit_count}")
-    if pending_count:
-        lines.append(f"⏳ انتظار Pullback: {pending_count}")
-
-    return "\n".join(lines)
-
+    msg = "\n".join(lines)
+    if len(msg) > 7600:
+        msg = msg[:7400].rsplit("\n", 1)[0] + "\n\n⚠️ تم اختصار التقرير للحفاظ على طول مناسب."
+    return msg
 
 def _fmt_price_perf(value) -> str:
     """تنسيق سعر ديناميكي."""
