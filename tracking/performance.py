@@ -3650,7 +3650,6 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"📊 <b>{title}</b>",
         sep,
         "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
-        "",
         "📊 <b>Quick Stats</b>",
         f"• Signals: {signals}",
         f"• Open: {open_count}",
@@ -4296,31 +4295,34 @@ def format_open_trades_message(
 
     if winners_s:
         lines.append("")
-        for idx, trade in enumerate(winners_s):
+        for idx, trade in enumerate(winners_s[:5]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        
+        if len(winners_s) > 5:
+            lines.append(f"📂 +{len(winners_s) - 5} صفقات رابحة مفتوحة أخرى")
     else:
         lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
     lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
     if losers_s:
-        for idx, trade in enumerate(losers_s):
+        for idx, trade in enumerate(losers_s[:5]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        
+        if len(losers_s) > 5:
+            lines.append(f"📂 +{len(losers_s) - 5} صفقات خاسرة مفتوحة أخرى")
     else:
         lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
     if pending_s:
         lines.extend(["━━━━━━━━━━━━", "⏳ <b>Pending Pullback</b>"])
-        for idx, trade in enumerate(pending_s):
+        for idx, trade in enumerate(pending_s[:5]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        
+        if len(pending_s) > 5:
+            lines.append(f"📂 +{len(pending_s) - 5} صفقات Pending أخرى")
 
     lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
 
