@@ -1,9 +1,9 @@
-# Version: main_v202_market_mode_and_reminder_balance.py
+# Version: main_v204_help_open_trades_integration_fix.py
 # Date: 2026-05-11
-# Base: main_v201_v200_architecture_cleaned.py
-# Changes: Market-mode balance, fast mode monitor, human-readable mode reasons, reminder cadence/UI, near-resistance tuning.
-# Preserved: Telegram UI/contracts, market modes, reports, tracking/performance integration, execution modules.
-# Fixed: breadth-only BLOCK overreaction, debug-style mode reasons, reminder timing/wording, over-aggressive resistance hard rejects.
+# Base: main_v203_open_trades_help_ui.py
+# Changes: Help UI + open-trades integration fix; dashboard splitter; strong-exception reads unified execution_setup_tags.
+# Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
+# Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
 import os 
 import sys 
@@ -1609,7 +1609,7 @@ def send_telegram_message(message: str, reply_markup=None) -> dict:
     payload["reply_markup"] = reply_markup
  return telegram_api_call("sendMessage", payload)
 
-def send_telegram_reply(chat_id: str, message: str) -> bool:
+def send_telegram_reply(chat_id: str, message: str, reply_markup=None) -> bool:
  if not BOT_TOKEN or not chat_id:
     logger.error("❌ Telegram reply config missing")
     return False
@@ -1619,6 +1619,8 @@ def send_telegram_reply(chat_id: str, message: str) -> bool:
     "parse_mode": "HTML",
     "disable_web_page_preview": True,
  }
+ if reply_markup:
+    payload["reply_markup"] = reply_markup
  data = telegram_api_call("sendMessage", payload)
  return bool(data.get("ok"))
 
@@ -1658,6 +1660,58 @@ def split_telegram_message(text: str, limit: int = 3600) -> list:
     return chunks or [text[:limit]]
  except Exception:
     return [str(text or "")[:limit]]
+
+
+def split_open_trades_dashboard_message(text: str, limit: int = 3600) -> list:
+ """Split /open_trades dashboard safely by lines/sections.
+
+ The generic splitter uses blank blocks.  Open-trades dashboard is denser, so
+ this function avoids cutting inside HTML tags and prefers section boundaries.
+ """
+ try:
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+    section_starts = (
+        "⚠️ <b>Danger",
+        "🔒 <b>TP1",
+        "🟢 <b>Winners",
+        "⏳ <b>Pending",
+        "📌 <b>Other",
+        "🧾 <b>Executive",
+    )
+    chunks = []
+    current = []
+    current_len = 0
+
+    for line in text.split("\n"):
+        line_len = len(line) + 1
+        prefer_boundary = any(line.startswith(prefix) for prefix in section_starts)
+        if current and (current_len + line_len > limit or (prefer_boundary and current_len > int(limit * 0.65))):
+            chunks.append("\n".join(current).strip())
+            current = []
+            current_len = 0
+
+        if line_len > limit:
+            if current:
+                chunks.append("\n".join(current).strip())
+                current = []
+                current_len = 0
+            for i in range(0, len(line), limit):
+                part = line[i:i + limit]
+                if part:
+                    chunks.append(part)
+            continue
+
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current).strip())
+
+    return [c for c in chunks if c] or [text[:limit]]
+ except Exception:
+    return split_telegram_message(text, limit=limit)
 
 
 def send_telegram_reply_chunks(chat_id: str, messages) -> bool:
@@ -1816,54 +1870,198 @@ def build_dynamic_help_note() -> str:
     )
 
 def build_help_message() -> str:
- return f"""<b>😋 OKX Scanner Bot - LONG</b>
+ return """🚀 <b>OKX Scanner</b>
+<b>Trading Command Center</b>
 
-<b>⚡ أساسي:</b>
-/mood — حالة السوق
-/status — نفس /mood
-/open_trades — الصفقات المفتوحة
-/help — قائمة الأوامر
+━━━━━━━━━━━━━━━━
 
-<b>📊 تقارير عادية:</b>
-/report_1h — آخر ساعة
-/report_today — اليوم
-/report_7d — آخر 7 أيام
-/report_30d — آخر 30 يوم
-/report_all — كل الصفقات
+⚡ <b>Quick Access</b>
+/mood
+/report_execution
+/open_trades
+/help
 
-<b>🚀 تقارير التنفيذ:</b>
-/report_execution — منذ البداية
-/report_execution_1h — آخر ساعة
-/report_execution_today — اليوم
-/report_execution_7d — آخر 7 أيام
-/report_execution_30d — آخر 30 يوم
-/report_execution_losses — خسائر صفقات التنفيذ فقط
-/report_execution_guard — حالة Daily DD / Wallet Guard
+━━━━━━━━━━━━━━━━
 
-<b>⚙️ أوامر التنفيذ:</b>
-/exec_status — اختبار OKX
-/exec_mode — وضع التنفيذ
-/stop_trading — إيقاف تنفيذ جديد
-/resume_trading — تشغيل التنفيذ
+🎛 <b>Select Module from the buttons below</b>
 
-<b>🧠 تحليلات:</b>
-/report_deep — تحليل شامل
-/report_exits — جودة الخروج
-/report_rejections — أسباب الرفض
-/report_setups — أداء setups
-/report_scores — تحليل السكور
-/report_market — أداء السوق
-/report_losses — أسباب الخسارة
-/report_diagnostics — تشخيص كامل
+🟢 <b>Mode:</b> <code>{mode}</code>
+{execution_line}
+🛡 <b>Protection:</b> <code>{protection}</code>
 
-<b>🛠 إدارة:</b>
-/reset_stats — تصفير ناعم
-/hard_reset — مسح بيانات اللونج
-/stats_since_reset — منذ آخر تصفير
-/how_it_work — شرح البوت
+━━━━━━━━━━━━━━━━
 
-<b>ℹ️ ملاحظة:</b>
-{build_dynamic_help_note()}"""
+📝 <b>ملاحظات</b>
+• الأزرار بالأسفل تفتح أقسام الأوامر مباشرة.
+• /open_trades يعرض كل الصفقات المتابعة.
+• /report_execution خاص بصفقات التنفيذ / المرشحة.
+• أوامر OKX تعتمد على وضع التنفيذ الحالي.""".format(
+    mode=html.escape(_get_current_market_mode_for_help()),
+    execution_line=html.escape(_get_execution_status_line_for_help()),
+    protection=html.escape(_get_protection_status_for_help()),
+ )
+
+
+def build_help_inline_keyboard() -> dict:
+ return {
+    "inline_keyboard": [
+        [
+            {"text": "🚀 Execution", "callback_data": "help:execution"},
+            {"text": "📊 Normal Trades", "callback_data": "help:normal"},
+        ],
+        [
+            {"text": "🧠 Diagnostics", "callback_data": "help:diagnostics"},
+            {"text": "🤖 OKX Control", "callback_data": "help:okx"},
+        ],
+        [
+            {"text": "⚙️ Admin", "callback_data": "help:admin"},
+            {"text": "📘 System Info", "callback_data": "help:info"},
+        ],
+    ]
+ }
+
+
+def _get_current_market_mode_for_help() -> str:
+ try:
+    if r:
+        return normalize_market_mode(r.get(MARKET_MODE_KEY) or MODE_NORMAL_LONG)
+ except Exception:
+    pass
+ return MODE_NORMAL_LONG
+
+
+def _get_execution_status_line_for_help() -> str:
+ try:
+    paused = bool(r and r.exists(EXECUTION_PAUSE_KEY))
+    return "🔴 Execution: PAUSED" if paused else "🟢 Execution: ACTIVE"
+ except Exception:
+    return "🟡 Execution: UNKNOWN"
+
+
+def _get_protection_status_for_help() -> str:
+ try:
+    mode = _get_current_market_mode_for_help()
+    if mode == MODE_BLOCK_LONGS:
+        return "STRICT"
+    return "ENABLED"
+ except Exception:
+    return "ENABLED"
+
+
+def build_help_execution_message() -> str:
+ return """🚀 <b>صفقات التنفيذ</b>
+<code>/help_execution</code>
+
+• <b>التنفيذ المفتوح</b>
+/report_execution
+/report_execution_today
+/report_execution_7d
+
+• <b>أرباح التنفيذ</b>
+/report_execution_profit
+/report_execution_profit_today
+/report_execution_profit_7d
+
+• <b>خسائر التنفيذ</b>
+/report_execution_losses
+/report_execution_losses_today
+/report_execution_losses_7d
+
+• <b>أداء التنفيذ</b>
+/report_execution_analysis
+/report_execution_setups
+/report_execution_exits
+
+• <b>تشخيص التنفيذ</b>
+/report_execution_diagnostics"""
+
+
+def build_help_normal_message() -> str:
+ return """📊 <b>الصفقات العادية</b>
+<code>/help_normal</code>
+
+• <b>الصفقات المفتوحة</b>
+/open_trades
+
+• <b>التقارير العامة</b>
+/report_all
+/report_today
+/report_7d
+
+• <b>الأرباح</b>
+/report_profit
+/report_profit_today
+/report_profit_7d
+
+• <b>الخسائر</b>
+/report_losses
+/report_losses_today
+/report_losses_7d
+
+• <b>الأداء والتحليل</b>
+/report_exits
+/report_setups
+/report_scores
+/report_market"""
+
+
+def build_help_diagnostics_message() -> str:
+ return """🧠 <b>التشخيص والتحليل</b>
+<code>/diagnostics</code>
+
+/report_deep
+/report_diagnostics
+/report_rejections
+/report_filters
+/report_market_guard
+/report_mode_history
+/report_top_setups
+/report_recovery"""
+
+
+def build_help_okx_message() -> str:
+ return """🤖 <b>التنفيذ و OKX</b>
+<code>/okx_execution</code>
+
+• <b>حالة التنفيذ</b>
+/execution_status
+/execution_mode
+/positions
+/open_orders
+
+• <b>التحكم</b>
+/stop_trading
+/resume_trading
+
+• <b>إدارة الصفقات</b>
+/cancel_all
+/close_all
+
+• <b>معلومات النظام</b>
+/max_positions
+/daily_dd"""
+
+
+def build_help_admin_message() -> str:
+ return """⚙️ <b>الإدارة</b>
+<code>/admin_help</code>
+
+/status
+/ping
+/restart
+/reload
+/clear_cache
+/reset_reports
+/hard_reset"""
+
+
+def build_help_info_message() -> str:
+ return """📘 <b>معلومات النظام</b>
+
+/how_it_work
+/version
+/changelog
+/about"""
 
 def build_how_it_work_message() -> str:
  return """📘 <b>كيف يعمل بوت اللونج؟</b>
@@ -2846,9 +3044,15 @@ def build_market_status_message() -> str:
 
 
 def is_strong_exception(candidate: dict) -> bool:
-    """Allow only very strong / relatively strong coins during BLOCK_LONGS."""
+    """Allow only very strong / relatively strong coins during BLOCK_LONGS.
+
+    v204: use canonical execution_setup_tags first, then fall back to setup_type
+    text for backward compatibility.
+    """
     try:
+        candidate = _ensure_execution_setup_tags(candidate or {})
         setup_type = str(candidate.get("setup_type", "") or "")
+        tags = set(_collect_execution_setup_tags(candidate))
         score = float(candidate.get("effective_score", candidate.get("score", 0.0)) or 0.0)
         vol_ratio = float(candidate.get("vol_ratio", 0.0) or 0.0)
         mtf = bool(candidate.get("mtf_confirmed", False))
@@ -2858,15 +3062,21 @@ def is_strong_exception(candidate: dict) -> bool:
             relative_strength_short >= 1.5
             or relative_strength_24 >= 2.0
             or bool(candidate.get("relative_strength_vs_btc", False))
+            or "relative_strength_vs_btc" in tags
         )
+        strong_tag_names = {
+            "vwap_reclaim",
+            "retest_breakout_confirmed",
+            "wave_3",
+            "liquidity_sweep_reclaim",
+            "support_bounce_confirmed",
+            "higher_low_continuation",
+            "failed_breakdown_trap",
+        }
         strong_setup = (
-            "vwap_reclaim" in setup_type
-            or "retest_breakout_confirmed" in setup_type
-            or "wave_3" in setup_type
-            or "liquidity_sweep_reclaim" in setup_type
-            or "support_bounce_confirmed" in setup_type
-            or "higher_low_continuation" in setup_type
+            bool(tags.intersection(strong_tag_names))
             or "breakout|mtf_yes|vol_high" in setup_type
+            or any(tag in setup_type for tag in strong_tag_names)
         )
         return (
             strong_setup
@@ -4416,23 +4626,40 @@ def build_exec_resume_message() -> str:
 def _send_open_trades(chat_id: str):
  try:
     msg = build_open_trades_message()
-    if len(msg) <= 4000:
-        send_telegram_reply(chat_id, msg)
-        return
-    import re
-    parts = re.split(r'(?=\n\d️⃣)', msg)
-    chunk = parts[0]
-    for part in parts[1:]:
-        if len(chunk) + len(part) <= 4000:
-            chunk += part
-        else:
-            send_telegram_reply(chat_id, chunk)
-            chunk = part
-    if chunk:
-        send_telegram_reply(chat_id, chunk)
+    chunks = split_open_trades_dashboard_message(msg, limit=3600)
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        final_chunk = chunk
+        if total > 1:
+            final_chunk = f"{chunk}\n\n📨 <b>جزء {idx}/{total}</b>"
+        send_telegram_reply(chat_id, final_chunk)
+        time.sleep(0.20)
  except Exception as e:
     logger.error(f"_send_open_trades error: {e}", exc_info=True)
     send_telegram_reply(chat_id, f"❌ خطأ في جلب الصفقات: {html.escape(str(e))}")
+
+
+def _build_open_trades_report_context() -> dict:
+    try:
+        snapshot = load_market_status_snapshot(max_age_seconds=600) or {}
+        current_mode = normalize_market_mode(
+            snapshot.get("current_mode") or (r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG) or MODE_NORMAL_LONG
+        )
+        btc_mode = snapshot.get("btc_mode", "")
+        alt_snapshot = snapshot.get("alt_snapshot", {}) or {}
+        alt_mode = alt_snapshot.get("alt_mode", "")
+        market_info = snapshot.get("market_info", {}) or {}
+        market_state_label = market_info.get("market_state_label", "")
+        market_bias_label = market_info.get("market_bias_label", "")
+        drift = get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
+        execution_status = "PAUSED" if bool(r and r.exists(EXECUTION_PAUSE_KEY)) else "ACTIVE"
+        return {
+            "market_mode": current_mode,
+            "weak_drift": drift.get("label", "Weak Drift: OFF"),
+            "execution_status": execution_status,
+        }
+    except Exception:
+        return {"market_mode": MODE_NORMAL_LONG, "weak_drift": "Weak Drift: OFF", "execution_status": "UNKNOWN"}
 
 
 def build_open_trades_message() -> str:
@@ -4440,14 +4667,33 @@ def build_open_trades_message() -> str:
     if not r:
         return "❌ لا يوجد اتصال بقاعدة البيانات"
     trades = get_open_trades_summary(r, market_type="futures", side="long")
-    return format_open_trades_message(trades, side="long")
+    ctx = _build_open_trades_report_context()
+    return format_open_trades_message(
+        trades,
+        side="long",
+        market_mode=ctx.get("market_mode"),
+        weak_drift=ctx.get("weak_drift"),
+        execution_status=ctx.get("execution_status"),
+    )
  except Exception as e:
     logger.error(f"build_open_trades_message error: {e}", exc_info=True)
     return f"❌ خطأ في جلب الصفقات المفتوحة: {html.escape(str(e))}"
 
 
 COMMAND_HANDLERS = {
- "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message()),
+ "/help": lambda chat_id: send_telegram_reply(chat_id, build_help_message(), reply_markup=build_help_inline_keyboard()),
+ "/start": lambda chat_id: send_telegram_reply(chat_id, build_help_message(), reply_markup=build_help_inline_keyboard()),
+ "/help_execution": lambda chat_id: send_telegram_reply(chat_id, build_help_execution_message()),
+ "/execution_reports": lambda chat_id: send_telegram_reply(chat_id, build_help_execution_message()),
+ "/help_normal": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
+ "/normal_reports": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
+ "/diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
+ "/help_analysis": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
+ "/okx_execution": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
+ "/help_okx": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
+ "/admin_help": lambda chat_id: send_telegram_reply(chat_id, build_help_admin_message()),
+ "/help_admin": lambda chat_id: send_telegram_reply(chat_id, build_help_admin_message()),
+ "/system_info": lambda chat_id: send_telegram_reply(chat_id, build_help_info_message()),
  "/mood": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
@@ -4473,6 +4719,20 @@ COMMAND_HANDLERS = {
  "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
  "/report_execution_losses": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_guard": lambda chat_id: send_telegram_reply(chat_id, build_execution_guard_report_message()),
+ "/report_execution_profit": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
+ "/report_execution_profit_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
+ "/report_execution_profit_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
+ "/report_execution_losses_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_losses_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
+ "/report_execution_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
+ "/report_execution_exits": lambda chat_id: send_telegram_reply(chat_id, build_exits_report_message()),
+ "/report_execution_diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_full_diagnostics_report(r, market_type="futures", side="long", period="all")),
+ "/report_profit": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
+ "/report_profit_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
+ "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+ "/report_losses_today": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="today")),
+ "/report_losses_7d": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="7d")),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
  "/report_market": lambda chat_id: send_telegram_reply(chat_id, build_market_report(r, market_type="futures", side="long", period="all")),
  "/report_losses": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
@@ -5319,6 +5579,25 @@ def handle_callback_query(callback_query: dict):
     message = callback_query.get("message") or {}
     message_id = str(message.get("message_id", ""))
     chat_id = str((message.get("chat") or {}).get("id", "") or "")
+    if data.startswith("help:"):
+        section = data.split(":", 1)[1].strip().lower()
+        answer_callback_query(callback_id, "فتح القسم")
+        if not chat_id:
+            return
+        section_map = {
+            "execution": build_help_execution_message,
+            "normal": build_help_normal_message,
+            "diagnostics": build_help_diagnostics_message,
+            "okx": build_help_okx_message,
+            "admin": build_help_admin_message,
+            "info": build_help_info_message,
+        }
+        builder = section_map.get(section)
+        if builder:
+            send_telegram_reply(chat_id, builder())
+        else:
+            send_telegram_reply(chat_id, build_help_message(), reply_markup=build_help_inline_keyboard())
+        return
     if not data.startswith("track_long:"):
         answer_callback_query(callback_id, "زر غير مدعوم")
         return
