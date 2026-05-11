@@ -118,7 +118,50 @@ def _fmt(value) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
-def build_execution_preview_message(order: dict, setup_type: str, order_id: str) -> str:
+
+
+def _slot_lines(decision: dict) -> list:
+    try:
+        active = int(decision.get("active_count", 0) or 0)
+        max_pos = int(decision.get("max_positions", 0) or 0)
+        remaining = int(decision.get("remaining_slots", max(0, max_pos - active)) or 0)
+        plan = decision.get("position_plan", {}) or {}
+        margin = plan.get("margin_per_trade")
+        capital = plan.get("max_capital_in_use")
+        lines = [
+            f"📊 <b>حد الصفقات:</b> {_fmt(max_pos)}",
+            f"📂 <b>المفتوح المحسوب:</b> {_fmt(active)}",
+            f"✅ <b>المتبقي:</b> {_fmt(remaining)}",
+        ]
+        if margin is not None and capital is not None:
+            lines.append(f"💰 <b>Capital:</b> {_fmt(capital)}$ | <b>Margin/Trade:</b> {_fmt(margin)}$")
+        return lines
+    except Exception:
+        return []
+
+
+def build_execution_rejected_message(symbol: str, decision: dict, setup_type: str = "") -> str:
+    reason = str((decision or {}).get("reason") or "")
+    if reason == "max_positions_reached":
+        reason_ar = "تم الوصول للحد الأقصى للصفقات"
+    elif reason == "same_symbol_open":
+        reason_ar = "توجد صفقة تنفيذ مفتوحة لنفس الزوج قبل TP2"
+    else:
+        reason_ar = html.escape(reason or "execution_rejected")
+    return "\n".join([
+        "⚠️ <b>Execution Candidate Rejected</b>",
+        "━━━━━━━━━━━━",
+        "",
+        f"🪙 <b>{_fmt(symbol)}</b>",
+        f"🧠 <b>Setup:</b> {_fmt(setup_type)}",
+        f"❌ <b>السبب:</b> {reason_ar}",
+        "",
+        *_slot_lines(decision or {}),
+        "",
+        "ℹ️ TP2 protected runners لا تُحسب ضمن الحد.",
+    ])
+
+def build_execution_preview_message(order: dict, setup_type: str, order_id: str, decision: dict = None) -> str:
     tp_plan = order.get("tp_plan", {}) or {}
 
     return "\n".join([
@@ -137,13 +180,16 @@ def build_execution_preview_message(order: dict, setup_type: str, order_id: str)
         f"🎯 <b>TP2:</b> {_fmt(order.get('tp2'))} | إغلاق {_fmt(tp_plan.get('tp2_close_pct'))}%",
         f"🏃 <b>Trailing:</b> {_fmt(tp_plan.get('trailing_position_pct'))}% | {_fmt(tp_plan.get('trailing_pct'))}%",
         "",
-        "🔒 <b>بعد TP1:</b> SL → Entry",
+        "🔒 <b>TP1:</b> إغلاق 40% فقط — SL لا يتحرك",
+        "🛡 <b>TP2:</b> إغلاق 40% + SL → TP1 + Trailing 20%",
+        "",
+        *(_slot_lines(decision or {})),
         "",
         "⚠️ <b>Simulation فقط - لم يتم إرسال أمر حقيقي إلى OKX</b>",
     ])
 
 
-def build_pending_pullback_message(order: dict, setup_type: str, order_id: str) -> str:
+def build_pending_pullback_message(order: dict, setup_type: str, order_id: str, decision: dict = None) -> str:
     tp_plan = order.get("tp_plan", {}) or {}
 
     return "\n".join([
@@ -166,6 +212,10 @@ def build_pending_pullback_message(order: dict, setup_type: str, order_id: str) 
         "",
         "⏳ <b>لن يتم تنفيذ Market الآن.</b>",
         "✅ سيتم انتظار السعر داخل منطقة Pullback.",
+        "🔒 <b>TP1:</b> إغلاق 40% فقط — SL لا يتحرك",
+        "🛡 <b>TP2:</b> إغلاق 40% + SL → TP1 + Trailing 20%",
+        "",
+        *(_slot_lines(decision or {})),
         "",
         "⚠️ <b>Simulation فقط - لم يتم إرسال أمر حقيقي إلى OKX</b>",
     ])
@@ -199,10 +249,16 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
     decision = can_execute_trade(redis_client, symbol, candidate)
 
     if not decision.get("allowed"):
+        rejection_message = build_execution_rejected_message(symbol, decision, setup_decision.get("setup_type"))
         return {
             "status": "rejected",
             "reason": decision.get("reason"),
             "setup_type": setup_decision.get("setup_type"),
+            "active_count": decision.get("active_count"),
+            "max_positions": decision.get("max_positions"),
+            "remaining_slots": decision.get("remaining_slots"),
+            "position_plan": decision.get("position_plan"),
+            "execution_message": rejection_message,
         }
 
     # 3) Build order preview
@@ -238,6 +294,13 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "original_tp1": order.get("original_tp1"),
         "block_longs_tp1_adjusted": order.get("block_longs_tp1_adjusted", False),
         "tp2": order.get("tp2"),
+        "tp1_close_pct": order.get("tp_plan", {}).get("tp1_close_pct"),
+        "tp2_close_pct": order.get("tp_plan", {}).get("tp2_close_pct"),
+        "trailing_pct": order.get("tp_plan", {}).get("trailing_pct"),
+        "trailing_position_pct": order.get("tp_plan", {}).get("trailing_position_pct"),
+        "slot_active_count": decision.get("active_count"),
+        "slot_max_positions": decision.get("max_positions"),
+        "slot_remaining": decision.get("remaining_slots"),
         "created_ts": int(time.time()),
     }
 
@@ -270,12 +333,14 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
             order,
             setup_decision.get("setup_type"),
             order_id,
+            decision,
         )
     else:
         execution_message = build_execution_preview_message(
             order,
             setup_decision.get("setup_type"),
             order_id,
+            decision,
         )
 
     return {
@@ -285,4 +350,8 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "setup_type": setup_decision.get("setup_type"),
         "entry_mode": order.get("entry_mode", "market"),
         "execution_message": execution_message,
+        "active_count": decision.get("active_count"),
+        "max_positions": decision.get("max_positions"),
+        "remaining_slots": decision.get("remaining_slots"),
+        "position_plan": decision.get("position_plan"),
     }
