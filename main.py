@@ -1,4 +1,4 @@
-# Version: main_v204_help_open_trades_integration_fix.py
+# Version: main_v205_execution_help_signal_ui_whitelist.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
 # Changes: Help UI + open-trades integration fix; dashboard splitter; strong-exception reads unified execution_setup_tags.
@@ -1952,58 +1952,143 @@ def build_help_execution_message() -> str:
  return """🚀 <b>صفقات التنفيذ</b>
 <code>/help_execution</code>
 
-• <b>التنفيذ المفتوح</b>
+━━━━━━━━━━━━━━
+
+📊 <b>التقرير العام</b>
+يعرض كل صفقات التنفيذ:
+المفتوحة + المغلقة + الأداء العام
+
 /report_execution
+/report_execution_1h
 /report_execution_today
 /report_execution_7d
 
-• <b>أرباح التنفيذ</b>
-/report_execution_profit
-/report_execution_profit_today
-/report_execution_profit_7d
+━━━━━━━━━━━━━━
 
-• <b>خسائر التنفيذ</b>
-/report_execution_losses
-/report_execution_losses_today
-/report_execution_losses_7d
+📂 <b>الصفقات المفتوحة فقط</b>
+يعرض الصفقات النشطة الحالية فقط
 
-• <b>أداء التنفيذ</b>
+/report_execution_open
+/report_execution_open_1h
+/report_execution_open_today
+/report_execution_open_7d
+
+━━━━━━━━━━━━━━
+
+📈 <b>تحليل الأرباح</b>
+تحليل أسباب وأفضل عوامل الربح
+
+/report_execution_profit_analysis
+/report_execution_profit_analysis_1h
+/report_execution_profit_analysis_today
+/report_execution_profit_analysis_7d
+
+━━━━━━━━━━━━━━
+
+📉 <b>تحليل الخسائر</b>
+تحليل أسباب الخسائر والمشاكل المتكررة
+
+/report_execution_losses_analysis
+/report_execution_losses_analysis_1h
+/report_execution_losses_analysis_today
+/report_execution_losses_analysis_7d
+
+━━━━━━━━━━━━━━
+
+⚙️ <b>أداء التنفيذ</b>
+
 /report_execution_analysis
+↳ قراءة عامة لأداء المرشحين
+
 /report_execution_setups
+↳ مقارنة أداء أنواع الفرص
+
 /report_execution_exits
+↳ تحليل TP1 / TP2 / SL / Trailing
 
-• <b>تشخيص التنفيذ</b>
-/report_execution_diagnostics"""
+━━━━━━━━━━━━━━
 
+🧠 <b>تشخيص التنفيذ</b>
+
+/report_execution_diagnostics
+↳ تشخيص شامل للتنفيذ والفلترة"""
 
 def build_help_normal_message() -> str:
  return """📊 <b>الصفقات العادية</b>
 <code>/help_normal</code>
 
-• <b>الصفقات المفتوحة</b>
-/open_trades
+━━━━━━━━━━━━━━
 
-• <b>التقارير العامة</b>
+📊 <b>التقرير العام</b>
+يعرض كل الصفقات:
+المفتوحة + المغلقة + الأداء العام
+
 /report_all
+/report_1h
 /report_today
 /report_7d
 
-• <b>الأرباح</b>
-/report_profit
-/report_profit_today
-/report_profit_7d
+━━━━━━━━━━━━━━
 
-• <b>الخسائر</b>
-/report_losses
-/report_losses_today
-/report_losses_7d
+📂 <b>الصفقات المفتوحة فقط</b>
+يعرض الصفقات النشطة الحالية فقط
 
-• <b>الأداء والتحليل</b>
-/report_exits
+/open_trades
+/open_trades_1h
+/open_trades_today
+/open_trades_7d
+
+━━━━━━━━━━━━━━
+
+📈 <b>تحليل الأرباح</b>
+تحليل أسباب وأفضل عوامل الربح
+
+/report_profit_analysis
+/report_profit_analysis_1h
+/report_profit_analysis_today
+/report_profit_analysis_7d
+
+━━━━━━━━━━━━━━
+
+📉 <b>تحليل الخسائر</b>
+تحليل أسباب الخسائر والمشاكل المتكررة
+
+/report_losses_analysis
+/report_losses_analysis_1h
+/report_losses_analysis_today
+/report_losses_analysis_7d
+
+━━━━━━━━━━━━━━
+
+⚙️ <b>أداء الصفقات</b>
+
 /report_setups
-/report_scores
-/report_market"""
+↳ مقارنة أداء أنواع الفرص
 
+/report_scores
+↳ تحليل السكور وجودة الإشارات
+
+/report_exits
+↳ تحليل TP1 / TP2 / SL / Trailing
+
+/report_market
+↳ أداء السوق وتأثير المودات
+
+━━━━━━━━━━━━━━
+
+🧠 <b>التشخيص والتحليل</b>
+
+/report_deep
+↳ تحليل شامل للبوت والسوق
+
+/report_diagnostics
+↳ تشخيص كامل للإشارات والتتبع
+
+/report_rejections
+↳ تحليل أسباب رفض الإشارات
+
+/report_filters
+↳ تأثير الفلاتر والخصومات"""
 
 def build_help_diagnostics_message() -> str:
  return """🧠 <b>التشخيص والتحليل</b>
@@ -3141,6 +3226,12 @@ except Exception:
         "relative_strength_vs_btc",
     }
 
+# v205: keep main/executor whitelist aligned with the execution tag system.
+EXECUTION_SETUP_WHITELIST = set(EXECUTION_SETUP_WHITELIST) | {
+    "higher_low_continuation",
+    "support_bounce_confirmed",
+    "failed_breakdown_trap",
+}
 EXECUTION_WHITELIST_KEYWORDS = tuple(EXECUTION_SETUP_WHITELIST)
 
 # NORMAL_LONG-only execution gate expansion.
@@ -3993,6 +4084,60 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
     return lines
 
 
+def build_execution_open_report_message(period: str = "all") -> str:
+    """Open-only report for execution-candidate trades.
+
+    This is a UI/report helper only; it does not alter tracking or execution logic.
+    """
+    try:
+        since_ts = _execution_report_since_ts(period)
+        try:
+            trades = load_all_trades_for_report(
+                r, market_type="futures", side="long", since_ts=since_ts, include_open=True
+            )
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1500)
+            if since_ts:
+                trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+        trades = [t for t in trades if is_execution_candidate_trade(t) and _is_execution_trade_open(t)]
+        trades.sort(key=_trade_created_ts_for_exec, reverse=True)
+        title_map = {
+            "all": "منذ البداية",
+            "1h": "آخر ساعة",
+            "hour": "آخر ساعة",
+            "today": "آخر يوم",
+            "7d": "آخر 7 أيام",
+            "30d": "آخر 30 يوم",
+            "month": "آخر 30 يوم",
+        }
+        title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
+        if not trades:
+            return f"📭 لا توجد صفقات تنفيذ مفتوحة ({html.escape(title_period)})."
+        pnls = [p for p in (_execution_floating_pnl_pct(t) for t in trades) if p is not None]
+        winners = sum(1 for p in pnls if p > 0)
+        losers = sum(1 for p in pnls if p < 0)
+        net = sum(pnls) if pnls else 0.0
+        lines = [
+            f"🚀 <b>صفقات التنفيذ المفتوحة</b> — {html.escape(title_period)}",
+            "",
+            "📌 <b>Executive Summary</b>",
+            f"• المفتوحة: {len(trades)}",
+            f"• الرابحة الآن: {winners} | الخاسرة الآن: {losers}",
+            f"• Net Floating PnL 40/40/20: {_pct_safe(net)}",
+            "",
+            "━━━━━━━━━━━━━━",
+        ]
+        for trade in trades[:12]:
+            lines.extend(_format_execution_trade_card(trade, is_open=True))
+            lines.append("━━━━━━━━━━━━━━")
+        if len(trades) > 12:
+            lines.append(f"… وتم إخفاء {len(trades) - 12} صفقة لتقليل طول التقرير")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"build_execution_open_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير صفقات التنفيذ المفتوحة: {html.escape(str(e))}"
+
+
 def build_execution_report_message(period: str = "all") -> str:
     """Final execution-candidates report: compact wallet impact + behavior analytics."""
     try:
@@ -4717,6 +4862,18 @@ COMMAND_HANDLERS = {
  "/report_execution_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
  "/report_execution_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
  "/report_execution_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("30d"))),
+ "/report_execution_open": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("all"))),
+ "/report_execution_open_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("1h"))),
+ "/report_execution_open_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("today"))),
+ "/report_execution_open_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("7d"))),
+ "/report_execution_profit_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
+ "/report_execution_profit_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("1h"))),
+ "/report_execution_profit_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
+ "/report_execution_profit_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
+ "/report_execution_losses_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_losses_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_losses_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_losses_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_losses": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_guard": lambda chat_id: send_telegram_reply(chat_id, build_execution_guard_report_message()),
  "/report_execution_profit": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
@@ -4731,6 +4888,17 @@ COMMAND_HANDLERS = {
  "/report_profit": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_profit_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
  "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+ "/open_trades_1h": lambda chat_id: _send_open_trades(chat_id),
+ "/open_trades_today": lambda chat_id: _send_open_trades(chat_id),
+ "/open_trades_7d": lambda chat_id: _send_open_trades(chat_id),
+ "/report_profit_analysis": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
+ "/report_profit_analysis_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
+ "/report_profit_analysis_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
+ "/report_profit_analysis_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+ "/report_losses_analysis": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
+ "/report_losses_analysis_1h": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="1h")),
+ "/report_losses_analysis_today": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="today")),
+ "/report_losses_analysis_7d": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="7d")),
  "/report_losses_today": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="today")),
  "/report_losses_7d": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="7d")),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
@@ -8640,8 +8808,12 @@ def build_execution_badge_line(candidate: dict) -> str:
     if not is_candidate_for_execution(candidate):
         return ""
     return (
-        "🚀🔥 <b>مرشحة للتنفيذ التجريبي</b> 🔥🚀\n"
-        "⚡ <b>Execution Candidate</b>"
+        "🚀🔥 <b>EXECUTION PRIORITY</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "🔥 <b>فرصة مرشحة للتنفيذ التجريبي</b>\n"
+        "✅ <b>Whitelist ACTIVE</b>\n"
+        "🧠 <b>Quality Filters: PASS</b>\n"
+        "⚡ <b>جاهزة لمعاينة التنفيذ</b>"
     )
 
 
@@ -8821,7 +8993,10 @@ def build_message(
  else:
     price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
 
- return f"""{header_block}🚀 <b>لونج فيوتشر | {safe_symbol}</b>
+ return f"""{header_block}📈 <b>LONG SIGNAL</b>
+━━━━━━━━━━━━━━━━
+
+🚀 <b>لونج فيوتشر | {safe_symbol}</b>
 {price_line}
 ⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
 🏷 <b>التصنيف:</b> {safe_rating}
@@ -14112,6 +14287,9 @@ def run_scanner_loop():
                     candidate["execution_status"] = "not_candidate"
                     candidate.setdefault("execution_reject_reason", "no_execution_badge")
                 if badge:
+                    # Execution candidates have their own premium hero header;
+                    # remove the calmer normal-signal header to avoid visual duplication.
+                    message = message.replace("📈 <b>LONG SIGNAL</b>\n━━━━━━━━━━━━━━━━\n\n", "", 1)
                     message = badge + "\n\n" + message
 
                 sent_data = send_telegram_message(
