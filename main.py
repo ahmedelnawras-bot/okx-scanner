@@ -1870,10 +1870,13 @@ def build_dynamic_help_note() -> str:
     )
 
 def build_help_message() -> str:
- return """🚀 <b>OKX Scanner</b>
+ mode = _get_current_market_mode_for_help()
+ mode_icon = _market_mode_icon_for_help(mode)
+ execution_status = _get_execution_status_value_for_help()
+ protection = _get_protection_status_for_help()
+ return f"""🚀 <b>OKX Scanner</b>
 <b>Trading Command Center</b>
-
-━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━
 
 ⚡ <b>Quick Access</b>
 /mood
@@ -1881,26 +1884,19 @@ def build_help_message() -> str:
 /open_trades
 /help
 
-━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━
+🧭 <b>System Status</b>
 
-🎛 <b>Select Module from the buttons below</b>
+📈 Market Mode: {mode_icon} <code>{html.escape(mode)}</code>
+⚡ Execution Engine: <code>{html.escape(execution_status)}</code>
+🛡 Risk Protection: <code>{html.escape(protection)}</code>
 
-🟢 <b>Mode:</b> <code>{mode}</code>
-{execution_line}
-🛡 <b>Protection:</b> <code>{protection}</code>
-
-━━━━━━━━━━━━━━━━
-
+━━━━━━━━━━━━
 📝 <b>ملاحظات</b>
 • الأزرار بالأسفل تفتح أقسام الأوامر مباشرة.
 • /open_trades يعرض كل الصفقات المتابعة.
 • /report_execution خاص بصفقات التنفيذ / المرشحة.
-• أوامر OKX تعتمد على وضع التنفيذ الحالي.""".format(
-    mode=html.escape(_get_current_market_mode_for_help()),
-    execution_line=html.escape(_get_execution_status_line_for_help()),
-    protection=html.escape(_get_protection_status_for_help()),
- )
-
+• أوامر OKX تعتمد على وضع التنفيذ الحالي."""
 
 def build_help_inline_keyboard() -> dict:
  return {
@@ -1930,12 +1926,25 @@ def _get_current_market_mode_for_help() -> str:
  return MODE_NORMAL_LONG
 
 
-def _get_execution_status_line_for_help() -> str:
+def _market_mode_icon_for_help(mode: str) -> str:
+    mode = normalize_market_mode(mode or MODE_NORMAL_LONG)
+    if mode == MODE_NORMAL_LONG:
+        return "🟢"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "🟡"
+    if mode == MODE_BLOCK_LONGS:
+        return "🔴"
+    if mode == MODE_RECOVERY_LONG:
+        return "🔵"
+    return "⚪"
+
+
+def _get_execution_status_value_for_help() -> str:
  try:
     paused = bool(r and r.exists(EXECUTION_PAUSE_KEY))
-    return "🔴 Execution: PAUSED" if paused else "🟢 Execution: ACTIVE"
+    return "PAUSED" if paused else "ACTIVE"
  except Exception:
-    return "🟡 Execution: UNKNOWN"
+    return "UNKNOWN"
 
 
 def _get_protection_status_for_help() -> str:
@@ -1951,7 +1960,7 @@ def _get_protection_status_for_help() -> str:
 def build_help_execution_message() -> str:
  return """🚀 <b>صفقات التنفيذ</b>
 📘 <code>/help_execution</code>
-┄┄┄┄┄┄┄┄
+━━━━━━━━━━━━
 
 📊 <b>التقرير العام</b>
 /report_execution
@@ -1965,13 +1974,17 @@ def build_help_execution_message() -> str:
 /report_execution_open_today
 /report_execution_open_7d
 
-📈 <b>تحليل الأرباح</b>
+📈 <b>تحليل أسباب الأرباح</b>
 /report_execution_profit_analysis
+/report_execution_profit_analysis_1h
 /report_execution_profit_analysis_today
+/report_execution_profit_analysis_7d
 
-📉 <b>تحليل الخسائر</b>
+📉 <b>تحليل أسباب الخسائر</b>
 /report_execution_losses_analysis
+/report_execution_losses_analysis_1h
 /report_execution_losses_analysis_today
+/report_execution_losses_analysis_7d
 
 ⚙️ <b>أداء التنفيذ</b>
 /report_execution_analysis
@@ -1984,7 +1997,7 @@ def build_help_execution_message() -> str:
 def build_help_normal_message() -> str:
  return """📊 <b>الصفقات العادية</b>
 📘 <code>/help_normal</code>
-┄┄┄┄┄┄┄┄
+━━━━━━━━━━━━
 
 📊 <b>التقرير العام</b>
 /report_all
@@ -1998,13 +2011,17 @@ def build_help_normal_message() -> str:
 /open_trades_today
 /open_trades_7d
 
-📈 <b>تحليل الأرباح</b>
+📈 <b>تحليل أسباب الأرباح</b>
 /report_profit_analysis
+/report_profit_analysis_1h
 /report_profit_analysis_today
+/report_profit_analysis_7d
 
-📉 <b>تحليل الخسائر</b>
+📉 <b>تحليل أسباب الخسائر</b>
 /report_losses_analysis
+/report_losses_analysis_1h
 /report_losses_analysis_today
+/report_losses_analysis_7d
 
 ⚙️ <b>أداء الصفقات</b>
 /report_setups
@@ -2034,26 +2051,26 @@ def build_help_diagnostics_message() -> str:
 
 def build_help_okx_message() -> str:
  return """🤖 <b>التنفيذ و OKX</b>
-<code>/okx_execution</code>
+📘 <code>/okx_execution</code>
+━━━━━━━━━━━━
 
-• <b>حالة التنفيذ</b>
-/execution_status
-/execution_mode
-/positions
-/open_orders
+📊 <b>حالة التنفيذ</b>
+/execution_status — حالة محرك التنفيذ
+/execution_mode — وضع التنفيذ الحالي
+/positions — المراكز المفتوحة على OKX
+/open_orders — الأوامر المفتوحة
 
-• <b>التحكم</b>
-/stop_trading
-/resume_trading
+⚙️ <b>التحكم</b>
+/stop_trading — إيقاف فتح صفقات جديدة
+/resume_trading — استئناف التنفيذ
 
-• <b>إدارة الصفقات</b>
-/cancel_all
-/close_all
+🧹 <b>إدارة الصفقات</b>
+/cancel_all — إلغاء كل الأوامر المفتوحة
+/close_all — إغلاق كل المراكز المفتوحة ⚠️
 
-• <b>معلومات النظام</b>
-/max_positions
-/daily_dd"""
-
+🛡 <b>معلومات النظام</b>
+/max_positions — الحد الأقصى للصفقات
+/daily_dd — حد الخسارة اليومي"""
 
 def build_help_admin_message() -> str:
  return """⚙️ <b>الإدارة</b>
@@ -4390,17 +4407,16 @@ def build_execution_report_message(period: str = "all") -> str:
         floating_icon = "🟢" if floating_net_usd >= 0 else "🔴"
 
         lines = [
-            "🚀 <b>تقرير أداء صفقات التنفيذ</b>",
+            "🚀 <b>تقرير أداء التنفيذ</b>",
             f"📅 {html.escape(title_period)}",
-            "┄┄┄┄┄┄┄┄┄┄",
+            "━━━━━━━━━━━━",
+            "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
             "",
             "📊 <b>Quick Stats</b>",
             f"• Candidates: {len(trades)}",
             f"• Open: {len(open_trades)}",
             f"• Closed: {len(closed_trades)}",
-            "",
-            "🏆 <b>Win Rate</b>",
-            f"<b>{win_rate:.1f}%</b>",
+            f"🏆 Win Rate: <b>{win_rate:.1f}%</b>",
             "",
             f"🟢 Winners: {len(winners_pairs)}",
             f"🔴 Losers: {len(losers_pairs)}",
@@ -4410,19 +4426,25 @@ def build_execution_report_message(period: str = "all") -> str:
             "",
             "✅ <b>الصفقات المغلقة</b>",
             "📈 الأرباح",
-            f"{money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
+            f"{money(realized_profit_usd)}",
+            f"{exposure(realized_profit_pct)}",
             "📉 الخسائر",
-            f"{money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
+            f"{money(realized_loss_usd)}",
+            f"{exposure(realized_loss_pct)}",
             "⚖️ الصافي",
-            f"<b>{net_icon} {money(realized_net_usd)} | {exposure(realized_net_pct)}</b>",
+            f"<b>{net_icon} {money(realized_net_usd)}</b>",
+            f"<b>{exposure(realized_net_pct)}</b>",
             "",
             "🔄 <b>الصفقات المفتوحة</b>",
             "📈 الأرباح العائمة",
-            f"{money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
+            f"{money(floating_profit_usd)}",
+            f"{exposure(floating_profit_pct)}",
             "📉 الخسائر العائمة",
-            f"{money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
+            f"{money(floating_loss_usd)}",
+            f"{exposure(floating_loss_pct)}",
             "⚖️ الصافي العائم",
-            f"<b>{floating_icon} {money(floating_net_usd)} | {exposure(floating_net_pct)}</b>",
+            f"<b>{floating_icon} {money(floating_net_usd)}</b>",
+            f"<b>{exposure(floating_net_pct)}</b>",
             "",
             "💼 <b>التأثير الحالي على المحفظة</b>",
             f"<b>{impact_icon} {money(portfolio_net_usd)}</b>",
@@ -4473,54 +4495,52 @@ def build_execution_report_message(period: str = "all") -> str:
         # Keep winners immediately under the Open Trades header without an additional section break.
         if open_winners_sorted:
             lines.append("")
-            for idx, (trade, pnl) in enumerate(open_winners_sorted[:3]):
+            for idx, (trade, pnl) in enumerate(open_winners_sorted):
                 if idx > 0:
                     lines.append(trade_separator)
                 icon = "🟡" if _execution_trade_reached_tp1_for_display(trade) else "🟢"
                 lines.extend(_trade_card_lines(trade, pnl, icon))
-            if len(open_winners_sorted) > 3:
-                lines.append(f"📂 +{len(open_winners_sorted) - 3} more winning trades...")
+            if False:
+                pass
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
         lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
         if open_losers_sorted:
-            for idx, (trade, pnl) in enumerate(open_losers_sorted[:2]):
+            for idx, (trade, pnl) in enumerate(open_losers_sorted):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🔴"))
-            if len(open_losers_sorted) > 2:
-                lines.append(f"📂 +{len(open_losers_sorted) - 2} more losing trades...")
+            if False:
+                pass
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
         lines.extend(["━━━━━━━━━━━━", "🏆 <b>Closed Winners</b>"])
         if closed_winners_sorted:
-            for idx, (trade, pnl) in enumerate(closed_winners_sorted[:2]):
+            for idx, (trade, pnl) in enumerate(closed_winners_sorted):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🏆", status_text=_execution_close_type_for_trade(trade)))
-            if len(closed_winners_sorted) > 2:
-                lines.append(f"📂 +{len(closed_winners_sorted) - 2} more closed winners...")
+            if False:
+                pass
         else:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
 
         lines.extend(["━━━━━━━━━━━━", "🛑 <b>Closed Losers</b>"])
         if closed_losers_sorted:
-            for idx, (trade, pnl) in enumerate(closed_losers_sorted[:2]):
+            for idx, (trade, pnl) in enumerate(closed_losers_sorted):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🛑", status_text=_execution_close_type_for_trade(trade)))
-            if len(closed_losers_sorted) > 2:
-                lines.append(f"📂 +{len(closed_losers_sorted) - 2} more closed losers...")
+            if False:
+                pass
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
 
         lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
 
         msg = "\n".join(lines).strip()
-        if len(msg) > 7600:
-            msg = msg[:7400].rsplit("\n", 1)[0] + "\n\n⚠️ تم اختصار التقرير للحفاظ على طول مناسب."
         return msg
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
@@ -4564,12 +4584,16 @@ def build_execution_guard_report_message() -> str:
         return f"❌ خطأ في تقرير Execution Guard: {html.escape(str(e))}"
 
 
-def build_execution_losses_report_message() -> str:
+def build_execution_losses_report_message(period: str = "all") -> str:
     try:
+        period = (period or "all").lower()
+        since_ts = _period_since_ts(period)
         try:
-            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=None, include_open=True)
+            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
         except Exception:
             trades = _load_long_trades_from_redis(limit=1500)
+            if since_ts:
+                trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
         trades = [
             t for t in trades
             if is_execution_candidate_trade(t)
