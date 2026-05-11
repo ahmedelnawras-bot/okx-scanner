@@ -3778,6 +3778,82 @@ def _execution_report_since_ts(period: str):
         return now - 30 * 86400
     return None
 
+
+def _format_report_range_label(period: str = "all", trades: list = None, since_ts: int = None) -> str:
+    """Human-readable report period/range for Telegram reports. UI only."""
+    try:
+        period_key = str(period or "all").lower()
+        now_ts = int(time.time())
+        if since_ts is None:
+            since_ts = _execution_report_since_ts(period_key)
+        if period_key in ("1h", "hour"):
+            return f"آخر ساعة | {time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts or now_ts - 3600))} → {time.strftime('%H:%M', time.localtime(now_ts))}"
+        if period_key == "today":
+            return f"اليوم | {time.strftime('%Y-%m-%d', time.localtime(now_ts))}"
+        if period_key in ("7d", "week"):
+            return f"آخر 7 أيام | {time.strftime('%Y-%m-%d', time.localtime(since_ts or now_ts - 7*86400))} → {time.strftime('%Y-%m-%d', time.localtime(now_ts))}"
+        if period_key in ("30d", "month"):
+            return f"آخر 30 يوم | {time.strftime('%Y-%m-%d', time.localtime(since_ts or now_ts - 30*86400))} → {time.strftime('%Y-%m-%d', time.localtime(now_ts))}"
+        # All time: use earliest trade timestamp if available; otherwise keep classic wording.
+        if trades:
+            timestamps = []
+            for item in trades:
+                try:
+                    ts = _trade_created_ts_for_exec(item)
+                    if ts > 0:
+                        timestamps.append(ts)
+                except Exception:
+                    pass
+            if timestamps:
+                return f"منذ البداية | {time.strftime('%Y-%m-%d', time.localtime(min(timestamps)))} → {time.strftime('%Y-%m-%d', time.localtime(now_ts))}"
+        return "منذ البداية"
+    except Exception:
+        return "منذ البداية"
+
+
+def _avg_open_age_for_report(open_items: list) -> str:
+    """Average open trade age used by open-report formatters. UI only."""
+    try:
+        if not open_items:
+            return "0m"
+        now = int(time.time())
+        ages = []
+        for item in open_items:
+            ts = _trade_created_ts_for_exec(item)
+            if ts > 0:
+                ages.append(max(0, now - ts))
+        if not ages:
+            return "0m"
+        avg = int(sum(ages) / len(ages))
+        mins = avg // 60
+        if mins < 60:
+            return f"{mins}m"
+        if mins < 1440:
+            return f"{mins // 60}h {mins % 60}m"
+        return f"{mins // 1440}d {(mins % 1440) // 60}h"
+    except Exception:
+        return "0m"
+
+
+def _append_sampled_trade_cards(lines: list, pairs: list, card_func, icon: str, more_label: str, limit: int = 5, separator: str = "┄┄┄┄┄┄", status_func=None) -> None:
+    """Append representative trade cards only, preserving counters for the rest. UI only."""
+    selected = pairs[:max(0, int(limit or 0))]
+    if not selected:
+        lines.append("لا توجد بيانات حاليًا.")
+        return
+    for idx, pair in enumerate(selected):
+        trade, pnl = pair
+        if idx > 0:
+            lines.append(separator)
+        status_text = status_func(trade) if status_func else None
+        try:
+            lines.extend(card_func(trade, pnl, icon, status_text=status_text))
+        except TypeError:
+            lines.extend(card_func(trade, is_open=True))
+    remaining = len(pairs) - len(selected)
+    if remaining > 0:
+        lines.append(f"📂 +{remaining} {more_label}")
+
 def _format_exec_num(value, decimals=6):
     """Format execution-report prices without hiding micro-price differences.
 
@@ -4061,7 +4137,7 @@ def build_execution_open_report_message(period: str = "all") -> str:
             "30d": "آخر 30 يوم",
             "month": "آخر 30 يوم",
         }
-        title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
+        title_period = _format_report_range_label(period, trades, since_ts)
         if not trades:
             return f"📭 لا توجد صفقات تنفيذ مفتوحة ({html.escape(title_period)})."
 
@@ -4071,15 +4147,15 @@ def build_execution_open_report_message(period: str = "all") -> str:
             pairs.append((t, 0.0 if p is None else float(p)))
         winners = [(t, p) for t, p in pairs if p >= 0]
         losers = [(t, p) for t, p in pairs if p < 0]
-        avg_trade_time = _avg_open_age(trades)
+        avg_trade_time = _avg_open_age_for_report(trades)
         net = sum(p for _, p in pairs)
         win_rate = (len(winners) / len(pairs) * 100.0) if pairs else 0.0
 
         lines = [
             "🚀 <b>صفقات التنفيذ المفتوحة</b>",
             f"📅 {html.escape(title_period)}",
-            "┄┄┄┄┄┄┄┄┄┄",
-            "",
+            "━━━━━━━━━━━━",
+            "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
             "📊 <b>Quick Stats</b>",
             f"• Open: {len(trades)}",
             f"• Winners: {len(winners)}",
@@ -4099,18 +4175,22 @@ def build_execution_open_report_message(period: str = "all") -> str:
         losers_sorted = sorted(losers, key=lambda x: x[1])
         if winners_sorted:
             lines.append("")
-            for idx, (trade, _) in enumerate(winners_sorted):
+            for idx, (trade, _) in enumerate(winners_sorted[:5]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
+            if len(winners_sorted) > 5:
+                lines.append(f"📂 +{len(winners_sorted) - 5} صفقات رابحة مفتوحة أخرى")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
         lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
         if losers_sorted:
-            for idx, (trade, _) in enumerate(losers_sorted):
+            for idx, (trade, _) in enumerate(losers_sorted[:5]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
+            if len(losers_sorted) > 5:
+                lines.append(f"📂 +{len(losers_sorted) - 5} صفقات خاسرة مفتوحة أخرى")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
         lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام 40/40/20"])
@@ -4176,7 +4256,7 @@ def build_execution_report_message(period: str = "all") -> str:
             "30d": "آخر 30 يوم",
             "month": "آخر 30 يوم",
         }
-        title_period = title_map.get(str(period or "all").lower(), "منذ البداية")
+        title_period = _format_report_range_label(period, trades, since_ts)
 
         realized_profit_pct = sum(p for p in closed_pnls if p > 0)
         realized_loss_pct = sum(p for p in closed_pnls if p < 0)
@@ -4411,19 +4491,16 @@ def build_execution_report_message(period: str = "all") -> str:
             f"📅 {html.escape(title_period)}",
             "━━━━━━━━━━━━",
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
-            "",
             "📊 <b>Quick Stats</b>",
             f"• Candidates: {len(trades)}",
             f"• Open: {len(open_trades)}",
             f"• Closed: {len(closed_trades)}",
             f"🏆 Win Rate: <b>{win_rate:.1f}%</b>",
-            "",
             f"🟢 Winners: {len(winners_pairs)}",
             f"🔴 Losers: {len(losers_pairs)}",
             "━━━━━━━━━━━━",
             "💰 <b>Wallet Impact</b>",
             f"📌 رأس المال: {wallet_capital_usd:.0f}$",
-            "",
             "✅ <b>الصفقات المغلقة</b>",
             "📈 الأرباح",
             f"{money(realized_profit_usd)}",
@@ -4434,7 +4511,6 @@ def build_execution_report_message(period: str = "all") -> str:
             "⚖️ الصافي",
             f"<b>{net_icon} {money(realized_net_usd)}</b>",
             f"<b>{exposure(realized_net_pct)}</b>",
-            "",
             "🔄 <b>الصفقات المفتوحة</b>",
             "📈 الأرباح العائمة",
             f"{money(floating_profit_usd)}",
@@ -4445,7 +4521,6 @@ def build_execution_report_message(period: str = "all") -> str:
             "⚖️ الصافي العائم",
             f"<b>{floating_icon} {money(floating_net_usd)}</b>",
             f"<b>{exposure(floating_net_pct)}</b>",
-            "",
             "💼 <b>التأثير الحالي على المحفظة</b>",
             f"<b>{impact_icon} {money(portfolio_net_usd)}</b>",
             "━━━━━━━━━━━━",
@@ -4495,46 +4570,46 @@ def build_execution_report_message(period: str = "all") -> str:
         # Keep winners immediately under the Open Trades header without an additional section break.
         if open_winners_sorted:
             lines.append("")
-            for idx, (trade, pnl) in enumerate(open_winners_sorted):
+            for idx, (trade, pnl) in enumerate(open_winners_sorted[:5]):
                 if idx > 0:
                     lines.append(trade_separator)
                 icon = "🟡" if _execution_trade_reached_tp1_for_display(trade) else "🟢"
                 lines.extend(_trade_card_lines(trade, pnl, icon))
-            if False:
-                pass
+            if len(open_winners_sorted) > 5:
+                lines.append(f"📂 +{len(open_winners_sorted) - 5} صفقات رابحة مفتوحة أخرى")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
         lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
         if open_losers_sorted:
-            for idx, (trade, pnl) in enumerate(open_losers_sorted):
+            for idx, (trade, pnl) in enumerate(open_losers_sorted[:5]):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🔴"))
-            if False:
-                pass
+            if len(open_losers_sorted) > 5:
+                lines.append(f"📂 +{len(open_losers_sorted) - 5} صفقات خاسرة مفتوحة أخرى")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
         lines.extend(["━━━━━━━━━━━━", "🏆 <b>Closed Winners</b>"])
         if closed_winners_sorted:
-            for idx, (trade, pnl) in enumerate(closed_winners_sorted):
+            for idx, (trade, pnl) in enumerate(closed_winners_sorted[:5]):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🏆", status_text=_execution_close_type_for_trade(trade)))
-            if False:
-                pass
+            if len(closed_winners_sorted) > 5:
+                lines.append(f"📂 +{len(closed_winners_sorted) - 5} صفقات رابحة مغلقة أخرى")
         else:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
 
         lines.extend(["━━━━━━━━━━━━", "🛑 <b>Closed Losers</b>"])
         if closed_losers_sorted:
-            for idx, (trade, pnl) in enumerate(closed_losers_sorted):
+            for idx, (trade, pnl) in enumerate(closed_losers_sorted[:5]):
                 if idx > 0:
                     lines.append(trade_separator)
                 lines.extend(_trade_card_lines(trade, pnl, "🛑", status_text=_execution_close_type_for_trade(trade)))
-            if False:
-                pass
+            if len(closed_losers_sorted) > 5:
+                lines.append(f"📂 +{len(closed_losers_sorted) - 5} صفقات خاسرة مغلقة أخرى")
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
 
