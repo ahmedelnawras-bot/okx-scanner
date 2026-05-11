@@ -132,3 +132,90 @@ class OKXTradeClient:
             except Exception:
                 continue
         return count
+
+    def place_algo_stop_loss(
+        self,
+        inst_id: str,
+        side: str,
+        stop_price: float,
+        size: str = "",
+        td_mode: str = "cross",
+        pos_side: str = "long",
+        reduce_only: bool = True,
+    ) -> dict:
+        """Place a reduce-only conditional SL algo order on OKX.
+
+        This is intentionally narrow and defensive. It is used by BLOCK_LONGS
+        protection after tracking decides that a protected SL/trailing floor
+        should be pushed to the platform.
+        """
+        try:
+            inst_id = str(inst_id or "").strip()
+            if not inst_id:
+                return {"ok": False, "code": "missing_inst_id", "msg": "instId is required", "data": []}
+            stop_price = float(stop_price or 0.0)
+            if stop_price <= 0:
+                return {"ok": False, "code": "invalid_stop_price", "msg": "stop price must be positive", "data": []}
+
+            close_side = str(side or "sell").strip().lower()
+            if close_side not in ("buy", "sell"):
+                close_side = "sell"
+
+            body = {
+                "instId": inst_id,
+                "tdMode": str(td_mode or "cross"),
+                "side": close_side,
+                "ordType": "conditional",
+                "slTriggerPx": str(stop_price),
+                "slOrdPx": "-1",
+                "reduceOnly": "true" if reduce_only else "false",
+            }
+            if size:
+                body["sz"] = str(size)
+            if pos_side:
+                body["posSide"] = str(pos_side)
+            return self._request("POST", "/api/v5/trade/order-algo", body=body)
+        except Exception as e:
+            return {"ok": False, "code": "place_algo_stop_loss_error", "msg": str(e), "data": []}
+
+    def protect_long_position_sl(
+        self,
+        inst_id: str,
+        stop_price: float,
+        size: str = "",
+        td_mode: str = "cross",
+        pos_side: str = "long",
+    ) -> dict:
+        """Convenience wrapper for long-position protection.
+
+        For a long, protection exits with side=sell. In simulated OKX mode this
+        still sends to OKX demo if credentials/flag are configured; callers can
+        choose not to call this at all when they want tracking-only behavior.
+        """
+        return self.place_algo_stop_loss(
+            inst_id=inst_id,
+            side="sell",
+            stop_price=stop_price,
+            size=size,
+            td_mode=td_mode,
+            pos_side=pos_side,
+            reduce_only=True,
+        )
+
+    def protect_short_position_sl(
+        self,
+        inst_id: str,
+        stop_price: float,
+        size: str = "",
+        td_mode: str = "cross",
+        pos_side: str = "short",
+    ) -> dict:
+        return self.place_algo_stop_loss(
+            inst_id=inst_id,
+            side="buy",
+            stop_price=stop_price,
+            size=size,
+            td_mode=td_mode,
+            pos_side=pos_side,
+            reduce_only=True,
+        )
