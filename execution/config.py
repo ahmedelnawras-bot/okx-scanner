@@ -44,6 +44,9 @@ EXECUTION_SETUP_WHITELIST = {
     "wave_3",
     "relative_strength_vs_btc",
     "elite_long_opportunity",
+    "higher_low_continuation",
+    "support_bounce_confirmed",
+    "failed_breakdown_trap",
 }
 
 # Backward-compatible names used by older execution files.
