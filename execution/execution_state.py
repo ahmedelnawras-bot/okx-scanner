@@ -83,6 +83,8 @@ def _trade_execution_status(trade: dict) -> str:
 
 
 def _is_protected_after_tp1(trade: dict) -> bool:
+    # Backward-compatible helper only. Under the new lifecycle TP1 alone does
+    # not exempt a trade from slot counting; TP2 runner logic is the source of truth.
     return _boolish(trade.get("tp1_hit")) and _boolish(trade.get("sl_moved_to_entry"))
 
 
@@ -143,15 +145,19 @@ def _load_execution_trades_from_performance(redis_client) -> list:
 
 
 def count_active_execution_trades(redis_client) -> int:
-    """
-    Count active execution trades for the 7-trade limit.
-    Trades that hit TP1 and moved SL to entry are protected and do not count.
+    """Count active execution trades for the dynamic slot limit.
+
+    New lifecycle rule:
+    - TP1 alone still counts as an active risk slot because SL is no longer
+      moved to breakeven at TP1.
+    - TP2 protected runners do NOT count because 80% is closed and the
+      remaining 20% is protected/trailing.
     """
     count = 0
     for trade in _load_execution_trades_from_performance(redis_client):
         if not _is_execution_trade_active(trade):
             continue
-        if _is_protected_after_tp1(trade):
+        if _is_runner_only_after_tp2(trade):
             continue
         count += 1
     return count
