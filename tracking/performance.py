@@ -1,7 +1,7 @@
 # tracking/performance.py
-# Version: performance_v51_open_trades_dashboard_header_fix
+# Version: performance_v56_intelligence_open_dashboard
 # Base: performance_v49_report_command_html_fix
-# Changes: Professional /open_trades dashboard with executive summary and grouped sections.
+# Changes: UI/reporting only: stronger open-trades dashboard summary, compact spacing, smart sampling.
 # Fix: header/version corrected; dashboard context fields are displayed in the report.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -4133,7 +4133,17 @@ def _format_open_trade_compact_card(t: dict, index: int = 0) -> List[str]:
         "failed_breakdown_trap", "liquidity_sweep_reclaim",
     ]
     setup = next((p for p in preferred if p in setup_parts), setup_parts[-1] if setup_parts else "Setup N/A")
-    setup = setup.replace("_", " ").title()
+    mapping = {
+        "vwap_reclaim": "VWAP Reclaim",
+        "retest_breakout_confirmed": "Retest Breakout",
+        "higher_low_continuation": "Higher Low",
+        "relative_strength_vs_btc": "RS vs BTC",
+        "wave_3": "Wave 3",
+        "support_bounce_confirmed": "Support Bounce",
+        "failed_breakdown_trap": "Failed Breakdown Trap",
+        "liquidity_sweep_reclaim": "Liquidity Sweep",
+    }
+    setup = mapping.get(str(setup), setup.replace("_", " ").title())
 
     if phase == "trailing":
         phase_line = "Trailing Active"
@@ -4154,9 +4164,9 @@ def _format_open_trade_compact_card(t: dict, index: int = 0) -> List[str]:
         f"🎯 TP1: {_fmt_price_perf(tp1)} | 🏁 TP2: {_fmt_price_perf(tp2)}",
     ]
     if sl_is_entry:
-        lines.append(f"🛡 SL Entry | ⭐ Score: {score:.2f}")
+        lines.append(f"🛡 SL Entry | ⭐ {score:.2f}")
     else:
-        lines.append(f"🛡 SL: {_fmt_price_perf(sl)} | ⭐ Score: {score:.2f}")
+        lines.append(f"🛡 SL: {_fmt_price_perf(sl)} | ⭐ {score:.2f}")
     lines.append(f"🧠 {setup}")
     if tv_link:
         lines.append(f'🔗 <a href="{tv_link}">TradingView</a>')
@@ -4206,6 +4216,7 @@ def format_open_trades_message(
     market_mode: str = None,
     weak_drift: str = None,
     execution_status: str = None,
+    period_label: str = "الآن",
 ) -> str:
     """Official compact /open_trades dashboard style."""
     if not trades:
@@ -4256,36 +4267,34 @@ def format_open_trades_message(
     mode_text = market_mode or "N/A"
     drift_text = (weak_drift or "N/A").replace("🔴 ", "").replace("🟢 ", "")
     exec_text = execution_status or "N/A"
+    win_rate = (len(winners) / total * 100.0) if total else 0.0
+    avg_score_vals = [safe_float(t.get("score"), 0.0) for t in trades if safe_float(t.get("score"), 0.0) > 0]
+    avg_score = (sum(avg_score_vals) / len(avg_score_vals)) if avg_score_vals else 0.0
+    protected_count = len(tp1_protected)
+    danger_count = len(danger)
 
     lines = [
         "📋 <b>تقرير الصفقات المفتوحة</b>",
-        "📅 الآن",
+        f"📅 {html.escape(str(period_label or 'الآن'))}",
         "━━━━━━━━━━━━",
         "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
-        "",
         "📊 <b>Quick Stats</b>",
-        f"• Open: {total}",
-        f"• Winners: {len(winners)}",
-        f"• Losers: {len(losers)}",
-        f"• Avg Trade Time: {_avg_age(trades)}",
-        "",
-        "💰 <b>Open Portfolio</b>",
-        "📈 Net PnL",
-        f"<b>{net_pnl:+.2f}%</b>",
-        "⚡ Leveraged",
-        f"<b>{net_lev:+.1f}% Exposure</b>",
-        f"📈 Best: <b>{best_text}</b>",
-        f"📉 Worst: <b>{worst_text}</b>",
+        f"• Open: {total} | Winners: {len(winners)} | Losers: {len(losers)}",
+        f"• Win Rate: <b>{win_rate:.1f}%</b> | Net Floating: <b>{net_pnl:+.2f}%</b>",
+        f"• TP1: {tp1_hit_count} | TP2 Active: {tp2_hit_count} | Trailing: {trailing_count}",
+        f"• Protected: {protected_count} | Danger: {danger_count}",
+        f"• Avg Time: {_avg_age(trades)} | Avg Score: {avg_score:.2f}",
+        f"• Best: <b>{html.escape(best_text)}</b>",
+        f"• Worst: <b>{html.escape(worst_text)}</b>",
         "━━━━━━━━━━━━",
-        "🧠 <b>Context</b>",
-        f"• Mode: <code>{mode_text}</code>",
-        f"• Weak Drift: <code>{drift_text}</code>",
-        f"• Execution: <code>{exec_text}</code>",
+        "💰 <b>Open Portfolio</b>",
+        f"⚖️ Net: <b>{net_pnl:+.2f}%</b> | <b>{net_lev:+.1f}% Exposure</b>",
+        f"🧠 Mode: <code>{html.escape(mode_text)}</code> | Weak Drift: <code>{html.escape(drift_text)}</code>",
+        f"⚡ Execution: <code>{html.escape(exec_text)}</code>",
         "━━━━━━━━━━━━",
         "📂 <b>Open Trades</b>",
         f"🟢 Open Winners: {len(winners)}",
         f"🔴 Open Losers: {len(losers)}",
-        f"⏱️ Avg Trade Time: {_avg_age(trades)}",
     ]
 
     separator = "┄┄┄┄┄┄"
