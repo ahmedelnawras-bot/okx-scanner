@@ -1,9 +1,9 @@
-# Version: main_v201_v200_architecture_cleaned.py
+# Version: main_v202_market_mode_and_reminder_balance.py
 # Date: 2026-05-11
-# Base: main_v200_architecture_rebuild.py
-# Changes: Cleanup + safer v200 decision balance.
+# Base: main_v201_v200_architecture_cleaned.py
+# Changes: Market-mode balance, fast mode monitor, human-readable mode reasons, reminder cadence/UI, near-resistance tuning.
 # Preserved: Telegram UI/contracts, market modes, reports, tracking/performance integration, execution modules.
-# Fixed: removed old v08/UI-only header residue; softened normal VWAP/RSI/MACD/near-resistance rejections unless true danger.
+# Fixed: breadth-only BLOCK overreaction, debug-style mode reasons, reminder timing/wording, over-aggressive resistance hard rejects.
 
 import os 
 import sys 
@@ -9446,23 +9446,29 @@ def build_compact_market_mode_reminder(
     ranked_pairs_count: int = 0,
     block_protection_active: bool = False,
     protection_summary: dict = None,
+    market_guard: dict = None,
 ) -> str:
-    """Agreed compact Market Reminder template for all modes.
+    """Compact human Market Reminder template for all modes.
 
-    Includes only the useful short monitoring fields:
-    Signals/Exec/Reject, Strong Setups, Top Reject, Open Candidates summary, Execution status.
-    BLOCK_LONGS has a special Protection Triggered section when protection is active.
+    v202: first reminder after 15m, then every 30m; text is actionable and
+    avoids debug-style reason strings.
     """
     normalized_mode = normalize_market_mode(current_mode)
     mode_icon = _market_reminder_mode_icon(normalized_mode)
-    btc_short = _btc_short_label(btc_mode)
-    market_short = _market_short_label(market_state_label, alt_mode, market_bias_label)
     duration_text = get_market_mode_duration_text(normalized_mode)
     drift = get_weak_drift_display_status(
         normalized_mode, btc_mode, market_state_label, alt_mode, market_bias_label
     )
     drift_label = str(drift.get("label", "🟢 Weak Drift: OFF"))
-    stats = _market_reminder_collect_stats(window_seconds=1200)
+    stats = _market_reminder_collect_stats(window_seconds=1800)
+    market_guard = market_guard or {}
+
+    try:
+        red_ratio_pct = float(market_guard.get("red_ratio_15m", 0.0) or 0.0) * 100.0
+        avg15m = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+        btc15m = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+    except Exception:
+        red_ratio_pct, avg15m, btc15m = 0.0, 0.0, 0.0
 
     try:
         strong_coins_count = max(0, int(strong_coins_count or 0))
@@ -9473,51 +9479,70 @@ def build_compact_market_mode_reminder(
     except Exception:
         ranked_pairs_count = 0
 
+    if normalized_mode == MODE_BLOCK_LONGS:
+        status_text = "📉 السوق مازال تحت ضغط جماعي."
+        action_lines = [
+            "• تجنب المطاردة",
+            "• السماح فقط بالإشارات القوية جدًا",
+            "• متابعة حماية الصفقات المفتوحة",
+        ]
+    elif normalized_mode == MODE_STRONG_LONG_ONLY:
+        status_text = "⚠️ السوق انتقائي حاليًا؛ نركز على الجودة فقط."
+        action_lines = [
+            "• التركيز على reclaim / retest / wave_3",
+            "• الإشارة العادية ممكنة لو الجودة قوية",
+            "• التنفيذ التجريبي يخضع للـ Whitelist/Elite",
+        ]
+    elif normalized_mode == MODE_RECOVERY_LONG:
+        status_text = "🟠 السوق يحاول التعافي بعد ضغط."
+        action_lines = [
+            "• فرص Recovery محدودة",
+            "• تأكيد التعافي أهم من الكمية",
+            "• تجنب أول شمعة ارتداد ضعيفة",
+        ]
+    else:
+        status_text = "🟢 السوق يسمح بالبحث الطبيعي عن فرص لونج."
+        action_lines = [
+            "• الإشارات العادية مسموحة حسب الفلاتر",
+            "• التنفيذ التجريبي: Whitelist + Quality Filters",
+            "• Weak Drift يمنع التنفيذ الضعيف فقط",
+        ]
+
     lines = [
         f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b>",
+        f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)}",
         "",
-        f"🕒 {html.escape(duration_text)} in {html.escape(normalized_mode)}",
-        f"{btc_short} | {market_short}",
+        status_text,
+        "",
+        f"📊 <b>السوق اللحظي:</b> Red {red_ratio_pct:.0f}% | Avg {avg15m:+.2f}% | BTC {btc15m:+.2f}%",
+        f"🌍 <b>السياق:</b> {html.escape(_btc_short_label(btc_mode))} | {html.escape(_market_short_label(market_state_label, alt_mode, market_bias_label))}",
+        f"⚡ <b>Strong Setups:</b> {strong_coins_count} / {ranked_pairs_count}",
+        "",
+        "🎯 <b>التصرف:</b>",
+    ]
+    lines.extend([html.escape(x) for x in action_lines])
+    lines.extend([
         "",
         f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
-        f"⚡ Strong Setups: {strong_coins_count} / {ranked_pairs_count}",
+        f"❌ <b>Top Reject:</b> {html.escape(str(stats.get('top_reject') or 'N/A'))}",
         "",
-        "❌ <b>Top Reject:</b>",
-        html.escape(str(stats.get("top_reject") or "N/A")),
+        "💼 <b>Open Candidates:</b>",
+        f"🟢 {int(stats.get('open_winners', 0))} Winners | 🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected | 🔴 {int(stats.get('open_danger', 0))} Danger",
         "",
-    ]
+        f"🧠 <b>Execution:</b> {html.escape(_market_reminder_execution_line(normalized_mode, drift_label))}",
+    ])
 
     if normalized_mode == MODE_BLOCK_LONGS and (block_protection_active or protection_summary):
         summary = protection_summary or {}
         protected = int(summary.get("protected_winners") or stats.get("protected_on_block") or 0)
-        tp1_protected = int(stats.get("open_tp1_protected") or 0)
-        danger = int(stats.get("open_danger") or 0)
         lines.extend([
-            "🛡 <b>Protection Triggered</b>",
-            f"🔒 {protected} SL moved to Entry",
-            f"🟡 {tp1_protected} TP1 Protected",
-            f"🔴 {danger} High Risk Open",
             "",
-            "💼 <b>Open Candidates:</b>",
-            f"🟢 {int(stats.get('open_winners', 0))} Winners",
-            f"🔴 {danger} Danger",
-            "",
-            "🧠 <b>Execution:</b>",
-            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
-        ])
-    else:
-        lines.extend([
-            "💼 <b>Open Candidates:</b>",
-            f"🟢 {int(stats.get('open_winners', 0))} Winners",
-            f"🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected",
-            f"🔴 {int(stats.get('open_danger', 0))} Danger",
-            "",
-            "🧠 <b>Execution:</b>",
-            html.escape(_market_reminder_execution_line(normalized_mode, drift_label)),
+            "🛡 <b>Protection Check:</b>",
+            f"🔒 Protected winners: {protected}",
+            "⚠️ Tracking فقط — لا يوجد أمر SL مباشر إلى OKX من هذا الريمايندر.",
         ])
 
     return "\n".join(lines)
-
 
 def maybe_send_market_mode_reminder(
     current_mode: str,
@@ -9534,7 +9559,6 @@ def maybe_send_market_mode_reminder(
     """
     if not r:
         return False
-    REMINDER_INTERVAL = 1200  # 20 minutes
     now_ts_local = int(time.time())
     market_info = market_info or {}
     alt_snapshot = alt_snapshot or {}
@@ -9542,13 +9566,21 @@ def maybe_send_market_mode_reminder(
     market_guard = market_guard or {}
     try:
         last_reminder = int(r.get(MARKET_MODE_LAST_REMINDER_KEY) or 0)
-        if now_ts_local - last_reminder < REMINDER_INTERVAL:
-            return False
-
         reminder_mode = r.get(MARKET_MODE_REMINDER_MODE_KEY) or current_mode
         reminder_count = int(r.get(MARKET_MODE_REMINDER_COUNT_KEY) or 0)
         if reminder_mode != current_mode:
             reminder_count = 0
+            last_reminder = 0
+
+        # v202 cadence: first reminder after 15m, then every 30m.
+        if last_reminder <= 0:
+            r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
+            r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
+            return False
+        required_interval = MARKET_REMINDER_FIRST_INTERVAL if reminder_count <= 0 else MARKET_REMINDER_INTERVAL
+        if now_ts_local - last_reminder < required_interval:
+            return False
+
         reminder_count += 1
 
         protection_summary = None
@@ -9589,6 +9621,7 @@ def maybe_send_market_mode_reminder(
             ranked_pairs_count=len(ranked_pairs),
             block_protection_active=block_protection_active,
             protection_summary=protection_summary,
+            market_guard=market_guard,
         )
         send_telegram_message(reminder_msg)
 
@@ -9624,7 +9657,49 @@ def format_block_protection_summary_message(summary: dict) -> str:
         "⚠️ <b>Tracking فقط</b> — لم يتم إرسال أمر تعديل SL مباشر إلى OKX حاليًا."
     )
 
-def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "") -> str:
+def format_market_mode_reason_for_message(reason: str = "", metrics: dict = None) -> str:
+    """Turn internal mode reasons into human Telegram text."""
+    metrics = metrics or {}
+    reason_text = str(reason or "").strip()
+
+    def pct_from_ratio(value):
+        try:
+            return f"{float(value or 0) * 100:.0f}%"
+        except Exception:
+            return "N/A"
+
+    red_ratio = metrics.get("red_ratio_15m")
+    avg15m = metrics.get("avg_change_15m")
+    btc15m = metrics.get("btc_change_15m")
+    guard = str(metrics.get("market_guard_level") or metrics.get("guard") or "normal")
+
+    if reason_text in ("fast_intraday_block", "fast_intraday_strong", "fast_intraday_monitor") or "fast_intraday" in reason_text:
+        if reason_text == "fast_intraday_block":
+            title = "ضغط جماعي سريع مع تأكيد خطر لحظي"
+            decision = "لذلك تم تفعيل وضع الحماية BLOCK_LONGS."
+        elif reason_text == "fast_intraday_strong":
+            title = "ضغط جماعي سريع بدون انهيار مؤكد"
+            decision = "لذلك تم الانتقال إلى STRONG_LONG_ONLY بدل BLOCK_LONGS."
+        else:
+            title = "ضغط لحظي تحت المراقبة"
+            decision = "تم تحديث المود حسب قراءة السوق السريعة."
+        return (
+            f"{title}\n"
+            f"• Red Ratio: {pct_from_ratio(red_ratio)}\n"
+            f"• Avg 15m: {fmt_pct(avg15m)}\n"
+            f"• BTC 15m: {fmt_pct(btc15m)}\n"
+            f"• Guard: {html.escape(guard)}\n\n"
+            f"{decision}"
+        )
+
+    cleaned = reason_text
+    # Remove confusing stale fragments from previous decisions.
+    cleaned = cleaned.replace("لا يوجد تغيير في المود |", "").replace("لا يوجد تغيير في المود", "").strip(" |")
+    if not cleaned:
+        return "تحديث حالة السوق بناءً على قراءة المود الحالية."
+    return html.escape(cleaned)
+
+def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "", reason_metrics: dict = None, human_reason: str = "") -> str:
     old_mode = normalize_market_mode(old_mode)
     new_mode = normalize_market_mode(new_mode)
     mode_ar = _market_mode_label(new_mode)
@@ -9633,6 +9708,7 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
     mode_desc = get_market_mode_arabic_description(new_mode)
     action = get_market_mode_action_text(new_mode)
     allowed_lines = get_market_mode_allowed_lines(new_mode)
+    reason_display = human_reason or format_market_mode_reason_for_message(reason, reason_metrics or {})
 
     lines = [
         f"{mode_icon} <b>Market Mood - {new_mode}</b>",
@@ -9644,10 +9720,11 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         "",
         f"🔄 <b>الانتقال:</b> {transition}",
     ]
-    if reason:
+    if reason_display:
         lines.extend([
             "",
-            f"🧠 <b>السبب:</b> {html.escape(str(reason))}",
+            "🧠 <b>السبب:</b>",
+            reason_display,
         ])
     lines.extend([
         "",
@@ -9661,12 +9738,12 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
         lines.extend([
             "",
             "🛡️ <b>حماية BLOCK:</b>",
-            "السوق دخل وضع حماية. سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
+            "سيتم تقييم صفقات التنفيذ المفتوحة عند أول Market Reminder داخل BLOCK_LONGS.",
             "⚠️ الحماية الحالية Tracking فقط وليست أمر SL مباشر على OKX.",
         ])
     lines.extend([
         "",
-        "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
+        "📌 <b>ملاحظة:</b> الإشارة العادية منفصلة عن التنفيذ التجريبي؛ التنفيذ يخضع لقواعد الجودة والزخم.",
     ])
     if new_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
         lines.append("🧩 <b>Weak Drift:</b> يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة العادية.")
@@ -9679,7 +9756,7 @@ def handle_market_mode_transition(mode_result: dict) -> str:
  try:
     last_mode = r.get(MARKET_MODE_LAST_KEY) or MODE_NORMAL_LONG
     if new_mode != last_mode:
-        msg = format_mode_transition_message(last_mode, new_mode, reason=mode_result.get("reason", ""))
+        msg = format_mode_transition_message(last_mode, new_mode, reason=mode_result.get("reason", ""), reason_metrics=mode_result.get("reason_metrics", {}), human_reason=mode_result.get("human_reason", ""))
         send_telegram_message(msg)
         now_ts = int(time.time())
         if new_mode == MODE_BLOCK_LONGS and last_mode != MODE_BLOCK_LONGS:
@@ -9718,9 +9795,19 @@ def handle_market_mode_transition(mode_result: dict) -> str:
 FAST_INTRADAY_RED_RATIO = 0.85
 FAST_INTRADAY_AVG15M = -0.70
 FAST_INTRADAY_BTC15M = -0.35
-FAST_INTRADAY_BLOCK_AVG15M = -1.10
-FAST_INTRADAY_BLOCK_BTC15M = -0.55
-FAST_INTRADAY_BLOCK_RED_RATIO = 0.92
+# v202: breadth-only stress should usually move NORMAL -> STRONG, not BLOCK.
+# BLOCK needs breadth + price pressure, BTC pressure, or explicit guard danger.
+FAST_INTRADAY_BLOCK_AVG15M = -0.70
+FAST_INTRADAY_BLOCK_BTC15M = -0.35
+FAST_INTRADAY_BLOCK_RED_RATIO = 0.85
+FAST_INTRADAY_HARD_BTC15M = -0.70
+FAST_INTRADAY_HARD_AVG15M = -1.00
+FAST_MODE_MONITOR_INTERVAL = 75
+FAST_MODE_MONITOR_SAMPLE_SIZE = 30
+FAST_MODE_MONITOR_LOCK_KEY = "market_mode:long:fast_monitor_lock"
+FAST_MODE_MONITOR_LOCK_TTL = 65
+MARKET_REMINDER_FIRST_INTERVAL = 15 * 60
+MARKET_REMINDER_INTERVAL = 30 * 60
 
 HARD_RESISTANCE_SOURCES = {"previous_rejection", "swing_high_confirmed", "round_level_confirmed"}
 SOFT_RESISTANCE_SOURCES = {"bb_upper", "recent_high", "recent_20_high", "minor_round", "dynamic_resistance", "bb_upper_hint"}
@@ -9757,20 +9844,43 @@ def _arch_add_adjustment(candidate: dict, name: str, value: float, reason: str) 
 
 
 def build_market_engine_context(market_guard: dict, market_state: str, btc_mode: str, alt_snapshot: dict) -> dict:
-    """Separates slow trend context from 15m intraday stress for v200 decisions."""
+    """Separate slow trend from 15m intraday stress for v202 mode decisions.
+
+    Breadth-only redness moves the bot to STRONG_LONG_ONLY.  BLOCK_LONGS requires
+    confirmed danger: breadth + price pressure, BTC pressure, or explicit guard danger.
+    """
     market_guard = market_guard or {}
     alt_snapshot = alt_snapshot or {}
     red_ratio = _arch_float(market_guard.get("red_ratio_15m"), 0.0)
     avg15m = _arch_float(market_guard.get("avg_change_15m"), 0.0)
     btc15m = _arch_float(market_guard.get("btc_change_15m"), 0.0)
-    guard_level = str(market_guard.get("level") or "normal")
-    danger = guard_level == "danger" or red_ratio >= FAST_INTRADAY_RED_RATIO or avg15m <= FAST_INTRADAY_AVG15M or btc15m <= FAST_INTRADAY_BTC15M
-    severe = guard_level in ("danger", "block") or red_ratio >= FAST_INTRADAY_BLOCK_RED_RATIO or avg15m <= FAST_INTRADAY_BLOCK_AVG15M or btc15m <= FAST_INTRADAY_BLOCK_BTC15M
+    guard_level = str(market_guard.get("level") or "normal").lower()
+
+    breadth_stress = red_ratio >= FAST_INTRADAY_RED_RATIO
+    avg_stress = avg15m <= FAST_INTRADAY_AVG15M
+    btc_stress = btc15m <= FAST_INTRADAY_BTC15M
+    guard_danger = guard_level in ("danger", "block")
+    danger = bool(breadth_stress or avg_stress or btc_stress or guard_danger)
+
+    severe = bool(
+        guard_danger
+        or btc15m <= FAST_INTRADAY_HARD_BTC15M
+        or avg15m <= FAST_INTRADAY_HARD_AVG15M
+        or (breadth_stress and (avg_stress or btc_stress))
+    )
+
+    if severe:
+        stress_label = "severe"
+    elif danger:
+        stress_label = "breadth_stress" if breadth_stress and not (avg_stress or btc_stress or guard_danger) else "danger"
+    else:
+        stress_label = "normal"
+
     return {
         "overall_trend": market_state or "unknown",
         "btc_mode": btc_mode or "unknown",
         "alt_mode": alt_snapshot.get("alt_mode", "unknown"),
-        "intraday_stress": "severe" if severe else ("danger" if danger else "normal"),
+        "intraday_stress": stress_label,
         "fast_intraday_override": bool(danger),
         "fast_intraday_severe": bool(severe),
         "red_ratio_15m": red_ratio,
@@ -9783,25 +9893,46 @@ def build_market_engine_context(market_guard: dict, market_state: str, btc_mode:
     }
 
 
+def _format_fast_intraday_reason_for_logs(market_engine: dict) -> str:
+    try:
+        return (
+            f"red_ratio={float(market_engine.get('red_ratio_15m', 0) or 0):.2f}, "
+            f"avg15m={float(market_engine.get('avg_change_15m', 0) or 0):.2f}, "
+            f"btc15m={float(market_engine.get('btc_change_15m', 0) or 0):.2f}, "
+            f"guard={market_engine.get('market_guard_level', 'normal')}"
+        )
+    except Exception:
+        return str(market_engine.get("fast_intraday_reason", ""))
+
+
 def apply_fast_intraday_override(mode_result: dict, market_engine: dict, current_mode: str) -> dict:
-    """Fast 15m stress cannot leave the bot in NORMAL_LONG."""
+    """Fast 15m stress cannot leave the bot in NORMAL_LONG, but breadth-only stress is STRONG not BLOCK."""
     result = dict(mode_result or {})
     if not market_engine.get("fast_intraday_override"):
         result.setdefault("architecture_layer", "market_engine")
         return result
-    old_mode = result.get("mode", current_mode or MODE_NORMAL_LONG)
-    reason = result.get("reason", "")
-    override_reason = "fast_intraday_override: " + market_engine.get("fast_intraday_reason", "")
-    if market_engine.get("fast_intraday_severe"):
+
+    old_mode = normalize_market_mode(result.get("mode", current_mode or MODE_NORMAL_LONG))
+    severe = bool(market_engine.get("fast_intraday_severe"))
+
+    if severe:
         result["mode"] = MODE_BLOCK_LONGS
+        reason_key = "fast_intraday_block"
     elif old_mode == MODE_NORMAL_LONG:
         result["mode"] = MODE_STRONG_LONG_ONLY
-    result["reason"] = (str(reason) + " | " if reason else "") + override_reason
+        reason_key = "fast_intraday_strong"
+    else:
+        result["mode"] = old_mode
+        reason_key = "fast_intraday_monitor"
+
+    result["reason"] = reason_key
+    result["human_reason"] = format_market_mode_reason_for_message(reason_key, market_engine)
+    result["reason_metrics"] = dict(market_engine or {})
     result["fast_intraday_override"] = True
     result["intraday_stress"] = market_engine.get("intraday_stress")
     logger.info(
         "MARKET ENGINE FAST OVERRIDE | "
-        f"old={old_mode} -> new={result.get('mode')} | {override_reason}"
+        f"old={old_mode} -> new={result.get('mode')} | {_format_fast_intraday_reason_for_logs(market_engine)}"
     )
     return result
 
@@ -10664,7 +10795,7 @@ def run_scanner_loop():
             }
             save_market_status_snapshot(snapshot_data)
 
-            # Periodic compact market mode reminder (every 20 minutes)
+            # Periodic compact market mode reminder (first after 15m, then every 30m)
             maybe_send_market_mode_reminder(
                 current_mode=current_mode,
                 btc_mode=btc_mode,
@@ -12593,7 +12724,7 @@ def run_scanner_loop():
                             market_state in ("bull_market", "alt_season")
                             or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
                         )
-                        _res_is_ultra_close = (_res_dist_pct < 0.10 or _res_r < 0.15)
+                        _res_is_ultra_close = (_res_dist_pct < 0.08 or _res_r < 0.10)
                         _normal_dynamic_hint_warning_only = (
                             current_mode == MODE_NORMAL_LONG
                             and _res_is_dynamic_hint
@@ -12619,12 +12750,17 @@ def run_scanner_loop():
                                 f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
                             )
                         else:
-                            if _res_relaxed_setup:
-                                _hard_dist_limit = 0.40
+                            if _res_relaxed_setup or _bull_mtf_flex:
+                                # v202: strong/whitelist/Bull+MTF setups should not die on normal nearby resistance.
+                                # Hard reject only for truly ultra-close resistance.
+                                _hard_dist_limit = 0.15
+                                _hard_r_limit = 0.10
+                            elif _res_is_major_structural:
+                                _hard_dist_limit = 0.50
                                 _hard_r_limit = 0.35
                             else:
-                                _hard_dist_limit = 0.80
-                                _hard_r_limit = 0.70
+                                _hard_dist_limit = 0.35
+                                _hard_r_limit = 0.25
 
                             _should_hard_reject_resistance = (
                                 _res_is_ultra_close
@@ -12682,7 +12818,7 @@ def run_scanner_loop():
                         _tp1_unrewarding_structural = (
                             _tp1_structure < _min_tp1
                             and _res_is_structural
-                            and not (_res_relaxed_setup and _res_r >= 0.35 and _res_dist_pct >= 0.40)
+                            and not ((_res_relaxed_setup or _bull_mtf_flex) and _res_r >= 0.10 and _res_dist_pct >= 0.15)
                             and not _bull_mtf_flex
                         )
 
@@ -13908,7 +14044,7 @@ def run_scanner_loop():
                 exec_candidates_this_run = 0
             logger.info(f"Sent long alerts this run: {sent_count}")
             logger.info(
-                "LONG RUN SUMMARY v201 | "
+                "LONG RUN SUMMARY v202 | "
                 f"scanned={tested} | "
                 f"rejected_hard={sum(LONG_REJECTION_REASON_COUNTER.values())} | "
                 f"soft_penalty_only={LONG_LAYER_COUNTER.get('soft_penalty_only', 0)} | "
@@ -13929,6 +14065,127 @@ def run_scanner_loop():
             if scan_locked:
                 release_scan_lock()
 
+def acquire_fast_mode_monitor_lock() -> bool:
+    if not r:
+        return True
+    try:
+        return bool(r.set(FAST_MODE_MONITOR_LOCK_KEY, "1", ex=FAST_MODE_MONITOR_LOCK_TTL, nx=True))
+    except Exception:
+        return False
+
+
+def run_fast_market_mode_monitor():
+    """Lightweight mode checker independent from the full 200-pair scan.
+
+    It prevents the old delay problem: market mode can change every ~75 seconds
+    using BTC 15m + top 30 alts 15m, even if the full scan is still busy.
+    """
+    logger.info(f"⚡ Fast market mode monitor entered | every {FAST_MODE_MONITOR_INTERVAL}s")
+    while True:
+        try:
+            if not acquire_fast_mode_monitor_lock():
+                time.sleep(FAST_MODE_MONITOR_INTERVAL)
+                continue
+
+            ranked_pairs = get_ranked_pairs()
+            if not ranked_pairs:
+                time.sleep(FAST_MODE_MONITOR_INTERVAL)
+                continue
+
+            sample_pairs = sorted(
+                ranked_pairs,
+                key=lambda x: x.get("_rank_volume_24h", 0),
+                reverse=True,
+            )[:FAST_MODE_MONITOR_SAMPLE_SIZE]
+            guard_candles_map = fetch_candles_parallel(
+                sample_pairs,
+                timeframe="15m",
+                limit=MARKET_GUARD_CANDLE_LIMIT,
+                max_workers=min(MAX_CANDLE_FETCH_WORKERS, 8),
+            )
+            if "BTC-USDT-SWAP" not in guard_candles_map:
+                guard_candles_map["BTC-USDT-SWAP"] = get_candles("BTC-USDT-SWAP", "15m", 5)
+
+            btc_mode = get_btc_mode()
+            btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
+
+            alt_snapshot = None
+            if r:
+                try:
+                    cached_snapshot = r.get(ALT_SNAPSHOT_CACHE_KEY)
+                    if cached_snapshot:
+                        alt_snapshot = json.loads(cached_snapshot)
+                except Exception:
+                    alt_snapshot = None
+            if alt_snapshot is None:
+                alt_snapshot = get_alt_market_snapshot(ranked_pairs)
+                if r:
+                    try:
+                        r.set(ALT_SNAPSHOT_CACHE_KEY, json.dumps(alt_snapshot), ex=ALT_SNAPSHOT_CACHE_TTL)
+                    except Exception:
+                        pass
+
+            market_info = get_market_state(btc_mode, alt_snapshot)
+            market_guard = get_market_guard_snapshot(
+                ranked_pairs=ranked_pairs,
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+                candles_map_15m=guard_candles_map,
+                btc_zone=btc_zone,
+            )
+            current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
+            if not current_mode:
+                current_mode = MODE_NORMAL_LONG
+
+            market_engine_context = build_market_engine_context(
+                market_guard=market_guard,
+                market_state=market_info.get("market_state", "mixed"),
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+            )
+            mode_result = determine_long_market_mode(
+                market_guard=market_guard,
+                market_state=market_info.get("market_state", "mixed"),
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+                current_mode=current_mode,
+                allow_state_writes=True,
+            )
+            mode_result = apply_fast_intraday_override(mode_result, market_engine_context, current_mode)
+            new_mode = handle_market_mode_transition(mode_result)
+
+            try:
+                snapshot_data = {
+                    "created_ts": int(time.time()),
+                    "source": "fast_market_mode_monitor",
+                    "current_mode": new_mode,
+                    "mode_reason": mode_result.get("reason", ""),
+                    "human_reason": mode_result.get("human_reason", ""),
+                    "btc_mode": btc_mode,
+                    "btc_zone": btc_zone,
+                    "alt_snapshot": alt_snapshot,
+                    "market_info": market_info,
+                    "market_guard": market_guard,
+                    "market_engine_context": market_engine_context,
+                    "ranked_pairs_count": len(ranked_pairs),
+                    "suggested_mode": mode_result.get("mode", new_mode),
+                    "suggested_reason": mode_result.get("reason", ""),
+                }
+                save_market_status_snapshot(snapshot_data)
+            except Exception:
+                pass
+
+            logger.info(
+                "FAST MODE CHECK | "
+                f"mode={new_mode} | red={market_guard.get('red_ratio_15m')} | "
+                f"avg={market_guard.get('avg_change_15m')} | btc={market_guard.get('btc_change_15m')} | "
+                f"stress={market_engine_context.get('intraday_stress')} | reason={mode_result.get('reason')}"
+            )
+        except Exception as e:
+            logger.warning(f"Fast market mode monitor error: {e}")
+        time.sleep(FAST_MODE_MONITOR_INTERVAL)
+
+
 def run():
     logger.info(
         f"LONG BOT STARTED | pid={os.getpid()} | replica={os.getenv('RAILWAY_REPLICA_ID', 'unknown')}"
@@ -13937,6 +14194,8 @@ def run():
     clear_stale_scan_locks_on_startup()
     command_thread = threading.Thread(target=run_command_poller, daemon=True)
     command_thread.start()
+    fast_mode_thread = threading.Thread(target=run_fast_market_mode_monitor, daemon=True)
+    fast_mode_thread.start()
     run_scanner_loop()
 
 if __name__ == "__main__":
