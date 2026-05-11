@@ -1,7 +1,7 @@
-# Version: main_v206_signal_help_ui_cleanup.py
+# Version: main_v211_intelligence_open_dashboard.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: Help UI + open-trades integration fix; dashboard splitter; strong-exception reads unified execution_setup_tags.
+# Changes: UI/reporting only: Exec/Market Intelligence buttons+reports; stronger open-report dashboard; compact sampling.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1906,6 +1906,10 @@ def build_help_inline_keyboard() -> dict:
             {"text": "📊 Normal Trades", "callback_data": "help:normal"},
         ],
         [
+            {"text": "🧠 Exec Intelligence", "callback_data": "help:exec_intelligence"},
+            {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
+        ],
+        [
             {"text": "🧠 Diagnostics", "callback_data": "help:diagnostics"},
             {"text": "🤖 OKX Control", "callback_data": "help:okx"},
         ],
@@ -2027,26 +2031,50 @@ def build_help_normal_message() -> str:
 /report_setups
 /report_scores
 /report_exits
-/report_market
+/report_market"""
 
-🧠 <b>التشخيص والتحليل</b>
-/report_deep
-/report_diagnostics
-/report_rejections
-/report_filters"""
+def build_help_exec_intelligence_message() -> str:
+ return """🧠 <b>Exec Intelligence</b>
+📘 <code>/help_exec_intelligence</code>
+━━━━━━━━━━━━
+
+🚀 <b>ذكاء صفقات التنفيذ</b>
+/report_execution_intelligence
+/report_execution_intelligence_1h
+/report_execution_intelligence_today
+/report_execution_intelligence_7d
+
+ℹ️ يعرض أقوى Setups، التحذيرات، جودة الخروج، ومراجعة الفلاتر بالأرقام."""
+
+def build_help_market_intelligence_message() -> str:
+ return """🧠 <b>Market Intelligence</b>
+📘 <code>/help_market_intelligence</code>
+━━━━━━━━━━━━
+
+📊 <b>ذكاء الصفقات العادية</b>
+/report_intelligence
+/report_intelligence_1h
+/report_intelligence_today
+/report_intelligence_7d
+
+ℹ️ يعرض جودة السوق، أفضل الأنماط، وملاحظات تحسين الأداء من الصفقات العادية."""
 
 def build_help_diagnostics_message() -> str:
- return """🧠 <b>التشخيص والتحليل</b>
-<code>/diagnostics</code>
+ return """🧠 <b>التشخيص</b>
+📘 <code>/diagnostics</code>
+━━━━━━━━━━━━
 
-/report_deep
 /report_diagnostics
 /report_rejections
 /report_filters
 /report_market_guard
+/report_recovery
+
+📊 <b>التحليل</b>
+/report_deep
+/report_market
 /report_mode_history
-/report_top_setups
-/report_recovery"""
+/report_top_setups"""
 
 
 def build_help_okx_message() -> str:
@@ -3779,6 +3807,11 @@ def _execution_report_since_ts(period: str):
     return None
 
 
+def _period_since_ts(period: str):
+    """Compatibility alias for UI/report helpers."""
+    return _execution_report_since_ts(period)
+
+
 def _format_report_range_label(period: str = "all", trades: list = None, since_ts: int = None) -> str:
     """Human-readable report period/range for Telegram reports. UI only."""
     try:
@@ -4084,7 +4117,17 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
             "failed_breakdown_trap", "liquidity_sweep_reclaim",
         ]
         setup = next((p for p in preferred if p in parts), parts[-1] if parts else setup_raw[:40])
-        return html.escape(str(setup or "Setup N/A").replace("_", " ").title())
+        mapping = {
+            "vwap_reclaim": "VWAP Reclaim",
+            "retest_breakout_confirmed": "Retest Breakout",
+            "higher_low_continuation": "Higher Low",
+            "relative_strength_vs_btc": "RS vs BTC",
+            "wave_3": "Wave 3",
+            "support_bounce_confirmed": "Support Bounce",
+            "failed_breakdown_trap": "Failed Breakdown Trap",
+            "liquidity_sweep_reclaim": "Liquidity Sweep",
+        }
+        return html.escape(mapping.get(str(setup), str(setup or "Setup N/A").replace("_", " ").title()))
 
     score = html.escape(str(_trade_field(trade, "score", "N/A")))
     duration = html.escape(_execution_duration_text(trade))
@@ -4108,7 +4151,7 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
         f"{icon} <b>{symbol}</b> | {pnl_txt}",
         f"⏱️ {duration} | 📍 {phase}",
         f"🎯 TP1: {_format_exec_num(plan.get('tp1'))} | 🏁 TP2: {_format_exec_num(plan.get('tp2'))}",
-        f"🛡 {html.escape(sl_text)} | ⭐ Score: {score}",
+        f"🛡 {html.escape(sl_text)} | ⭐ {score}",
         f"🧠 {_compact_setup()}",
     ]
     if tv_link:
@@ -4151,24 +4194,34 @@ def build_execution_open_report_message(period: str = "all") -> str:
         net = sum(p for _, p in pairs)
         win_rate = (len(winners) / len(pairs) * 100.0) if pairs else 0.0
 
+        tp1_hit_count = sum(1 for t in trades if _execution_trade_reached_tp1_for_display(t))
+        tp2_active_count = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("status", "") or "").lower() in ("tp2_partial", "trailing", "trailing_open"))
+        trailing_count = sum(1 for t in trades if bool(t.get("trailing_active", False)) or str(t.get("status", "") or "").lower() in ("trailing", "trailing_open"))
+        protected_count = sum(1 for t in trades if bool(t.get("sl_moved_to_entry", False)) or bool(t.get("protected_breakeven", False)) or _execution_trade_reached_tp1_for_display(t))
+        danger_count = sum(1 for _, p in pairs if p <= -10.0)
+        scores = [_safe_trade_float_value(_trade_field(t, "score", 0.0), 0.0) or 0.0 for t in trades]
+        avg_score = _avg(scores) if scores else 0.0
+        best_pair = max(pairs, key=lambda x: x[1]) if pairs else None
+        worst_pair = min(pairs, key=lambda x: x[1]) if pairs else None
+        best_txt = f"{str(best_pair[0].get('symbol','?')).replace('-SWAP','')} {_pct_safe(best_pair[1])}" if best_pair else "—"
+        worst_txt = f"{str(worst_pair[0].get('symbol','?')).replace('-SWAP','')} {_pct_safe(worst_pair[1])}" if worst_pair else "—"
         lines = [
             "🚀 <b>صفقات التنفيذ المفتوحة</b>",
             f"📅 {html.escape(title_period)}",
             "━━━━━━━━━━━━",
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
             "📊 <b>Quick Stats</b>",
-            f"• Open: {len(trades)}",
-            f"• Winners: {len(winners)}",
-            f"• Losers: {len(losers)}",
-            f"• Net Floating: {_pct_safe(net)}",
-            "",
-            "🏆 <b>Win Rate</b>",
-            f"<b>{win_rate:.1f}%</b>",
+            f"• Open: {len(trades)} | Winners: {len(winners)} | Losers: {len(losers)}",
+            f"• Win Rate: <b>{win_rate:.1f}%</b> | Net Floating: <b>{_pct_safe(net)}</b>",
+            f"• TP1: {tp1_hit_count} | TP2 Active: {tp2_active_count} | Trailing: {trailing_count}",
+            f"• Protected: {protected_count} | Danger: {danger_count}",
+            f"• Avg Time: {html.escape(avg_trade_time)} | Avg Score: {avg_score:.2f}",
+            f"• Best: <b>{html.escape(best_txt)}</b>",
+            f"• Worst: <b>{html.escape(worst_txt)}</b>",
             "━━━━━━━━━━━━",
             "📂 <b>Open Trades</b>",
             f"🟢 Open Winners: {len(winners)}",
             f"🔴 Open Losers: {len(losers)}",
-            f"⏱️ Avg Trade Time: {html.escape(avg_trade_time)}",
         ]
         sep = "┄┄┄┄┄┄"
         winners_sorted = sorted(winners, key=lambda x: x[1], reverse=True)
@@ -4465,7 +4518,7 @@ def build_execution_report_message(period: str = "all") -> str:
                 f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
                 f"⏱️ {html.escape(age)} | 📍 {html.escape(str(phase))}",
                 f"🎯 TP1: {tp1} | 🏁 TP2: {tp2}",
-                f"🛡 SL: {sl} | ⭐ Score: {html.escape(str(score))}",
+                f"🛡 SL: {sl} | ⭐ {html.escape(str(score))}",
                 f"🧠 {setup}",
                 f"🔗 {tv}",
             ]
@@ -4620,6 +4673,183 @@ def build_execution_report_message(period: str = "all") -> str:
     except Exception as e:
         logger.error(f"build_execution_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير التنفيذ: {html.escape(str(e))}"
+
+
+def _intelligence_setup_name(trade: dict) -> str:
+    raw = str(
+        _trade_field(trade, "primary_extra_setup")
+        or _trade_field(trade, "extra_setup")
+        or _trade_field(trade, "setup_type")
+        or "unknown"
+    )
+    parts = [p.strip() for p in raw.replace(",", "|").split("|") if p.strip()]
+    preferred = [
+        "vwap_reclaim", "retest_breakout_confirmed", "higher_low_continuation",
+        "relative_strength_vs_btc", "wave_3", "support_bounce_confirmed",
+        "failed_breakdown_trap", "liquidity_sweep_reclaim",
+    ]
+    setup = next((p for p in preferred if p in parts), parts[-1] if parts else raw[:40])
+    mapping = {
+        "vwap_reclaim": "VWAP Reclaim",
+        "retest_breakout_confirmed": "Retest Breakout",
+        "higher_low_continuation": "Higher Low",
+        "relative_strength_vs_btc": "RS vs BTC",
+        "wave_3": "Wave 3",
+        "support_bounce_confirmed": "Support Bounce",
+        "failed_breakdown_trap": "Failed Breakdown Trap",
+        "liquidity_sweep_reclaim": "Liquidity Sweep",
+    }
+    return mapping.get(str(setup), str(setup or "Unknown").replace("_", " ").title())
+
+
+def _intelligence_exit_stats(trades: list) -> dict:
+    total = max(1, len(trades))
+    tp1 = sum(1 for t in trades if bool(t.get("tp1_hit", False)) or _execution_trade_reached_tp1_for_display(t))
+    tp2 = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
+    trailing = sum(1 for t in trades if str(t.get("result", "") or "").lower() == "trailing_win" or bool(t.get("trailing_active", False)))
+    direct_sl = sum(1 for t in trades if _execution_close_type_for_trade(t) == "Direct SL" or str(t.get("result", "") or "").lower() == "loss")
+    return {
+        "tp1_rate": tp1 / total * 100.0,
+        "tp2_rate": tp2 / total * 100.0,
+        "tp1_to_tp2": (tp2 / tp1 * 100.0) if tp1 else 0.0,
+        "trailing_rate": trailing / total * 100.0,
+        "direct_sl_rate": direct_sl / total * 100.0,
+    }
+
+
+def build_intelligence_report_message(kind: str = "execution", period: str = "all") -> str:
+    """Data-backed Intelligence report. Reporting/UI only; does not change strategy."""
+    try:
+        kind = str(kind or "execution").lower()
+        since_ts = _execution_report_since_ts(period)
+        try:
+            trades = load_all_trades_for_report(
+                r, market_type="futures", side="long", since_ts=since_ts, include_open=True
+            )
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=1500)
+            if since_ts:
+                trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+        if kind == "execution":
+            trades = [t for t in trades if is_execution_candidate_trade(t)]
+            title = "🧠 <b>Exec Intelligence</b>"
+        else:
+            trades = [t for t in trades if not is_execution_candidate_trade(t)]
+            title = "🧠 <b>Market Intelligence</b>"
+        trades.sort(key=_trade_created_ts_for_exec, reverse=True)
+        period_label = _format_report_range_label(period, trades, since_ts)
+        if not trades:
+            return f"{title}\n📅 {html.escape(period_label)}\n━━━━━━━━━━━━\n📭 لا توجد بيانات كافية لهذا التقرير."
+
+        closed_pairs = []
+        for t in trades:
+            if _is_execution_trade_open(t):
+                continue
+            pnl = _execution_final_pnl_pct(t)
+            if pnl is not None:
+                closed_pairs.append((t, float(pnl)))
+        setup_map = {}
+        for t in trades:
+            name = _intelligence_setup_name(t)
+            bucket = setup_map.setdefault(name, {"all": [], "closed": []})
+            bucket["all"].append(t)
+        for t, pnl in closed_pairs:
+            name = _intelligence_setup_name(t)
+            setup_map.setdefault(name, {"all": [], "closed": []})["closed"].append((t, pnl))
+
+        setup_rows = []
+        for name, data in setup_map.items():
+            all_items = data.get("all", [])
+            closed = data.get("closed", [])
+            closed_n = len(closed)
+            wins = sum(1 for _, p in closed if p > 0)
+            avg = _avg([p for _, p in closed]) if closed else 0.0
+            exit_stats = _intelligence_exit_stats(all_items)
+            wr = (wins / closed_n * 100.0) if closed_n else 0.0
+            setup_rows.append({
+                "name": name,
+                "n": len(all_items),
+                "closed": closed_n,
+                "wr": wr,
+                "avg": avg,
+                **exit_stats,
+            })
+        reliable_rows = [row for row in setup_rows if row["closed"] >= 2 or row["n"] >= 4]
+        strongest = sorted(reliable_rows, key=lambda x: (x["wr"], x["tp2_rate"], x["avg"], x["n"]), reverse=True)[:3]
+        caution = sorted(reliable_rows, key=lambda x: (x["wr"], -x["direct_sl_rate"], x["avg"]))[:3]
+
+        closed_total = len(closed_pairs)
+        wins_total = sum(1 for _, p in closed_pairs if p > 0)
+        overall_wr = (wins_total / closed_total * 100.0) if closed_total else 0.0
+        exit_all = _intelligence_exit_stats(trades)
+
+        from collections import Counter
+        filters = Counter()
+        for t in trades:
+            for key in ("reasons", "warning_reasons", "reject_reason", "rejection_reason"):
+                vals = _trade_field(t, key, [])
+                if isinstance(vals, str):
+                    vals = [vals]
+                if not isinstance(vals, (list, tuple)):
+                    vals = []
+                for val in vals:
+                    txt = str(val or "").strip()
+                    if txt:
+                        filters[txt[:42]] += 1
+        filter_rows = filters.most_common(3)
+
+        lines = [
+            title,
+            f"📅 {html.escape(period_label)}",
+            "━━━━━━━━━━━━",
+            "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
+            f"📊 Sample: {len(trades)} | Closed: {closed_total} | WR: <b>{overall_wr:.1f}%</b>",
+        ]
+        if len(trades) < 10 or closed_total < 5:
+            lines.append("⚠️ العينة صغيرة — القرار غير مؤكد")
+        lines.extend(["━━━━━━━━━━━━", "✅ <b>أقوى Setups</b>"])
+        if strongest:
+            for row in strongest:
+                lines.append(
+                    f"• {html.escape(row['name'])} — WR {row['wr']:.1f}% | TP1 {row['tp1_rate']:.1f}% | TP2 {row['tp2_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
+                )
+        else:
+            lines.append("• لا توجد عينة كافية لتحديد أقوى Setup.")
+        lines.extend(["", "⚠️ <b>Setups تحتاج حذر</b>"])
+        if caution:
+            for row in caution:
+                lines.append(
+                    f"• {html.escape(row['name'])} — WR {row['wr']:.1f}% | Direct SL {row['direct_sl_rate']:.1f}% | Avg {_pct_safe(row['avg'])}"
+                )
+        else:
+            lines.append("• لا توجد عينة كافية للتحذير.")
+        lines.extend(["", "🧱 <b>Filters Review</b>"])
+        if filter_rows:
+            for reason, count in filter_rows:
+                lines.append(f"• {html.escape(reason)} — {count} مرة")
+        else:
+            lines.append("• لا توجد أسباب فلترة كافية في العينة الحالية.")
+        lines.extend([
+            "",
+            "🎯 <b>Exit Quality</b>",
+            f"• TP1 Rate: {exit_all['tp1_rate']:.1f}%",
+            f"• TP2 Conversion: {exit_all['tp1_to_tp2']:.1f}%",
+            f"• Trailing Exit: {exit_all['trailing_rate']:.1f}%",
+            f"• Direct SL: {exit_all['direct_sl_rate']:.1f}%",
+            "━━━━━━━━━━━━",
+            "🧠 <b>توصية مؤقتة</b>",
+        ])
+        if strongest:
+            focus = " / ".join(row["name"] for row in strongest[:3])
+            lines.append(f"ركز المتابعة على: {html.escape(focus)}")
+        if caution:
+            avoid = " / ".join(row["name"] for row in caution[:2])
+            lines.append(f"راقب بحذر: {html.escape(avoid)}")
+        lines.append("لا يتم تغيير أي فلتر تلقائيًا — التقرير للقياس فقط.")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"build_intelligence_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير Intelligence: {html.escape(str(e))}"
 
 
 def build_execution_guard_report_message() -> str:
@@ -4968,9 +5198,9 @@ def build_exec_resume_message() -> str:
         return f"❌ فشل إعادة التداول\nالسبب: {html.escape(str(e))}"
 
 
-def _send_open_trades(chat_id: str):
+def _send_open_trades(chat_id: str, period: str = "all"):
  try:
-    msg = build_open_trades_message()
+    msg = build_open_trades_message(period)
     chunks = split_open_trades_dashboard_message(msg, limit=3600)
     total = len(chunks)
     for idx, chunk in enumerate(chunks, start=1):
@@ -5007,11 +5237,23 @@ def _build_open_trades_report_context() -> dict:
         return {"market_mode": MODE_NORMAL_LONG, "weak_drift": "Weak Drift: OFF", "execution_status": "UNKNOWN"}
 
 
-def build_open_trades_message() -> str:
+def build_open_trades_message(period: str = "all") -> str:
  try:
     if not r:
         return "❌ لا يوجد اتصال بقاعدة البيانات"
     trades = get_open_trades_summary(r, market_type="futures", side="long")
+    since_ts = _execution_report_since_ts(period)
+    if since_ts:
+        def _open_created_ts(item):
+            for key in ("created_at", "created_ts", "candle_time"):
+                try:
+                    v = int(float(item.get(key) or 0))
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+            return 0
+        trades = [t for t in trades if _open_created_ts(t) >= since_ts]
     ctx = _build_open_trades_report_context()
     return format_open_trades_message(
         trades,
@@ -5019,6 +5261,7 @@ def build_open_trades_message() -> str:
         market_mode=ctx.get("market_mode"),
         weak_drift=ctx.get("weak_drift"),
         execution_status=ctx.get("execution_status"),
+        period_label=_format_report_range_label(period, trades, since_ts),
     )
  except Exception as e:
     logger.error(f"build_open_trades_message error: {e}", exc_info=True)
@@ -5032,6 +5275,8 @@ COMMAND_HANDLERS = {
  "/execution_reports": lambda chat_id: send_telegram_reply(chat_id, build_help_execution_message()),
  "/help_normal": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
  "/normal_reports": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
+ "/help_exec_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_exec_intelligence_message()),
+ "/help_market_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_market_intelligence_message()),
  "/diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
  "/help_analysis": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
  "/okx_execution": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
@@ -5042,7 +5287,7 @@ COMMAND_HANDLERS = {
  "/mood": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/status": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
  "/market": lambda chat_id: send_telegram_reply(chat_id, build_market_status_message()),
- "/open_trades": lambda chat_id: _send_open_trades(chat_id),
+ "/open_trades": lambda chat_id: _send_open_trades(chat_id, "all"),
  "/exec_status": lambda chat_id: send_telegram_reply(chat_id, build_exec_status_message()),
  "/exec_mode": lambda chat_id: send_telegram_reply(chat_id, build_exec_mode_message()),
  "/stop_trading": lambda chat_id: send_telegram_reply(chat_id, build_exec_pause_message()),
@@ -5085,12 +5330,20 @@ COMMAND_HANDLERS = {
  "/report_execution_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
  "/report_execution_exits": lambda chat_id: send_telegram_reply(chat_id, build_exits_report_message()),
  "/report_execution_diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_full_diagnostics_report(r, market_type="futures", side="long", period="all")),
+ "/report_execution_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "all")),
+ "/report_execution_intelligence_1h": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "1h")),
+ "/report_execution_intelligence_today": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "today")),
+ "/report_execution_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "7d")),
+ "/report_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "all")),
+ "/report_intelligence_1h": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "1h")),
+ "/report_intelligence_today": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "today")),
+ "/report_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "7d")),
  "/report_profit": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_profit_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
  "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
- "/open_trades_1h": lambda chat_id: _send_open_trades(chat_id),
- "/open_trades_today": lambda chat_id: _send_open_trades(chat_id),
- "/open_trades_7d": lambda chat_id: _send_open_trades(chat_id),
+ "/open_trades_1h": lambda chat_id: _send_open_trades(chat_id, "1h"),
+ "/open_trades_today": lambda chat_id: _send_open_trades(chat_id, "today"),
+ "/open_trades_7d": lambda chat_id: _send_open_trades(chat_id, "7d"),
  "/report_profit_analysis": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_profit_analysis_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
  "/report_profit_analysis_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
@@ -5955,6 +6208,8 @@ def handle_callback_query(callback_query: dict):
         section_map = {
             "execution": build_help_execution_message,
             "normal": build_help_normal_message,
+            "exec_intelligence": build_help_exec_intelligence_message,
+            "market_intelligence": build_help_market_intelligence_message,
             "diagnostics": build_help_diagnostics_message,
             "okx": build_help_okx_message,
             "admin": build_help_admin_message,
