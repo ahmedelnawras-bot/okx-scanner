@@ -125,6 +125,7 @@ SHORT_REPORT_NOTIONAL_PER_TRADE_USD = 300.0
 TP1_CLOSE_PCT = 40.0
 TP2_CLOSE_PCT = 40.0
 TRAILING_PCT = 2.5   # نسبة التراجع للـ trailing stop بعد TP2 — موحد مع main.py
+TP2_PROTECTED_SL_BUFFER_PCT = 0.0  # بعد TP2: حماية آخر 20% عند TP1 أو TP1+buffer
 
 # Dedup index
 ALERT_ID_INDEX_PREFIX = "alert_id_index:"
@@ -1370,6 +1371,27 @@ def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         trade_data["tp2_hit"] = True
         trade_data["tp2_hit_at"] = int(time.time())
         trade_data["status"] = "tp2_partial"   # الجزء المتبقي في trailing
+        trade_data["tp2_protected_runner"] = True
+        trade_data["tp1_only_unprotected"] = False
+
+        # After TP2, protect the remaining 20% at TP1 or TP1 + small buffer.
+        _tp1_price_for_sl = safe_float(trade_data.get("tp1"), 0.0)
+        _current_sl_for_tp2 = safe_float(trade_data.get("sl"), 0.0)
+        _buffer = TP2_PROTECTED_SL_BUFFER_PCT / 100.0
+        if _tp1_price_for_sl > 0:
+            if side == "long":
+                _tp2_protected_sl = round_price(_tp1_price_for_sl * (1.0 + _buffer))
+                if _tp2_protected_sl > _current_sl_for_tp2:
+                    trade_data["original_sl_before_tp2_protection"] = _current_sl_for_tp2
+                    trade_data["sl"] = _tp2_protected_sl
+            else:
+                _tp2_protected_sl = round_price(_tp1_price_for_sl * (1.0 - _buffer))
+                if _current_sl_for_tp2 <= 0 or _tp2_protected_sl < _current_sl_for_tp2:
+                    trade_data["original_sl_before_tp2_protection"] = _current_sl_for_tp2
+                    trade_data["sl"] = _tp2_protected_sl
+            trade_data["sl_moved_to_entry"] = False
+            trade_data["sl_moved_to_tp1_after_tp2"] = True
+            trade_data["sl_move_reason"] = "TP2 hit - protect runner at TP1"
 
         # تفعيل trailing للـ 20% المتبقية
         trade_data["trailing_active"] = True
@@ -1402,6 +1424,9 @@ def mark_tp2_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         diagnostics = trade_data.get("diagnostics", {}) or {}
         diagnostics["tp2_hit"] = True
         diagnostics["tp2_hit_at"] = trade_data["tp2_hit_at"]
+        diagnostics["tp2_protected_runner"] = True
+        diagnostics["sl_moved_to_tp1_after_tp2"] = trade_data.get("sl_moved_to_tp1_after_tp2", False)
+        diagnostics["sl_move_reason"] = trade_data.get("sl_move_reason")
         diagnostics["trailing_active"] = True
         trade_data["diagnostics"] = diagnostics
 
@@ -1428,6 +1453,14 @@ def mark_trade_closed(redis_client, trade_key: str, trade_data: dict, result: st
     # معالجة breakeven بعد TP1: إذا تم تفعيل TP1 ثم رجع السعر إلى effective_entry، تعتبر فوز جزئي وليس خسارة
     effective_entry = get_trade_effective_entry(trade_data)
     tp1_hit = normalize_bool(trade_data.get("tp1_hit", False))
+    tp2_hit = normalize_bool(trade_data.get("tp2_hit", False)) or normalize_bool(trade_data.get("tp2_protected_runner", False))
+
+    if result == "loss" and tp2_hit:
+        # After TP2, remaining runner SL is expected at TP1/TP1+buffer; classify as TP2 protected win.
+        result = "tp2_win"
+        trade_data["tp2_protected_runner_exit"] = True
+        if not trade_data.get("exit_reason"):
+            trade_data["exit_reason"] = "tp2_runner_protected_sl"
 
     if result == "loss" and tp1_hit:
         # التأكد إن SL الحالي يساوي effective_entry تقريباً (breakeven protected)
@@ -1525,21 +1558,13 @@ def mark_tp1_hit(redis_client, trade_key: str, trade_data: dict, processed_candl
         trade_data["remaining_position_pct"] = remaining_pct
         trade_data["updated_at"] = int(time.time())
 
-        # نقل SL إلى نقطة الدخول الفعلية (breakeven)
-        move_sl = normalize_bool(
-            trade_data.get("move_sl_to_entry_after_tp1",
-                          diagnostics.get("move_sl_to_entry_after_tp1", True))
-        )
-        if move_sl:
-            new_sl = round_price(effective_entry) if effective_entry > 0 else trade_data["entry"]
-            trade_data["sl"] = new_sl
-            trade_data["sl_moved_to_entry"] = True
-            trade_data["sl_move_reason"] = "TP1 hit - protect remaining position"
-        else:
-            trade_data["sl_moved_to_entry"] = False
-            trade_data["sl_move_reason"] = "TP1 hit - SL unchanged by config"
+        # New lifecycle: TP1 closes 40% only. Do NOT move SL here.
+        # Protection starts after TP2 to avoid early breakeven exits before continuation.
+        trade_data["sl_moved_to_entry"] = False
+        trade_data["sl_move_reason"] = "TP1 hit - SL unchanged; protection starts after TP2"
+        trade_data["tp1_only_unprotected"] = True
 
-        diagnostics["sl_moved_to_entry"] = trade_data["sl_moved_to_entry"]
+        diagnostics["sl_moved_to_entry"] = False
         diagnostics["sl_move_reason"] = trade_data["sl_move_reason"]
         diagnostics["partial_close_pct"] = tp1_close_pct
         diagnostics["remaining_position_pct"] = remaining_pct
@@ -1770,6 +1795,9 @@ def _new_block_protection_summary(market_mode: str = "", reason: str = "") -> di
         "skipped_close_to_sl": 0,
         "skipped_not_eligible": 0,
         "updated_symbols": [],
+        "platform_updates_sent": 0,
+        "platform_updates_failed": 0,
+        "platform_update_errors": [],
         "tracking_only": True,
     }
 
@@ -1881,6 +1909,42 @@ def update_open_trades(
     breakeven_buffer_pct = max(0.0, safe_float(kwargs.get("breakeven_buffer_pct", 0.0), 0.0))
     loss_compression_buffer_pct = max(0.05, safe_float(kwargs.get("block_loss_compression_buffer_pct", 0.30), 0.30))
     severe_block_pressure = _is_severe_block_pressure(kwargs)
+    block_live_protection_callback = kwargs.get("block_live_protection_callback")
+
+    def _record_platform_result(trade_obj: dict, diagnostics_obj: dict, protection_payload: dict):
+        if not callable(block_live_protection_callback):
+            return
+        try:
+            result_payload = block_live_protection_callback(trade_obj, protection_payload) or {}
+            status = str(result_payload.get("status") or "").strip()
+            mode = str(result_payload.get("mode") or "").strip()
+            ok = bool(result_payload.get("ok"))
+            trade_obj["platform_sl_update_status"] = status or ("ok" if ok else "failed")
+            trade_obj["platform_sl_update_mode"] = mode
+            trade_obj["platform_sl_update_result"] = result_payload
+            diagnostics_obj["platform_sl_update_status"] = trade_obj["platform_sl_update_status"]
+            diagnostics_obj["platform_sl_update_mode"] = mode
+            diagnostics_obj["platform_sl_update_result"] = result_payload
+            if ok:
+                block_protection_summary["platform_updates_sent"] += 1
+                if mode != "simulation":
+                    block_protection_summary["tracking_only"] = False
+            else:
+                block_protection_summary["platform_updates_failed"] += 1
+                block_protection_summary["platform_update_errors"].append({
+                    "symbol": trade_obj.get("symbol"),
+                    "status": status,
+                    "reason": result_payload.get("reason") or result_payload.get("msg") or result_payload.get("code"),
+                })
+        except Exception as _platform_exc:
+            trade_obj["platform_sl_update_status"] = "callback_error"
+            diagnostics_obj["platform_sl_update_status"] = "callback_error"
+            block_protection_summary["platform_updates_failed"] += 1
+            block_protection_summary["platform_update_errors"].append({
+                "symbol": trade_obj.get("symbol"),
+                "status": "callback_error",
+                "reason": str(_platform_exc),
+            })
 
     for trade_key in trade_keys:
         try:
@@ -2053,26 +2117,33 @@ def update_open_trades(
                                 if not isinstance(diagnostics, dict):
                                     diagnostics = {}
 
-                                # Winners / TP1 / protected trades: move protection to Entry + buffer.
-                                if current_profit_pct >= breakeven_min_profit_pct or normalize_bool(trade.get("tp1_hit", False)):
-                                    target_sl = _entry_buffer_sl(entry_price, trade_side, breakeven_buffer_pct)
+                                # New lifecycle: BLOCK protection mainly acts on TP2 protected runners.
+                                is_tp2_runner = normalize_bool(trade.get("tp2_hit", False)) and normalize_bool(trade.get("trailing_active", False))
+                                is_tp1_only = normalize_bool(trade.get("tp1_hit", False)) and not normalize_bool(trade.get("tp2_hit", False))
+                                if is_tp2_runner:
+                                    tp1_price = safe_float(trade.get("tp1"), 0.0)
+                                    target_sl = round_price(tp1_price) if tp1_price > 0 else _entry_buffer_sl(entry_price, trade_side, breakeven_buffer_pct)
                                     moved_anything = False
 
                                     if _sl_is_better(trade_side, target_sl, current_sl):
                                         if trade.get("original_sl_before_breakeven") is None:
                                             trade["original_sl_before_breakeven"] = current_sl
                                         trade["sl"] = target_sl
-                                        trade["protected_breakeven"] = True
+                                        trade["protected_on_block"] = True
+                                        trade["tp2_runner_block_protected"] = True
                                         trade["breakeven_protection_reason"] = reason or "market_block_protection"
                                         trade["breakeven_protected_ts"] = now_ts
-                                        trade["sl_moved_to_entry"] = True
-                                        trade["sl_move_reason"] = reason or "market_block_protection"
-                                        diagnostics["protected_breakeven"] = True
+                                        trade["sl_moved_to_entry"] = False
+                                        trade["sl_moved_to_tp1_after_tp2"] = True
+                                        trade["sl_move_reason"] = reason or "market_block_tp2_runner_protection"
+                                        diagnostics["protected_on_block"] = True
+                                        diagnostics["tp2_runner_block_protected"] = True
                                         diagnostics["breakeven_protection_reason"] = reason or "market_block_protection"
                                         diagnostics["breakeven_protected_ts"] = now_ts
                                         diagnostics["original_sl_before_breakeven"] = current_sl
-                                        diagnostics["sl_moved_to_entry"] = True
-                                        diagnostics["sl_move_reason"] = reason or "market_block_protection"
+                                        diagnostics["sl_moved_to_entry"] = False
+                                        diagnostics["sl_moved_to_tp1_after_tp2"] = True
+                                        diagnostics["sl_move_reason"] = reason or "market_block_tp2_runner_protection"
                                         moved_anything = True
 
                                     # After TP2, keep trailing active but never below Entry + buffer.
@@ -2087,14 +2158,21 @@ def update_open_trades(
                                         _set_block_protection_fields(
                                             trade, diagnostics, now_ts=now_ts, new_sl=target_sl, old_sl=current_sl,
                                             reason=reason or "market_block_protection",
-                                            protection_type="winner_entry_buffer",
-                                            note=f"Tracking only: SL protected at Entry + {breakeven_buffer_pct:.2f}%",
+                                            protection_type="tp2_runner_block_protection",
+                                            note="TP2 runner protected at TP1 / tightened trailing",
                                         )
+                                        _record_platform_result(trade, diagnostics, {
+                                            "eligible": True,
+                                            "symbol": symbol,
+                                            "protected_sl": target_sl,
+                                            "action": "lock_runner_at_tp1_or_better",
+                                            "reason": reason or "market_block_protection",
+                                        })
                                         trade["diagnostics"] = diagnostics
                                         state_changed = True
                                         block_protection_summary["protected_winners"] += 1
                                         block_protection_summary["updated_symbols"].append(str(symbol))
-                                        logger.info(f"{symbol} → BLOCK protection applied at Entry + buffer")
+                                        logger.info(f"{symbol} → BLOCK TP2 runner protection applied")
                                     else:
                                         block_protection_summary["already_protected"] += 1
 
@@ -2118,8 +2196,15 @@ def update_open_trades(
                                                     trade, diagnostics, now_ts=now_ts, new_sl=compression_sl, old_sl=current_sl,
                                                     reason=reason or "market_block_risk_compression",
                                                     protection_type="risk_compression",
-                                                    note="Tracking only: loser risk compressed because BLOCK pressure is severe",
+                                                    note="Loser risk compressed because BLOCK pressure is severe",
                                                 )
+                                                _record_platform_result(trade, diagnostics, {
+                                                    "eligible": True,
+                                                    "symbol": symbol,
+                                                    "protected_sl": compression_sl,
+                                                    "action": "emergency_risk_compression",
+                                                    "reason": reason or "market_block_risk_compression",
+                                                })
                                                 trade["diagnostics"] = diagnostics
                                                 state_changed = True
                                                 block_protection_summary["risk_compressed"] += 1
