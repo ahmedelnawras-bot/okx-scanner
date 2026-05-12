@@ -1,7 +1,7 @@
 # tracking/performance.py
-# Version: performance_v60_report_ui_compact
+# Version: performance_v61_open_trades_wallet_ui
 # Base: performance_v49_report_command_html_fix
-# Changes: UI/reporting only: compact report style #2 and open-trades style #3; no calculation/trading logic changes.
+# Changes: UI/reporting only: open-trades wallet impact block, compact spacing, Top 5 winners/losers.
 # Fix: header/version corrected; dashboard context fields are displayed in the report.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -68,6 +68,7 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - حفظ nearest_resistance_source وخطة 40/40/20 كاملة بدون تغيير register_trade signature.
 """
 
+import os
 import json
 import html
 import time
@@ -4454,6 +4455,20 @@ def _format_open_trades_section(title: str, items: List[dict], start_index: int 
     return lines
 
 
+def _open_trade_locked_leveraged_pct(t: dict) -> float:
+    """Locked TP1/TP2 profit for an open trade, measured after report leverage."""
+    try:
+        locked = 0.0
+        if bool(t.get("tp1_hit", False)) or str(t.get("phase", "") or "") in ("tp1_hit", "tp2_hit", "trailing"):
+            locked += safe_float(t.get("tp1_pct", 0.0), 0.0) * 0.40
+        if bool(t.get("tp2_hit", False)) or str(t.get("phase", "") or "") in ("tp2_hit", "trailing"):
+            locked += safe_float(t.get("tp2_pct", 0.0), 0.0) * 0.40
+        lev = safe_float(t.get("leverage", REPORT_LEVERAGE), REPORT_LEVERAGE)
+        return locked * lev
+    except Exception:
+        return 0.0
+
+
 def format_open_trades_message(
     trades: List[dict],
     side: str = "long",
@@ -4467,21 +4482,21 @@ def format_open_trades_message(
         return "📋 <b>لا توجد صفقات مفتوحة حاليًا</b>"
 
     total = len(trades)
-    winners = [t for t in trades if safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0) > 0.05]
-    losers = [t for t in trades if safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0) < -0.05]
-    pending = [t for t in trades if t.get("phase") == "pending_pullback"]
-    tp1_protected = [t for t in trades if t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("sl_is_entry", False))]
-    tp1_hit_count = sum(1 for t in trades if t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("tp1_hit", False)))
-    tp2_hit_count = sum(1 for t in trades if t.get("phase") in ("tp2_hit", "trailing") or bool(t.get("tp2_hit", False)))
-    trailing_count = sum(1 for t in trades if t.get("phase") == "trailing")
-    near_tp1 = [t for t in trades if _open_trade_near_tp1(t)]
-    danger = [t for t in trades if _open_trade_is_danger(t)]
 
     def _wp(t):
         return safe_float(t.get("weighted_pnl_pct", t.get("current_pnl_pct", 0.0)), 0.0)
 
     def _wl(t):
         return safe_float(t.get("weighted_pnl_leveraged", t.get("current_pnl_leveraged", 0.0)), 0.0)
+
+    winners = [t for t in trades if _wp(t) > 0.05]
+    losers = [t for t in trades if _wp(t) < -0.05]
+    pending = [t for t in trades if t.get("phase") == "pending_pullback"]
+    tp1_hit_count = sum(1 for t in trades if t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("tp1_hit", False)))
+    tp2_hit_count = sum(1 for t in trades if t.get("phase") in ("tp2_hit", "trailing") or bool(t.get("tp2_hit", False)))
+    trailing_count = sum(1 for t in trades if t.get("phase") == "trailing" or bool(t.get("trailing_active", False)))
+    before_tp1_count = sum(1 for t in trades if not (t.get("phase") in ("tp1_hit", "tp2_hit", "trailing") or bool(t.get("tp1_hit", False))))
+    tp1_partial_count = sum(1 for t in trades if (t.get("phase") == "tp1_hit" or bool(t.get("tp1_hit", False))) and not (t.get("phase") in ("tp2_hit", "trailing") or bool(t.get("tp2_hit", False))))
 
     def _avg_age(items):
         if not items:
@@ -4501,71 +4516,85 @@ def format_open_trades_message(
             return f"{mins // 60}h {mins % 60}m"
         return f"{mins // 1440}d {(mins % 1440) // 60}h"
 
+    total_weighted_lev = sum(_wl(t) for t in trades)
+    locked_lev = sum(_open_trade_locked_leveraged_pct(t) for t in trades)
+    floating_lev = total_weighted_lev - locked_lev
     net_pnl = sum(_wp(t) for t in trades)
-    net_lev = sum(_wl(t) for t in trades)
     best = max(trades, key=_wp) if trades else None
     worst = min(trades, key=_wp) if trades else None
     best_text = f"{str(best.get('symbol','?')).replace('-SWAP','')} {_wp(best):+.2f}%" if best else "—"
     worst_text = f"{str(worst.get('symbol','?')).replace('-SWAP','')} {_wp(worst):+.2f}%" if worst else "—"
-
-    mode_text = market_mode or "N/A"
-    drift_text = (weak_drift or "N/A").replace("🔴 ", "").replace("🟢 ", "")
-    exec_text = execution_status or "N/A"
     win_rate = (len(winners) / total * 100.0) if total else 0.0
     avg_score_vals = [safe_float(t.get("score"), 0.0) for t in trades if safe_float(t.get("score"), 0.0) > 0]
     avg_score = (sum(avg_score_vals) / len(avg_score_vals)) if avg_score_vals else 0.0
-    protected_count = len(tp1_protected)
-    danger_count = len(danger)
+
+    trade_margin_usd = safe_float(os.getenv("EXEC_REPORT_TRADE_MARGIN_USD", "35"), 35.0)
+    floating_usd = floating_lev * trade_margin_usd / 100.0
+    locked_usd = locked_lev * trade_margin_usd / 100.0
+    total_usd = total_weighted_lev * trade_margin_usd / 100.0
+
+    def _money(v: float) -> str:
+        return f"{v:+.0f}$" if abs(v) >= 10 else f"{v:+.2f}$"
+
+    def _icon(v: float) -> str:
+        return "🟢" if v >= 0 else "🔴"
 
     lines = [
         "📋 <b>تقرير الصفقات المفتوحة</b>",
         f"📅 {html.escape(str(period_label or 'الآن'))}",
-        "━━━━━━━━━━━━",
         "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
+        "┄┄┄┄┄┄┄┄",
         "📊 <b>Quick Stats</b>",
         f"• Open: {total}",
         f"• Winners: {len(winners)} | Losers: {len(losers)}",
         f"• Win Rate: <b>{win_rate:.1f}%</b>",
         f"• Net Floating: <b>{'🟢' if net_pnl >= 0 else '🔴'} {net_pnl:+.2f}%</b>",
-        f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_hit_count} | 📍 Trailing: {trailing_count}",
-        f"🛡 Protected: {protected_count} | ⚠️ Danger: {danger_count}",
-        f"⏱ Avg Time: {_avg_age(trades)} | ⭐ Avg Score: {avg_score:.2f}",
+        f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_hit_count}",
         f"🔥 Best: <b>{html.escape(best_text)}</b>",
-        f"⚠️ Worst: <b>{html.escape(worst_text)}</b>",
-        "━━━━━━━━━━━━",
-        "💰 <b>Open Portfolio</b>",
-        f"⚖️ Net: <b>{net_pnl:+.2f}%</b> | <b>{net_lev:+.1f}% Exposure</b>",
-        f"🧠 Mode: <code>{html.escape(mode_text)}</code> | Weak Drift: <code>{html.escape(drift_text)}</code>",
-        f"⚡ Execution: <code>{html.escape(exec_text)}</code>",
-        "━━━━━━━━━━━━",
-        "📂 <b>Open Trades</b>",
-        f"🟢 Top 4 Winners: {len(winners)} | 🔴 Top 4 Losers: {len(losers)}",
+        f"📉 Worst: <b>{html.escape(worst_text)}</b>",
+        "┄┄┄┄┄┄┄┄",
+        "💼 <b>Wallet Impact</b>",
+        f"📈 Floating: {_icon(floating_usd)} {_money(floating_usd)} ({floating_lev:+.2f}%)",
+        f"🔒 Locked: {_icon(locked_usd)} {_money(locked_usd)}",
+        f"⚖️ Total Impact: <b>{_icon(total_usd)} {_money(total_usd)}</b>",
+        f"📂 Open Trades: {total}",
+        "┄┄┄┄┄┄┄┄",
+        "📍 <b>Trade Stages</b>",
+        f"• Before TP1: {before_tp1_count} → لم تحقق TP1 بعد",
+        f"• TP1 Partial: {tp1_partial_count} → تم إغلاق أول 40%",
+        f"• TP2 Runner: {tp2_hit_count} → تم تفعيل الـ Runner",
+        f"• Trailing Active: {trailing_count} → trailing stop يعمل حاليا",
+        "┄┄┄┄┄┄┄┄",
+        "🛡 <b>Risk Snapshot</b>",
+        f"• Avg Open Age: {_avg_age(trades)}",
+        f"• Avg Signal Score: {avg_score:.2f}",
+        "• Leverage Model: 15x",
     ]
 
-    separator = "┄┄┄┄┄┄"
+    separator = "┄┄┄"
     winners_s = sorted(winners, key=_wp, reverse=True)
     losers_s = sorted(losers, key=_wp)
     pending_s = sorted(pending, key=lambda t: safe_timestamp(t.get("created_at", 0), 0), reverse=True)
 
+    lines.extend(["━━━━━━━━━━━━", "🟢 <b>Open Winners — Top 5</b>"])
     if winners_s:
-        lines.extend(["", "📂 <b>Open Winners — Top 4</b>"])
-        for idx, trade in enumerate(winners_s[:4]):
+        for idx, trade in enumerate(winners_s[:5]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(winners_s) > 4:
-            lines.append(f"📂 +{len(winners_s) - 4} more winning trades...")
+        if len(winners_s) > 5:
+            lines.append(f"📂 +{len(winners_s) - 5} more winning trades...")
     else:
         lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
-    lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 4</b>"])
+    lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 5</b>"])
     if losers_s:
-        for idx, trade in enumerate(losers_s[:4]):
+        for idx, trade in enumerate(losers_s[:5]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(losers_s) > 4:
-            lines.append(f"📂 +{len(losers_s) - 4} more losing trades...")
+        if len(losers_s) > 5:
+            lines.append(f"📂 +{len(losers_s) - 5} more losing trades...")
     else:
         lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
@@ -4579,9 +4608,7 @@ def format_open_trades_message(
             lines.append(f"📂 +{len(pending_s) - 5} صفقات Pending أخرى")
 
     lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
-
     return "\n".join(lines)
-
 
 def _fmt_price_perf(value) -> str:
     """تنسيق سعر ديناميكي."""
