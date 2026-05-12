@@ -1,7 +1,7 @@
-# Version: main_v302_report_ui_compact.py
+# Version: main_v306_wallet_impact_logging.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: UI-only report/help compact style updates #1 #2 #3; no trading logic changes.
+# Changes: Add separate execution Wallet Impact equity-curve reports and improve Oversold/Falling-Knife logging; preserve trading logic.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1919,7 +1919,10 @@ def build_help_inline_keyboard() -> dict:
             {"text": "📊 Normal Trades", "callback_data": "help:normal"},
         ],
         [
+            {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
             {"text": "🧠 Exec Intelligence", "callback_data": "help:exec_intelligence"},
+        ],
+        [
             {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
         ],
         [
@@ -2016,6 +2019,24 @@ def build_help_execution_message() -> str:
 🧠 <b>تشخيص التنفيذ</b>
 ┄┄┄┄┄┄
 /report_execution_diagnostics"""
+
+def build_help_wallet_message() -> str:
+ return """💼 <b>Wallet Impact</b>
+📘 <code>/report_execution_wallet</code>
+━━━━━━━━━━━━
+
+📊 <b>Execution Equity Curve</b>
+تقرير منفصل لتأثير صفقات التنفيذ على المحفظة الافتراضية.
+يعرض Open / Close / Net / Max Up / Max DD.
+
+📅 <b>الأوامر</b>
+/report_execution_wallet — منذ البداية / يومي
+/report_execution_wallet_month — آخر شهر / يومي
+/report_execution_wallet_7d — آخر أسبوع / يومي
+/report_execution_wallet_today — اليوم / بالساعة
+
+ℹ️ التقرير يعتمد على Virtual Execution Wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة."""
+
 
 def build_help_normal_message() -> str:
  return """📊 <b>الصفقات العادية</b>
@@ -4906,6 +4927,244 @@ def build_intelligence_report_message(kind: str = "execution", period: str = "al
         return f"❌ خطأ في تقرير Intelligence: {html.escape(str(e))}"
 
 
+
+def _execution_wallet_money(value) -> str:
+    try:
+        v = float(value or 0.0)
+        sign = "+" if v > 0 else ""
+        if abs(v) >= 1000:
+            return f"{sign}{v:.0f}$"
+        if abs(v) >= 100:
+            return f"{sign}{v:.1f}$"
+        return f"{sign}{v:.2f}$"
+    except Exception:
+        return "0.00$"
+
+
+def _execution_wallet_plain_money(value) -> str:
+    try:
+        v = float(value or 0.0)
+        if abs(v) >= 1000:
+            return f"{v:.0f}$"
+        if abs(v) >= 100:
+            return f"{v:.1f}$"
+        return f"{v:.2f}$"
+    except Exception:
+        return "0.00$"
+
+
+def _execution_wallet_impact_usd_for_trade(trade: dict) -> float:
+    """Virtual wallet impact for one execution trade, in USD.
+
+    Uses the same 40/40/20 execution PnL helpers used by execution reports.
+    Open trades use floating PnL; closed trades use final PnL.
+    """
+    try:
+        pnl_pct = _execution_floating_pnl_pct(trade) if _is_execution_trade_open(trade) else _execution_final_pnl_pct(trade)
+        if pnl_pct is None:
+            return 0.0
+        margin = float(_trade_field(trade, "execution_margin_usd", None) or EXECUTION_TRADE_MARGIN_USD or 35.0)
+        return float(pnl_pct) * margin / 100.0
+    except Exception:
+        return 0.0
+
+
+def _execution_wallet_event_ts(trade: dict) -> int:
+    """Timestamp used for the equity-curve bucket.
+
+    Closed trades are assigned to close/update time. Open trades are assigned to
+    current report time so today/hourly floating impact remains visible without
+    pretending we have historical intraday equity snapshots.
+    """
+    try:
+        if _is_execution_trade_open(trade):
+            return int(time.time())
+        for key in ("closed_ts", "exit_ts", "closed_at", "updated_ts", "updated_at", "created_ts", "created_at", "candle_time"):
+            try:
+                v = int(float(trade.get(key) or 0))
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _trade_created_ts_for_exec(trade) or int(time.time())
+
+
+def _load_execution_wallet_trades(since_ts=None) -> list:
+    try:
+        try:
+            trades = load_all_trades_for_report(r, market_type="futures", side="long", since_ts=since_ts, include_open=True)
+        except Exception:
+            trades = _load_long_trades_from_redis(limit=3000)
+        filtered = []
+        for t in trades:
+            try:
+                # Wallet Impact tracks trades that truly entered the execution path.
+                # This avoids adding rejected_limit / candidate_only / normal signals
+                # to the virtual equity curve.
+                if not _is_trade_counted_for_execution_drawdown_guard(t):
+                    continue
+                ts = _execution_wallet_event_ts(t)
+                if since_ts and ts < int(since_ts):
+                    continue
+                filtered.append(t)
+            except Exception:
+                continue
+        return filtered
+    except Exception as e:
+        logger.warning(f"_load_execution_wallet_trades error: {e}")
+        return []
+
+
+def _execution_wallet_bucket_key(ts: int, hourly: bool = False) -> str:
+    try:
+        fmt = "%m-%d %H:00" if hourly else "%m-%d"
+        return time.strftime(fmt, time.localtime(int(ts)))
+    except Exception:
+        return "N/A"
+
+
+def _execution_wallet_period_title(period: str) -> str:
+    period = str(period or "all").lower()
+    if period == "today":
+        return "Today / Hourly"
+    if period in ("7d", "week"):
+        return "7D / Daily"
+    if period in ("30d", "month"):
+        return "Month / Daily"
+    return "Since Start / Daily"
+
+
+def _execution_wallet_since_ts(period: str):
+    period = str(period or "all").lower()
+    now = int(time.time())
+    if period == "today":
+        return get_local_day_start_ts()
+    if period in ("7d", "week"):
+        return now - 7 * 86400
+    if period in ("30d", "month"):
+        return now - 30 * 86400
+    return None
+
+
+def build_execution_wallet_impact_report_message(period: str = "all") -> str:
+    """Standalone virtual execution equity curve report.
+
+    Reports historical wallet impact by day, and today's impact by hour.
+    It is intentionally separate from /report_execution and is based on the
+    internal virtual execution wallet, not direct OKX account equity.
+    """
+    try:
+        period = str(period or "all").lower()
+        hourly = period == "today"
+        since_ts = _execution_wallet_since_ts(period)
+        trades = _load_execution_wallet_trades(since_ts=since_ts)
+        start_balance = _get_simulated_start_equity_usd()
+        if period == "today":
+            start_balance, _source = get_execution_daily_start_equity_usd()
+        title = _execution_wallet_period_title(period)
+
+        if not trades:
+            return "\n".join([
+                f"💼 <b>Execution Wallet Impact — {html.escape(title)}</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "لا توجد صفقات تنفيذ محسوبة في هذه الفترة.",
+                "ℹ️ التقرير يعتمد على Virtual Execution Wallet من التتبع الداخلي.",
+            ])
+
+        # Build bucket net values from trade impacts. Open trades are placed in
+        # the current bucket; closed trades in close/update bucket.
+        buckets = {}
+        for trade in trades:
+            ts = _execution_wallet_event_ts(trade)
+            key = _execution_wallet_bucket_key(ts, hourly=hourly)
+            buckets.setdefault(key, {"net": 0.0, "count": 0, "ts": ts})
+            buckets[key]["net"] += _execution_wallet_impact_usd_for_trade(trade)
+            buckets[key]["count"] += 1
+            buckets[key]["ts"] = min(int(buckets[key].get("ts") or ts), int(ts))
+
+        ordered = sorted(buckets.items(), key=lambda kv: kv[1].get("ts", 0))
+        balance = float(start_balance or 0.0)
+        rows = []
+        best_day = None
+        worst_dd = None
+        green_days = 0
+        red_days = 0
+        total_net = 0.0
+
+        for key, info in ordered:
+            open_balance = balance
+            net = float(info.get("net", 0.0) or 0.0)
+            close_balance = open_balance + net
+            # Without stored equity snapshots, Max Up/DD are conservative bucket
+            # extremes based on the realized/floating bucket impact.
+            max_up = max(net, 0.0)
+            max_dd = min(net, 0.0)
+            balance = close_balance
+            total_net += net
+            if net >= 0:
+                green_days += 1
+            else:
+                red_days += 1
+            best_day = net if best_day is None else max(best_day, net)
+            worst_dd = max_dd if worst_dd is None else min(worst_dd, max_dd)
+            rows.append({
+                "date": key,
+                "open": open_balance,
+                "close": close_balance,
+                "net": net,
+                "max_up": max_up,
+                "max_dd": max_dd,
+                "count": int(info.get("count", 0) or 0),
+            })
+
+        # Keep Telegram compact while preserving review value.
+        max_rows = 24 if hourly else 14
+        display_rows = rows[-max_rows:]
+        hidden = max(0, len(rows) - len(display_rows))
+
+        table_lines = [
+            "Date       Open    Close   Net      ↑Max    ↓DD",
+            "-----------------------------------------------",
+        ]
+        for row in display_rows:
+            icon = "🟢" if row["net"] >= 0 else "🔴"
+            table_lines.append(
+                f"{row['date']:<10} "
+                f"{_execution_wallet_plain_money(row['open']):>7} "
+                f"{_execution_wallet_plain_money(row['close']):>7} "
+                f"{icon}{_execution_wallet_money(row['net']):>8} "
+                f"{_execution_wallet_money(row['max_up']):>7} "
+                f"{_execution_wallet_money(row['max_dd']):>7}"
+            )
+        if hidden:
+            table_lines.append(f"... +{hidden} older rows")
+
+        avg_daily = total_net / len(rows) if rows else 0.0
+        impact_icon = "🟢" if total_net >= 0 else "🔴"
+        lines = [
+            f"💼 <b>Execution Wallet Impact — {html.escape(title)}</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"💰 Start: <b>{_execution_wallet_plain_money(start_balance)}</b>",
+            f"🏁 Current: <b>{_execution_wallet_plain_money(balance)}</b>",
+            f"⚖️ Net: <b>{impact_icon} {_execution_wallet_money(total_net)}</b>",
+            "",
+            f"<pre>{html.escape(chr(10).join(table_lines))}</pre>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🧠 <b>Summary</b>",
+            f"• Best Day: {_execution_wallet_money(best_day or 0.0)}",
+            f"• Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
+            f"• Avg Bucket: {_execution_wallet_money(avg_daily)}",
+            f"• Green / Red: {green_days} / {red_days}",
+            "ℹ️ Virtual execution wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة.",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"build_execution_wallet_impact_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير Wallet Impact: {html.escape(str(e))}"
+
+
 def build_execution_guard_report_message() -> str:
     try:
         snap = get_execution_daily_guard_snapshot()
@@ -5375,6 +5634,11 @@ COMMAND_HANDLERS = {
  "/report_execution_losses_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_losses": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_guard": lambda chat_id: send_telegram_reply(chat_id, build_execution_guard_report_message()),
+ "/report_execution_wallet": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("all"))),
+ "/report_execution_wallet_month": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("month"))),
+ "/report_execution_wallet_30d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("month"))),
+ "/report_execution_wallet_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("7d"))),
+ "/report_execution_wallet_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("today"))),
  "/report_execution_profit": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
  "/report_execution_profit_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
  "/report_execution_profit_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
@@ -6332,6 +6596,7 @@ def handle_callback_query(callback_query: dict):
         section_map = {
             "execution": build_help_execution_message,
             "normal": build_help_normal_message,
+            "wallet": build_help_wallet_message,
             "exec_intelligence": build_help_exec_intelligence_message,
             "market_intelligence": build_help_market_intelligence_message,
             "diagnostics": build_help_diagnostics_message,
@@ -7301,7 +7566,18 @@ def is_oversold_reversal_long(
         return False
     falling = detect_falling_knife_risk(df, dist_ma, change_24h, vol_ratio)
     if falling.get("falling_knife_risk"):
-        logger.info(f"Oversold reversal blocked by falling knife: {falling.get('reasons', [])}")
+        try:
+            symbol_for_log = str(df.attrs.get("symbol") or "") if hasattr(df, "attrs") else ""
+        except Exception:
+            symbol_for_log = ""
+        if not symbol_for_log:
+            symbol_for_log = str(globals().get("symbol", "") or "UNKNOWN")
+        reasons_for_log = falling.get("reasons", [])
+        checks_for_log = falling.get("checks", falling.get("confirmation_checks", "?"))
+        logger.info(
+            f"{symbol_for_log} --> oversold_reversal_blocked | reason=falling_knife | "
+            f"checks={checks_for_log}/3 | details={reasons_for_log}"
+        )
         return False
     bullish_close_ = close_ > open_
     gained_momentum_ = close_ >= prev_close_
