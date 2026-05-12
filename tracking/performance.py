@@ -4576,7 +4576,7 @@ def format_open_trades_message(
     losers_s = sorted(losers, key=_wp)
     pending_s = sorted(pending, key=lambda t: safe_timestamp(t.get("created_at", 0), 0), reverse=True)
 
-    lines.extend(["━━━━━━━━━━━━", "🟢 <b>Open Winners — Top 5</b>"])
+    lines.extend(["┄┄┄┄┄┄┄┄", "📈 <b>Open Winners — Top 5</b>"])
     if winners_s:
         for idx, trade in enumerate(winners_s[:5]):
             if idx > 0:
@@ -4587,7 +4587,7 @@ def format_open_trades_message(
     else:
         lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
-    lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 5</b>"])
+    lines.extend(["┄┄┄┄┄┄┄┄", "📉 <b>Open Losers — Top 5</b>"])
     if losers_s:
         for idx, trade in enumerate(losers_s[:5]):
             if idx > 0:
