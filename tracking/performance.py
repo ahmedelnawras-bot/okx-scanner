@@ -1,7 +1,7 @@
 # tracking/performance.py
-# Version: performance_v61_open_trades_wallet_ui
+# Version: performance_v63_recovery_pnl_support
 # Base: performance_v49_report_command_html_fix
-# Changes: UI/reporting only: open-trades wallet impact block, compact spacing, Top 5 winners/losers.
+# Changes: add Recovery 50/25/25 reporting support without changing core tracking decisions.
 # Fix: header/version corrected; dashboard context fields are displayed in the report.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -2892,8 +2892,9 @@ def get_winrate_summary(redis_client, market_type: str = "futures", side: str = 
 def _partial_lifecycle_realized_pnl_for_report(trade: dict) -> float:
     """Return leveraged realized/locked PnL for non-closed lifecycle states.
 
-    Reporting only: TP1 contributes 40%, TP2 contributes 40%, trailing 20% is
-    counted only when a trailing/current/exit price exists.
+    Reporting only: defaults to 40/40/20. Recovery trades can use 50/25/25
+    through tp1_close_pct/tp2_close_pct. Trailing is counted only when a
+    trailing/current/exit price exists.
     """
     try:
         if not isinstance(trade, dict):
@@ -2916,14 +2917,15 @@ def _partial_lifecycle_realized_pnl_for_report(trade: dict) -> float:
             if side == "short":
                 return ((entry - target) / entry) * 100.0
             return ((target - entry) / entry) * 100.0
+        tp1_w, tp2_w, runner_w = _trade_exit_weights_for_report(trade)
         raw = 0.0
         if _is_tp1_hit(trade):
-            raw += pct_to(tp1) * 0.40
+            raw += pct_to(tp1) * tp1_w
         if _is_tp2_hit(trade):
-            raw += pct_to(tp2) * 0.40
+            raw += pct_to(tp2) * tp2_w
             trailing_price = safe_float(trade.get("current_price") or trade.get("trailing_exit_price") or trade.get("exit_price"), 0.0)
             if trailing_price > 0:
-                raw += pct_to(trailing_price) * 0.20
+                raw += pct_to(trailing_price) * runner_w
         return round(raw * leverage, 4)
     except Exception:
         return 0.0
@@ -4260,19 +4262,18 @@ def get_open_trades_summary(
                 current_pnl_pct = ((effective_entry - current_price) / effective_entry) * 100
             current_pnl_leveraged = current_pnl_pct * REPORT_LEVERAGE
 
-            # Weighted PnL الفعلي حسب 40/40/20
+            # Weighted PnL الفعلي حسب خطة الصفقة (40/40/20 أو Recovery 50/25/25)
             _tp1_pct_move = ((tp1 - effective_entry) / effective_entry * 100) if tp1 > 0 and effective_entry > 0 else 0.0
             _tp2_pct_move = ((tp2 - effective_entry) / effective_entry * 100) if tp2 > 0 and effective_entry > 0 else 0.0
+            _tp1_w, _tp2_w, _runner_w = _trade_exit_weights_for_report(trade)
             if side_norm == "short":
                 _tp1_pct_move = -_tp1_pct_move
                 _tp2_pct_move = -_tp2_pct_move
 
             if phase == "trailing":
-                # TP1 40% + TP2 40% + current 20%
-                weighted_pnl_pct = (_tp1_pct_move * 0.40) + (_tp2_pct_move * 0.40) + (current_pnl_pct * 0.20)
+                weighted_pnl_pct = (_tp1_pct_move * _tp1_w) + (_tp2_pct_move * _tp2_w) + (current_pnl_pct * _runner_w)
             elif phase == "tp1_hit":
-                # TP1 40% + current 60%
-                weighted_pnl_pct = (_tp1_pct_move * 0.40) + (current_pnl_pct * 0.60)
+                weighted_pnl_pct = (_tp1_pct_move * _tp1_w) + (current_pnl_pct * max(0.0, 1.0 - _tp1_w))
             else:
                 # قبل TP1: الربح = حركة السعر الحالية 100%
                 weighted_pnl_pct = current_pnl_pct
@@ -4458,11 +4459,12 @@ def _format_open_trades_section(title: str, items: List[dict], start_index: int 
 def _open_trade_locked_leveraged_pct(t: dict) -> float:
     """Locked TP1/TP2 profit for an open trade, measured after report leverage."""
     try:
+        tp1_w, tp2_w, _runner_w = _trade_exit_weights_for_report(t)
         locked = 0.0
         if bool(t.get("tp1_hit", False)) or str(t.get("phase", "") or "") in ("tp1_hit", "tp2_hit", "trailing"):
-            locked += safe_float(t.get("tp1_pct", 0.0), 0.0) * 0.40
+            locked += safe_float(t.get("tp1_pct", 0.0), 0.0) * tp1_w
         if bool(t.get("tp2_hit", False)) or str(t.get("phase", "") or "") in ("tp2_hit", "trailing"):
-            locked += safe_float(t.get("tp2_pct", 0.0), 0.0) * 0.40
+            locked += safe_float(t.get("tp2_pct", 0.0), 0.0) * tp2_w
         lev = safe_float(t.get("leverage", REPORT_LEVERAGE), REPORT_LEVERAGE)
         return locked * lev
     except Exception:
