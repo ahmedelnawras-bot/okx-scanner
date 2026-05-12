@@ -1,7 +1,7 @@
-# Version: main_v306_wallet_impact_logging.py
+# Version: main_v307_wallet_open_reports_polish.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: Add separate execution Wallet Impact equity-curve reports and improve Oversold/Falling-Knife logging; preserve trading logic.
+# Changes: Polish Wallet Impact UI and open-trades dashboards; preserve trading/execution logic.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1919,11 +1919,11 @@ def build_help_inline_keyboard() -> dict:
             {"text": "📊 Normal Trades", "callback_data": "help:normal"},
         ],
         [
-            {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
+            {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
             {"text": "🧠 Exec Intelligence", "callback_data": "help:exec_intelligence"},
         ],
         [
-            {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
+            {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
         ],
         [
             {"text": "🧠 Diagnostics", "callback_data": "help:diagnostics"},
@@ -4223,8 +4223,28 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
         lines.append(f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>')
     return lines
 
+def _execution_open_locked_pnl_pct(trade: dict) -> float:
+    """Leveraged locked profit from TP1/TP2 partial closes for an open execution trade."""
+    try:
+        plan = _execution_plan_for_trade(trade)
+        entry = _safe_trade_float_value(plan.get("entry") or _trade_field(trade, "entry"), 0.0)
+        if entry <= 0:
+            return 0.0
+        tp1 = _safe_trade_float_value(plan.get("tp1") or trade.get("tp1"), 0.0)
+        tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), 0.0)
+        raw = 0.0
+        if _execution_trade_reached_tp1_for_display(trade) and tp1 > 0:
+            raw += ((tp1 - entry) / entry * 100.0) * 0.40
+        if (bool(trade.get("tp2_hit", False)) or str(trade.get("status", "") or "").lower() in ("tp2_partial", "trailing", "trailing_open")) and tp2 > 0:
+            raw += ((tp2 - entry) / entry * 100.0) * 0.40
+        leverage = float(_trade_field(trade, "leverage", TRACK_LEVERAGE) or TRACK_LEVERAGE)
+        return raw * leverage
+    except Exception:
+        return 0.0
+
+
 def build_execution_open_report_message(period: str = "all") -> str:
-    """Open-only report for execution-candidate trades using the official compact UI style."""
+    """Open-only report for execution-candidate trades using compact dashboard UI."""
     try:
         since_ts = _execution_report_since_ts(period)
         try:
@@ -4236,80 +4256,108 @@ def build_execution_open_report_message(period: str = "all") -> str:
             if since_ts:
                 trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
         trades = [t for t in trades if is_execution_candidate_trade(t) and _is_execution_trade_open(t)]
-        title_map = {
-            "all": "منذ البداية",
-            "1h": "آخر ساعة",
-            "hour": "آخر ساعة",
-            "today": "آخر يوم",
-            "7d": "آخر 7 أيام",
-            "30d": "آخر 30 يوم",
-            "month": "آخر 30 يوم",
-        }
         title_period = _format_report_range_label(period, trades, since_ts)
         if not trades:
             return f"📭 لا توجد صفقات تنفيذ مفتوحة ({html.escape(title_period)})."
 
         pairs = []
+        locked_pct_total = 0.0
+        total_impact_pct = 0.0
         for t in trades:
-            p = _execution_floating_pnl_pct(t)
-            pairs.append((t, 0.0 if p is None else float(p)))
-        winners = [(t, p) for t, p in pairs if p >= 0]
-        losers = [(t, p) for t, p in pairs if p < 0]
+            total_p = _execution_floating_pnl_pct(t)
+            total_p = 0.0 if total_p is None else float(total_p)
+            locked_p = _execution_open_locked_pnl_pct(t)
+            floating_p = total_p - locked_p
+            locked_pct_total += locked_p
+            total_impact_pct += total_p
+            pairs.append((t, total_p, floating_p, locked_p))
+
+        winners = [(t, p) for t, p, _, _ in pairs if p >= 0]
+        losers = [(t, p) for t, p, _, _ in pairs if p < 0]
         avg_trade_time = _avg_open_age_for_report(trades)
-        net = sum(p for _, p in pairs)
+        net = sum(p for _, p, _, _ in pairs)
+        floating_pct_total = sum(fp for _, _, fp, _ in pairs)
         win_rate = (len(winners) / len(pairs) * 100.0) if pairs else 0.0
 
         tp1_hit_count = sum(1 for t in trades if _execution_trade_reached_tp1_for_display(t))
         tp2_active_count = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("status", "") or "").lower() in ("tp2_partial", "trailing", "trailing_open"))
         trailing_count = sum(1 for t in trades if bool(t.get("trailing_active", False)) or str(t.get("status", "") or "").lower() in ("trailing", "trailing_open"))
-        protected_count = sum(1 for t in trades if bool(t.get("sl_moved_to_entry", False)) or bool(t.get("protected_breakeven", False)) or _execution_trade_reached_tp1_for_display(t))
-        danger_count = sum(1 for _, p in pairs if p <= -10.0)
+        before_tp1_count = sum(1 for t in trades if not _execution_trade_reached_tp1_for_display(t))
+        tp1_partial_count = sum(
+            1 for t in trades
+            if _execution_trade_reached_tp1_for_display(t)
+            and not (bool(t.get("tp2_hit", False)) or str(t.get("status", "") or "").lower() in ("tp2_partial", "trailing", "trailing_open"))
+        )
         scores = [_safe_trade_float_value(_trade_field(t, "score", 0.0), 0.0) or 0.0 for t in trades]
         avg_score = _avg(scores) if scores else 0.0
-        best_pair = max(pairs, key=lambda x: x[1]) if pairs else None
-        worst_pair = min(pairs, key=lambda x: x[1]) if pairs else None
+        best_pair = max([(t, p) for t, p, _, _ in pairs], key=lambda x: x[1]) if pairs else None
+        worst_pair = min([(t, p) for t, p, _, _ in pairs], key=lambda x: x[1]) if pairs else None
         best_txt = f"{str(best_pair[0].get('symbol','?')).replace('-SWAP','')} {_pct_safe(best_pair[1])}" if best_pair else "—"
         worst_txt = f"{str(worst_pair[0].get('symbol','?')).replace('-SWAP','')} {_pct_safe(worst_pair[1])}" if worst_pair else "—"
+
+        margin = float(EXECUTION_TRADE_MARGIN_USD or 35.0)
+        floating_usd = floating_pct_total * margin / 100.0
+        locked_usd = locked_pct_total * margin / 100.0
+        total_usd = total_impact_pct * margin / 100.0
+
+        def _money(v: float) -> str:
+            return f"{v:+.0f}$" if abs(v) >= 10 else f"{v:+.2f}$"
+
+        def _icon(v: float) -> str:
+            return "🟢" if v >= 0 else "🔴"
+
         lines = [
             "🚀 <b>صفقات التنفيذ المفتوحة</b>",
             f"📅 {html.escape(title_period)}",
-            "━━━━━━━━━━━━",
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
+            "┄┄┄┄┄┄┄┄",
             "📊 <b>Quick Stats</b>",
             f"• Open: {len(trades)}",
             f"• Winners: {len(winners)} | Losers: {len(losers)}",
             f"• Win Rate: <b>{win_rate:.1f}%</b>",
             f"• Net Floating: <b>{'🟢' if net >= 0 else '🔴'} {_pct_safe(net)}</b>",
-            f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_active_count} | 📍 Trailing: {trailing_count}",
-            f"🛡 Protected: {protected_count} | ⚠️ Danger: {danger_count}",
-            f"⏱ Avg Time: {html.escape(avg_trade_time)} | ⭐ Avg Score: {avg_score:.2f}",
+            f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_active_count}",
             f"🔥 Best: <b>{html.escape(best_txt)}</b>",
-            f"⚠️ Worst: <b>{html.escape(worst_txt)}</b>",
-            "━━━━━━━━━━━━",
-            "📂 <b>Open Trades</b>",
-            f"🟢 Top 4 Winners: {len(winners)} | 🔴 Top 4 Losers: {len(losers)}",
+            f"📉 Worst: <b>{html.escape(worst_txt)}</b>",
+            "┄┄┄┄┄┄┄┄",
+            "💼 <b>Wallet Impact</b>",
+            f"📈 Floating: {_icon(floating_usd)} {_money(floating_usd)} ({_pct_safe(floating_pct_total)})",
+            f"🔒 Locked: {_icon(locked_usd)} {_money(locked_usd)}",
+            f"⚖️ Total Impact: <b>{_icon(total_usd)} {_money(total_usd)}</b>",
+            f"📂 Open Trades: {len(trades)}",
+            "┄┄┄┄┄┄┄┄",
+            "📍 <b>Trade Stages</b>",
+            f"• Before TP1: {before_tp1_count} → لم تحقق TP1 بعد",
+            f"• TP1 Partial: {tp1_partial_count} → تم إغلاق أول 40%",
+            f"• TP2 Runner: {tp2_active_count} → تم تفعيل الـ Runner",
+            f"• Trailing Active: {trailing_count} → trailing stop يعمل حاليا",
+            "┄┄┄┄┄┄┄┄",
+            "🛡 <b>Risk Snapshot</b>",
+            f"• Avg Open Age: {html.escape(avg_trade_time)}",
+            f"• Avg Signal Score: {avg_score:.2f}",
+            "• Leverage Model: 15x",
         ]
-        sep = "┄┄┄┄┄┄"
+        sep = "┄┄┄"
         winners_sorted = sorted(winners, key=lambda x: x[1], reverse=True)
         losers_sorted = sorted(losers, key=lambda x: x[1])
+        lines.extend(["━━━━━━━━━━━━", "🟢 <b>Open Winners — Top 5</b>"])
         if winners_sorted:
-            lines.extend(["", "📂 <b>Open Winners — Top 4</b>"])
-            for idx, (trade, _) in enumerate(winners_sorted[:4]):
+            for idx, (trade, _) in enumerate(winners_sorted[:5]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
-            if len(winners_sorted) > 4:
-                lines.append(f"📂 +{len(winners_sorted) - 4} more winning trades...")
+            if len(winners_sorted) > 5:
+                lines.append(f"📂 +{len(winners_sorted) - 5} more winning trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
-        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 4</b>"])
+        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 5</b>"])
         if losers_sorted:
-            for idx, (trade, _) in enumerate(losers_sorted[:4]):
+            for idx, (trade, _) in enumerate(losers_sorted[:5]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
-            if len(losers_sorted) > 4:
-                lines.append(f"📂 +{len(losers_sorted) - 4} more losing trades...")
+            if len(losers_sorted) > 5:
+                lines.append(f"📂 +{len(losers_sorted) - 5} more losing trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
         lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
@@ -4317,7 +4365,6 @@ def build_execution_open_report_message(period: str = "all") -> str:
     except Exception as e:
         logger.error(f"build_execution_open_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير صفقات التنفيذ المفتوحة: {html.escape(str(e))}"
-
 
 def build_execution_report_message(period: str = "all") -> str:
     """Final execution-candidates report: compact wallet impact + behavior analytics."""
@@ -5067,8 +5114,9 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
 
         if not trades:
             return "\n".join([
-                f"💼 <b>Execution Wallet Impact — {html.escape(title)}</b>",
-                "━━━━━━━━━━━━━━━━━━━━",
+                "💼 <b>Wallet Impact</b>",
+                f"📅 {html.escape(title)}",
+                "┄┄┄┄┄┄┄┄",
                 "لا توجد صفقات تنفيذ محسوبة في هذه الفترة.",
                 "ℹ️ التقرير يعتمد على Virtual Execution Wallet من التتبع الداخلي.",
             ])
@@ -5097,8 +5145,6 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
             open_balance = balance
             net = float(info.get("net", 0.0) or 0.0)
             close_balance = open_balance + net
-            # Without stored equity snapshots, Max Up/DD are conservative bucket
-            # extremes based on the realized/floating bucket impact.
             max_up = max(net, 0.0)
             max_dd = min(net, 0.0)
             balance = close_balance
@@ -5119,46 +5165,44 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
                 "count": int(info.get("count", 0) or 0),
             })
 
-        # Keep Telegram compact while preserving review value.
         max_rows = 24 if hourly else 14
         display_rows = rows[-max_rows:]
         hidden = max(0, len(rows) - len(display_rows))
-
-        table_lines = [
-            "Date       Open    Close   Net      ↑Max    ↓DD",
-            "-----------------------------------------------",
-        ]
+        row_lines = []
         for row in display_rows:
             icon = "🟢" if row["net"] >= 0 else "🔴"
-            table_lines.append(
-                f"{row['date']:<10} "
-                f"{_execution_wallet_plain_money(row['open']):>7} "
-                f"{_execution_wallet_plain_money(row['close']):>7} "
-                f"{icon}{_execution_wallet_money(row['net']):>8} "
-                f"{_execution_wallet_money(row['max_up']):>7} "
-                f"{_execution_wallet_money(row['max_dd']):>7}"
+            row_lines.append(
+                f"{html.escape(str(row['date']))} | "
+                f"{_execution_wallet_plain_money(row['open'])} → {_execution_wallet_plain_money(row['close'])} | "
+                f"{icon} {_execution_wallet_money(row['net'])} | "
+                f"↑ {_execution_wallet_money(row['max_up'])} | ↓ {_execution_wallet_money(row['max_dd'])}"
             )
         if hidden:
-            table_lines.append(f"... +{hidden} older rows")
+            row_lines.append(f"📂 +{hidden} older rows...")
 
         avg_daily = total_net / len(rows) if rows else 0.0
         impact_icon = "🟢" if total_net >= 0 else "🔴"
         lines = [
-            f"💼 <b>Execution Wallet Impact — {html.escape(title)}</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
+            "💼 <b>Wallet Impact</b>",
+            f"📅 {html.escape(title)}",
+            "┄┄┄┄┄┄┄┄",
             f"💰 Start: <b>{_execution_wallet_plain_money(start_balance)}</b>",
             f"🏁 Current: <b>{_execution_wallet_plain_money(balance)}</b>",
             f"⚖️ Net: <b>{impact_icon} {_execution_wallet_money(total_net)}</b>",
-            "",
-            f"<pre>{html.escape(chr(10).join(table_lines))}</pre>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "🧠 <b>Summary</b>",
-            f"• Best Day: {_execution_wallet_money(best_day or 0.0)}",
-            f"• Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
-            f"• Avg Bucket: {_execution_wallet_money(avg_daily)}",
-            f"• Green / Red: {green_days} / {red_days}",
-            "ℹ️ Virtual execution wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة.",
+            "┄┄┄┄┄┄┄┄",
+            "📅 <b>Curve</b>",
         ]
+        lines.extend(row_lines)
+        lines.extend([
+            "┄┄┄┄┄┄┄┄",
+            "🧠 <b>Summary</b>",
+            f"🟢 Green: {green_days}",
+            f"🔴 Red: {red_days}",
+            f"📈 Best: {_execution_wallet_money(best_day or 0.0)}",
+            f"📉 Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
+            f"⚖️ Avg Bucket: {_execution_wallet_money(avg_daily)}",
+            "ℹ️ Virtual execution wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة.",
+        ])
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"build_execution_wallet_impact_report_message error: {e}", exc_info=True)
