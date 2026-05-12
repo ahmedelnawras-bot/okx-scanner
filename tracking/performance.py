@@ -1,7 +1,7 @@
 # tracking/performance.py
-# Version: performance_v57_ui_intelligence_open_polish
+# Version: performance_v60_report_ui_compact
 # Base: performance_v49_report_command_html_fix
-# Changes: UI/reporting only: stronger open-trades dashboard summary, compact spacing, smart sampling.
+# Changes: UI/reporting only: compact report style #2 and open-trades style #3; no calculation/trading logic changes.
 # Fix: header/version corrected; dashboard context fields are displayed in the report.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -3026,11 +3026,31 @@ def build_trade_summary_from_trades(
     ]:
         summary[key] = plan[key]
 
-    summary["recent_winning_trades"] = sorted(
-        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
-        key=lambda t: safe_timestamp(t.get("closed_at") or t.get("updated_at") or t.get("created_at"), 0),
+    open_report_trades = [
+        t for t in filtered_trades
+        if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")
+        and str(t.get("result", "") or "").lower() not in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven")
+    ]
+    summary["open_report_winners"] = sorted(
+        [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) >= 0],
+        key=lambda t: safe_timestamp(t.get("created_at") or t.get("created_ts") or t.get("candle_time"), 0),
         reverse=True,
-    )[:5]
+    )
+    summary["open_report_losers"] = sorted(
+        [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) < 0],
+        key=lambda t: safe_timestamp(t.get("created_at") or t.get("created_ts") or t.get("candle_time"), 0),
+        reverse=True,
+    )
+    summary["closed_winning_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
+        key=lambda t: calculate_trade_pnl(t).get("pnl_leveraged", 0.0),
+        reverse=True,
+    )
+    summary["closed_losing_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) < 0],
+        key=lambda t: calculate_trade_pnl(t).get("pnl_leveraged", 0.0),
+    )
+    summary["recent_winning_trades"] = summary["closed_winning_trades"][:5]
 
     return summary
 
@@ -3145,11 +3165,31 @@ def get_trade_summary(
     ]:
         summary[key] = plan[key]
 
-    summary["recent_winning_trades"] = sorted(
-        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
-        key=lambda t: safe_timestamp(t.get("closed_at") or t.get("updated_at") or t.get("created_at"), 0),
+    open_report_trades = [
+        t for t in filtered_trades
+        if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")
+        and str(t.get("result", "") or "").lower() not in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven")
+    ]
+    summary["open_report_winners"] = sorted(
+        [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) >= 0],
+        key=lambda t: safe_timestamp(t.get("created_at") or t.get("created_ts") or t.get("candle_time"), 0),
         reverse=True,
-    )[:5]
+    )
+    summary["open_report_losers"] = sorted(
+        [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) < 0],
+        key=lambda t: safe_timestamp(t.get("created_at") or t.get("created_ts") or t.get("candle_time"), 0),
+        reverse=True,
+    )
+    summary["closed_winning_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) > 0],
+        key=lambda t: calculate_trade_pnl(t).get("pnl_leveraged", 0.0),
+        reverse=True,
+    )
+    summary["closed_losing_trades"] = sorted(
+        [t for t in closed_trades if calculate_trade_pnl(t).get("pnl_leveraged", 0.0) < 0],
+        key=lambda t: calculate_trade_pnl(t).get("pnl_leveraged", 0.0),
+    )
+    summary["recent_winning_trades"] = summary["closed_winning_trades"][:5]
 
     return summary
 
@@ -3740,8 +3780,7 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• Open: {open_count}",
         f"• Closed: {closed}",
         f"🏆 Win Rate: <b>{winrate:.1f}%</b>",
-        f"🟢 Winners: {wins}",
-        f"🔴 Losers: {losses}",
+        f"🟢 Winners: {wins} | 🔴 Losers: {losses}",
     ]
     if expired:
         lines.append(f"⚫ Expired: {expired}")
@@ -3753,25 +3792,19 @@ def format_period_summary(title: str, summary: dict) -> str:
         "💰 <b>Wallet Impact</b>",
         "✅ الصفقات المغلقة",
         "📈 الأرباح",
-        f"{gross_profit:+.2f}%",
-        f"{gross_profit_usd:+.2f}$",
+        f"{gross_profit_usd:+.2f}$ | {gross_profit:+.2f}% Exposure",
         "📉 الخسائر",
-        f"{-abs(gross_loss):+.2f}%",
-        f"{-abs(gross_loss_usd):+.2f}$",
+        f"{-abs(gross_loss_usd):+.2f}$ | {-abs(gross_loss):+.2f}% Exposure",
         "⚖️ الصافي",
-        f"<b>{net_icon} {net_pnl:+.2f}%</b>",
-        f"<b>{net_pnl_usd:+.2f}$</b>",
-        "",
+        f"<b>{net_icon} {net_pnl_usd:+.2f}$ | {net_pnl:+.2f}% Exposure</b>",
         "💼 <b>التأثير الحالي على المحفظة</b>",
-        f"<b>{wallet_icon} {wallet_pnl_usd:+.2f}$</b>",
-        f"<b>{wallet_pnl_pct:+.2f}%</b>",
+        f"<b>{wallet_icon} {wallet_pnl_usd:+.2f}$ | {wallet_pnl_pct:+.2f}%</b>",
         sep,
         "🧠 <b>Execution Behavior Summary</b>",
         "📦 Model: 40/40/20",
         f"📈 Avg Winner: {avg_win:+.2f}%",
         f"📉 Avg Loser: {avg_loss:+.2f}%",
-        f"🎯 TP1 Rate: {tp1_rate:.1f}%",
-        f"🏁 TP2 Rate: {tp2_rate:.1f}%",
+        f"🎯 TP1 Rate: {tp1_rate:.1f}% | 🏁 TP2 Rate: {tp2_rate:.1f}%",
         f"🔁 TP1 → TP2: {tp1_to_tp2_rate:.1f}%",
         f"🔄 Trailing Wins: {trailing_wins}",
         f"⚖️ Partial Open PnL: {partial_lifecycle_pnl:+.2f}%",
@@ -3798,16 +3831,143 @@ def format_period_summary(title: str, summary: dict) -> str:
         f"• الإجراء المقترح: {diagnosis['action']}",
     ]
 
-    recent_winning_trades = summary.get("recent_winning_trades") or []
-    if recent_winning_trades:
-        trade_separator = "┄┄┄┄┄┄"
-        lines.extend([sep, "🏆 <b>آخر 5 صفقات رابحة</b>"])
-        for idx, trade in enumerate(recent_winning_trades[:5]):
-            lines.extend(_format_recent_report_trade_lines(trade))
-            if idx < len(recent_winning_trades[:5]) - 1:
+    trade_separator = "┄┄┄┄┄┄"
+    open_winners = summary.get("open_report_winners") or []
+    open_losers = summary.get("open_report_losers") or []
+    closed_winners = summary.get("closed_winning_trades") or []
+    closed_losers = summary.get("closed_losing_trades") or []
+
+    def _append_cards(section_title: str, trades_list: list, limit: int, more_text: str, is_open: bool = False):
+        lines.extend([sep, section_title])
+        if not trades_list:
+            lines.append("لا توجد بيانات حاليًا.")
+            return
+        for idx, trade in enumerate(trades_list[:limit]):
+            if idx > 0:
                 lines.append(trade_separator)
+            lines.extend(_format_period_report_trade_card(trade, is_open=is_open))
+        if len(trades_list) > limit:
+            lines.append(f"📂 +{len(trades_list) - limit} {more_text}")
+
+    lines.extend([sep, "📂 <b>Open Trades</b>"])
+    _append_cards("🟢 <b>Latest 3 Winners</b>", open_winners, 3, "more winning trades...", is_open=True)
+    _append_cards("🔴 <b>Latest 3 Losers</b>", open_losers, 3, "more losing trades...", is_open=True)
+    _append_cards("✅ <b>Closed Wins</b>\n🏆 Top 3 Best Winners", closed_winners, 3, "more winning trades...", is_open=False)
+    _append_cards("❌ <b>Closed Losses</b>\n📉 Top 3 Worst Losses", closed_losers, 3, "more losing trades...", is_open=False)
 
     return "\n".join(lines)
+
+
+def _period_report_trade_pnl_pct(trade: dict, is_open: bool = False) -> float:
+    """UI-only helper for compact normal report trade cards."""
+    try:
+        if is_open:
+            return safe_float(trade.get("weighted_pnl_pct", trade.get("current_pnl_pct", 0.0)), 0.0)
+        pnl_data = calculate_trade_pnl(trade)
+        if pnl_data.get("skipped") or pnl_data.get("is_pending"):
+            return 0.0
+        return safe_float(pnl_data.get("pnl_leveraged", 0.0), 0.0)
+    except Exception:
+        return 0.0
+
+
+def _period_report_trade_duration(trade: dict) -> str:
+    try:
+        start = safe_timestamp(trade.get("created_at") or trade.get("created_ts") or trade.get("candle_time"), 0)
+        end = safe_timestamp(trade.get("closed_at") or trade.get("updated_at"), 0) or int(time.time())
+        if start <= 0:
+            return "N/A"
+        mins = max(0, int(end - start)) // 60
+        if mins < 60:
+            return f"{mins}m"
+        if mins < 1440:
+            return f"{mins // 60}h {mins % 60}m"
+        return f"{mins // 1440}d {(mins % 1440) // 60}h"
+    except Exception:
+        return "N/A"
+
+
+def _period_report_trade_stage(trade: dict, is_open: bool = False) -> str:
+    try:
+        if is_open:
+            phase = str(trade.get("phase") or trade.get("status") or "open").lower()
+            if phase in ("trailing", "trailing_open"):
+                return "Trailing Active"
+            if phase in ("tp2_hit", "tp2_partial") or bool(trade.get("tp2_hit", False)):
+                return "TP2 Hit"
+            if phase == "tp1_hit" or bool(trade.get("tp1_hit", False)):
+                return "TP1 Hit"
+            if phase == "pending_pullback":
+                return "Pending Pullback"
+            return "Before TP1"
+        result = str(trade.get("result", "") or "").lower()
+        if result == "trailing_win":
+            return "TP2 + Runner"
+        if result == "tp2_win":
+            return "TP2 Hit"
+        if result == "tp1_win":
+            return "TP1 Only"
+        if result == "loss":
+            return "SL Hit"
+        if result == "breakeven":
+            return "Breakeven"
+        return result.replace("_", " ").title() or "Closed"
+    except Exception:
+        return "N/A"
+
+
+def _period_report_setup_name(trade: dict) -> str:
+    raw = str(trade.get("primary_extra_setup") or trade.get("extra_setup") or trade.get("setup_type") or "Setup N/A")
+    parts = [p.strip() for p in raw.replace(",", "|").split("|") if p.strip()]
+    preferred = [
+        "vwap_reclaim", "retest_breakout_confirmed", "higher_low_continuation",
+        "relative_strength_vs_btc", "wave_3", "support_bounce_confirmed",
+        "failed_breakdown_trap", "liquidity_sweep_reclaim",
+    ]
+    setup = next((p for p in preferred if p in parts), parts[-1] if parts else raw)
+    mapping = {
+        "vwap_reclaim": "VWAP Reclaim",
+        "retest_breakout_confirmed": "Retest Breakout",
+        "higher_low_continuation": "Higher Low Continuation",
+        "relative_strength_vs_btc": "RS vs BTC",
+        "wave_3": "Wave 3",
+        "support_bounce_confirmed": "Support Bounce",
+        "failed_breakdown_trap": "Failed Breakdown Trap",
+        "liquidity_sweep_reclaim": "Liquidity Sweep",
+    }
+    return mapping.get(str(setup), str(setup or "Setup N/A").replace("_", " ").title())
+
+
+def _format_period_report_trade_card(trade: dict, is_open: bool = False) -> list:
+    """Compact card used in normal general reports. UI only."""
+    try:
+        symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+        pnl = _period_report_trade_pnl_pct(trade, is_open=is_open)
+        duration = html.escape(_period_report_trade_duration(trade))
+        stage = html.escape(_period_report_trade_stage(trade, is_open=is_open))
+        tp1 = _fmt_price_perf(safe_float(trade.get("tp1"), 0.0))
+        tp2 = _fmt_price_perf(safe_float(trade.get("tp2"), 0.0))
+        sl = _fmt_price_perf(safe_float(trade.get("sl"), 0.0))
+        score = safe_float(trade.get("score"), 0.0)
+        setup = html.escape(_period_report_setup_name(trade))
+        tv_link = ""
+        try:
+            clean_sym = str(trade.get("symbol", "")).replace("-SWAP", "").replace("-USDT", "USDT")
+            tv_link = f"https://www.tradingview.com/chart/?symbol=OKX:{clean_sym}.P&interval=15"
+        except Exception:
+            tv_link = ""
+        lines = [
+            f"• <b>{symbol}</b> | {pnl:+.2f}% Exposure",
+            f"⏱️ {duration} | 📍 {stage}",
+            f"🎯 TP1: {tp1} | 🏁 TP2: {tp2}",
+            f"🛡 SL: {sl} | ⭐ {score:.2f}",
+            f"🧠 {setup}",
+        ]
+        if tv_link:
+            lines.append(f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>')
+        return lines
+    except Exception as e:
+        return [f"• <b>{html.escape(str(trade.get('symbol', '?')))}</b>", f"⚠️ تعذر تنسيق الصفقة: {html.escape(str(e))}"]
 
 
 # ------------------------------------------------------------
@@ -4241,8 +4401,7 @@ def _format_open_trade_compact_card(t: dict, index: int = 0) -> List[str]:
     else:
         phase_line = "Before TP1"
 
-    pnl_icon = "🟢" if pnl > 0.05 else "🔴" if pnl < -0.05 else "🟡"
-    header = f"{pnl_icon} <b>{sym}</b> | {pnl:+.2f}%"
+    header = f"• <b>{sym}</b> | {pnl:+.2f}%"
     lines = [
         header,
         f"⏱️ {age} | 📍 {phase_line}",
@@ -4365,17 +4524,12 @@ def format_open_trades_message(
         "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
         "📊 <b>Quick Stats</b>",
         f"• Open: {total}",
-        f"• Winners: {len(winners)}",
-        f"• Losers: {len(losers)}",
+        f"• Winners: {len(winners)} | Losers: {len(losers)}",
         f"• Win Rate: <b>{win_rate:.1f}%</b>",
-        f"• Net Floating: <b>{net_pnl:+.2f}%</b>",
-        f"🎯 TP1: {tp1_hit_count}",
-        f"🏁 TP2: {tp2_hit_count}",
-        f"📍 Trailing: {trailing_count}",
-        f"🛡 Protected: {protected_count}",
-        f"⚠️ Danger: {danger_count}",
-        f"⏱ Avg Time: {_avg_age(trades)}",
-        f"⭐ Avg Score: {avg_score:.2f}",
+        f"• Net Floating: <b>{'🟢' if net_pnl >= 0 else '🔴'} {net_pnl:+.2f}%</b>",
+        f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_hit_count} | 📍 Trailing: {trailing_count}",
+        f"🛡 Protected: {protected_count} | ⚠️ Danger: {danger_count}",
+        f"⏱ Avg Time: {_avg_age(trades)} | ⭐ Avg Score: {avg_score:.2f}",
         f"🔥 Best: <b>{html.escape(best_text)}</b>",
         f"⚠️ Worst: <b>{html.escape(worst_text)}</b>",
         "━━━━━━━━━━━━",
@@ -4385,8 +4539,7 @@ def format_open_trades_message(
         f"⚡ Execution: <code>{html.escape(exec_text)}</code>",
         "━━━━━━━━━━━━",
         "📂 <b>Open Trades</b>",
-        f"🟢 Open Winners: {len(winners)}",
-        f"🔴 Open Losers: {len(losers)}",
+        f"🟢 Top 4 Winners: {len(winners)} | 🔴 Top 4 Losers: {len(losers)}",
     ]
 
     separator = "┄┄┄┄┄┄"
@@ -4395,24 +4548,24 @@ def format_open_trades_message(
     pending_s = sorted(pending, key=lambda t: safe_timestamp(t.get("created_at", 0), 0), reverse=True)
 
     if winners_s:
-        lines.append("")
-        for idx, trade in enumerate(winners_s[:5]):
+        lines.extend(["", "📂 <b>Open Winners — Top 4</b>"])
+        for idx, trade in enumerate(winners_s[:4]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(winners_s) > 5:
-            lines.append(f"📂 +{len(winners_s) - 5} صفقات رابحة مفتوحة أخرى")
+        if len(winners_s) > 4:
+            lines.append(f"📂 +{len(winners_s) - 4} more winning trades...")
     else:
         lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
-    lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
+    lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 4</b>"])
     if losers_s:
-        for idx, trade in enumerate(losers_s[:5]):
+        for idx, trade in enumerate(losers_s[:4]):
             if idx > 0:
                 lines.append(separator)
             lines.extend(_format_open_trade_compact_card(trade))
-        if len(losers_s) > 5:
-            lines.append(f"📂 +{len(losers_s) - 5} صفقات خاسرة مفتوحة أخرى")
+        if len(losers_s) > 4:
+            lines.append(f"📂 +{len(losers_s) - 4} more losing trades...")
     else:
         lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
