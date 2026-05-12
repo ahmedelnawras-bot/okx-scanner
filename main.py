@@ -301,6 +301,7 @@ MARKET_GUARD_ALT_WEAK_BLOCK = True
 
 # Recovery Long
 RECOVERY_MAX_ALERTS = 3
+RECOVERY_UNIVERSE_LIMIT = 100
 RECOVERY_CYCLE_MAX_TRADES = 3
 RECOVERY_MODE_MAX_DURATION_SECONDS = 90 * 60
 RECOVERY_TOTAL_SIZE_PCT = 30
@@ -2017,30 +2018,30 @@ def build_help_execution_message() -> str:
 📊 <b>التقرير العام</b>
 ┄┄┄┄┄┄
 /report_execution
-/report_execution_1h
-/report_execution_today
 /report_execution_7d
+/report_execution_today
+/report_execution_1h
 
 📂 <b>الصفقات المفتوحة</b>
 ┄┄┄┄┄┄
 /report_execution_open
-/report_execution_open_1h
-/report_execution_open_today
 /report_execution_open_7d
+/report_execution_open_today
+/report_execution_open_1h
 
 📈 <b>تحليل أسباب الأرباح</b>
 ┄┄┄┄┄┄
 /report_execution_profit_analysis
-/report_execution_profit_analysis_1h
-/report_execution_profit_analysis_today
 /report_execution_profit_analysis_7d
+/report_execution_profit_analysis_today
+/report_execution_profit_analysis_1h
 
 📉 <b>تحليل أسباب الخسائر</b>
 ┄┄┄┄┄┄
 /report_execution_losses_analysis
-/report_execution_losses_analysis_1h
-/report_execution_losses_analysis_today
 /report_execution_losses_analysis_7d
+/report_execution_losses_analysis_today
+/report_execution_losses_analysis_1h
 
 ⚙️ <b>أداء التنفيذ</b>
 ┄┄┄┄┄┄
@@ -2062,10 +2063,10 @@ def build_help_wallet_message() -> str:
 يعرض Open / Close / Net / Max Up / Max DD.
 
 📅 <b>الأوامر</b>
-/report_execution_wallet — منذ البداية / يومي
-/report_execution_wallet_month — آخر شهر / يومي
-/report_execution_wallet_7d — آخر أسبوع / يومي
-/report_execution_wallet_today — اليوم / بالساعة
+/report_execution_wallet — Since Start / Daily
+/report_execution_wallet_7d — Last 7D / Daily
+/report_execution_wallet_today — Today / Hourly
+/report_execution_wallet_month — Last 30D / Daily
 
 ℹ️ التقرير يعتمد على Virtual Execution Wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة."""
 
@@ -2078,30 +2079,30 @@ def build_help_normal_message() -> str:
 📊 <b>التقرير العام</b>
 ┄┄┄┄┄┄
 /report_all
-/report_1h
-/report_today
 /report_7d
+/report_today
+/report_1h
 
 📂 <b>الصفقات المفتوحة</b>
 ┄┄┄┄┄┄
 /open_trades
-/open_trades_1h
-/open_trades_today
 /open_trades_7d
+/open_trades_today
+/open_trades_1h
 
 📈 <b>تحليل أسباب الأرباح</b>
 ┄┄┄┄┄┄
 /report_profit_analysis
-/report_profit_analysis_1h
-/report_profit_analysis_today
 /report_profit_analysis_7d
+/report_profit_analysis_today
+/report_profit_analysis_1h
 
 📉 <b>تحليل أسباب الخسائر</b>
 ┄┄┄┄┄┄
 /report_losses_analysis
-/report_losses_analysis_1h
-/report_losses_analysis_today
 /report_losses_analysis_7d
+/report_losses_analysis_today
+/report_losses_analysis_1h
 
 ⚙️ <b>أداء الصفقات</b>
 ┄┄┄┄┄┄
@@ -2118,18 +2119,18 @@ def build_help_exec_intelligence_message() -> str:
 🚀 <b>ذكاء الصفقات المرشحة</b>
 ℹ️ يعرض جودة execution candidates وتحليل أداء الترشيحات والتنفيذ.
 /report_execution_intelligence
-/report_execution_intelligence_1h
-/report_execution_intelligence_today
 /report_execution_intelligence_7d
+/report_execution_intelligence_today
+/report_execution_intelligence_1h
 
 ┄┄┄┄┄┄┄┄
 
 🧪 <b>تحليل رفض الترشيحات</b>
 ℹ️ يعرض أسباب رفض execution candidates وجودة execution filters.
 /report_execution_rejections
-/report_execution_rejections_1h
+/report_execution_rejections_7d
 /report_execution_rejections_today
-/report_execution_rejections_7d"""
+/report_execution_rejections_1h"""
 
 def build_help_market_intelligence_message() -> str:
  return """🧠 <b>Market Intelligence</b>
@@ -2139,18 +2140,18 @@ def build_help_market_intelligence_message() -> str:
 📊 <b>ذكاء الصفقات العادية</b>
 ℹ️ يعرض جودة السوق، أفضل الأنماط، وملاحظات تحسين الأداء من الصفقات العادية.
 /report_intelligence
-/report_intelligence_1h
-/report_intelligence_today
 /report_intelligence_7d
+/report_intelligence_today
+/report_intelligence_1h
 
 ┄┄┄┄┄┄┄┄
 
 🧪 <b>تحليل الرفض والفلاتر</b>
 ℹ️ يعرض أسباب رفض الصفقات العادية وهل الفلاتر كانت دقيقة أو aggressive زيادة.
 /report_rejection_intelligence
-/report_rejection_intelligence_1h
+/report_rejection_intelligence_7d
 /report_rejection_intelligence_today
-/report_rejection_intelligence_7d"""
+/report_rejection_intelligence_1h"""
 
 def build_help_diagnostics_message() -> str:
  return """🧠 <b>التشخيص</b>
@@ -5421,12 +5422,13 @@ def build_execution_losses_report_message(period: str = "all") -> str:
 
         period_title = _analysis_period_title(period)
         lines = [
-            f"📉 <b>تحليل أسباب خسائر التنفيذ | {period_title}</b>",
+            "📉 <b>تحليل أسباب خسائر التنفيذ</b>",
+            f"📅 <b>الفترة:</b> {period_title}",
             "━━━━━━━━━━━━",
-            f"إجمالي صفقات التنفيذ: <b>{len(trades)}</b>",
-            f"الخسائر المغلقة: <b>{len(losses)}</b>",
-            f"متوسط الخسارة بعد الرافعة: <b>{avg_loss_pct:.2f}%</b>",
-            f"تأثير الخسائر التقريبي: <b>{total_loss_usd:.2f}$</b>",
+            f"📊 الصفقات داخل الفترة: <b>{len(trades)}</b>",
+            f"❌ الصفقات الخاسرة داخل الفترة: <b>{len(losses)}</b>",
+            f"⚖️ متوسط خسارة الصفقات الخاسرة: <b>{avg_loss_pct:.2f}%</b>",
+            f"💰 إجمالي خسائر الصفقات الخاسرة: <b>{total_loss_usd:.2f}$</b>",
             "",
             "🔴 <b>أكثر الأسباب تكرارًا:</b>",
             *top_lines(reasons, 10),
@@ -5655,6 +5657,7 @@ def build_trade_reason_analysis_report_message(scope: str = "execution", result_
     try:
         scope = _analysis_scope_en(scope)
         period = _analysis_period_key(period)
+        all_period_trades = _analysis_load_trades(scope, period, include_open=True)
         trades = _analysis_load_trades(scope, period, include_open=False)
         closed = [t for t in trades if not _analysis_is_open_trade(t)]
         pairs = []
@@ -5680,13 +5683,18 @@ def build_trade_reason_analysis_report_message(scope: str = "execution", result_
         period_title = _analysis_period_title(period)
         icon = "📈" if result_type == "profit" else "📉"
         noun = "أرباح" if result_type == "profit" else "خسائر"
-        title = f"{icon} <b>تحليل أسباب {noun} {scope_ar} | {period_title}</b>"
+        title = f"{icon} <b>تحليل أسباب {noun} {scope_ar}</b>"
+        target_line = "✅ الصفقات الرابحة داخل الفترة" if result_type == "profit" else "❌ الصفقات الخاسرة داخل الفترة"
+        avg_label = "متوسط ربح الصفقات الرابحة" if result_type == "profit" else "متوسط خسارة الصفقات الخاسرة"
+        total_label = "إجمالي أرباح الصفقات الرابحة" if result_type == "profit" else "إجمالي خسائر الصفقات الخاسرة"
         lines = [
             title,
+            f"📅 <b>الفترة:</b> {period_title}",
             "━━━━━━━━━━━━",
-            f"📊 العينة: <b>{count}</b>",
-            f"⚖️ متوسط PnL بعد الرافعة: <b>{avg_pnl:+.2f}%</b>",
-            f"💰 إجمالي PnL تقريبي: <b>{total_pnl:+.2f}% Exposure</b>",
+            f"📊 الصفقات داخل الفترة: <b>{len(all_period_trades)}</b>",
+            f"{target_line}: <b>{count}</b>",
+            f"⚖️ {avg_label}: <b>{avg_pnl:+.2f}%</b>",
+            f"💰 {total_label}: <b>{total_pnl:+.2f}% Exposure</b>",
             "",
             "🧩 <b>حسب Setup:</b>",
         ]
@@ -5762,7 +5770,7 @@ def build_ai_analysis_snapshot(scope: str = "execution", period: str = "today") 
             "generated_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
             "market_type": "futures",
             "side": "long",
-            "source_file_version": "main_final_v01_analysis_packages_routing",
+            "source_file_version": "main_final_v03_recovery_universe_period_ui",
         },
         "summary": {
             "total_trades": len(trades),
@@ -6204,7 +6212,7 @@ COMMAND_HANDLERS = {
  "/report_rejection_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
  "/report_profit": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_profit_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
- "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+ "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_report_message("7d")),
  "/open_trades_1h": lambda chat_id: _send_open_trades(chat_id, "1h"),
  "/open_trades_today": lambda chat_id: _send_open_trades(chat_id, "today"),
  "/open_trades_7d": lambda chat_id: _send_open_trades(chat_id, "7d"),
@@ -6228,7 +6236,7 @@ COMMAND_HANDLERS = {
     build_rejections_report_message(r)
 ),
  "/report_daily": lambda chat_id: send_telegram_reply(chat_id, build_daily_report_message()),
- "/report_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
+ "/report_7d": lambda chat_id: send_telegram_reply(chat_id, build_report_message("7d")),
  "/reset_stats": lambda chat_id: reset_stats(chat_id),
  "/stats_since_reset": lambda chat_id: stats_since_reset(chat_id),
  "/hard_reset": handle_hard_reset,
@@ -11112,6 +11120,79 @@ def _recovery_candidate_quality(symbol: str, df, btc_df, dist_ma: float, rsi_now
     except Exception as e:
         return {"ok": False, "extra": {}, "reasons": [f"quality_error:{e}"], "reclaim_ok": False, "micro_high_break": False}
 
+
+def _recovery_candidate_score(symbol: str, df, btc_df, dist_ma: float, rsi_now: float, vol_ratio: float, atr_value: float, quality: dict = None) -> float:
+    """Rank RECOVERY_LONG candidates after the wider universe scan.
+
+    Score is used only to order already-qualified recovery candidates. It does
+    not change normal scanning, scoring, filters, execution whitelist, TP/SL, or
+    market-mode transitions.
+    """
+    try:
+        quality = quality or {}
+        row = get_signal_row(df)
+        if row is None:
+            return 0.0
+        close = _safe_float(row.get("close"), 0.0)
+        if close <= 0:
+            return 0.0
+
+        recent = df.tail(24).copy()
+        lows = recent["low"].astype(float) if "low" in recent else []
+        recent_low = float(min(lows)) if len(lows) else close
+        bounce_pct = ((close - recent_low) / recent_low * 100.0) if recent_low > 0 else 0.0
+
+        rsi_series = recent["rsi"].astype(float) if "rsi" in recent else []
+        rsi_recovery = 0.0
+        if len(rsi_series) >= 6:
+            rsi_recovery = max(0.0, float(rsi_series.iloc[-1]) - float(rsi_series.iloc[-6:-1].min()))
+
+        vwap = _safe_float(row.get("vwap"), 0.0)
+        ma = _safe_float(row.get("ma"), 0.0)
+        vwap_reclaim_bonus = 0.0
+        if vwap > 0 and close >= vwap:
+            vwap_reclaim_bonus += 1.3
+        if ma > 0 and close >= ma:
+            vwap_reclaim_bonus += 0.8
+        if quality.get("micro_high_break"):
+            vwap_reclaim_bonus += 1.0
+        if quality.get("reclaim_ok"):
+            vwap_reclaim_bonus += 0.7
+
+        no_new_low_bonus = 0.0
+        try:
+            prev_low = float(recent.iloc[-6:-1]["low"].astype(float).min())
+            latest_low = float(recent.iloc[-1]["low"])
+            if latest_low >= prev_low:
+                no_new_low_bonus = 1.0
+        except Exception:
+            pass
+
+        rs_bonus = 0.0
+        try:
+            if btc_df is not None and not btc_df.empty and len(df) >= 8 and len(btc_df) >= 8:
+                alt_change = (float(df.iloc[-1]["close"]) / float(df.iloc[-6]["close"]) - 1.0) * 100.0
+                btc_change = (float(btc_df.iloc[-1]["close"]) / float(btc_df.iloc[-6]["close"]) - 1.0) * 100.0
+                rs_bonus = max(0.0, min(2.0, (alt_change - btc_change) * 0.6))
+        except Exception:
+            pass
+
+        atr_pct = (atr_value / close * 100.0) if close > 0 and atr_value > 0 else 0.0
+        atr_bonus = 0.6 if 0.25 <= atr_pct <= 3.5 else 0.0
+
+        score = 0.0
+        score += min(3.0, abs(float(dist_ma or 0.0)) * 0.35)
+        score += min(2.5, max(0.0, bounce_pct) * 0.45)
+        score += min(2.0, max(0.0, rsi_recovery) * 0.25)
+        score += min(2.0, max(0.0, float(vol_ratio or 0.0) - 1.0) * 2.5)
+        score += vwap_reclaim_bonus
+        score += no_new_low_bonus
+        score += rs_bonus
+        score += atr_bonus
+        return round(float(score), 4)
+    except Exception:
+        return 0.0
+
 # =========================
 # DETERMINE LONG MARKET MODE
 # =========================
@@ -13380,11 +13461,54 @@ def run_scanner_loop():
 
             # ---------- RECOVERY LONG ----------
             if current_mode == MODE_RECOVERY_LONG:
+                # RECOVERY_LONG uses a wider universe so fast small/mid-cap rebounds are not missed.
+                # Keep the cycle cap unchanged; only the candidate search universe is wider.
                 scan_pairs = sorted(
                     ranked_pairs,
                     key=lambda x: x.get("_rank_volume_24h", 0),
                     reverse=True
-                )[:20]
+                )[:RECOVERY_UNIVERSE_LIMIT]
+                logger.info(f"RECOVERY_LONG universe scan: top {len(scan_pairs)} pairs by liquidity; max cycle trades={RECOVERY_CYCLE_MAX_TRADES}")
+
+                # Rank the wider recovery universe by a lightweight Recovery Score before sending.
+                # This preserves the 3-trade cycle cap while giving smaller/faster rebounders a fair chance.
+                try:
+                    btc_df_for_recovery_rank = to_dataframe(get_candles("BTC-USDT-SWAP", TIMEFRAME, 100))
+                except Exception:
+                    btc_df_for_recovery_rank = None
+                ranked_recovery_pairs = []
+                for _pair_data in scan_pairs:
+                    _pair_copy = dict(_pair_data)
+                    _symbol = _pair_copy.get("instId")
+                    _score = 0.0
+                    _candles = []
+                    try:
+                        _candles = get_candles(_symbol, TIMEFRAME, 100)
+                        if _candles:
+                            _df = to_dataframe(_candles)
+                            _row = get_signal_row(_df) if _df is not None and not _df.empty else None
+                            if _row is not None:
+                                _dist_ma = get_distance_from_ma_percent(_df)
+                                _rsi_now = _safe_float(_row.get("rsi"), 50)
+                                _vol_ratio = get_volume_ratio(_df)
+                                _atr_value = _safe_float(_row.get("atr"), 0)
+                                _quality = _recovery_candidate_quality(_symbol, _df, btc_df_for_recovery_rank, _dist_ma, _rsi_now, _vol_ratio, _atr_value)
+                                _score = _recovery_candidate_score(_symbol, _df, btc_df_for_recovery_rank, _dist_ma, _rsi_now, _vol_ratio, _atr_value, _quality)
+                    except Exception:
+                        _score = 0.0
+                    _pair_copy["_recovery_rank_score"] = float(_score or 0.0)
+                    _pair_copy["_recovery_cached_candles"] = _candles or []
+                    ranked_recovery_pairs.append(_pair_copy)
+                scan_pairs = sorted(
+                    ranked_recovery_pairs,
+                    key=lambda x: (x.get("_recovery_rank_score", 0.0), x.get("_rank_volume_24h", 0.0)),
+                    reverse=True,
+                )
+                logger.info(
+                    "RECOVERY_LONG ranked universe top scores: " + ", ".join(
+                        f"{p.get('instId')}={float(p.get('_recovery_rank_score', 0.0)):.2f}" for p in scan_pairs[:8]
+                    )
+                )
                 recovery_started_ts = int(r.get(MARKET_MODE_RECOVERY_STARTED_KEY) or 0) if r else 0
                 if not recovery_started_ts:
                     recovery_started_ts = int(time.time())
@@ -13398,7 +13522,7 @@ def run_scanner_loop():
                         logger.info(f"RECOVERY_LONG cycle limit reached: active={active_recovery_count}, sent_now={recovery_sent}, max={RECOVERY_CYCLE_MAX_TRADES}")
                         break
                     symbol = pair_data["instId"]
-                    candles = get_candles(symbol, TIMEFRAME, 100)
+                    candles = pair_data.get("_recovery_cached_candles") or get_candles(symbol, TIMEFRAME, 100)
                     if not candles:
                         time.sleep(0.4)
                         candles = get_candles(symbol, TIMEFRAME, 100)
@@ -13452,6 +13576,8 @@ def run_scanner_loop():
                     if not recovery_quality.get("ok"):
                         log_long_rejection(symbol=symbol, reason="recovery_quality_not_confirmed", candle_time=candle_time, market_state=market_state, current_mode=current_mode, vol_ratio=vol_ratio, extra={"quality_reasons": recovery_quality.get("reasons", [])})
                         continue
+                    recovery_rank_score = _recovery_candidate_score(symbol, df, btc_df_for_recovery, dist_ma, rsi_now, vol_ratio, atr_value, recovery_quality)
+                    logger.info(f"RECOVERY_LONG candidate score | {symbol} | score={recovery_rank_score} | dist_ma={dist_ma:.2f} | rsi={rsi_now:.1f} | vol={vol_ratio:.2f} | reasons={recovery_quality.get('reasons', [])}")
                     entry1 = price
                     entry2 = round(price - (atr_value * RECOVERY_ENTRY2_ATR_MULT), 6)
                     avg_entry = round((entry1 + entry2) / 2, 6)
@@ -13531,6 +13657,8 @@ def run_scanner_loop():
                             "market_avg_change_15m": avg_change,
                             "btc_change_15m": btc_change,
                             "recovery_reason": "Post block BTC recovery rebound",
+                            "recovery_rank_score": recovery_rank_score,
+                            "recovery_quality_reasons": recovery_quality.get("reasons", []),
                             "execution_setup_tags": ["recovery_long", "recovery_scout", "relative_strength_vs_btc", "vwap_reclaim"],
                             "execution_badge": "⚡ Recovery Candidate",
                             "above_upper_bb": False,
