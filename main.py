@@ -1,7 +1,7 @@
-# Version: main_v301_full_live_protection.py
+# Version: main_v302_report_ui_compact.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: live risk sizing, TP lifecycle, dynamic slots, BLOCK_LONGS live protection integration.
+# Changes: UI-only report/help compact style updates #1 #2 #3; no trading logic changes.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1773,11 +1773,11 @@ def get_local_day_start_ts() -> int:
 
 def build_report_message(period: str) -> str:
  title_map = {
-    "1h": "Long Report - Last 1H",
-    "today": "Long Report - Today",
-    "month": "Long Report - Last 30 Days",
-    "30d": "Long Report - Last 30 Days",
-    "all": "Long Report - All Time",
+    "1h": "التقرير العام للصفقات العادية - آخر ساعة",
+    "today": "التقرير العام للصفقات العادية - اليوم",
+    "month": "التقرير العام للصفقات العادية - آخر 30 يوم",
+    "30d": "التقرير العام للصفقات العادية - آخر 30 يوم",
+    "all": "التقرير العام للصفقات العادية",
  }
  try:
     if period == "today":
@@ -1980,35 +1980,41 @@ def build_help_execution_message() -> str:
 ━━━━━━━━━━━━
 
 📊 <b>التقرير العام</b>
+┄┄┄┄┄┄
 /report_execution
 /report_execution_1h
 /report_execution_today
 /report_execution_7d
 
 📂 <b>الصفقات المفتوحة</b>
+┄┄┄┄┄┄
 /report_execution_open
 /report_execution_open_1h
 /report_execution_open_today
 /report_execution_open_7d
 
 📈 <b>تحليل أسباب الأرباح</b>
+┄┄┄┄┄┄
 /report_execution_profit_analysis
 /report_execution_profit_analysis_1h
 /report_execution_profit_analysis_today
 /report_execution_profit_analysis_7d
 
 📉 <b>تحليل أسباب الخسائر</b>
+┄┄┄┄┄┄
 /report_execution_losses_analysis
 /report_execution_losses_analysis_1h
 /report_execution_losses_analysis_today
 /report_execution_losses_analysis_7d
 
 ⚙️ <b>أداء التنفيذ</b>
+┄┄┄┄┄┄
 /report_execution_analysis
 /report_execution_setups
 /report_execution_exits
 
 🧠 <b>تشخيص التنفيذ</b>
+┄┄┄┄┄┄
 /report_execution_diagnostics"""
 
 def build_help_normal_message() -> str:
@@ -2017,30 +2023,35 @@ def build_help_normal_message() -> str:
 ━━━━━━━━━━━━
 
 📊 <b>التقرير العام</b>
+┄┄┄┄┄┄
 /report_all
 /report_1h
 /report_today
 /report_7d
 
 📂 <b>الصفقات المفتوحة</b>
+┄┄┄┄┄┄
 /open_trades
 /open_trades_1h
 /open_trades_today
 /open_trades_7d
 
 📈 <b>تحليل أسباب الأرباح</b>
+┄┄┄┄┄┄
 /report_profit_analysis
 /report_profit_analysis_1h
 /report_profit_analysis_today
 /report_profit_analysis_7d
 
 📉 <b>تحليل أسباب الخسائر</b>
+┄┄┄┄┄┄
 /report_losses_analysis
 /report_losses_analysis_1h
 /report_losses_analysis_today
 /report_losses_analysis_7d
 
 ⚙️ <b>أداء الصفقات</b>
+┄┄┄┄┄┄
 /report_setups
 /report_scores
 /report_exits
@@ -4162,7 +4173,7 @@ def _format_execution_trade_card(trade: dict, is_open: bool) -> list:
 
     sl_text = "SL Entry" if bool(trade.get("sl_moved_to_entry", False)) or bool(trade.get("sl_is_entry", False)) else f"SL: {_format_exec_num(plan.get('sl'))}"
     lines = [
-        f"{icon} <b>{symbol}</b> | {pnl_txt}",
+        f"• <b>{symbol}</b> | {pnl_txt}",
         f"⏱️ {duration} | 📍 {phase}",
         f"🎯 TP1: {_format_exec_num(plan.get('tp1'))} | 🏁 TP2: {_format_exec_num(plan.get('tp2'))}",
         f"🛡 {html.escape(sl_text)} | ⭐ {score}",
@@ -4226,45 +4237,39 @@ def build_execution_open_report_message(period: str = "all") -> str:
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
             "📊 <b>Quick Stats</b>",
             f"• Open: {len(trades)}",
-            f"• Winners: {len(winners)}",
-            f"• Losers: {len(losers)}",
+            f"• Winners: {len(winners)} | Losers: {len(losers)}",
             f"• Win Rate: <b>{win_rate:.1f}%</b>",
-            f"• Net Floating: <b>{_pct_safe(net)}</b>",
-            f"🎯 TP1: {tp1_hit_count}",
-            f"🏁 TP2: {tp2_active_count}",
-            f"📍 Trailing: {trailing_count}",
-            f"🛡 Protected: {protected_count}",
-            f"⚠️ Danger: {danger_count}",
-            f"⏱ Avg Time: {html.escape(avg_trade_time)}",
-            f"⭐ Avg Score: {avg_score:.2f}",
+            f"• Net Floating: <b>{'🟢' if net >= 0 else '🔴'} {_pct_safe(net)}</b>",
+            f"🎯 TP1: {tp1_hit_count} | 🏁 TP2: {tp2_active_count} | 📍 Trailing: {trailing_count}",
+            f"🛡 Protected: {protected_count} | ⚠️ Danger: {danger_count}",
+            f"⏱ Avg Time: {html.escape(avg_trade_time)} | ⭐ Avg Score: {avg_score:.2f}",
             f"🔥 Best: <b>{html.escape(best_txt)}</b>",
             f"⚠️ Worst: <b>{html.escape(worst_txt)}</b>",
             "━━━━━━━━━━━━",
             "📂 <b>Open Trades</b>",
-            f"🟢 Open Winners: {len(winners)}",
-            f"🔴 Open Losers: {len(losers)}",
+            f"🟢 Top 4 Winners: {len(winners)} | 🔴 Top 4 Losers: {len(losers)}",
         ]
         sep = "┄┄┄┄┄┄"
         winners_sorted = sorted(winners, key=lambda x: x[1], reverse=True)
         losers_sorted = sorted(losers, key=lambda x: x[1])
         if winners_sorted:
-            lines.append("")
-            for idx, (trade, _) in enumerate(winners_sorted[:5]):
+            lines.extend(["", "📂 <b>Open Winners — Top 4</b>"])
+            for idx, (trade, _) in enumerate(winners_sorted[:4]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
-            if len(winners_sorted) > 5:
-                lines.append(f"📂 +{len(winners_sorted) - 5} صفقات رابحة مفتوحة أخرى")
+            if len(winners_sorted) > 4:
+                lines.append(f"📂 +{len(winners_sorted) - 4} more winning trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
-        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
+        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 4</b>"])
         if losers_sorted:
-            for idx, (trade, _) in enumerate(losers_sorted[:5]):
+            for idx, (trade, _) in enumerate(losers_sorted[:4]):
                 if idx > 0:
                     lines.append(sep)
                 lines.extend(_format_execution_trade_card(trade, is_open=True))
-            if len(losers_sorted) > 5:
-                lines.append(f"📂 +{len(losers_sorted) - 5} صفقات خاسرة مفتوحة أخرى")
+            if len(losers_sorted) > 4:
+                lines.append(f"📂 +{len(losers_sorted) - 4} more losing trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
         lines.extend(["━━━━━━━━━━━━", "💡 يعتمد على نظام إدارة 40/40/20"])
@@ -4446,7 +4451,7 @@ def build_execution_report_message(period: str = "all") -> str:
                 if sl_entry and "SL Entry" not in status_line:
                     status_line += " | 🔒 SL Entry"
                 return [
-                    f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
+                    f"• <b>{symbol}</b> | {exposure(pnl)}",
                     _execution_prices_line(trade),
                     f"📌 الحالة: {html.escape(status_line)}",
                     market_context_line(trade),
@@ -4454,8 +4459,8 @@ def build_execution_report_message(period: str = "all") -> str:
                     f"⭐ {html.escape(str(score))}{tv}",
                 ]
             return [
-                f"{icon} <b>{symbol}</b>",
-                f"{exposure(pnl)} | {html.escape(str(result_label))}",
+                f"• <b>{symbol}</b> | {exposure(pnl)}",
+                f"📍 {html.escape(str(result_label))}",
                 _execution_prices_line(trade),
                 market_context_line(trade),
                 concise_trade_reason(trade, is_win=is_win),
@@ -4536,7 +4541,7 @@ def build_execution_report_message(period: str = "all") -> str:
             tp1, tp2, sl = _trade_prices_for_card(trade)
             setup = html.escape(_clean_setup_name(trade))
             return [
-                f"{icon} <b>{symbol}</b> | {exposure(pnl)}",
+                f"• <b>{symbol}</b> | {exposure(pnl)}",
                 f"⏱️ {html.escape(age)} | 📍 {html.escape(str(phase))}",
                 f"🎯 TP1: {tp1} | 🏁 TP2: {tp2}",
                 f"🛡 SL: {sl} | ⭐ {html.escape(str(score))}",
@@ -4561,7 +4566,7 @@ def build_execution_report_message(period: str = "all") -> str:
         floating_icon = "🟢" if floating_net_usd >= 0 else "🔴"
 
         lines = [
-            "🚀 <b>تقرير أداء التنفيذ</b>",
+            "📊 <b>التقرير العام لصفقات التنفيذ</b>",
             f"📅 {html.escape(title_period)}",
             "━━━━━━━━━━━━",
             "⚡ جميع نسب الأداء محسوبة على رافعة 15x",
@@ -4570,31 +4575,24 @@ def build_execution_report_message(period: str = "all") -> str:
             f"• Open: {len(open_trades)}",
             f"• Closed: {len(closed_trades)}",
             f"🏆 Win Rate: <b>{win_rate:.1f}%</b>",
-            f"🟢 Winners: {len(winners_pairs)}",
-            f"🔴 Losers: {len(losers_pairs)}",
+            f"🟢 Winners: {len(winners_pairs)} | 🔴 Losers: {len(losers_pairs)}",
             "━━━━━━━━━━━━",
             "💰 <b>Wallet Impact</b>",
             f"📌 رأس المال: {wallet_capital_usd:.0f}$",
             "✅ <b>الصفقات المغلقة</b>",
             "📈 الأرباح",
-            f"{money(realized_profit_usd)}",
-            f"{exposure(realized_profit_pct)}",
+            f"{money(realized_profit_usd)} | {exposure(realized_profit_pct)}",
             "📉 الخسائر",
-            f"{money(realized_loss_usd)}",
-            f"{exposure(realized_loss_pct)}",
+            f"{money(realized_loss_usd)} | {exposure(realized_loss_pct)}",
             "⚖️ الصافي",
-            f"<b>{net_icon} {money(realized_net_usd)}</b>",
-            f"<b>{exposure(realized_net_pct)}</b>",
+            f"<b>{net_icon} {money(realized_net_usd)} | {exposure(realized_net_pct)}</b>",
             "🔄 <b>الصفقات المفتوحة</b>",
             "📈 الأرباح العائمة",
-            f"{money(floating_profit_usd)}",
-            f"{exposure(floating_profit_pct)}",
+            f"{money(floating_profit_usd)} | {exposure(floating_profit_pct)}",
             "📉 الخسائر العائمة",
-            f"{money(floating_loss_usd)}",
-            f"{exposure(floating_loss_pct)}",
+            f"{money(floating_loss_usd)} | {exposure(floating_loss_pct)}",
             "⚖️ الصافي العائم",
-            f"<b>{floating_icon} {money(floating_net_usd)}</b>",
-            f"<b>{exposure(floating_net_pct)}</b>",
+            f"<b>{floating_icon} {money(floating_net_usd)} | {exposure(floating_net_pct)}</b>",
             "💼 <b>التأثير الحالي على المحفظة</b>",
             f"<b>{impact_icon} {money(portfolio_net_usd)}</b>",
             "━━━━━━━━━━━━",
@@ -4602,8 +4600,7 @@ def build_execution_report_message(period: str = "all") -> str:
             "📦 Model: 40/40/20",
             f"📈 Avg Winner: {_pct_safe(avg_winner)}",
             f"📉 Avg Loser: {_pct_safe(avg_loser)}",
-            f"🎯 TP1 Rate: {tp1_hits / total * 100:.1f}%",
-            f"🏁 TP2 Rate: {tp2_hits / total * 100:.1f}%",
+            f"🎯 TP1 Rate: {tp1_hits / total * 100:.1f}% | 🏁 TP2 Rate: {tp2_hits / total * 100:.1f}%",
             f"🔁 TP1 → TP2: {tp1_to_tp2_pct:.1f}%",
             f"🔄 Trailing Exit: {trailing_wins / total * 100:.1f}%",
             f"🔒 Breakeven Exit: {breakeven_exits / total * 100:.1f}%",
@@ -4612,8 +4609,7 @@ def build_execution_report_message(period: str = "all") -> str:
             f"💡 Risk / Reward Quality: {html.escape(rr_quality)}",
             "━━━━━━━━━━━━",
             "📂 <b>Open Trades</b>",
-            f"🟢 Open Winners: {len(open_winners)}",
-            f"🔴 Open Losers: {len(open_losers)}",
+            f"🟢 Open Winners: {len(open_winners)} | 🔴 Open Losers: {len(open_losers)}",
             f"⏱️ Avg Trade Time: {html.escape(avg_trade_time)}",
         ]
 
@@ -4635,55 +4631,53 @@ def build_execution_report_message(period: str = "all") -> str:
             if len(pairs) > limit:
                 lines.append(f"📂 +{len(pairs) - limit} {more_label}")
 
-        # Open winners: highest floating PnL first. Open losers: worst floating PnL first.
-        open_winners_sorted = sorted(open_winners, key=lambda x: x[1], reverse=True)
-        open_losers_sorted = sorted(open_losers, key=lambda x: x[1])
-        closed_winners_sorted = sorted(winners_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
-        closed_losers_sorted = sorted(losers_pairs, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
+        # Report style #2: Open latest 3 winners/losers, then best/worst closed results.
+        open_winners_sorted = sorted(open_winners, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
+        open_losers_sorted = sorted(open_losers, key=lambda x: _trade_created_ts_for_exec(x[0]), reverse=True)
+        closed_winners_sorted = sorted(winners_pairs, key=lambda x: x[1], reverse=True)
+        closed_losers_sorted = sorted(losers_pairs, key=lambda x: x[1])
 
-        # Keep winners immediately under the Open Trades header without an additional section break.
+        lines.extend(["", "🟢 <b>Latest 3 Winners</b>"])
         if open_winners_sorted:
-            lines.append("")
-            for idx, (trade, pnl) in enumerate(open_winners_sorted[:5]):
+            for idx, (trade, pnl) in enumerate(open_winners_sorted[:3]):
                 if idx > 0:
                     lines.append(trade_separator)
-                icon = "🟡" if _execution_trade_reached_tp1_for_display(trade) else "🟢"
-                lines.extend(_trade_card_lines(trade, pnl, icon))
-            if len(open_winners_sorted) > 5:
-                lines.append(f"📂 +{len(open_winners_sorted) - 5} صفقات رابحة مفتوحة أخرى")
+                lines.extend(_trade_card_lines(trade, pnl, "•"))
+            if len(open_winners_sorted) > 3:
+                lines.append(f"📂 +{len(open_winners_sorted) - 3} more winning trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
 
-        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers</b>"])
+        lines.extend(["", "🔴 <b>Latest 3 Losers</b>"])
         if open_losers_sorted:
-            for idx, (trade, pnl) in enumerate(open_losers_sorted[:5]):
+            for idx, (trade, pnl) in enumerate(open_losers_sorted[:3]):
                 if idx > 0:
                     lines.append(trade_separator)
-                lines.extend(_trade_card_lines(trade, pnl, "🔴"))
-            if len(open_losers_sorted) > 5:
-                lines.append(f"📂 +{len(open_losers_sorted) - 5} صفقات خاسرة مفتوحة أخرى")
+                lines.extend(_trade_card_lines(trade, pnl, "•"))
+            if len(open_losers_sorted) > 3:
+                lines.append(f"📂 +{len(open_losers_sorted) - 3} more losing trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة خاسرة حاليًا.")
 
-        lines.extend(["━━━━━━━━━━━━", "🏆 <b>Closed Winners</b>"])
+        lines.extend(["━━━━━━━━━━━━", "✅ <b>Closed Wins</b>", "🏆 Top 3 Best Winners"])
         if closed_winners_sorted:
-            for idx, (trade, pnl) in enumerate(closed_winners_sorted[:5]):
+            for idx, (trade, pnl) in enumerate(closed_winners_sorted[:3]):
                 if idx > 0:
                     lines.append(trade_separator)
-                lines.extend(_trade_card_lines(trade, pnl, "🏆", status_text=_execution_close_type_for_trade(trade)))
-            if len(closed_winners_sorted) > 5:
-                lines.append(f"📂 +{len(closed_winners_sorted) - 5} صفقات رابحة مغلقة أخرى")
+                lines.extend(_trade_card_lines(trade, pnl, "•", status_text=_execution_close_type_for_trade(trade)))
+            if len(closed_winners_sorted) > 3:
+                lines.append(f"📂 +{len(closed_winners_sorted) - 3} more winning trades...")
         else:
             lines.append("لا توجد صفقات رابحة مغلقة حتى الآن.")
 
-        lines.extend(["━━━━━━━━━━━━", "🛑 <b>Closed Losers</b>"])
+        lines.extend(["━━━━━━━━━━━━", "❌ <b>Closed Losses</b>", "📉 Top 3 Worst Losses"])
         if closed_losers_sorted:
-            for idx, (trade, pnl) in enumerate(closed_losers_sorted[:5]):
+            for idx, (trade, pnl) in enumerate(closed_losers_sorted[:3]):
                 if idx > 0:
                     lines.append(trade_separator)
-                lines.extend(_trade_card_lines(trade, pnl, "🛑", status_text=_execution_close_type_for_trade(trade)))
-            if len(closed_losers_sorted) > 5:
-                lines.append(f"📂 +{len(closed_losers_sorted) - 5} صفقات خاسرة مغلقة أخرى")
+                lines.extend(_trade_card_lines(trade, pnl, "•", status_text=_execution_close_type_for_trade(trade)))
+            if len(closed_losers_sorted) > 3:
+                lines.append(f"📂 +{len(closed_losers_sorted) - 3} more losing trades...")
         else:
             lines.append("لا توجد صفقات خاسرة مغلقة حتى الآن.")
 
