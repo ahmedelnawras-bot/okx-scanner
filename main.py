@@ -3086,8 +3086,6 @@ def build_market_status_message() -> str:
         f"{mode_icon} <b>Market Mode: {html.escape(current_mode)}</b>",
         "━━━━━━━━━━━━",
         "",
-        f"🔄 {html.escape(transition)}",
-        "",
         _market_mix_line(market_mix_profile, compact=False),
         "",
         "📊 <b>Market State</b>",
@@ -3095,7 +3093,8 @@ def build_market_status_message() -> str:
         html.escape(_market_breadth_line(market_mix_profile, market_guard, alt_snapshot)),
         f"• BTC: {html.escape(str(btc_mode))}",
         f"• Alts: {html.escape(str(alt_mode))}",
-        f"• Red: {red_ratio * 100:.0f}% | Avg: {avg_change:+.2f}% | BTC 15m: {btc_change:+.2f}%",
+        f"• Avg: {avg_change:+.2f}%",
+        f"• BTC 15m: {btc_change:+.2f}%",
         "",
         "🧠 <b>Trigger</b>",
     ]
@@ -3131,7 +3130,7 @@ def build_market_status_message() -> str:
     drift_note = str(drift_info.get("note", "التنفيذ يعمل طبيعيًا."))
     lines.extend(["", html.escape(drift_label)])
     if "ON" in drift_label or "STRICT" in drift_label:
-        lines.append("⚠️ weak execution temporarily restricted")
+        lines.append("⚠️ التنفيذ الضعيف مقيد مؤقتًا")
     elif drift_note:
         lines.append(html.escape(drift_note))
     if suggested_mode != current_mode:
@@ -5800,19 +5799,19 @@ def format_trade_status_line(trade: dict) -> str:
     trailing_sl  = _safe_float(trade.get("trailing_sl"), 0.0)
 
     if status == "pending_pullback":
-        return "📌 حالة الصفقة: ⏳ معلّقة | انتظار Pullback"
+        return "📌 حالة الصفقة: ⏳ PENDING | Pullback"
 
     if status == "open":
-        return "📌 حالة الصفقة: 🟢 مفتوحة"
+        return "📌 حالة الصفقة: OPEN"
 
     if status == "partial":
-        line = "📌 حالة الصفقة: 🟡 جزئية | ✅ TP1 (40% مغلق)"
+        line = "📌 حالة الصفقة: 🟡 PARTIAL | ✅ TP1"
         if sl_moved_to_entry:
             line += " | 🔒 SL → Entry"
         return line
 
     if status in ("tp2_partial", "trailing_open", "trailing") or (tp2_hit and trailing_active):
-        line = "📌 حالة الصفقة: 🔵 جزئية | 🏁 TP2 (40% مغلق) | 🔄 Trailing شغال (20%)"
+        line = "📌 حالة الصفقة: 🔵 PARTIAL | 🏁 TP2 | 🔄 Runner"
         if trailing_high > 0:
             line += f"\n   📈 أعلى سعر: {_fmt_price(trailing_high)}"
         if trailing_sl > 0:
@@ -6078,6 +6077,72 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         logger.warning(f"format_lifecycle_pnl_block_for_track error: {e}")
         return "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n⚠️ تعذر حساب الربح الفعلي"
 
+
+def _clean_track_setup_name(value) -> str:
+    """UI-only setup cleaner for Track messages."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "—"
+    parts = [p.strip() for p in raw.replace(",", "|").split("|") if p.strip()]
+    mapping = {
+        "vwap_reclaim": "VWAP Reclaim",
+        "retest_breakout_confirmed": "Retest Breakout",
+        "higher_low_continuation": "Higher Low Continuation",
+        "relative_strength_vs_btc": "RS vs BTC",
+        "wave_3": "Wave 3",
+        "support_bounce_confirmed": "Support Bounce",
+        "failed_breakdown_trap": "Failed Breakdown Trap",
+        "liquidity_sweep_reclaim": "Liquidity Sweep",
+        "mtf_yes": "MTF Confirmed",
+        "mtf_confirmed": "MTF Confirmed",
+        "vol_high": "High Volume",
+        "volume_high": "High Volume",
+        "breakout": "Breakout",
+        "pullback": "Pullback",
+    }
+    priority = [
+        "vwap_reclaim",
+        "retest_breakout_confirmed",
+        "relative_strength_vs_btc",
+        "wave_3",
+        "support_bounce_confirmed",
+        "higher_low_continuation",
+        "failed_breakdown_trap",
+        "liquidity_sweep_reclaim",
+        "mtf_yes",
+        "mtf_confirmed",
+        "vol_high",
+        "breakout",
+    ]
+    found = []
+    lowered_parts = {p.lower(): p for p in parts}
+    for key in priority:
+        if key in lowered_parts and mapping[key] not in found:
+            found.append(mapping[key])
+    if found:
+        return " | ".join(found[:3])
+    return raw.replace("_", " ").replace("|", " | ").title()
+
+
+def _clean_track_market_context(value) -> str:
+    """UI-only market context cleaner for Track messages."""
+    raw = str(value or "—").strip()
+    lowered = raw.lower()
+    mapping = {
+        "risk_off": "🔴 Risk Off",
+        "risk off": "🔴 Risk Off",
+        "weak": "🔴 Weak",
+        "bearish": "🔴 Bearish",
+        "mixed": "🟡 Mixed",
+        "normal": "🟢 Normal",
+        "bull_market": "🟢 Bull Market",
+        "bullish": "🟢 Bullish",
+        "strong": "🟢 Strong",
+    }
+    if lowered in mapping:
+        return mapping[lowered]
+    return raw.replace("_", " ").title() if "_" in raw else raw
+
 def build_track_message(alert: dict) -> str:
     try:
         symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
@@ -6196,10 +6261,8 @@ def build_track_message(alert: dict) -> str:
             "🧠 <b>خطة الصفقة</b>\n"
             f"📍 Entry: {_fmt_price(effective_entry)}\n"
             f"🛡 SL: {_fmt_price(sl)}\n"
-            f"🎯 TP1: {_fmt_price(tp1)}\n"
-            "• إغلاق 40%\n"
-            f"🏁 TP2: {_fmt_price(tp2)}\n"
-            "• إغلاق 40%\n"
+            f"🎯 TP1: {_fmt_price(tp1)} • إغلاق 40%\n"
+            f"🏁 TP2: {_fmt_price(tp2)} • إغلاق 40%\n"
             "🔄 Runner\n"
             "• 20% trailing after TP2\n"
             f"• Trailing: {TRAILING_PCT}% below High\n\n"
@@ -6207,7 +6270,7 @@ def build_track_message(alert: dict) -> str:
             "📊 <b>Trade State</b>\n"
             f"💼 Entry Mode: {html.escape(entry_mode_label)}\n"
             "🧮 Model: 40 / 40 / 20\n"
-            f"⚡ Leverage: {TRACK_LEVERAGE:.0f}x\n\n"
+            f"⚡ Leverage: {TRACK_LEVERAGE:.0f}x\n"
         )
 
         if entry_mode == "pullback_pending" and not pullback_triggered:
@@ -6227,14 +6290,12 @@ def build_track_message(alert: dict) -> str:
             else:
                 msg += f"🛡 BLOCK Protection: ACTIVE | SL {_fmt_price(protected_sl)}\n"
 
-        setup_name = str(alert.get("setup_type") or alert.get("setup") or alert.get("opportunity_type") or "—")
-        btc_context = str(alert.get("btc_mode") or alert.get("btc_context") or "—")
-        market_context = str(alert.get("market_state") or alert.get("market_bias_label") or alert.get("market_mode") or "—")
+        setup_name = _clean_track_setup_name(alert.get("setup_type") or alert.get("setup") or alert.get("opportunity_type") or "—")
+        btc_context = _clean_track_market_context(alert.get("btc_mode") or alert.get("btc_context") or "—")
+        market_context = _clean_track_market_context(alert.get("market_state") or alert.get("market_bias_label") or alert.get("market_mode") or "—")
         msg += (
-            f"📌 Setup\n{html.escape(setup_name)}\n\n"
-            "🌍 <b>Market Context</b>\n"
-            f"• BTC: {html.escape(btc_context)}\n"
-            f"• Market: {html.escape(market_context)}\n\n"
+            f"📌 Setup: {html.escape(setup_name)}\n"
+            f"🌍 BTC: {html.escape(btc_context)} | Market: {html.escape(market_context)}\n\n"
             "━━━━━━━━━━━━\n"
             f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>\n'
             "15m / 1H"
@@ -10942,7 +11003,7 @@ def detect_market_mix_profile(
         note = {
             "CLEAR": "✅ القواعد العادية فعالة",
             "MIXED": "⚠️ mtf_no يحتاج جودة أعلى",
-            "CHOPPY": "⚠️ weak mtf_no tightened",
+            "CHOPPY": "🚫 weak mtf_no filtered",
         }.get(level, "✅ القواعد العادية فعالة")
         icon = {"CLEAR": "🌤", "MIXED": "🌗", "CHOPPY": "🌪"}.get(level, "🌤")
 
