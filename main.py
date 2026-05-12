@@ -237,6 +237,8 @@ MARKET_MODE_KEY = "market_mode:long:current"
 MARKET_MODE_LAST_KEY = "market_mode:long:last_mode"
 MARKET_MODE_LAST_TRANSITION_KEY = "market_mode:long:last_transition_ts"
 MARKET_MODE_LAST_RECOVERY_CHECK_KEY = "market_mode:long:last_recovery_check_ts"
+MARKET_MODE_RECOVERY_STARTED_KEY = "market_mode:long:recovery_started_ts"
+MARKET_MODE_RECOVERY_CYCLE_KEY = "market_mode:long:recovery_cycle_id"
 MARKET_MODE_NORMAL_CANDIDATE_KEY = "market_mode:long:normal_candidate_since"
 MARKET_MODE_BLOCK_STARTED_KEY = "market_mode:long:block_started_ts"
 MARKET_MODE_LAST_SAFE_SEEN_KEY = "market_mode:long:last_safe_seen_ts"
@@ -298,12 +300,17 @@ MARKET_GUARD_BTC_CHANGE_15M_BLOCK = -0.70
 MARKET_GUARD_ALT_WEAK_BLOCK = True
 
 # Recovery Long
-RECOVERY_MAX_ALERTS = 2
+RECOVERY_MAX_ALERTS = 3
+RECOVERY_CYCLE_MAX_TRADES = 3
+RECOVERY_MODE_MAX_DURATION_SECONDS = 90 * 60
 RECOVERY_TOTAL_SIZE_PCT = 30
 RECOVERY_ENTRY1_SIZE_PCT = 15
 RECOVERY_ENTRY2_SIZE_PCT = 15
+RECOVERY_TP1_CLOSE_PCT = 50
+RECOVERY_TP2_CLOSE_PCT = 25
+RECOVERY_RUNNER_PCT = 25
 RECOVERY_ENTRY2_ATR_MULT = 0.35
-RECOVERY_SL_ATR_MULT = 3.5
+RECOVERY_SL_ATR_MULT = 2.2
 
 # Parallel candle fetch
 MAX_CANDLE_FETCH_WORKERS = 10
@@ -1919,8 +1926,8 @@ def build_help_inline_keyboard() -> dict:
             {"text": "📊 Normal Trades", "callback_data": "help:normal"},
         ],
         [
-            {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
-            {"text": "🚀 Execution Intelligence", "callback_data": "help:exec_intelligence"},
+            {"text": "🧠🚀 Execution Intelligence", "callback_data": "help:exec_intelligence"},
+            {"text": "🧠📊 Market Intelligence", "callback_data": "help:market_intelligence"},
         ],
         [
             {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
@@ -4112,6 +4119,16 @@ def _execution_final_pnl_pct(trade: dict):
         return None
 
 
+def _trade_exit_weights(trade: dict) -> tuple[float, float, float]:
+    """Return TP1/TP2/runner weights from trade fields, defaulting to 40/40/20."""
+    try:
+        tp1_w = float(_trade_field(trade, "tp1_close_pct", TP1_CLOSE_PCT) or TP1_CLOSE_PCT) / 100.0
+        tp2_w = float(_trade_field(trade, "tp2_close_pct", TP2_CLOSE_PCT) or TP2_CLOSE_PCT) / 100.0
+        runner_w = max(0.0, 1.0 - tp1_w - tp2_w)
+        return tp1_w, tp2_w, runner_w
+    except Exception:
+        return 0.40, 0.40, 0.20
+
 def _execution_floating_pnl_pct(trade: dict):
     try:
         plan = _execution_plan_for_trade(trade)
@@ -4134,17 +4151,18 @@ def _execution_floating_pnl_pct(trade: dict):
         tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), 0.0)
         tp1_hit = bool(trade.get("tp1_hit", False))
         tp2_hit = bool(trade.get("tp2_hit", False))
+        tp1_w, tp2_w, runner_w = _trade_exit_weights(trade)
         raw = 0.0
         if not tp1_hit:
             raw = (current - entry) / entry * 100.0
         elif not tp2_hit:
-            tp1_part = ((tp1 - entry) / entry * 100.0) * 0.40 if tp1 > 0 else 0.0
-            float_part = ((current - entry) / entry * 100.0) * 0.60
+            tp1_part = ((tp1 - entry) / entry * 100.0) * tp1_w if tp1 > 0 else 0.0
+            float_part = ((current - entry) / entry * 100.0) * max(0.0, 1.0 - tp1_w)
             raw = tp1_part + float_part
         else:
-            tp1_part = ((tp1 - entry) / entry * 100.0) * 0.40 if tp1 > 0 else 0.0
-            tp2_part = ((tp2 - entry) / entry * 100.0) * 0.40 if tp2 > 0 else 0.0
-            trail_part = ((current - entry) / entry * 100.0) * 0.20
+            tp1_part = ((tp1 - entry) / entry * 100.0) * tp1_w if tp1 > 0 else 0.0
+            tp2_part = ((tp2 - entry) / entry * 100.0) * tp2_w if tp2 > 0 else 0.0
+            trail_part = ((current - entry) / entry * 100.0) * runner_w
             raw = tp1_part + tp2_part + trail_part
         leverage = float(_trade_field(trade, "leverage", TRACK_LEVERAGE) or TRACK_LEVERAGE)
         return raw * leverage
@@ -4248,11 +4266,12 @@ def _execution_open_locked_pnl_pct(trade: dict) -> float:
             return 0.0
         tp1 = _safe_trade_float_value(plan.get("tp1") or trade.get("tp1"), 0.0)
         tp2 = _safe_trade_float_value(plan.get("tp2") or trade.get("tp2"), 0.0)
+        tp1_w, tp2_w, _runner_w = _trade_exit_weights(trade)
         raw = 0.0
         if _execution_trade_reached_tp1_for_display(trade) and tp1 > 0:
-            raw += ((tp1 - entry) / entry * 100.0) * 0.40
+            raw += ((tp1 - entry) / entry * 100.0) * tp1_w
         if (bool(trade.get("tp2_hit", False)) or str(trade.get("status", "") or "").lower() in ("tp2_partial", "trailing", "trailing_open")) and tp2 > 0:
-            raw += ((tp2 - entry) / entry * 100.0) * 0.40
+            raw += ((tp2 - entry) / entry * 100.0) * tp2_w
         leverage = float(_trade_field(trade, "leverage", TRACK_LEVERAGE) or TRACK_LEVERAGE)
         return raw * leverage
     except Exception:
@@ -5177,7 +5196,9 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
         display_rows = list(reversed(rows[-max_rows:]))
         hidden = max(0, len(rows) - len(display_rows))
 
-        date_w = 11 if hourly else 8
+        # Use the same fixed-width table layout for hourly and daily reports.
+        # This keeps Telegram/mobile alignment stable across all Wallet periods.
+        date_w = 11
         open_w = 6
         close_w = 6
         net_w = 6
@@ -5206,7 +5227,10 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
             )
         table_text = "\n".join(table_rows)
 
-        avg_daily = total_net / len(rows) if rows else 0.0
+        avg_bucket = total_net / len(rows) if rows else 0.0
+        bucket_label = "Hours" if hourly else "Days"
+        best_label = "Best Hour" if hourly else "Best Day"
+        avg_label = "Avg Hour" if hourly else "Avg Daily"
         impact_icon = "🟢" if total_net >= 0 else "🔴"
         lines = [
             "💼 <b>Wallet Impact</b>",
@@ -5222,10 +5246,10 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
             lines.append(f"📂 +{hidden} older rows...")
         lines.extend([
             "🧠 <b>Summary</b>",
-            f"• Green Days: {green_days} / {len(rows)}",
-            f"• Best Day: {_execution_wallet_money(best_day or 0.0)}",
+            f"• Green {bucket_label}: {green_days} / {len(rows)}",
+            f"• {best_label}: {_execution_wallet_money(best_day or 0.0)}",
             f"• Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
-            f"• Avg Daily: {_execution_wallet_money(avg_daily)}",
+            f"• {avg_label}: {_execution_wallet_money(avg_bucket)}",
             "ℹ️ يعتمد على execution tracking الداخلي وليس رصيد OKX الحقيقي.",
         ])
         return "\n".join(lines).strip()
@@ -5491,6 +5515,8 @@ def handle_hard_reset(chat_id: str):
             MARKET_MODE_LAST_KEY,
             MARKET_MODE_LAST_TRANSITION_KEY,
             MARKET_MODE_LAST_RECOVERY_CHECK_KEY,
+            MARKET_MODE_RECOVERY_STARTED_KEY,
+            MARKET_MODE_RECOVERY_CYCLE_KEY,
             MARKET_MODE_NORMAL_CANDIDATE_KEY,
             MARKET_MODE_BLOCK_STARTED_KEY,
             MARKET_MODE_LAST_SAFE_SEEN_KEY,
@@ -6190,12 +6216,10 @@ def format_trade_status_line(trade: dict) -> str:
 
 
 def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = None) -> dict:
-    """Display-only weighted PnL using the 40/40/20 exit plan.
+    """Display-only weighted PnL using the trade exit plan.
 
-    This does not change tracking decisions. It only reports the effective PnL:
-    - before TP1: 100% of position moves with current price
-    - after TP1: 40% locked at TP1 + 60% live
-    - after TP2/trailing: 40% TP1 + 40% TP2 + 20% live/trailing exit
+    Defaults to 40/40/20. Recovery trades can use 50/25/25 through
+    tp1_close_pct/tp2_close_pct fields. This does not change tracking decisions.
     """
     try:
         if not isinstance(trade, dict):
@@ -6247,6 +6271,7 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
         current_raw = pct_to(price) if price > 0 else 0.0
         tp1_raw = pct_to(tp1)
         tp2_raw = pct_to(tp2)
+        tp1_w, tp2_w, runner_w = _trade_exit_weights(trade)
 
         if result == "loss":
             raw = pct_to(trade.get("sl") or trade.get("exit_price"))
@@ -6255,20 +6280,20 @@ def calculate_trade_lifecycle_pnl_for_track(trade: dict, current_price: float = 
             raw = 0.0
             phase = "breakeven"
         elif result == "tp1_win":
-            raw = tp1_raw * 0.40
+            raw = tp1_raw * tp1_w
             phase = "tp1_closed"
         elif result == "tp2_win":
-            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (tp2_raw * 0.20)
+            raw = (tp1_raw * tp1_w) + (tp2_raw * tp2_w) + (tp2_raw * runner_w)
             phase = "tp2_closed"
         elif result == "trailing_win":
             trailing_exit = _safe_float(trade.get("trailing_exit_price") or trade.get("exit_price"), price)
-            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (pct_to(trailing_exit) * 0.20)
+            raw = (tp1_raw * tp1_w) + (tp2_raw * tp2_w) + (pct_to(trailing_exit) * runner_w)
             phase = "trailing_closed"
         elif tp2_hit or trailing_active:
-            raw = (tp1_raw * 0.40) + (tp2_raw * 0.40) + (current_raw * 0.20)
+            raw = (tp1_raw * tp1_w) + (tp2_raw * tp2_w) + (current_raw * runner_w)
             phase = "trailing_live"
         elif tp1_hit or status == "partial":
-            raw = (tp1_raw * 0.40) + (current_raw * 0.60)
+            raw = (tp1_raw * tp1_w) + (current_raw * max(0.0, 1.0 - tp1_w))
             phase = "tp1_live"
         else:
             raw = current_raw
@@ -9978,7 +10003,7 @@ def build_recovery_long_message(
  red_ratio_pct = round(float(red_ratio or 0) * 100, 1)
  safe_symbol = html.escape(symbol_clean)
  safe_tv_link = html.escape(tv_link, quote=True)
- return f"""🔄 <b>RECOVERY LONG MODE</b>
+ return f"""⚡ <b>RECOVERY CANDIDATE</b>
 🪙 <b>{safe_symbol}</b>
 
 📉 <b>السياق:</b>
@@ -9990,14 +10015,14 @@ def build_recovery_long_message(
 • متوسط الدخول المخطط: {fmt_num(avg_entry, 6)}
 
 🎯 <b>الأهداف:</b>
-• TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
-• TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
-• بعد TP2: 20% trailing ({TRAILING_PCT}% تحت الـ high)
-• بعد TP1: نقل SL إلى Entry
+• TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق {RECOVERY_TP1_CLOSE_PCT}%)
+• TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق {RECOVERY_TP2_CLOSE_PCT}%)
+• بعد TP2: {RECOVERY_RUNNER_PCT}% trailing ({TRAILING_PCT}% تحت الـ high)
+• بعد TP2: نقل SL إلى Entry
 
 🛑 <b>وقف الخسارة:</b>
 • SL: {fmt_num(sl, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
-• ملاحظة: SL أوسع لأن المود Recovery بعد هبوط قوي (ATR × {RECOVERY_SL_ATR_MULT})
+• ملاحظة: SL أقرب من العادي لأن المود Recovery سريع (ATR × {RECOVERY_SL_ATR_MULT})
 
 📈 <b>سبب الدخول:</b>
 • هبوط/امتداد زائد
@@ -10290,6 +10315,195 @@ def is_supportive_bull_flow(red_ratio, avg_change, btc_change, btc_mode: str = "
  except Exception:
     return False
 
+
+def _btc_ma5_fast_danger_snapshot() -> dict:
+    """Parallel BTC Fast Danger path for quicker BLOCK_LONGS entry.
+
+    Uses 1H MA5 as the structural level and 15m candles as fast confirmation.
+    This is additive to the existing BLOCK logic, not a replacement.
+    """
+    out = {"danger": False, "reason": "", "details": {}}
+    try:
+        btc_1h = to_dataframe(get_candles("BTC-USDT-SWAP", "1H", 30))
+        btc_15m = to_dataframe(get_candles("BTC-USDT-SWAP", "15m", 20))
+        if btc_1h is None or btc_1h.empty or len(btc_1h) < 7 or btc_15m is None or btc_15m.empty or len(btc_15m) < 4:
+            out["reason"] = "btc_fast_danger_data_missing"
+            return out
+        closes_1h = btc_1h["close"].astype(float)
+        ma5_now = float(closes_1h.rolling(5).mean().iloc[-1])
+        ma5_prev = float(closes_1h.rolling(5).mean().iloc[-2])
+        close_1h = float(closes_1h.iloc[-1])
+        closes_15 = btc_15m["close"].astype(float)
+        open_15 = float(btc_15m.iloc[-1]["open"])
+        close_15 = float(closes_15.iloc[-1])
+        last2_below = bool(closes_15.iloc[-1] < ma5_now and closes_15.iloc[-2] < ma5_now)
+        btc15_negative = close_15 < open_15
+        ma5_slope_down = ma5_now < ma5_prev
+        no_fast_reclaim = close_15 < ma5_now
+        danger = bool((close_1h < ma5_now or last2_below) and last2_below and btc15_negative and ma5_slope_down and no_fast_reclaim)
+        out.update({
+            "danger": danger,
+            "reason": "BTC Fast Danger: 15m confirms break below 1H MA5" if danger else "btc_fast_danger_not_confirmed",
+            "details": {
+                "btc_1h_close": close_1h,
+                "btc_1h_ma5": ma5_now,
+                "btc_1h_ma5_prev": ma5_prev,
+                "btc_15m_close": close_15,
+                "last2_15m_below_1h_ma5": last2_below,
+                "btc15_negative": btc15_negative,
+                "ma5_slope_down": ma5_slope_down,
+            },
+        })
+    except Exception as e:
+        out["reason"] = f"btc_fast_danger_error: {e}"
+    return out
+
+
+def _btc_recovery_fast_snapshot(red_ratio: float = 1.0, avg_change: float = -9.0) -> dict:
+    """Fast BTC Recovery path used to exit BLOCK_LONGS earlier.
+
+    It does not open NORMAL directly. It only decides whether the BLOCK exit has
+    enough recovery edge for RECOVERY_LONG, otherwise the regular safe exit can
+    still go to STRONG_LONG_ONLY.
+    """
+    out = {"recovery": False, "edge": False, "reason": "", "details": {}}
+    try:
+        btc_1h = to_dataframe(get_candles("BTC-USDT-SWAP", "1H", 30))
+        btc_15m = to_dataframe(get_candles("BTC-USDT-SWAP", "15m", 20))
+        if btc_1h is None or btc_1h.empty or len(btc_1h) < 7 or btc_15m is None or btc_15m.empty or len(btc_15m) < 5:
+            out["reason"] = "btc_recovery_data_missing"
+            return out
+        closes_1h = btc_1h["close"].astype(float)
+        ma5_1h = float(closes_1h.rolling(5).mean().iloc[-1])
+        closes_15 = btc_15m["close"].astype(float)
+        highs_15 = btc_15m["high"].astype(float)
+        lows_15 = btc_15m["low"].astype(float)
+        open_15 = float(btc_15m.iloc[-1]["open"])
+        close_15 = float(closes_15.iloc[-1])
+        prev_micro_high = float(highs_15.iloc[-4:-1].max())
+        recent_low = float(lows_15.iloc[-4:-1].min())
+        last2_above = bool(closes_15.iloc[-1] > ma5_1h and closes_15.iloc[-2] > ma5_1h)
+        green_strength = bool(close_15 > open_15 and ((close_15 - open_15) / open_15 * 100.0 if open_15 > 0 else 0.0) >= 0.10)
+        no_new_low = bool(lows_15.iloc[-1] >= recent_low)
+        micro_break = bool(close_15 >= prev_micro_high)
+        breadth_starting_to_improve = bool(float(red_ratio or 1.0) < 0.70 or float(avg_change or -9.0) > -0.30)
+        recovery = bool(last2_above and no_new_low and (green_strength or micro_break))
+        edge = bool(recovery and breadth_starting_to_improve)
+        out.update({
+            "recovery": recovery,
+            "edge": edge,
+            "reason": "BTC Recovery: reclaim over 1H MA5 with 15m confirmation" if recovery else "btc_recovery_not_confirmed",
+            "details": {
+                "btc_1h_ma5": ma5_1h,
+                "btc_15m_close": close_15,
+                "last2_15m_above_1h_ma5": last2_above,
+                "no_new_low": no_new_low,
+                "green_strength": green_strength,
+                "micro_break": micro_break,
+                "breadth_starting_to_improve": breadth_starting_to_improve,
+            },
+        })
+    except Exception as e:
+        out["reason"] = f"btc_recovery_error: {e}"
+    return out
+
+
+def _get_recovery_cycle_id() -> str:
+    try:
+        if r:
+            cycle = r.get(MARKET_MODE_RECOVERY_CYCLE_KEY)
+            if cycle:
+                return str(cycle)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_trade_tp2_recovery_protected(trade: dict) -> bool:
+    try:
+        status = str(trade.get("status", "") or "").lower()
+        return bool(trade.get("tp2_hit", False)) or status in ("tp2_partial", "trailing", "trailing_open", "trailing_closed")
+    except Exception:
+        return False
+
+
+def _count_active_recovery_cycle_trades(recovery_started_ts: int = 0) -> int:
+    """Count active Recovery trades for the current Recovery cycle.
+
+    TP2-touched trades are not counted because 75% is closed/protected and the
+    remaining runner is managed separately.
+    """
+    try:
+        trades = load_all_trades_for_report(r, market_type="futures", side="long", include_open=True)
+    except Exception:
+        try:
+            trades = _load_long_trades_from_redis(limit=1000)
+        except Exception:
+            trades = []
+    count = 0
+    for t in trades or []:
+        try:
+            mode = str(t.get("market_mode", "") or t.get("mode", "") or t.get("current_mode", ""))
+            target_model = str(t.get("target_model", "") or "")
+            setup_type = str(t.get("setup_type", "") or "")
+            created_ts = int(float(t.get("created_ts") or t.get("created_at") or t.get("candle_time") or 0))
+            if recovery_started_ts and created_ts and created_ts < int(recovery_started_ts):
+                continue
+            if mode != MODE_RECOVERY_LONG and target_model != "recovery_50_25_25" and "recovery" not in setup_type:
+                continue
+            if not _is_execution_trade_open(t):
+                continue
+            if _is_trade_tp2_recovery_protected(t):
+                continue
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _recovery_candidate_quality(symbol: str, df, btc_df, dist_ma: float, rsi_now: float, vol_ratio: float, atr_value: float) -> dict:
+    """Strict quality gate for RECOVERY_LONG opportunities."""
+    try:
+        extra = detect_extra_strong_long_setups(
+            symbol=symbol,
+            df=df,
+            btc_df=btc_df,
+            dist_ma=dist_ma,
+            rsi_now=rsi_now,
+            vol_ratio=vol_ratio,
+            mtf_confirmed=False,
+            atr_value=atr_value,
+        )
+        setups = set(str(x) for x in (extra.get("setups") or []))
+        allowed = {
+            "relative_strength_vs_btc",
+            "vwap_reclaim",
+            "liquidity_sweep_reclaim",
+            "support_bounce_confirmed",
+            "higher_low_continuation",
+        }
+        row = get_signal_row(df)
+        close = _safe_float(row.get("close"), 0.0) if row is not None else 0.0
+        ma = _safe_float(row.get("ma"), 0.0) if row is not None else 0.0
+        vwap = _safe_float(row.get("vwap"), 0.0) if row is not None else 0.0
+        micro_high_break = False
+        try:
+            idx = row.name
+            recent_high = float(df.iloc[max(0, idx - 5):idx]["high"].astype(float).max())
+            micro_high_break = bool(close > recent_high)
+        except Exception:
+            pass
+        reclaim_ok = bool((vwap > 0 and close >= vwap) or (ma > 0 and close >= ma) or micro_high_break)
+        quality = bool((setups & allowed) and reclaim_ok and vol_ratio >= 1.05)
+        reasons = sorted(list(setups & allowed))
+        if micro_high_break:
+            reasons.append("micro_high_break")
+        if reclaim_ok:
+            reasons.append("reclaim_vwap_or_ma20")
+        return {"ok": quality, "extra": extra, "reasons": reasons, "reclaim_ok": reclaim_ok, "micro_high_break": micro_high_break}
+    except Exception as e:
+        return {"ok": False, "extra": {}, "reasons": [f"quality_error:{e}"], "reclaim_ok": False, "micro_high_break": False}
+
 # =========================
 # DETERMINE LONG MARKET MODE
 # =========================
@@ -10334,15 +10548,21 @@ def determine_long_market_mode(
     elif btc_change <= -0.70 and red_ratio >= 0.55:
         crash_triggered = True
         crash_reason = f"btc_change={btc_change:.2f} & red_ratio={red_ratio:.2f}"
-    elif alt_weak_cautious:
-        pass  # will be handled below as STRONG_LONG_ONLY
-    elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
-        if btc_zone_breakdown and red_ratio >= 0.60:
+    else:
+        btc_fast_danger = _btc_ma5_fast_danger_snapshot()
+        if btc_fast_danger.get("danger") and (red_ratio >= 0.55 or avg_change <= -0.30 or btc_change <= -0.20):
             crash_triggered = True
-            crash_reason = f"alt_weak + BTC breakdown & red_ratio={red_ratio:.2f}"
-        else:
-            alt_weak_cautious = True
-            crash_reason = f"alt_weak -> STRONG_LONG_ONLY (red_ratio={red_ratio:.2f})"
+            crash_reason = f"BTC Fast Danger + market pressure (red_ratio={red_ratio:.2f}, avg15m={avg_change:.2f}, btc15m={btc_change:.2f})"
+    if not crash_triggered:
+        if alt_weak_cautious:
+            pass  # will be handled below as STRONG_LONG_ONLY
+        elif alt_mode == "🔴 ضعيف" and red_ratio >= 0.60:
+            if btc_zone_breakdown and red_ratio >= 0.60:
+                crash_triggered = True
+                crash_reason = f"alt_weak + BTC breakdown & red_ratio={red_ratio:.2f}"
+            else:
+                alt_weak_cautious = True
+                crash_reason = f"alt_weak -> STRONG_LONG_ONLY (red_ratio={red_ratio:.2f})"
  if crash_triggered:
     if allow_state_writes and r:
         try:
@@ -10384,14 +10604,23 @@ def determine_long_market_mode(
                 r.set(MARKET_MODE_LAST_RECOVERY_CHECK_KEY, str(now_ts))
             except Exception:
                 pass
-        if is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode):
+        btc_recovery = _btc_recovery_fast_snapshot(red_ratio=red_ratio, avg_change=avg_change)
+        if btc_recovery.get("edge") and is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode):
             if allow_state_writes and r:
                 try:
                     r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
                     r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
                 except Exception:
                     pass
-            return {"mode": MODE_RECOVERY_LONG, "reason": "انتهى البلوك وشروط الريكافري اتحققت"}
+            return {"mode": MODE_RECOVERY_LONG, "reason": "BTC Recovery سريع + شروط Recovery edge اتحققت"}
+        if btc_recovery.get("recovery") and is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode):
+            if allow_state_writes and r:
+                try:
+                    r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
+                    r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
+                except Exception:
+                    pass
+            return {"mode": MODE_STRONG_LONG_ONLY, "reason": "BTC عمل reclaim سريع لكن بدون Recovery edge كافي → STRONG_LONG_ONLY"}
     block_exit_ready = is_market_no_longer_crashing(red_ratio, avg_change, btc_change, alt_mode)
     if btc_lower_range and not btc_zone_breakdown and red_ratio < 0.68 and avg_change > -1.05 and btc_change > -0.65:
         block_exit_ready = True
@@ -10470,6 +10699,16 @@ def determine_long_market_mode(
         return {"mode": MODE_STRONG_LONG_ONLY, "reason": "السوق ضعيف/مختلط لكن ليس كراش"}
     return {"mode": MODE_STRONG_LONG_ONLY, "reason": "الحالة مستقرة لكن لم تصل لشروط العودة الكاملة"}
  if current_mode == MODE_RECOVERY_LONG:
+    recovery_started_ts = 0
+    if r:
+        try:
+            recovery_started_ts = int(r.get(MARKET_MODE_RECOVERY_STARTED_KEY) or 0)
+        except Exception:
+            recovery_started_ts = 0
+    if recovery_started_ts and now_ts - recovery_started_ts >= RECOVERY_MODE_MAX_DURATION_SECONDS:
+        if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
+            return {"mode": MODE_NORMAL_LONG, "reason": "انتهت دورة RECOVERY بعد 90 دقيقة والسوق أصبح طبيعيًا"}
+        return {"mode": MODE_STRONG_LONG_ONLY, "reason": "انتهت دورة RECOVERY بعد 90 دقيقة → STRONG_LONG_ONLY"}
     if is_market_normal_ready(red_ratio, avg_change, btc_change, market_state):
         if normal_candidate_since == 0:
             if allow_state_writes and r:
@@ -11202,10 +11441,21 @@ def handle_market_mode_transition(mode_result: dict) -> str:
                 r.delete(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY)
             except Exception:
                 pass
+        if new_mode == MODE_RECOVERY_LONG and last_mode != MODE_RECOVERY_LONG:
+            try:
+                r.set(MARKET_MODE_RECOVERY_STARTED_KEY, str(now_ts))
+                r.set(MARKET_MODE_RECOVERY_CYCLE_KEY, str(now_ts))
+            except Exception:
+                pass
         if new_mode != MODE_BLOCK_LONGS:
             try:
                 r.delete(MARKET_MODE_LAST_SAFE_SEEN_KEY)
                 r.delete(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY)
+            except Exception:
+                pass
+        if new_mode != MODE_RECOVERY_LONG:
+            try:
+                r.delete(MARKET_MODE_RECOVERY_STARTED_KEY)
             except Exception:
                 pass
         r.set(MARKET_MODE_LAST_KEY, new_mode)
@@ -12527,9 +12777,17 @@ def run_scanner_loop():
                     key=lambda x: x.get("_rank_volume_24h", 0),
                     reverse=True
                 )[:20]
+                recovery_started_ts = int(r.get(MARKET_MODE_RECOVERY_STARTED_KEY) or 0) if r else 0
+                if not recovery_started_ts:
+                    recovery_started_ts = int(time.time())
+                    if r:
+                        r.set(MARKET_MODE_RECOVERY_STARTED_KEY, str(recovery_started_ts))
+                        r.set(MARKET_MODE_RECOVERY_CYCLE_KEY, str(recovery_started_ts))
+                active_recovery_count = _count_active_recovery_cycle_trades(recovery_started_ts)
                 recovery_sent = 0
                 for pair_data in scan_pairs:
-                    if recovery_sent >= RECOVERY_MAX_ALERTS:
+                    if active_recovery_count + recovery_sent >= RECOVERY_CYCLE_MAX_TRADES:
+                        logger.info(f"RECOVERY_LONG cycle limit reached: active={active_recovery_count}, sent_now={recovery_sent}, max={RECOVERY_CYCLE_MAX_TRADES}")
                         break
                     symbol = pair_data["instId"]
                     candles = get_candles(symbol, TIMEFRAME, 100)
@@ -12581,11 +12839,16 @@ def run_scanner_loop():
                     if atr_value <= 0:
                         log_long_rejection(symbol=symbol, reason="recovery_atr_invalid", candle_time=candle_time, market_state=market_state, current_mode=current_mode)
                         continue
+                    btc_df_for_recovery = to_dataframe(get_candles("BTC-USDT-SWAP", TIMEFRAME, 100))
+                    recovery_quality = _recovery_candidate_quality(symbol, df, btc_df_for_recovery, dist_ma, rsi_now, vol_ratio, atr_value)
+                    if not recovery_quality.get("ok"):
+                        log_long_rejection(symbol=symbol, reason="recovery_quality_not_confirmed", candle_time=candle_time, market_state=market_state, current_mode=current_mode, vol_ratio=vol_ratio, extra={"quality_reasons": recovery_quality.get("reasons", [])})
+                        continue
                     entry1 = price
                     entry2 = round(price - (atr_value * RECOVERY_ENTRY2_ATR_MULT), 6)
                     avg_entry = round((entry1 + entry2) / 2, 6)
                     sl = round(avg_entry - (atr_value * RECOVERY_SL_ATR_MULT), 6)
-                    rr1, rr2 = 2.0, 3.2
+                    rr1, rr2 = 1.35, 2.40
                     tp1 = calc_tp_long(avg_entry, sl, rr=rr1)
                     tp2 = calc_tp_long(avg_entry, sl, rr=rr2)
                     tv_link = build_tradingview_link(symbol)
@@ -12659,14 +12922,19 @@ def run_scanner_loop():
                             "market_red_ratio_15m": red_ratio,
                             "market_avg_change_15m": avg_change,
                             "btc_change_15m": btc_change,
-                            "recovery_reason": "Post crash rebound",
+                            "recovery_reason": "Post block BTC recovery rebound",
+                            "execution_setup_tags": ["recovery_long", "recovery_scout", "relative_strength_vs_btc", "vwap_reclaim"],
+                            "execution_badge": "⚡ Recovery Candidate",
                             "above_upper_bb": False,
                             "change_4h": 0.0,
                             "late_pump_risk": False,
                             "bull_continuation_risk": False,
-                            "tp1_close_pct": TP1_CLOSE_PCT,
-                            "tp2_close_pct": TP2_CLOSE_PCT,
-                            "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                            "tp1_close_pct": RECOVERY_TP1_CLOSE_PCT,
+                            "tp2_close_pct": RECOVERY_TP2_CLOSE_PCT,
+                            "runner_pct": RECOVERY_RUNNER_PCT,
+                            "target_model": "recovery_50_25_25",
+                            "move_sl_to_entry_after_tp1": False,
+                            "move_sl_to_entry_after_tp2": True,
                             "entry_mode": "market",
                             "pullback_triggered": True,
                         }
@@ -12680,7 +12948,7 @@ def run_scanner_loop():
                             "tp2": tp2,
                             "score": 0.0,
                             "setup_type": "recovery|mtf_yes|vol_mid|post_crash",
-                            "reasons": ["Recovery Long", "Post Crash", "Oversold Bounce"],
+                            "reasons": ["⚡ Recovery Candidate", "Post Block BTC Recovery", "Fast Rebound"],
                             "warning_reasons": [],
                             "btc_mode": btc_mode,
                             "funding_label": "🟡 محايد",
@@ -12753,9 +13021,12 @@ def run_scanner_loop():
                             "target_notes": [],
                             "sl_method": "atr",
                             "sl_notes": [],
-                            "tp1_close_pct": TP1_CLOSE_PCT,
-                            "tp2_close_pct": TP2_CLOSE_PCT,
-                            "move_sl_to_entry_after_tp1": MOVE_SL_TO_ENTRY_AFTER_TP1,
+                            "tp1_close_pct": RECOVERY_TP1_CLOSE_PCT,
+                            "tp2_close_pct": RECOVERY_TP2_CLOSE_PCT,
+                            "runner_pct": RECOVERY_RUNNER_PCT,
+                            "target_model": "recovery_50_25_25",
+                            "move_sl_to_entry_after_tp1": False,
+                            "move_sl_to_entry_after_tp2": True,
                             "has_extra_strong_setup": False,
                             "extra_setup_names": [],
                             "extra_setup_bonus": 0.0,
