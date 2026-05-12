@@ -1,7 +1,7 @@
-# Version: main_v307_wallet_open_reports_polish.py
+# Version: main_v308_ui_reports_track_final.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: Polish Wallet Impact UI and open-trades dashboards; preserve trading/execution logic.
+# Changes: Apply saved UI updates 1-4: intelligence menus, open reports polish, wallet table, track UI; preserve trading/execution logic.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1920,7 +1920,7 @@ def build_help_inline_keyboard() -> dict:
         ],
         [
             {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
-            {"text": "🧠 Exec Intelligence", "callback_data": "help:exec_intelligence"},
+            {"text": "🚀 Execution Intelligence", "callback_data": "help:exec_intelligence"},
         ],
         [
             {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
@@ -2079,17 +2079,25 @@ def build_help_normal_message() -> str:
 /report_market"""
 
 def build_help_exec_intelligence_message() -> str:
- return """🧠 <b>Exec Intelligence</b>
-📘 <code>/help_exec_intelligence</code>
+ return """🚀 <b>Execution Intelligence</b>
+📘 <code>/help_execution_intelligence</code>
 ━━━━━━━━━━━━
 
-🚀 <b>ذكاء صفقات التنفيذ</b>
+🚀 <b>ذكاء الصفقات المرشحة</b>
+ℹ️ يعرض جودة execution candidates وتحليل أداء الترشيحات والتنفيذ.
 /report_execution_intelligence
 /report_execution_intelligence_1h
 /report_execution_intelligence_today
 /report_execution_intelligence_7d
 
-ℹ️ يعرض أقوى Setups، التحذيرات، جودة الخروج، ومراجعة الفلاتر بالأرقام."""
+┄┄┄┄┄┄┄┄
+
+🧪 <b>تحليل رفض الترشيحات</b>
+ℹ️ يعرض أسباب رفض execution candidates وجودة execution filters.
+/report_execution_rejections
+/report_execution_rejections_1h
+/report_execution_rejections_today
+/report_execution_rejections_7d"""
 
 def build_help_market_intelligence_message() -> str:
  return """🧠 <b>Market Intelligence</b>
@@ -2097,12 +2105,20 @@ def build_help_market_intelligence_message() -> str:
 ━━━━━━━━━━━━
 
 📊 <b>ذكاء الصفقات العادية</b>
+ℹ️ يعرض جودة السوق، أفضل الأنماط، وملاحظات تحسين الأداء من الصفقات العادية.
 /report_intelligence
 /report_intelligence_1h
 /report_intelligence_today
 /report_intelligence_7d
 
-ℹ️ يعرض جودة السوق، أفضل الأنماط، وملاحظات تحسين الأداء من الصفقات العادية."""
+┄┄┄┄┄┄┄┄
+
+🧪 <b>تحليل الرفض والفلاتر</b>
+ℹ️ يعرض أسباب رفض الصفقات العادية وهل الفلاتر كانت دقيقة أو aggressive زيادة.
+/report_rejection_intelligence
+/report_rejection_intelligence_1h
+/report_rejection_intelligence_today
+/report_rejection_intelligence_7d"""
 
 def build_help_diagnostics_message() -> str:
  return """🧠 <b>التشخيص</b>
@@ -4340,7 +4356,7 @@ def build_execution_open_report_message(period: str = "all") -> str:
         sep = "┄┄┄"
         winners_sorted = sorted(winners, key=lambda x: x[1], reverse=True)
         losers_sorted = sorted(losers, key=lambda x: x[1])
-        lines.extend(["━━━━━━━━━━━━", "🟢 <b>Open Winners — Top 5</b>"])
+        lines.extend(["┄┄┄┄┄┄┄┄", "📈 <b>Open Winners — Top 5</b>"])
         if winners_sorted:
             for idx, (trade, _) in enumerate(winners_sorted[:5]):
                 if idx > 0:
@@ -4350,7 +4366,7 @@ def build_execution_open_report_message(period: str = "all") -> str:
                 lines.append(f"📂 +{len(winners_sorted) - 5} more winning trades...")
         else:
             lines.append("لا توجد صفقات مفتوحة رابحة حاليًا.")
-        lines.extend(["━━━━━━━━━━━━", "🔴 <b>Open Losers — Top 5</b>"])
+        lines.extend(["┄┄┄┄┄┄┄┄", "📉 <b>Open Losers — Top 5</b>"])
         if losers_sorted:
             for idx, (trade, _) in enumerate(losers_sorted[:5]):
                 if idx > 0:
@@ -4977,27 +4993,19 @@ def build_intelligence_report_message(kind: str = "execution", period: str = "al
 
 def _execution_wallet_money(value) -> str:
     try:
-        v = float(value or 0.0)
+        v = int(round(float(value or 0.0)))
         sign = "+" if v > 0 else ""
-        if abs(v) >= 1000:
-            return f"{sign}{v:.0f}$"
-        if abs(v) >= 100:
-            return f"{sign}{v:.1f}$"
-        return f"{sign}{v:.2f}$"
+        return f"{sign}{v}$"
     except Exception:
-        return "0.00$"
+        return "0$"
 
 
 def _execution_wallet_plain_money(value) -> str:
     try:
-        v = float(value or 0.0)
-        if abs(v) >= 1000:
-            return f"{v:.0f}$"
-        if abs(v) >= 100:
-            return f"{v:.1f}$"
-        return f"{v:.2f}$"
+        v = int(round(float(value or 0.0)))
+        return f"{v}$"
     except Exception:
-        return "0.00$"
+        return "0$"
 
 
 def _execution_wallet_impact_usd_for_trade(trade: dict) -> float:
@@ -5066,7 +5074,7 @@ def _load_execution_wallet_trades(since_ts=None) -> list:
 
 def _execution_wallet_bucket_key(ts: int, hourly: bool = False) -> str:
     try:
-        fmt = "%m-%d %H:00" if hourly else "%m-%d"
+        fmt = "%d-%m %H:00" if hourly else "%d-%m"
         return time.strftime(fmt, time.localtime(int(ts)))
     except Exception:
         return "N/A"
@@ -5166,19 +5174,37 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
             })
 
         max_rows = 24 if hourly else 14
-        display_rows = rows[-max_rows:]
+        display_rows = list(reversed(rows[-max_rows:]))
         hidden = max(0, len(rows) - len(display_rows))
-        row_lines = []
+
+        date_w = 11 if hourly else 8
+        open_w = 6
+        close_w = 6
+        net_w = 6
+        up_w = 6
+        dd_w = 5
+
+        def _table_plain(v) -> str:
+            return str(int(round(float(v or 0.0))))
+
+        def _table_signed(v) -> str:
+            n = int(round(float(v or 0.0)))
+            return f"+{n}" if n > 0 else str(n)
+
+        table_rows = [
+            f"{'Date':<{date_w}} | {'Open':^{open_w}} | {'Close':^{close_w}} | {'Net':>{net_w}} | {'Up':>{up_w}} | {'DD':>{dd_w}}",
+            f"{'-' * (date_w + 1)}|{'-' * (open_w + 2)}|{'-' * (close_w + 2)}|{'-' * (net_w + 2)}|{'-' * (up_w + 2)}|{'-' * (dd_w + 2)}",
+        ]
         for row in display_rows:
-            icon = "🟢" if row["net"] >= 0 else "🔴"
-            row_lines.append(
-                f"{html.escape(str(row['date']))} | "
-                f"{_execution_wallet_plain_money(row['open'])} → {_execution_wallet_plain_money(row['close'])} | "
-                f"{icon} {_execution_wallet_money(row['net'])} | "
-                f"↑ {_execution_wallet_money(row['max_up'])} | ↓ {_execution_wallet_money(row['max_dd'])}"
+            table_rows.append(
+                f"{str(row['date']):<{date_w}} | "
+                f"{_table_plain(row['open']):>{open_w}} | "
+                f"{_table_plain(row['close']):>{close_w}} | "
+                f"{_table_signed(row['net']):>{net_w}} | "
+                f"{_table_signed(row['max_up']):>{up_w}} | "
+                f"{_table_signed(row['max_dd']):>{dd_w}}"
             )
-        if hidden:
-            row_lines.append(f"📂 +{hidden} older rows...")
+        table_text = "\n".join(table_rows)
 
         avg_daily = total_net / len(rows) if rows else 0.0
         impact_icon = "🟢" if total_net >= 0 else "🔴"
@@ -5189,21 +5215,21 @@ def build_execution_wallet_impact_report_message(period: str = "all") -> str:
             f"💰 Start: <b>{_execution_wallet_plain_money(start_balance)}</b>",
             f"🏁 Current: <b>{_execution_wallet_plain_money(balance)}</b>",
             f"⚖️ Net: <b>{impact_icon} {_execution_wallet_money(total_net)}</b>",
-            "┄┄┄┄┄┄┄┄",
-            "📅 <b>Curve</b>",
+            "",
+            f"<pre>{html.escape(table_text)}</pre>",
         ]
-        lines.extend(row_lines)
+        if hidden:
+            lines.append(f"📂 +{hidden} older rows...")
         lines.extend([
-            "┄┄┄┄┄┄┄┄",
             "🧠 <b>Summary</b>",
-            f"🟢 Green: {green_days}",
-            f"🔴 Red: {red_days}",
-            f"📈 Best: {_execution_wallet_money(best_day or 0.0)}",
-            f"📉 Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
-            f"⚖️ Avg Bucket: {_execution_wallet_money(avg_daily)}",
-            "ℹ️ Virtual execution wallet من التتبع الداخلي، وليس رصيد OKX الحقيقي مباشرة.",
+            f"• Green Days: {green_days} / {len(rows)}",
+            f"• Best Day: {_execution_wallet_money(best_day or 0.0)}",
+            f"• Worst DD: {_execution_wallet_money(worst_dd or 0.0)}",
+            f"• Avg Daily: {_execution_wallet_money(avg_daily)}",
+            "ℹ️ يعتمد على execution tracking الداخلي وليس رصيد OKX الحقيقي.",
         ])
-        return "\n".join(lines)
+        return "\n".join(lines).strip()
+
     except Exception as e:
         logger.error(f"build_execution_wallet_impact_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير Wallet Impact: {html.escape(str(e))}"
@@ -5633,6 +5659,7 @@ COMMAND_HANDLERS = {
  "/help_normal": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
  "/normal_reports": lambda chat_id: send_telegram_reply(chat_id, build_help_normal_message()),
  "/help_exec_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_exec_intelligence_message()),
+ "/help_execution_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_exec_intelligence_message()),
  "/help_market_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_market_intelligence_message()),
  "/diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
  "/help_analysis": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
@@ -5696,10 +5723,18 @@ COMMAND_HANDLERS = {
  "/report_execution_intelligence_1h": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "1h")),
  "/report_execution_intelligence_today": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "today")),
  "/report_execution_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("execution", "7d")),
+ "/report_execution_rejections": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_execution_rejections_1h": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_execution_rejections_today": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_execution_rejections_7d": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
  "/report_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "all")),
  "/report_intelligence_1h": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "1h")),
  "/report_intelligence_today": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "today")),
  "/report_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_intelligence_report_message("normal", "7d")),
+ "/report_rejection_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_rejection_intelligence_1h": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_rejection_intelligence_today": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
+ "/report_rejection_intelligence_7d": lambda chat_id: send_telegram_reply(chat_id, build_rejections_report_message(r)),
  "/report_profit": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
  "/report_profit_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
  "/report_profit_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
@@ -6546,7 +6581,7 @@ def build_track_message(alert: dict) -> str:
 
         msg = (
             "📌 <b>Alert Track</b>\n"
-            "━━━━━━━━━━━━\n"
+            "┄┄┄┄┄┄┄┄\n"
             f"{pnl_sign} <b>{html.escape(symbol)}</b> | {leveraged_current:+.2f}%\n"
             f"⏱️ {html.escape(duration_text)} | {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
             f"{status_line}\n"
@@ -6555,9 +6590,9 @@ def build_track_message(alert: dict) -> str:
             f"🛡 SL: {sl_state}\n"
             f"🔄 Runner: {runner_state}"
             f"{recovery_extra}\n\n"
-            "━━━━━━━━━━━━\n"
+            "┄┄┄┄┄┄┄┄\n"
             "💰 <b>الحالة المالية</b>\n"
-            f"• الربح الحالي: {current_move:+.2f}%\n"
+            f"• PnL الحالي: {current_move:+.2f}%\n"
             f"⚡ بعد الرافعة: {leveraged_current:+.2f}%\n\n"
             "🚀 <b>أقصى صعود</b>\n"
             f"{_fmt_price(favorable_price)} | +{favorable_pct:.2f}%\n"
@@ -6565,7 +6600,7 @@ def build_track_message(alert: dict) -> str:
             "📉 <b>أقصى هبوط ضدك</b>\n"
             f"{_fmt_price(adverse_price)} | -{adverse_pct:.2f}%\n"
             f"⚡ -{abs(leveraged_adverse):.2f}% Lev\n\n"
-            "━━━━━━━━━━━━\n"
+            "┄┄┄┄┄┄┄┄\n"
             "🧠 <b>خطة الصفقة</b>\n"
             f"📍 Entry: {_fmt_price(effective_entry)}\n"
             f"🛡 SL: {_fmt_price(sl)}\n"
@@ -6574,7 +6609,7 @@ def build_track_message(alert: dict) -> str:
             "🔄 Runner\n"
             "• 20% trailing after TP2\n"
             f"• Trailing: {TRAILING_PCT}% below High\n\n"
-            "━━━━━━━━━━━━\n"
+            "┄┄┄┄┄┄┄┄\n"
             "📊 <b>Trade State</b>\n"
             f"💼 Entry Mode: {html.escape(entry_mode_label)}\n"
             "🧮 Model: 40 / 40 / 20\n"
@@ -6604,7 +6639,7 @@ def build_track_message(alert: dict) -> str:
         msg += (
             f"📌 Setup: {html.escape(setup_name)}\n"
             f"🌍 BTC: {html.escape(btc_context)} | Market: {html.escape(market_context)}\n\n"
-            "━━━━━━━━━━━━\n"
+            "┄┄┄┄┄┄┄┄\n"
             f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>\n'
             "15m / 1H"
         )
