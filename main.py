@@ -1,9 +1,9 @@
-# Version: main_final_v02_execution_loss_tuning.py
+# Version: main_final_v03_recovery_universe_period_ui.py
 # Date: 2026-05-12
-# Base: main_final_v01_analysis_packages_routing.py
-# Changes: Final v02 applies execution-only loss-reduction tuning for VWAP Reclaim, Higher Low, mid-move, and risk-off contexts.
-# Preserved: Normal signal flow, scoring engine, market modes, TP/SL, whitelist content, risk manager, reporting UI.
-# Fixed previously: /open_trades chunking safety, BLOCK exception setup tag consistency, analysis package routing.
+# Base: main_final_v02_execution_loss_tuning.py
+# Changes: Final v03 expands RECOVERY_LONG universe, adds Recovery Score ordering, unifies period ordering, and fixes Profit/Loss Analysis period wording.
+# Preserved: Normal signal flow, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and existing reporting calculations.
+# Fixed previously: /open_trades chunking safety, BLOCK exception setup tag consistency, analysis package routing, and execution-only loss-reduction tuning.
 
 import os 
 import sys 
