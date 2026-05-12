@@ -1,7 +1,7 @@
-# Version: main_v308_ui_reports_track_final.py
+# Version: main_final_v01_analysis_packages_routing.py
 # Date: 2026-05-11
 # Base: main_v203_open_trades_help_ui.py
-# Changes: Apply saved UI updates 1-4: intelligence menus, open reports polish, wallet table, track UI; preserve trading/execution logic.
+# Changes: Final v01 routing fix for profit/loss analysis + AI JSON analysis packages; no trading logic changes.
 # Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
 # Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
 
@@ -1747,6 +1747,31 @@ def send_telegram_reply_chunks(chat_id: str, messages) -> bool:
     time.sleep(0.25)
  return ok
 
+
+def send_telegram_document(chat_id: str, file_path: str, caption: str = None) -> bool:
+ """Send a local file as Telegram document. Used only for AI JSON snapshots."""
+ if not BOT_TOKEN or not chat_id:
+    logger.error("❌ Telegram document config missing")
+    return False
+ try:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+    with open(file_path, "rb") as f:
+        response = requests.post(url, data=data, files={"document": f}, timeout=30)
+    if response.status_code != 200:
+        logger.error(f"Telegram sendDocument HTTP Error: {response.text}")
+        return False
+    payload = response.json()
+    if not payload.get("ok"):
+        logger.error(f"Telegram sendDocument API Error: {payload}")
+        return False
+    return True
+ except Exception as e:
+    logger.error(f"Telegram sendDocument Exception: {e}", exc_info=True)
+    return False
+
 def get_telegram_updates(offset: int = 0):
  if not BOT_TOKEN:
     return []
@@ -2132,6 +2157,22 @@ def build_help_diagnostics_message() -> str:
 📘 <code>/diagnostics</code>
 ━━━━━━━━━━━━
 
+📦 <b>Analysis Packages</b>
+
+🚀 <b>الصفقات المرشحة</b>
+📅 يومي
+/daily_execution_analysis
+📊 أسبوعي
+/weekly_execution_analysis
+
+📈 <b>الصفقات العادية</b>
+📅 يومي
+/daily_normal_analysis
+📊 أسبوعي
+/weekly_normal_analysis
+
+━━━━━━━━━━━━
+🛡 <b>التشخيص</b>
 /report_diagnostics
 /report_rejections
 /report_filters
@@ -2142,7 +2183,22 @@ def build_help_diagnostics_message() -> str:
 /report_deep
 /report_market
 /report_mode_history
-/report_top_setups"""
+/report_top_setups
+
+📈 <b>تحليل الأرباح</b>
+/report_profit_analysis
+/report_execution_profit_analysis
+
+📉 <b>تحليل الخسائر</b>
+/report_losses_analysis
+/report_execution_losses_analysis
+
+🎯 <b>تحليل الخروج</b>
+/report_exits
+/report_execution_exits
+
+💼 <b>Wallet Intelligence</b>
+/report_execution_wallet"""
 
 
 def build_help_okx_message() -> str:
@@ -5363,8 +5419,9 @@ def build_execution_losses_report_message(period: str = "all") -> str:
                 return ["• لا توجد بيانات"]
             return [f"• {html.escape(str(k))}: {v}" for k, v in counter.most_common(limit)]
 
+        period_title = _analysis_period_title(period)
         lines = [
-            "📉 <b>Execution Losses Report</b>",
+            f"📉 <b>تحليل أسباب خسائر التنفيذ | {period_title}</b>",
             "━━━━━━━━━━━━",
             f"إجمالي صفقات التنفيذ: <b>{len(trades)}</b>",
             f"الخسائر المغلقة: <b>{len(losses)}</b>",
@@ -5399,6 +5456,386 @@ def build_execution_losses_report_message(period: str = "all") -> str:
     except Exception as e:
         logger.error(f"build_execution_losses_report_message error: {e}", exc_info=True)
         return f"❌ خطأ في تقرير خسائر التنفيذ: {html.escape(str(e))}"
+
+
+# =========================
+# ANALYSIS REPORT ROUTING + AI JSON SNAPSHOTS
+# =========================
+
+def _analysis_period_key(period: str) -> str:
+    period = str(period or "all").lower().strip()
+    if period in ("hour", "last_1h"):
+        return "1h"
+    if period in ("week", "last_7d"):
+        return "7d"
+    if period in ("", "since_start", "since start"):
+        return "all"
+    return period
+
+
+def _analysis_period_title(period: str) -> str:
+    period = _analysis_period_key(period)
+    return {
+        "all": "Since Start",
+        "1h": "Last 1H",
+        "today": "Today",
+        "7d": "Last 7D",
+        "30d": "Last 30D",
+        "month": "Last 30D",
+    }.get(period, period)
+
+
+def _analysis_scope_title(scope: str) -> str:
+    return "التنفيذ" if str(scope).lower() == "execution" else "الصفقات العادية"
+
+
+def _analysis_scope_en(scope: str) -> str:
+    return "execution" if str(scope).lower() == "execution" else "normal"
+
+
+def _analysis_load_trades(scope: str = "execution", period: str = "all", include_open: bool = True) -> list:
+    """Load trades for analysis packages without changing existing reports.
+
+    execution: only execution-candidate trades.
+    normal: tracked normal trades excluding execution candidates, so AI analysis stays separated.
+    """
+    scope = _analysis_scope_en(scope)
+    period = _analysis_period_key(period)
+    since_ts = _period_since_ts(period)
+    try:
+        trades = load_all_trades_for_report(
+            r, market_type="futures", side="long", since_ts=since_ts, include_open=include_open
+        )
+    except Exception:
+        trades = _load_long_trades_from_redis(limit=2500)
+        if since_ts:
+            trades = [t for t in trades if _trade_created_ts_for_exec(t) >= since_ts]
+    if scope == "execution":
+        trades = [t for t in trades if is_execution_candidate_trade(t)]
+    else:
+        trades = [t for t in trades if not is_execution_candidate_trade(t)]
+    trades.sort(key=_trade_created_ts_for_exec, reverse=True)
+    return trades
+
+
+def _analysis_is_open_trade(trade: dict) -> bool:
+    try:
+        if is_execution_candidate_trade(trade):
+            return _is_execution_trade_open(trade)
+    except Exception:
+        pass
+    status = str(trade.get("status", "") or "").lower()
+    result = str(trade.get("result", "") or "").lower()
+    return status in ("open", "partial", "pending_pullback", "trailing", "trailing_open", "tp2_partial") and result not in ("loss", "tp1_win", "tp2_win", "trailing_win", "expired", "pending_expired", "breakeven")
+
+
+def _analysis_pnl_pct(trade: dict):
+    try:
+        if is_execution_candidate_trade(trade):
+            return _execution_final_pnl_pct(trade)
+    except Exception:
+        pass
+    try:
+        return _get_trade_pnl_pct(trade)
+    except Exception:
+        return None
+
+
+def _analysis_floating_pnl_pct(trade: dict):
+    try:
+        if is_execution_candidate_trade(trade):
+            return _execution_floating_pnl_pct(trade)
+    except Exception:
+        pass
+    try:
+        return _get_trade_pnl_pct(trade)
+    except Exception:
+        return None
+
+
+def _analysis_close_type(trade: dict) -> str:
+    try:
+        if is_execution_candidate_trade(trade):
+            return _execution_close_type_for_trade(trade)
+    except Exception:
+        pass
+    return _trade_exit_bucket(trade)
+
+
+def _analysis_field(trade: dict, *keys, default=None):
+    for key in keys:
+        try:
+            value = _trade_field(trade, key, None)
+        except Exception:
+            value = trade.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _analysis_score_range(score) -> str:
+    score = _safe_trade_float_value(score, None)
+    if score is None:
+        return "N/A"
+    if score < 6:
+        return "<6"
+    if score < 6.5:
+        return "6.0-6.49"
+    if score < 7:
+        return "6.5-6.99"
+    if score < 7.5:
+        return "7.0-7.49"
+    if score < 8:
+        return "7.5-7.99"
+    if score < 9:
+        return "8.0-8.99"
+    return "9+"
+
+
+def _analysis_bucket_counters(trades_with_pnl: list) -> dict:
+    from collections import Counter
+    setup = Counter()
+    market = Counter()
+    timing = Counter()
+    scores = Counter()
+    reasons = Counter()
+    close_types = Counter()
+    for trade, pnl in trades_with_pnl:
+        setup[str(_analysis_field(trade, "primary_extra_setup", "extra_setup", "setup_type", default="unknown") or "unknown")[:120]] += 1
+        market[str(_analysis_field(trade, "market_state_label", "market_state", "current_mode", "market_mode", default="unknown") or "unknown")[:80]] += 1
+        timing[str(_analysis_field(trade, "entry_timing", default="unknown") or "unknown")[:80]] += 1
+        scores[_analysis_score_range(_analysis_field(trade, "score", default=None))] += 1
+        close_types[_analysis_close_type(trade)] += 1
+        for key in ("reasons", "warning_reasons"):
+            vals = _analysis_field(trade, key, default=[]) or []
+            if isinstance(vals, str):
+                vals = [vals]
+            for item in vals:
+                txt = str(item or "").strip()
+                if txt:
+                    reasons[txt[:120]] += 1
+    def top(counter, n=10):
+        return [{"name": str(k), "count": int(v)} for k, v in counter.most_common(n)]
+    return {
+        "setups": top(setup),
+        "market_states": top(market),
+        "entry_timing": top(timing),
+        "score_ranges": top(scores),
+        "reasons": top(reasons),
+        "close_types": top(close_types),
+    }
+
+
+def _analysis_trade_sample(trade: dict, pnl=None) -> dict:
+    try:
+        symbol = str(trade.get("symbol", "") or "")
+        return {
+            "symbol": symbol,
+            "pnl_pct_leveraged": None if pnl is None else round(float(pnl), 4),
+            "status": str(trade.get("status", "") or ""),
+            "result": str(trade.get("result", "") or ""),
+            "close_type": _analysis_close_type(trade),
+            "score": _safe_trade_float_value(_analysis_field(trade, "score", default=None), None),
+            "setup": str(_analysis_field(trade, "primary_extra_setup", "extra_setup", "setup_type", default="unknown") or "unknown"),
+            "market_state": str(_analysis_field(trade, "market_state_label", "market_state", "current_mode", "market_mode", default="unknown") or "unknown"),
+            "entry_timing": str(_analysis_field(trade, "entry_timing", default="unknown") or "unknown"),
+            "tp1_hit": bool(trade.get("tp1_hit", False)),
+            "tp2_hit": bool(trade.get("tp2_hit", False)),
+            "created_ts": _trade_created_ts_for_exec(trade),
+        }
+    except Exception:
+        return {"symbol": str(trade.get("symbol", "?") or "?"), "pnl_pct_leveraged": pnl}
+
+
+def build_trade_reason_analysis_report_message(scope: str = "execution", result_type: str = "profit", period: str = "all") -> str:
+    """Human Telegram analysis report for real profit/loss analysis routing.
+
+    This fixes command routing only. It does not alter trading logic, scoring, filters, execution, or TP/SL.
+    """
+    try:
+        scope = _analysis_scope_en(scope)
+        period = _analysis_period_key(period)
+        trades = _analysis_load_trades(scope, period, include_open=False)
+        closed = [t for t in trades if not _analysis_is_open_trade(t)]
+        pairs = []
+        for trade in closed:
+            pnl = _analysis_pnl_pct(trade)
+            result = str(trade.get("result", "") or "").lower()
+            if result_type == "profit":
+                if (pnl is not None and pnl > 0) or result in ("tp1_win", "tp2_win", "trailing_win", "win"):
+                    pairs.append((trade, float(pnl or 0.0)))
+            else:
+                if (pnl is not None and pnl < 0) or result == "loss":
+                    pairs.append((trade, float(pnl or 0.0)))
+        if not pairs:
+            label = "أرباح" if result_type == "profit" else "خسائر"
+            return f"📭 لا توجد {label} كافية للتحليل خلال هذه الفترة."
+
+        count = len(pairs)
+        avg_pnl = sum(p for _, p in pairs) / count if count else 0.0
+        total_pnl = sum(p for _, p in pairs)
+        buckets = _analysis_bucket_counters(pairs)
+        sorted_pairs = sorted(pairs, key=lambda x: x[1], reverse=(result_type == "profit"))
+        scope_ar = _analysis_scope_title(scope)
+        period_title = _analysis_period_title(period)
+        icon = "📈" if result_type == "profit" else "📉"
+        noun = "أرباح" if result_type == "profit" else "خسائر"
+        title = f"{icon} <b>تحليل أسباب {noun} {scope_ar} | {period_title}</b>"
+        lines = [
+            title,
+            "━━━━━━━━━━━━",
+            f"📊 العينة: <b>{count}</b>",
+            f"⚖️ متوسط PnL بعد الرافعة: <b>{avg_pnl:+.2f}%</b>",
+            f"💰 إجمالي PnL تقريبي: <b>{total_pnl:+.2f}% Exposure</b>",
+            "",
+            "🧩 <b>حسب Setup:</b>",
+        ]
+        for item in buckets["setups"][:8]:
+            lines.append(f"• {html.escape(item['name'])}: {item['count']}")
+        lines += ["", "🌍 <b>حسب حالة السوق:</b>"]
+        for item in buckets["market_states"][:6]:
+            lines.append(f"• {html.escape(item['name'])}: {item['count']}")
+        lines += ["", "⏱ <b>حسب توقيت الدخول:</b>"]
+        for item in buckets["entry_timing"][:6]:
+            lines.append(f"• {html.escape(item['name'])}: {item['count']}")
+        lines += ["", "⭐ <b>حسب السكور:</b>"]
+        for item in buckets["score_ranges"][:6]:
+            lines.append(f"• {html.escape(item['name'])}: {item['count']}")
+        lines += ["", "⚠️ <b>أكثر الأسباب/التحذيرات تكرارًا:</b>"]
+        if buckets["reasons"]:
+            for item in buckets["reasons"][:8]:
+                lines.append(f"• {html.escape(item['name'])}: {item['count']}")
+        else:
+            lines.append("• لا توجد أسباب مسجلة")
+        sample_title = "🏆 أعلى الصفقات الرابحة" if result_type == "profit" else "📌 أسوأ الصفقات الخاسرة"
+        lines += ["", f"{sample_title}:"]
+        for trade, pnl in sorted_pairs[:5]:
+            symbol = html.escape(str(trade.get("symbol", "?") or "?"))
+            setup = html.escape(str(_analysis_field(trade, "primary_extra_setup", "extra_setup", "setup_type", default="") or "")[:80])
+            close_type = html.escape(str(_analysis_close_type(trade))[:40])
+            lines.append(f"• <b>{symbol}</b> | {pnl:+.2f}% | {close_type}")
+            if setup:
+                lines.append(f"  🧠 {setup}")
+        return _limit_telegram_message("\n".join(lines))
+    except Exception as e:
+        logger.error(f"build_trade_reason_analysis_report_message error: {e}", exc_info=True)
+        return f"❌ خطأ في تقرير تحليل الأسباب: {html.escape(str(e))}"
+
+
+def build_ai_analysis_snapshot(scope: str = "execution", period: str = "today") -> dict:
+    """Structured JSON snapshot for AI analysis only.
+
+    This is intentionally isolated from all existing Telegram reports and trading logic.
+    """
+    scope = _analysis_scope_en(scope)
+    period = _analysis_period_key(period)
+    trades = _analysis_load_trades(scope, period, include_open=True)
+    since_ts = _period_since_ts(period)
+    closed_pairs = []
+    open_pairs = []
+    for trade in trades:
+        if _analysis_is_open_trade(trade):
+            open_pairs.append((trade, _analysis_floating_pnl_pct(trade)))
+        else:
+            pnl = _analysis_pnl_pct(trade)
+            if pnl is not None:
+                closed_pairs.append((trade, float(pnl)))
+    winners = [(t, p) for t, p in closed_pairs if p > 0]
+    losers = [(t, p) for t, p in closed_pairs if p < 0]
+    tp1_hits = sum(1 for t in trades if bool(t.get("tp1_hit", False)))
+    tp2_hits = sum(1 for t in trades if bool(t.get("tp2_hit", False)) or str(t.get("result", "") or "").lower() in ("tp2_win", "trailing_win"))
+    direct_sl = sum(1 for t, p in closed_pairs if p < 0 and _analysis_close_type(t) == "Direct SL")
+    winrate = (len(winners) / max(1, len(winners) + len(losers)) * 100.0) if (winners or losers) else 0.0
+    avg_winner = sum(p for _, p in winners) / len(winners) if winners else 0.0
+    avg_loser = sum(p for _, p in losers) / len(losers) if losers else 0.0
+    open_pnls = [float(p) for _, p in open_pairs if p is not None]
+
+    snapshot = {
+        "schema": "okx_ai_analysis_snapshot_v1",
+        "meta": {
+            "scope": scope,
+            "scope_label": _analysis_scope_title(scope),
+            "period": period,
+            "period_label": _analysis_period_title(period),
+            "range_label": _format_report_range_label(period, trades, since_ts),
+            "generated_at_ts": int(time.time()),
+            "generated_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "market_type": "futures",
+            "side": "long",
+            "source_file_version": "main_final_v01_analysis_packages_routing",
+        },
+        "summary": {
+            "total_trades": len(trades),
+            "open_trades": len(open_pairs),
+            "closed_trades": len(closed_pairs),
+            "winners": len(winners),
+            "losers": len(losers),
+            "winrate_pct": round(winrate, 4),
+            "avg_winner_pct_leveraged": round(avg_winner, 4),
+            "avg_loser_pct_leveraged": round(avg_loser, 4),
+            "realized_net_pct_leveraged": round(sum(p for _, p in closed_pairs), 4),
+            "floating_net_pct_leveraged": round(sum(open_pnls), 4),
+            "tp1_rate_pct": round(tp1_hits / max(1, len(trades)) * 100.0, 4),
+            "tp2_rate_pct": round(tp2_hits / max(1, len(trades)) * 100.0, 4),
+            "direct_sl_count": direct_sl,
+        },
+        "winners_analysis": _analysis_bucket_counters(winners),
+        "losses_analysis": _analysis_bucket_counters(losers),
+        "samples": {
+            "top_winners": [_analysis_trade_sample(t, p) for t, p in sorted(winners, key=lambda x: x[1], reverse=True)[:10]],
+            "worst_losers": [_analysis_trade_sample(t, p) for t, p in sorted(losers, key=lambda x: x[1])[:10]],
+            "open_trades": [_analysis_trade_sample(t, p) for t, p in sorted(open_pairs, key=lambda x: (x[1] is None, x[1] or 0), reverse=True)[:15]],
+        },
+        "raw_reports": {},
+    }
+    try:
+        if scope == "execution":
+            snapshot["raw_reports"] = {
+                "general": build_execution_report_message(period),
+                "profit_analysis": build_trade_reason_analysis_report_message("execution", "profit", period),
+                "losses_analysis": build_execution_losses_report_message(period),
+                "diagnostics": build_full_diagnostics_report(r, market_type="futures", side="long", period=period),
+                "setups": build_setup_performance_report_message(),
+                "exits": build_exits_report_message(),
+                "wallet": build_execution_wallet_impact_report_message(period),
+                "market": build_market_report(r, market_type="futures", side="long", period=period),
+                "rejections": build_rejections_report_message(r),
+            }
+        else:
+            snapshot["raw_reports"] = {
+                "general": build_report_message(period),
+                "profit_analysis": build_trade_reason_analysis_report_message("normal", "profit", period),
+                "losses_analysis": build_trade_reason_analysis_report_message("normal", "loss", period),
+                "diagnostics": build_full_diagnostics_report(r, market_type="futures", side="long", period=period),
+                "setups": build_setup_performance_report_message(),
+                "exits": build_exits_report_message(),
+                "market": build_market_report(r, market_type="futures", side="long", period=period),
+                "rejections": build_rejections_report_message(r),
+            }
+    except Exception as e:
+        snapshot["raw_reports_error"] = str(e)
+    return snapshot
+
+
+def send_ai_analysis_snapshot(chat_id: str, scope: str = "execution", period: str = "today") -> bool:
+    try:
+        scope = _analysis_scope_en(scope)
+        period = _analysis_period_key(period)
+        snapshot = build_ai_analysis_snapshot(scope, period)
+        ts_name = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        filename = f"ai_snapshot_{scope}_{period}_{ts_name}.json"
+        file_path = os.path.join("/tmp", filename)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+        caption = f"📦 AI Snapshot | {scope} | {_analysis_period_title(period)}"
+        ok = send_telegram_document(chat_id, file_path, caption=caption)
+        if not ok:
+            send_telegram_reply(chat_id, "❌ فشل إرسال ملف التحليل JSON. راجع Logs.")
+        return ok
+    except Exception as e:
+        logger.error(f"send_ai_analysis_snapshot error: {e}", exc_info=True)
+        send_telegram_reply(chat_id, f"❌ خطأ أثناء إنشاء AI Snapshot: {html.escape(str(e))}")
+        return False
 
 def build_setup_performance_report_message() -> str:
     try:
@@ -5689,6 +6126,10 @@ COMMAND_HANDLERS = {
  "/help_market_intelligence": lambda chat_id: send_telegram_reply(chat_id, build_help_market_intelligence_message()),
  "/diagnostics": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
  "/help_analysis": lambda chat_id: send_telegram_reply(chat_id, build_help_diagnostics_message()),
+ "/daily_execution_analysis": lambda chat_id: send_ai_analysis_snapshot(chat_id, "execution", "today"),
+ "/weekly_execution_analysis": lambda chat_id: send_ai_analysis_snapshot(chat_id, "execution", "7d"),
+ "/daily_normal_analysis": lambda chat_id: send_ai_analysis_snapshot(chat_id, "normal", "today"),
+ "/weekly_normal_analysis": lambda chat_id: send_ai_analysis_snapshot(chat_id, "normal", "7d"),
  "/okx_execution": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
  "/help_okx": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
  "/admin_help": lambda chat_id: send_telegram_reply(chat_id, build_help_admin_message()),
@@ -5721,14 +6162,14 @@ COMMAND_HANDLERS = {
  "/report_execution_open_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("1h"))),
  "/report_execution_open_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("today"))),
  "/report_execution_open_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_open_report_message("7d"))),
- "/report_execution_profit_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
- "/report_execution_profit_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("1h"))),
- "/report_execution_profit_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
- "/report_execution_profit_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
- "/report_execution_losses_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
- "/report_execution_losses_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
- "/report_execution_losses_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
- "/report_execution_losses_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_profit_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("execution", "profit", "all"))),
+ "/report_execution_profit_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("execution", "profit", "1h"))),
+ "/report_execution_profit_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("execution", "profit", "today"))),
+ "/report_execution_profit_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("execution", "profit", "7d"))),
+ "/report_execution_losses_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("all"))),
+ "/report_execution_losses_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("1h"))),
+ "/report_execution_losses_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("today"))),
+ "/report_execution_losses_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("7d"))),
  "/report_execution_losses": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
  "/report_execution_guard": lambda chat_id: send_telegram_reply(chat_id, build_execution_guard_report_message()),
  "/report_execution_wallet": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_wallet_impact_report_message("all"))),
@@ -5739,8 +6180,8 @@ COMMAND_HANDLERS = {
  "/report_execution_profit": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
  "/report_execution_profit_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("today"))),
  "/report_execution_profit_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("7d"))),
- "/report_execution_losses_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
- "/report_execution_losses_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message())),
+ "/report_execution_losses_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("today"))),
+ "/report_execution_losses_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_losses_report_message("7d"))),
  "/report_execution_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_execution_report_message("all"))),
  "/report_execution_setups": lambda chat_id: send_telegram_reply(chat_id, build_setup_performance_report_message()),
  "/report_execution_exits": lambda chat_id: send_telegram_reply(chat_id, build_exits_report_message()),
@@ -5767,14 +6208,14 @@ COMMAND_HANDLERS = {
  "/open_trades_1h": lambda chat_id: _send_open_trades(chat_id, "1h"),
  "/open_trades_today": lambda chat_id: _send_open_trades(chat_id, "today"),
  "/open_trades_7d": lambda chat_id: _send_open_trades(chat_id, "7d"),
- "/report_profit_analysis": lambda chat_id: send_telegram_reply(chat_id, build_report_message("all")),
- "/report_profit_analysis_1h": lambda chat_id: send_telegram_reply(chat_id, build_report_message("1h")),
- "/report_profit_analysis_today": lambda chat_id: send_telegram_reply(chat_id, build_report_message("today")),
- "/report_profit_analysis_7d": lambda chat_id: send_telegram_reply(chat_id, build_7d_report_message()),
- "/report_losses_analysis": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="all")),
- "/report_losses_analysis_1h": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="1h")),
- "/report_losses_analysis_today": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="today")),
- "/report_losses_analysis_7d": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="7d")),
+ "/report_profit_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "profit", "all"))),
+ "/report_profit_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "profit", "1h"))),
+ "/report_profit_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "profit", "today"))),
+ "/report_profit_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "profit", "7d"))),
+ "/report_losses_analysis": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "loss", "all"))),
+ "/report_losses_analysis_1h": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "loss", "1h"))),
+ "/report_losses_analysis_today": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "loss", "today"))),
+ "/report_losses_analysis_7d": lambda chat_id: send_telegram_reply_chunks(chat_id, split_telegram_message(build_trade_reason_analysis_report_message("normal", "loss", "7d"))),
  "/report_losses_today": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="today")),
  "/report_losses_7d": lambda chat_id: send_telegram_reply(chat_id, build_losses_report(r, market_type="futures", side="long", period="7d")),
  "/report_scores": lambda chat_id: send_telegram_reply(chat_id, build_scores_report(r, market_type="futures", side="long", period="all")),
