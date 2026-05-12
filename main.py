@@ -3127,10 +3127,13 @@ def build_market_status_message() -> str:
     ])
     lines.extend([html.escape(x) for x in _mode_execution_notes_lines(current_mode)])
     drift_info = get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
-    lines.extend([
-        "",
-        html.escape(str(drift_info.get("label", "🟢 Weak Drift: OFF"))) + " — " + html.escape(str(drift_info.get("note", "التنفيذ يعمل طبيعيًا."))),
-    ])
+    drift_label = str(drift_info.get("label", "🟢 Weak Drift: OFF"))
+    drift_note = str(drift_info.get("note", "التنفيذ يعمل طبيعيًا."))
+    lines.extend(["", html.escape(drift_label)])
+    if "ON" in drift_label or "STRICT" in drift_label:
+        lines.append("⚠️ weak execution temporarily restricted")
+    elif drift_note:
+        lines.append(html.escape(drift_note))
     if suggested_mode != current_mode:
         lines.extend([
             "",
@@ -6076,162 +6079,170 @@ def format_lifecycle_pnl_block_for_track(trade: dict, lifecycle_pnl: dict, curre
         return "📊 <b>الحالة المالية الفعلية 40/40/20</b>\n⚠️ تعذر حساب الربح الفعلي"
 
 def build_track_message(alert: dict) -> str:
- try:
-    symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
-    mode = alert.get("mode") or alert.get("market_mode", "")
-    avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
-    entry = _safe_float(alert.get("entry"), 0.0)
-    recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
-    pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
-    market_entry = _safe_float(alert.get("market_entry"), 0.0)
-    entry_mode = alert.get("entry_mode", "market")
-    pullback_triggered = bool(alert.get("pullback_triggered", False))
-    sl = _safe_float(alert.get("sl"), 0.0)
-    tp1 = _safe_float(alert.get("tp1"), 0.0)
-    tp2 = _safe_float(alert.get("tp2"), 0.0)
-    candle_time = int(_safe_float(alert.get("candle_time"), 0))
-    created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
-    current_price = get_last_price(alert.get("symbol", ""))
+    try:
+        symbol = clean_symbol_for_message(alert.get("symbol", "Unknown"))
+        mode = alert.get("mode") or alert.get("market_mode", "")
+        avg_planned = _safe_float(alert.get("average_planned_entry"), 0.0)
+        entry = _safe_float(alert.get("entry"), 0.0)
+        recommended_entry = _safe_float(alert.get("recommended_entry"), 0.0)
+        pullback_entry = _safe_float(alert.get("pullback_entry"), 0.0)
+        market_entry = _safe_float(alert.get("market_entry"), 0.0)
+        entry_mode = alert.get("entry_mode", "market")
+        pullback_triggered = bool(alert.get("pullback_triggered", False))
+        sl = _safe_float(alert.get("sl"), 0.0)
+        tp1 = _safe_float(alert.get("tp1"), 0.0)
+        tp2 = _safe_float(alert.get("tp2"), 0.0)
+        candle_time = int(_safe_float(alert.get("candle_time"), 0))
+        created_ts = int(_safe_float(alert.get("created_ts"), candle_time))
+        current_price = get_last_price(alert.get("symbol", ""))
 
-    if mode == MODE_RECOVERY_LONG and avg_planned > 0:
-        effective_entry = avg_planned
-    elif entry_mode == "pullback_pending":
-        if pullback_triggered:
-            effective_entry = pullback_entry if pullback_entry > 0 else entry
+        if mode == MODE_RECOVERY_LONG and avg_planned > 0:
+            effective_entry = avg_planned
+        elif entry_mode == "pullback_pending":
+            if pullback_triggered:
+                effective_entry = pullback_entry if pullback_entry > 0 else entry
+            else:
+                effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
         else:
-            effective_entry = pullback_entry if pullback_entry > 0 else recommended_entry if recommended_entry > 0 else entry
-    else:
-        effective_entry = market_entry if market_entry > 0 else entry
+            effective_entry = market_entry if market_entry > 0 else entry
 
-    favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
-        symbol=alert.get("symbol", ""),
-        since_ts=candle_time,
-        entry=effective_entry,
-        side="long",
-    )
-
-    trade = load_registered_trade_for_alert(alert)
-    status_line = format_trade_status_line(trade) if trade else format_trade_status_line(None)
-
-    status_info = resolve_alert_official_or_estimated_status(alert)
-    display_status = status_info["display_status"]
-    is_official = status_info["is_official"]
-
-    if entry_mode == "pullback_pending" and not pullback_triggered:
-        display_status = "⏳ Pending Pullback"
-        is_official = False
-
-    if is_official:
-        logger.info(f"Track using official status for {alert.get('alert_id')}: {display_status}")
-    else:
-        logger.info(f"Track using estimated status for {alert.get('alert_id')}: {display_status}")
-
-    duration_seconds = max(0, int(time.time()) - created_ts)
-    duration_h = duration_seconds // 3600
-    duration_m = (duration_seconds % 3600) // 60
-    current_move = 0.0
-    if effective_entry > 0 and current_price > 0:
-        current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
-    state_badge = get_track_state_badge(display_status, current_move)
-    tv_link = build_track_tradingview_link(alert.get("symbol", ""))
-    leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
-    lifecycle_pnl = calculate_trade_lifecycle_pnl_for_track(trade, current_price) if trade else {"available": False}
-    track_trade_closed = _is_track_trade_closed(trade) if trade else False
-    leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
-    leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
-    recovery_extra = ""
-    if mode == MODE_RECOVERY_LONG:
-        entry1 = _safe_float(alert.get("entry1"), entry)
-        entry2 = _safe_float(alert.get("entry2"), 0.0)
-        recovery_extra = (
-            f"\n🔄 Mode: Recovery Long\n"
-            f"• Entry 1: {entry1:.6f}\n"
-            f"• Entry 2: {entry2:.6f}\n"
-            f"• Avg Planned Entry: {avg_planned:.6f}"
+        favorable_price, favorable_pct, adverse_price, adverse_pct = get_max_move_since_alert(
+            symbol=alert.get("symbol", ""),
+            since_ts=candle_time,
+            entry=effective_entry,
+            side="long",
         )
-    msg = (
-        f"📌 <b>Alert Track</b>\n\n"
-        f"🪙 {html.escape(symbol)}\n"
-        f"📈 Long\n"
-        f"⏱ {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n"
-        f"{status_line}\n"
-        f"{recovery_extra}\n"
-        f"📍 <b>Entry Mode:</b> {'Market' if entry_mode == 'market' else 'Pullback Pending'}\n"
-        f"{format_final_result_block_for_track(trade, favorable_pct, adverse_pct) if track_trade_closed else format_lifecycle_pnl_block_for_track(trade, lifecycle_pnl, current_price)}\n"
-    )
-    if entry_mode == "pullback_pending" and not pullback_triggered:
-        msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>، الحساب تقديري على سعر البول باك المخطط.\n"
-    msg += (
-        f"💰 Signal Entry: {entry:.6f}\n"
-    )
-    if entry_mode == "pullback_pending" and market_entry > 0:
-        msg += f"💵 سعر السوق عند الإرسال: {market_entry:.6f}\n"
-    if recommended_entry > 0 and recommended_entry != entry:
-        msg += f"📌 Recommended Entry: {recommended_entry:.6f}\n"
-    if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
-        msg += f"⚡ Effective Entry: {effective_entry:.6f}\n"
-    msg += (
-        f"🛑 SL: {sl:.6f}\n"
-        f"🎯 TP1: {tp1:.6f} | إغلاق 40%\n"
-        f"🏁 TP2: {tp2:.6f} | إغلاق 40%\n"
-        f"🔄 بعد TP2: Trailing Stop 20% ({TRAILING_PCT}% تحت الـ High)\n"
-        f"🛡 بعد TP1: نقل SL إلى Entry\n\n"
-        f"{state_badge}\n"
-        f"📊 {html.escape(display_status)}"
-    )
-    if is_official:
-        msg += "\n🏛️ <b>حالة رسمية</b> (مستندة إلى سجل الصفقة)"
-    else:
-        msg += "\n⚠️ <b>حالة تقديرية</b> لعدم توفر صفقة مسجلة"
 
-    if trade:
-        trailing_active = bool(trade.get("trailing_active", False))
-        tp2_hit_flag = bool(trade.get("tp2_hit", False))
-        t_high = _safe_float(trade.get("trailing_high"), 0.0)
-        t_sl   = _safe_float(trade.get("trailing_sl"), 0.0)
-        t_pct  = _safe_float(trade.get("trailing_pct"), TRAILING_PCT)
-        if trailing_active and tp2_hit_flag:
-            gain_from_entry = 0.0
-            if effective_entry > 0 and t_high > 0:
-                gain_from_entry = ((t_high - effective_entry) / effective_entry) * 100
-            msg += (
-                f"\n\n🔄 <b>Trailing Stop شغال (20%)</b>\n"
-                f"• أعلى سعر وصله: {_fmt_price(t_high)} (+{gain_from_entry:.2f}%)\n"
-                f"• Trailing SL الحالي: {_fmt_price(t_sl)} ({t_pct:.1f}% تحت الـ High)"
-            )
-    if trade and bool(trade.get("protected_on_block", False)):
-        protected_sl = _safe_float(trade.get("protected_sl") or trade.get("sl"), 0.0)
-        protection_type = str(trade.get("block_protection_type", "") or "")
-        if protection_type == "risk_compression":
-            msg += (
-                f"\n\n🛡️ <b>حماية BLOCK مفعّلة</b>\n"
-                f"🟡 تم تقليل المخاطرة بسبب ضغط السوق\n"
-                f"🔒 SL الحالي: {_fmt_price(protected_sl)}\n"
-                f"⚠️ Tracking فقط، لم يتم تحديث OKX مباشرة."
-            )
+        trade = load_registered_trade_for_alert(alert)
+        status_line = format_trade_status_line(trade) if trade else format_trade_status_line(None)
+        status_line = status_line.replace("📌 حالة الصفقة:", "📍 <b>حالة الصفقة:</b>")
+
+        status_info = resolve_alert_official_or_estimated_status(alert)
+        display_status = status_info["display_status"]
+        is_official = status_info["is_official"]
+
+        if entry_mode == "pullback_pending" and not pullback_triggered:
+            display_status = "⏳ Pending Pullback"
+            is_official = False
+
+        if is_official:
+            logger.info(f"Track using official status for {alert.get('alert_id')}: {display_status}")
         else:
-            msg += (
-                f"\n\n🛡️ <b>حماية BLOCK مفعّلة</b>\n"
-                f"🔒 SL الحالي: {_fmt_price(protected_sl)} | Entry +{PROTECT_ON_BLOCK_BUFFER_PCT:.2f}%\n"
-                f"⚠️ Tracking فقط، لم يتم تحديث OKX مباشرة."
+            logger.info(f"Track using estimated status for {alert.get('alert_id')}: {display_status}")
+
+        duration_seconds = max(0, int(time.time()) - created_ts)
+        duration_h = duration_seconds // 3600
+        duration_m = (duration_seconds % 3600) // 60
+        duration_text = f"{duration_h}h {duration_m}m" if duration_h else f"{duration_m}m"
+
+        current_move = 0.0
+        if effective_entry > 0 and current_price > 0:
+            current_move = round(((current_price - effective_entry) / effective_entry) * 100, 2)
+        leveraged_current = round(current_move * TRACK_LEVERAGE, 2)
+        leveraged_favorable = round(favorable_pct * TRACK_LEVERAGE, 2)
+        leveraged_adverse = round(adverse_pct * TRACK_LEVERAGE, 2)
+        tv_link = build_track_tradingview_link(alert.get("symbol", ""))
+
+        result = str((trade or {}).get("result", "") or "").lower()
+        status = str((trade or {}).get("status", "") or "").lower()
+        tp1_hit = bool((trade or {}).get("tp1_hit", False)) or result in ("tp1_win", "tp2_win", "trailing_win")
+        tp2_hit = bool((trade or {}).get("tp2_hit", False)) or result in ("tp2_win", "trailing_win") or status in ("tp2_partial", "trailing_open", "trailing")
+        trailing_active = bool((trade or {}).get("trailing_active", False)) or status in ("trailing_open", "trailing")
+        sl_hit = result == "loss"
+
+        tp1_state = "✅ Hit" if tp1_hit else "⏳ Pending"
+        tp2_state = "✅ Hit" if tp2_hit else "⏳ Pending"
+        sl_state = "❌ Hit" if sl_hit else "ACTIVE"
+        if result in ("breakeven",) or bool((trade or {}).get("protected_breakeven_exit", False)):
+            sl_state = "🔒 Breakeven"
+        runner_state = "🔄 Active" if trailing_active else "Not Started"
+
+        entry_mode_label = "Market" if entry_mode == "market" else "Pullback Pending"
+        pnl_sign = "🟢" if leveraged_current >= 0 else "🔴"
+
+        recovery_extra = ""
+        if mode == MODE_RECOVERY_LONG:
+            entry1 = _safe_float(alert.get("entry1"), entry)
+            entry2 = _safe_float(alert.get("entry2"), 0.0)
+            recovery_extra = (
+                f"\n🔄 Mode: Recovery Long"
+                f"\n• Entry 1: {_fmt_price(entry1)}"
+                f"\n• Entry 2: {_fmt_price(entry2)}"
+                f"\n• Avg Planned Entry: {_fmt_price(avg_planned)}"
             )
 
-    if not track_trade_closed:
+        msg = (
+            "📌 <b>Alert Track</b>\n"
+            "━━━━━━━━━━━━\n"
+            f"{pnl_sign} <b>{html.escape(symbol)}</b> | {leveraged_current:+.2f}%\n"
+            f"⏱️ {html.escape(duration_text)} | {html.escape(str(alert.get('timeframe', TIMEFRAME)))}\n\n"
+            f"{status_line}\n"
+            f"🎯 TP1: {tp1_state}\n"
+            f"🏁 TP2: {tp2_state}\n"
+            f"🛡 SL: {sl_state}\n"
+            f"🔄 Runner: {runner_state}"
+            f"{recovery_extra}\n\n"
+            "━━━━━━━━━━━━\n"
+            "💰 <b>الحالة المالية</b>\n"
+            f"• الربح الحالي: {current_move:+.2f}%\n"
+            f"⚡ بعد الرافعة: {leveraged_current:+.2f}%\n\n"
+            "🚀 <b>أقصى صعود</b>\n"
+            f"{_fmt_price(favorable_price)} | +{favorable_pct:.2f}%\n"
+            f"⚡ +{leveraged_favorable:.2f}% Lev\n"
+            "📉 <b>أقصى هبوط ضدك</b>\n"
+            f"{_fmt_price(adverse_price)} | -{adverse_pct:.2f}%\n"
+            f"⚡ -{abs(leveraged_adverse):.2f}% Lev\n\n"
+            "━━━━━━━━━━━━\n"
+            "🧠 <b>خطة الصفقة</b>\n"
+            f"📍 Entry: {_fmt_price(effective_entry)}\n"
+            f"🛡 SL: {_fmt_price(sl)}\n"
+            f"🎯 TP1: {_fmt_price(tp1)}\n"
+            "• إغلاق 40%\n"
+            f"🏁 TP2: {_fmt_price(tp2)}\n"
+            "• إغلاق 40%\n"
+            "🔄 Runner\n"
+            "• 20% trailing after TP2\n"
+            f"• Trailing: {TRAILING_PCT}% below High\n\n"
+            "━━━━━━━━━━━━\n"
+            "📊 <b>Trade State</b>\n"
+            f"💼 Entry Mode: {html.escape(entry_mode_label)}\n"
+            "🧮 Model: 40 / 40 / 20\n"
+            f"⚡ Leverage: {TRACK_LEVERAGE:.0f}x\n\n"
+        )
+
+        if entry_mode == "pullback_pending" and not pullback_triggered:
+            msg += "⏳ <b>لم يتم تفعيل دخول البول باك بعد</b>\n"
+        if entry_mode == "pullback_pending" and market_entry > 0:
+            msg += f"💵 Market at signal: {_fmt_price(market_entry)}\n"
+        if recommended_entry > 0 and recommended_entry != entry:
+            msg += f"📌 Recommended Entry: {_fmt_price(recommended_entry)}\n"
+        if effective_entry != entry and mode != MODE_RECOVERY_LONG and entry_mode != "market":
+            msg += f"⚡ Effective Entry: {_fmt_price(effective_entry)}\n"
+
+        if trade and bool(trade.get("protected_on_block", False)):
+            protected_sl = _safe_float(trade.get("protected_sl") or trade.get("sl"), 0.0)
+            protection_type = str(trade.get("block_protection_type", "") or "")
+            if protection_type == "risk_compression":
+                msg += f"🛡 BLOCK Protection: Risk Compression | SL {_fmt_price(protected_sl)}\n"
+            else:
+                msg += f"🛡 BLOCK Protection: ACTIVE | SL {_fmt_price(protected_sl)}\n"
+
+        setup_name = str(alert.get("setup_type") or alert.get("setup") or alert.get("opportunity_type") or "—")
+        btc_context = str(alert.get("btc_mode") or alert.get("btc_context") or "—")
+        market_context = str(alert.get("market_state") or alert.get("market_bias_label") or alert.get("market_mode") or "—")
         msg += (
-            f"\n💵 السعر الحالي: {current_price:.6f}\n"
-            f"🔢 الرافعة: {TRACK_LEVERAGE:.0f}x\n"
-            f"📈 التغير الحالي: {current_move:.2f}% | بعد الرافعة: {leveraged_current:.2f}%\n"
-            f"🚀 أقصى صعود: {favorable_price:.6f} | +{favorable_pct:.2f}% | بعد الرافعة: +{leveraged_favorable:.2f}%\n"
-            f"📉 أقصى هبوط ضدك: {adverse_price:.6f} | -{adverse_pct:.2f}% | بعد الرافعة: -{leveraged_adverse:.2f}%\n"
+            f"📌 Setup\n{html.escape(setup_name)}\n\n"
+            "🌍 <b>Market Context</b>\n"
+            f"• BTC: {html.escape(btc_context)}\n"
+            f"• Market: {html.escape(market_context)}\n\n"
+            "━━━━━━━━━━━━\n"
+            f'🔗 <a href="{html.escape(tv_link, quote=True)}">TradingView</a>\n'
+            "15m / 1H"
         )
-    msg += (
-        f"⏳ المدة: {duration_h}h {duration_m}m\n\n"
-        f'🔗 <a href="{html.escape(tv_link, quote=True)}">فتح الشارت على TradingView - 15m / 1H</a>'
-    )
-    return msg
- except Exception as e:
-    logger.error(f"build_track_message error: {e}")
-    return "❌ حصل خطأ أثناء متابعة الإشارة"
+        return msg
+    except Exception as e:
+        logger.error(f"build_track_message error: {e}")
+        return "❌ حصل خطأ أثناء متابعة الإشارة"
 
 def build_track_reply_markup(alert_id: str) -> dict:
  return {
@@ -10931,7 +10942,7 @@ def detect_market_mix_profile(
         note = {
             "CLEAR": "✅ القواعد العادية فعالة",
             "MIXED": "⚠️ mtf_no يحتاج جودة أعلى",
-            "CHOPPY": "🚫 weak mtf_no filtered",
+            "CHOPPY": "⚠️ weak mtf_no tightened",
         }.get(level, "✅ القواعد العادية فعالة")
         icon = {"CLEAR": "🌤", "MIXED": "🌗", "CHOPPY": "🌪"}.get(level, "🌤")
 
@@ -14460,54 +14471,46 @@ def run_scanner_loop():
                     breakout_quality=breakout_quality,
                 )
                 if (not mtf_confirmed) and not is_reverse and market_mix_level in ("MIXED", "CHOPPY"):
+                    # Market Mix is a context layer, not an execution/strategy hard blocker.
+                    # v304: soften its impact by roughly 25% so it improves quality without
+                    # suppressing too many valid normal/strong signals.
                     if current_mode == MODE_NORMAL_LONG and market_mix_level == "MIXED" and not market_mix_exception:
-                        if final_threshold < 7.8:
+                        mixed_target = 7.45
+                        if final_threshold < mixed_target:
                             adjustments_log.append({
-                                "name": "market_mix_mtf_no_threshold",
-                                "value": round(7.8 - final_threshold, 2),
-                                "reason": "mixed_market_mtf_no_requires_higher_quality",
+                                "name": "market_mix_mtf_no_threshold_softened",
+                                "value": round(mixed_target - final_threshold, 2),
+                                "reason": "mixed_market_mtf_no_requires_higher_quality_softened_25pct",
                                 "market_mix_level": market_mix_level,
                             })
-                        final_threshold = max(final_threshold, 7.8)
+                        final_threshold = max(final_threshold, mixed_target)
                     elif market_mix_level == "CHOPPY" and not market_mix_exception:
-                        log_long_rejection(
-                            symbol=symbol,
-                            reason="choppy_mixed_no_mtf",
-                            candle_time=candle_time,
-                            score=score_result.get("score"),
-                            raw_score=raw_score,
-                            final_threshold=final_threshold,
-                            market_state=market_state,
-                            current_mode=current_mode,
-                            entry_timing=entry_timing,
-                            opportunity_type=opportunity_type,
-                            dist_ma=dist_ma,
-                            rsi_now=rsi_now,
-                            vol_ratio=vol_ratio,
-                            vwap_distance=vwap_distance,
-                            mtf_confirmed=mtf_confirmed,
-                            breakout=breakout,
-                            pre_breakout=pre_breakout,
-                            is_reverse=is_reverse,
-                            extra={
-                                "market_mix_profile": market_mix_profile,
-                                "has_extra_strong_setup": has_extra_strong_setup,
-                                "extra_setup_names": extra_setup_names,
-                                "primary_extra_setup": primary_extra_setup,
-                                "extra_setup_bonus": extra_setup_bonus,
-                            },
-                        )
-                        logger.info(f"{symbol} --> skipped (CHOPPY market mix + mtf_no)")
-                        continue
-                    elif current_mode == MODE_STRONG_LONG_ONLY and market_mix_level == "MIXED" and not market_mix_exception:
-                        if final_threshold < (STRONG_ONLY_MIN_SCORE + 0.20):
+                        if current_mode == MODE_STRONG_LONG_ONLY:
+                            choppy_target = STRONG_ONLY_MIN_SCORE + 0.15
+                        else:
+                            choppy_target = 7.65
+                        if final_threshold < choppy_target:
                             adjustments_log.append({
-                                "name": "strong_mode_mixed_mtf_no_quality_lift",
-                                "value": round((STRONG_ONLY_MIN_SCORE + 0.20) - final_threshold, 2),
-                                "reason": "strong_mode_mixed_market_no_mtf",
+                                "name": "choppy_market_mix_mtf_no_soft_penalty",
+                                "value": round(choppy_target - final_threshold, 2),
+                                "reason": "choppy_market_mix_mtf_no_penalty_not_hard_reject",
                                 "market_mix_level": market_mix_level,
                             })
-                        final_threshold = max(final_threshold, STRONG_ONLY_MIN_SCORE + 0.20)
+                        final_threshold = max(final_threshold, choppy_target)
+                        try:
+                            warning_reasons.append("Market Mix CHOPPY: mtf_no يحتاج جودة أعلى")
+                        except Exception:
+                            pass
+                    elif current_mode == MODE_STRONG_LONG_ONLY and market_mix_level == "MIXED" and not market_mix_exception:
+                        strong_mixed_target = STRONG_ONLY_MIN_SCORE + 0.15
+                        if final_threshold < strong_mixed_target:
+                            adjustments_log.append({
+                                "name": "strong_mode_mixed_mtf_no_quality_lift_softened",
+                                "value": round(strong_mixed_target - final_threshold, 2),
+                                "reason": "strong_mode_mixed_market_no_mtf_softened_25pct",
+                                "market_mix_level": market_mix_level,
+                            })
+                        final_threshold = max(final_threshold, strong_mixed_target)
 
                 final_threshold = round(final_threshold, 2)
 
