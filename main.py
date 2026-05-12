@@ -3023,6 +3023,12 @@ def build_market_status_message() -> str:
         avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
         guard_level = str(market_guard.get("level", "normal"))
+        market_mix_profile = snapshot.get("market_mix_profile") or detect_market_mix_profile(
+            btc_mode=btc_mode,
+            alt_snapshot=alt_snapshot,
+            market_guard=market_guard,
+            market_info=market_info,
+        )
         suggested_mode = normalize_market_mode(snapshot.get("suggested_mode", snapshot.get("current_mode", MODE_NORMAL_LONG)))
         suggested_reason = snapshot.get("suggested_reason", mode_reason)
     else:
@@ -3042,6 +3048,13 @@ def build_market_status_message() -> str:
         avg_change = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
         btc_change = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
         guard_level = str(market_guard.get("level", "normal"))
+        market_mix_profile = detect_market_mix_profile(
+            btc_mode=btc_mode,
+            alt_snapshot=alt_snapshot,
+            market_guard=market_guard,
+            market_info=market_info,
+            btc_zone=btc_zone,
+        )
         mode_result = determine_long_market_mode(
             market_guard=market_guard,
             market_state=market_info.get("market_state", "mixed"),
@@ -3070,36 +3083,36 @@ def build_market_status_message() -> str:
     transition = f"{_market_mode_label(last_mode)} → {mode_ar}" if last_mode != current_mode else f"{mode_ar}"
 
     lines = [
-        f"{mode_icon} <b>Market Mood - {current_mode}</b>",
+        f"{mode_icon} <b>Market Mode: {html.escape(current_mode)}</b>",
+        "━━━━━━━━━━━━",
         "",
-        f"⚙️ <b>المود الحالي:</b> {mode_ar}",
-        f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
+        f"🔄 {html.escape(transition)}",
         "",
-        f"🔄 <b>الانتقال:</b> {transition}",
+        _market_mix_line(market_mix_profile, compact=False),
         "",
-        f"🧠 <b>السبب:</b> {html.escape(reason_text)}",
-        "",
-        "🧪 <b>Weak Drift Block:</b>",
-        f"{html.escape(get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label).get('label', '🟢 Weak Drift: OFF'))} — {html.escape(get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label).get('note', 'التنفيذ يعمل طبيعيًا.'))}",
-        "",
-        "🌍 <b>السوق:</b>",
+        "📊 <b>Market State</b>",
+        html.escape(_mode_market_state_line(current_mode, market_mix_profile)),
+        html.escape(_market_breadth_line(market_mix_profile, market_guard, alt_snapshot)),
         f"• BTC: {html.escape(str(btc_mode))}",
-        f"• Alt Mode: {html.escape(str(alt_mode))}",
-        f"• State: {html.escape(str(market_state_label))}",
-        f"• Flow: {html.escape(str(market_bias_label))}",
+        f"• Alts: {html.escape(str(alt_mode))}",
+        f"• Red: {red_ratio * 100:.0f}% | Avg: {avg_change:+.2f}% | BTC 15m: {btc_change:+.2f}%",
         "",
-        "🛡 <b>Market Guard 15m:</b>",
-        f"• Level: {html.escape(guard_level)}",
-        f"• Red Ratio: {red_ratio * 100:.1f}%",
-        f"• Avg 15m: {avg_change:+.2f}%",
-        f"• BTC 15m: {btc_change:+.2f}%",
-        "",
-        "🎯 <b>التصرف:</b>",
-        html.escape(action),
-        "",
-        "✅ <b>المسموح:</b>",
+        "🧠 <b>Trigger</b>",
     ]
-    lines.extend([html.escape(x) for x in allowed_lines])
+    lines.extend([html.escape(x) for x in _mode_trigger_lines(current_mode, market_mix_profile)])
+    lines.extend([
+        "",
+        "📌 <b>Mode Reason</b>",
+        html.escape(reason_text),
+        "",
+        "🎯 <b>Signal Rules</b>",
+    ])
+    lines.extend([html.escape(x) for x in _mode_signal_rules_lines(current_mode)])
+    lines.extend([
+        "",
+        "✅ <b>Requirements</b>",
+    ])
+    lines.extend([html.escape(x) for x in _mode_requirements_lines(current_mode)])
     if current_mode == MODE_BLOCK_LONGS:
         lines.extend([
             "",
@@ -3110,10 +3123,14 @@ def build_market_status_message() -> str:
         ])
     lines.extend([
         "",
-        "📌 <b>ملاحظة:</b> قد تظهر إشارات قوية على اللوحة، لكن التنفيذ التجريبي يخضع لقواعد جودة الحركة والزخم.",
+        "⚡ <b>Execution Notes</b>",
     ])
-    if current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
-        lines.append("🧩 <b>Weak Drift:</b> يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة العادية.")
+    lines.extend([html.escape(x) for x in _mode_execution_notes_lines(current_mode)])
+    drift_info = get_weak_drift_display_status(current_mode, btc_mode, market_state_label, alt_mode, market_bias_label)
+    lines.extend([
+        "",
+        html.escape(str(drift_info.get("label", "🟢 Weak Drift: OFF"))) + " — " + html.escape(str(drift_info.get("note", "التنفيذ يعمل طبيعيًا."))),
+    ])
     if suggested_mode != current_mode:
         lines.extend([
             "",
@@ -10391,11 +10408,11 @@ def build_compact_market_mode_reminder(
     block_protection_active: bool = False,
     protection_summary: dict = None,
     market_guard: dict = None,
+    market_mix_profile: dict = None,
 ) -> str:
-    """Compact human Market Reminder template for all modes.
+    """Compact operational Market Reminder template for all modes.
 
-    v202: first reminder after 15m, then every 30m; text is actionable and
-    avoids debug-style reason strings.
+    UI-only formatting. Timing, mode logic, execution, and risk behavior remain unchanged.
     """
     normalized_mode = normalize_market_mode(current_mode)
     mode_icon = _market_reminder_mode_icon(normalized_mode)
@@ -10406,6 +10423,12 @@ def build_compact_market_mode_reminder(
     drift_label = str(drift.get("label", "🟢 Weak Drift: OFF"))
     stats = _market_reminder_collect_stats(window_seconds=1800)
     market_guard = market_guard or {}
+    market_mix_profile = market_mix_profile or detect_market_mix_profile(
+        btc_mode=btc_mode,
+        alt_snapshot={"alt_mode": alt_mode},
+        market_guard=market_guard,
+        market_info={"market_state_label": market_state_label, "market_bias_label": market_bias_label},
+    )
 
     try:
         red_ratio_pct = float(market_guard.get("red_ratio_15m", 0.0) or 0.0) * 100.0
@@ -10423,66 +10446,66 @@ def build_compact_market_mode_reminder(
     except Exception:
         ranked_pairs_count = 0
 
+    # Mode-specific focus/protection line. This preserves BLOCK_LONGS protection escalation.
     if normalized_mode == MODE_BLOCK_LONGS:
-        status_text = "📉 السوق مازال تحت ضغط جماعي."
+        focus_line = "🚫 New longs paused"
         if int(reminder_count or 0) <= 1:
-            action_lines = ["• Protection → Monitor only", "• لا تعديل SL / Trailing"]
+            protection_level = "🛡 Protection Level 1 — Monitoring"
+            protection_note = "Monitor only | لا تعديل SL / Trailing"
         elif int(reminder_count or 0) == 2:
-            action_lines = ["• Protection → Soft Protection", "• TP2 runners: tighten / lock TP1", "• لا Panic close للخاسرين"]
+            protection_level = "🛡 Protection Level 2 — Soft Protection"
+            protection_note = "Tightening weak runners | لا Panic close للخاسرين"
         else:
-            action_lines = ["• Protection → Defensive", "• تشديد حماية الأرباح", "• Emergency compression للخطر الشديد فقط"]
+            protection_level = "🛡 Protection Level 3 — Defensive Protection"
+            protection_note = "Aggressive profit protection | Emergency compression only"
     elif normalized_mode == MODE_STRONG_LONG_ONLY:
-        status_text = "⚠️ السوق انتقائي حاليًا؛ نركز على الجودة فقط."
-        action_lines = [
-            "• التركيز على reclaim / retest / wave_3",
-            "• الإشارة العادية ممكنة لو الجودة قوية",
-            "• التنفيذ التجريبي يخضع للـ Whitelist/Elite",
-        ]
+        focus_line = "🎯 Focus: reclaim / retest / wave_3"
+        protection_level = "🛡 Protection: ENABLED"
+        protection_note = ""
     elif normalized_mode == MODE_RECOVERY_LONG:
-        status_text = "🟠 السوق يحاول التعافي بعد ضغط."
-        action_lines = [
-            "• فرص Recovery محدودة",
-            "• تأكيد التعافي أهم من الكمية",
-            "• تجنب أول شمعة ارتداد ضعيفة",
-        ]
+        focus_line = "🎯 Focus: recovery + MTF confirmation"
+        protection_level = "🛡 Protection: ENABLED"
+        protection_note = ""
     else:
-        status_text = "🟢 السوق يسمح بالبحث الطبيعي عن فرص لونج."
-        action_lines = [
-            "• الإشارات العادية مسموحة حسب الفلاتر",
-            "• التنفيذ التجريبي: Whitelist + Quality Filters",
-            "• Weak Drift يمنع التنفيذ الضعيف فقط",
-        ]
+        focus_line = "🚀 Longs allowed normally"
+        protection_level = "🛡 Protection: ENABLED"
+        protection_note = ""
 
     lines = [
         f"{mode_icon} <b>Market Reminder #{int(reminder_count)}</b>",
         f"⏱ {html.escape(duration_text)} in {html.escape(normalized_mode)}",
         "",
-        status_text,
+        _market_mix_line(market_mix_profile, compact=True),
         "",
-        f"📊 <b>السوق اللحظي:</b> Red {red_ratio_pct:.0f}% | Avg {avg15m:+.2f}% | BTC {btc15m:+.2f}%",
-        f"🌍 <b>السياق:</b> {html.escape(_btc_short_label(btc_mode))} | {html.escape(_market_short_label(market_state_label, alt_mode, market_bias_label))}",
+        "📊 <b>Market Snapshot</b>",
+        f"• BTC: {html.escape(str(btc_mode or 'N/A'))} ({btc15m:+.2f}%)",
+        f"• Alts: {html.escape(str(alt_mode or 'N/A'))}",
+        f"• Red: {red_ratio_pct:.0f}% | Avg: {avg15m:+.2f}%",
+        "",
         f"⚡ <b>Strong Setups:</b> {strong_coins_count} / {ranked_pairs_count}",
+        html.escape(focus_line),
         "",
-        "🎯 <b>التصرف:</b>",
+        "📂 <b>Open Candidates</b>",
+        f"🟢 {int(stats.get('open_winners', 0))} Winners | 🟡 {int(stats.get('open_tp1_protected', 0))} Protected | 🔴 {int(stats.get('open_danger', 0))} Danger",
+        "",
+        f"📈 Signals: {int(stats.get('signals', 0))}",
+        f"🚀 Exec: {int(stats.get('exec_candidates', 0))}",
+        f"❌ Rejects: {int(stats.get('rejections', 0))}",
+        "",
+        f"⚠️ <b>Top Reject:</b> {html.escape(str(stats.get('top_reject') or 'N/A'))}",
+        "",
+        f"⚡ <b>Execution:</b> {html.escape(_market_reminder_execution_line(normalized_mode, drift_label))}",
+        html.escape(protection_level),
     ]
-    lines.extend([html.escape(x) for x in action_lines])
-    lines.extend([
-        "",
-        f"📡 Signals {int(stats.get('signals', 0))} | 🚀 Exec {int(stats.get('exec_candidates', 0))} | ❌ Reject {int(stats.get('rejections', 0))}",
-        f"❌ <b>Top Reject:</b> {html.escape(str(stats.get('top_reject') or 'N/A'))}",
-        "",
-        "💼 <b>Open Candidates:</b>",
-        f"🟢 {int(stats.get('open_winners', 0))} Winners | 🟡 {int(stats.get('open_tp1_protected', 0))} TP1 Protected | 🔴 {int(stats.get('open_danger', 0))} Danger",
-        "",
-        f"🧠 <b>Execution:</b> {html.escape(_market_reminder_execution_line(normalized_mode, drift_label))}",
-    ])
+    if protection_note:
+        lines.append(html.escape(protection_note))
 
     if normalized_mode == MODE_BLOCK_LONGS and (block_protection_active or protection_summary):
         summary = protection_summary or {}
         protected = int(summary.get("protected_winners") or stats.get("protected_on_block") or 0)
         lines.extend([
             "",
-            "🛡 <b>Protection Check:</b>",
+            "🛡 <b>Protection Check</b>",
             f"🔒 Protected winners: {protected}",
             ("🧪 Protection: Simulation / Tracking only" if bool(summary.get("tracking_only", True)) else f"⚙️ OKX Protection: sent {int(summary.get('platform_updates_sent') or 0)} | failed {int(summary.get('platform_updates_failed') or 0)}"),
         ])
@@ -10496,6 +10519,7 @@ def maybe_send_market_mode_reminder(
     alt_snapshot: dict = None,
     ranked_pairs: list = None,
     market_guard: dict = None,
+    market_mix_profile: dict = None,
 ) -> bool:
     """Send the periodic Market Reminder when due.
 
@@ -10573,6 +10597,7 @@ def maybe_send_market_mode_reminder(
             block_protection_active=block_protection_active,
             protection_summary=protection_summary,
             market_guard=market_guard,
+            market_mix_profile=market_mix_profile,
         )
         send_telegram_message(reminder_msg)
 
@@ -10658,41 +10683,59 @@ def format_market_mode_reason_for_message(reason: str = "", metrics: dict = None
         return "تحديث حالة السوق بناءً على قراءة المود الحالية."
     return html.escape(cleaned)
 
-def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "", reason_metrics: dict = None, human_reason: str = "") -> str:
+def format_mode_transition_message(
+    old_mode: str,
+    new_mode: str,
+    reason: str = "",
+    reason_metrics: dict = None,
+    human_reason: str = "",
+    market_mix_profile: dict = None,
+) -> str:
+    """Medium Dashboard Style mode transition message. UI-only formatting."""
     old_mode = normalize_market_mode(old_mode)
     new_mode = normalize_market_mode(new_mode)
     mode_ar = _market_mode_label(new_mode)
     mode_icon = str(mode_ar).split(" ", 1)[0] if mode_ar else "🧭"
-    transition = f"{_market_mode_label(old_mode)} → {mode_ar}"
-    mode_desc = get_market_mode_arabic_description(new_mode)
-    action = get_market_mode_action_text(new_mode)
-    allowed_lines = get_market_mode_allowed_lines(new_mode)
-    reason_display = human_reason or format_market_mode_reason_for_message(reason, reason_metrics or {})
+    transition = f"{old_mode} → {new_mode}"
+    reason_metrics = reason_metrics or {}
+    market_mix_profile = market_mix_profile or reason_metrics.get("market_mix_profile") or {}
+    reason_display = human_reason or format_market_mode_reason_for_message(reason, reason_metrics)
 
     lines = [
-        f"{mode_icon} <b>Market Mood - {new_mode}</b>",
+        f"{mode_icon} <b>Market Mode: {html.escape(new_mode)}</b>",
+        "━━━━━━━━━━━━",
         "",
-        "🔁 <b>تغيير المود</b>",
+        f"🔄 {html.escape(transition)}",
         "",
-        f"⚙️ <b>المود الحالي:</b> {mode_ar}",
-        f"📋 <b>الوصف:</b> {html.escape(mode_desc)}",
+        _market_mix_line(market_mix_profile, compact=False),
         "",
-        f"🔄 <b>الانتقال:</b> {transition}",
+        "📊 <b>Market State</b>",
+        html.escape(_mode_market_state_line(new_mode, market_mix_profile)),
+        html.escape(_market_breadth_line(market_mix_profile, reason_metrics, {})),
+        "",
+        "🧠 <b>Trigger</b>",
     ]
+    lines.extend([html.escape(x) for x in _mode_trigger_lines(new_mode, market_mix_profile)])
+
     if reason_display:
         lines.extend([
             "",
-            "🧠 <b>السبب:</b>",
+            "📌 <b>Mode Reason</b>",
             reason_display,
         ])
+
     lines.extend([
         "",
-        "🎯 <b>التصرف:</b>",
-        html.escape(action),
-        "",
-        "✅ <b>المسموح:</b>",
+        "🎯 <b>Signal Rules</b>",
     ])
-    lines.extend([html.escape(x) for x in allowed_lines])
+    lines.extend([html.escape(x) for x in _mode_signal_rules_lines(new_mode)])
+
+    lines.extend([
+        "",
+        "✅ <b>Requirements</b>",
+    ])
+    lines.extend([html.escape(x) for x in _mode_requirements_lines(new_mode)])
+
     if new_mode == MODE_BLOCK_LONGS:
         lines.extend([
             "",
@@ -10701,12 +10744,12 @@ def format_mode_transition_message(old_mode: str, new_mode: str, reason: str = "
             "• Reminder #2 → Soft Protection",
             "• Reminder #3 → Defensive Protection",
         ])
+
     lines.extend([
         "",
-        "📌 <b>ملاحظة:</b> الإشارة العادية منفصلة عن التنفيذ التجريبي؛ التنفيذ يخضع لقواعد الجودة والزخم.",
+        "⚡ <b>Execution Notes</b>",
     ])
-    if new_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
-        lines.append("🧩 <b>Weak Drift:</b> يمنع التنفيذ الضعيف فقط ولا يمنع الإشارة العادية.")
+    lines.extend([html.escape(x) for x in _mode_execution_notes_lines(new_mode)])
     return "\n".join(lines)
 
 def handle_market_mode_transition(mode_result: dict) -> str:
@@ -10716,7 +10759,14 @@ def handle_market_mode_transition(mode_result: dict) -> str:
  try:
     last_mode = r.get(MARKET_MODE_LAST_KEY) or MODE_NORMAL_LONG
     if new_mode != last_mode:
-        msg = format_mode_transition_message(last_mode, new_mode, reason=mode_result.get("reason", ""), reason_metrics=mode_result.get("reason_metrics", {}), human_reason=mode_result.get("human_reason", ""))
+        msg = format_mode_transition_message(
+            last_mode,
+            new_mode,
+            reason=mode_result.get("reason", ""),
+            reason_metrics=mode_result.get("reason_metrics", {}),
+            human_reason=mode_result.get("human_reason", ""),
+            market_mix_profile=mode_result.get("market_mix_profile", {}),
+        )
         send_telegram_message(msg)
         now_ts = int(time.time())
         if new_mode == MODE_BLOCK_LONGS and last_mode != MODE_BLOCK_LONGS:
@@ -10802,6 +10852,242 @@ def _arch_add_adjustment(candidate: dict, name: str, value: float, reason: str) 
         candidate["adjustments_log"] = []
     candidate["adjustments_log"].append({"name": name, "value": value, "reason": reason})
 
+
+
+# =====================
+# MARKET MIX CONTEXT (display + threshold layer only)
+# =====================
+def detect_market_mix_profile(
+    btc_mode: str = "",
+    alt_snapshot: dict = None,
+    market_guard: dict = None,
+    market_info: dict = None,
+    btc_zone: dict = None,
+) -> dict:
+    """Detect CLEAR / MIXED / CHOPPY as a context layer, not a market mode.
+
+    This helper is calculated once per scan loop and is used by all symbols in
+    that scan. It is intentionally lightweight and defensive; failures return
+    CLEAR so it never breaks scanning.
+    """
+    try:
+        alt_snapshot = alt_snapshot or {}
+        market_guard = market_guard or {}
+        market_info = market_info or {}
+        btc_zone = btc_zone or {}
+
+        score = 0
+        reasons = []
+
+        btc_text = str(btc_mode or "")
+        btc_zone_name = str(btc_zone.get("zone") or "")
+        market_state = str(market_info.get("market_state") or market_info.get("market_state_label") or "").lower()
+        alt_mode_text = str(alt_snapshot.get("alt_mode") or "")
+
+        positive_24h = _arch_float(alt_snapshot.get("positive_24h_ratio"), 0.0)
+        above_ma = _arch_float(alt_snapshot.get("above_ma_ratio"), 0.0)
+        rsi_support = _arch_float(alt_snapshot.get("rsi_support_ratio"), 0.0)
+        alt_strength = _arch_float(alt_snapshot.get("alt_strength_score"), 0.0)
+
+        red_ratio = _arch_float(market_guard.get("red_ratio_15m"), 0.0)
+        avg15m = _arch_float(market_guard.get("avg_change_15m"), 0.0)
+        btc15m = _arch_float(market_guard.get("btc_change_15m"), 0.0)
+        valid_count = int(_arch_float(market_guard.get("valid_count"), 0.0))
+
+        if "محايد" in btc_text or btc_zone_name in ("middle_range", "upper_mid", "unknown"):
+            score += 1
+            reasons.append("btc_neutral_or_range")
+        if "مختلط" in market_state or "mixed" in market_state or "btc_leading" in market_state:
+            score += 1
+            reasons.append("market_state_mixed")
+        if 0.45 <= positive_24h <= 0.55 or 0.45 <= (1.0 - red_ratio) <= 0.55:
+            score += 1
+            reasons.append("breadth_balanced")
+        if abs(avg15m) <= 0.20:
+            score += 1
+            reasons.append("avg_15m_flat")
+        if abs(btc15m) <= 0.20:
+            score += 1
+            reasons.append("btc_15m_choppy")
+        if "محايد" in alt_mode_text or (0.42 <= alt_strength <= 0.62):
+            score += 1
+            reasons.append("alts_selective")
+
+        # Choppy escalation: still not necessarily BLOCK_LONGS, but mtf_no is risky.
+        choppy_pressure = bool(
+            (red_ratio >= 0.58 and avg15m <= 0.10)
+            or (red_ratio >= 0.52 and avg15m < -0.20)
+            or ("ضعيف" in alt_mode_text and abs(btc15m) <= 0.25)
+        )
+
+        if score >= 4 or choppy_pressure:
+            level = "CHOPPY"
+        elif score >= 3:
+            level = "MIXED"
+        else:
+            level = "CLEAR"
+
+        green_ratio = max(0.0, min(1.0, 1.0 - red_ratio)) if valid_count > 0 else positive_24h
+        note = {
+            "CLEAR": "✅ القواعد العادية فعالة",
+            "MIXED": "⚠️ mtf_no يحتاج جودة أعلى",
+            "CHOPPY": "🚫 weak mtf_no filtered",
+        }.get(level, "✅ القواعد العادية فعالة")
+        icon = {"CLEAR": "🌤", "MIXED": "🌗", "CHOPPY": "🌪"}.get(level, "🌤")
+
+        return {
+            "level": level,
+            "score": int(score),
+            "max_score": 6,
+            "icon": icon,
+            "note": note,
+            "reasons": reasons,
+            "red_ratio_15m": red_ratio,
+            "green_ratio_15m": green_ratio,
+            "avg_change_15m": avg15m,
+            "btc_change_15m": btc15m,
+            "alt_strength_score": alt_strength,
+            "positive_24h_ratio": positive_24h,
+            "above_ma_ratio": above_ma,
+            "rsi_support_ratio": rsi_support,
+            "valid_count": valid_count,
+        }
+    except Exception as exc:
+        logger.debug(f"detect_market_mix_profile skipped: {exc}")
+        return {
+            "level": "CLEAR",
+            "score": 0,
+            "max_score": 6,
+            "icon": "🌤",
+            "note": "✅ القواعد العادية فعالة",
+            "reasons": [],
+        }
+
+
+def _market_mix_line(market_mix_profile: dict, compact: bool = False) -> str:
+    profile = market_mix_profile or {}
+    level = str(profile.get("level") or "CLEAR")
+    icon = str(profile.get("icon") or {"CLEAR": "🌤", "MIXED": "🌗", "CHOPPY": "🌪"}.get(level, "🌤"))
+    score = int(_arch_float(profile.get("score"), 0.0))
+    max_score = int(_arch_float(profile.get("max_score"), 6.0)) or 6
+    note = str(profile.get("note") or "✅ القواعد العادية فعالة")
+    if compact:
+        return f"{icon} <b>Mix:</b> {html.escape(level)} | {html.escape(note)}"
+    return f"{icon} <b>Market Mix:</b> {html.escape(level)} | Score {score}/{max_score}\n{html.escape(note)}"
+
+
+def _market_breadth_line(market_mix_profile: dict, market_guard: dict = None, alt_snapshot: dict = None) -> str:
+    profile = market_mix_profile or {}
+    market_guard = market_guard or {}
+    alt_snapshot = alt_snapshot or {}
+    try:
+        if profile.get("valid_count") or market_guard.get("valid_count"):
+            red_ratio = _arch_float(profile.get("red_ratio_15m", market_guard.get("red_ratio_15m")), 0.0)
+            green = max(0.0, min(1.0, 1.0 - red_ratio)) * 100.0
+            red = max(0.0, min(1.0, red_ratio)) * 100.0
+            if red >= 55:
+                return f"🌐 Red Market: {red:.0f}%"
+            return f"🌐 Breadth: {green:.0f}% green"
+        pos = _arch_float(profile.get("positive_24h_ratio", alt_snapshot.get("positive_24h_ratio")), 0.0) * 100.0
+        return f"🌐 Breadth: {pos:.0f}% green"
+    except Exception:
+        return "🌐 Breadth: N/A"
+
+
+def _mode_market_state_line(mode: str, market_mix_profile: dict) -> str:
+    mode = normalize_market_mode(mode)
+    level = str((market_mix_profile or {}).get("level") or "CLEAR")
+    if mode == MODE_BLOCK_LONGS:
+        return "السوق تحت ضغط واضح — أولوية الحماية قبل أي دخول"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "السوق انتقائي — التركيز على الفرص الأقوى فقط"
+    if mode == MODE_RECOVERY_LONG:
+        return "السوق يحاول الاستقرار — العودة التدريجية بحذر"
+    if level == "MIXED":
+        return "السوق متذبذب نسبيًا — الإشارات مسموحة مع جودة أعلى"
+    if level == "CHOPPY":
+        return "السوق متذبذب بقوة — ضعف MTF يحتاج حذر شديد"
+    return "السوق مستقر نسبيًا — فرص اللونج متاحة بشكل طبيعي"
+
+
+def _mode_trigger_lines(mode: str, market_mix_profile: dict) -> list:
+    mode = normalize_market_mode(mode)
+    level = str((market_mix_profile or {}).get("level") or "CLEAR")
+    if mode == MODE_BLOCK_LONGS:
+        return ["• ضغط أو هبوط جماعي", "• Breadth ضعيف", "• حماية الصفقات لها الأولوية"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• BTC أقوى نسبيًا", "• ALT أضعف من المطلوب", "• فرص الجودة العالية فقط"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• BTC stabilizing", "• ضعف الألت يتباطأ", "• ظهور قوة انتقائية"]
+    if level == "MIXED":
+        return ["• السوق غير متفق بالكامل", "• mtf_no يحتاج جودة أعلى", "• نراقب breadth والزخم اللحظي"]
+    return ["• BTC مستقر", "• ALT breadth مقبول", "• momentum طبيعي"]
+
+
+def _mode_signal_rules_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• New longs paused", "• Strong exceptions only", "• Protection tightened on runners"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• Normal → strongest setups only", "• Execution → Whitelist / Elite only"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• High-quality recovery setups only", "• Prefer MTF confirmed entries"]
+    return ["• Normal → standard quality allowed", "• Execution → whitelist quality filters active"]
+
+
+def _mode_requirements_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_STRONG_LONG_ONLY:
+        return [f"• Score ≥ {STRONG_ONLY_MIN_SCORE}", f"• Volume ≥ {STRONG_ONLY_MIN_VOL_RATIO}", "• MTF confirmation preferred", "• Avoid late entries"]
+    if mode == MODE_BLOCK_LONGS:
+        return ["• لا دخولات جديدة إلا استثناء قوي", "• حماية الأرباح المفتوحة", "• مراقبة الخطر اللحظي"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• Strong setup quality", "• Relative strength preferred", "• Momentum confirmation needed"]
+    return [f"• Score ≥ {FINAL_MIN_SCORE}", "• Volume confirmation preferred", "• MTF يزيد الجودة"]
+
+
+def _mode_execution_notes_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• Execution paused", "• Existing trades monitored", "• Protection escalation active"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• Normal signals remain active", "• Execution uses quality filters", "• Weak Drift blocks weak execution only"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• Limited execution active", "• Risk protection still enabled", "• Weak setups filtered aggressively"]
+    return ["• Long execution active", "• Weak Drift still enabled", "• Quality filters remain active"]
+
+
+def _market_mix_allows_mtf_no_exception(
+    has_extra_strong_setup: bool = False,
+    extra_setup_names: list = None,
+    primary_extra_setup: str = "",
+    vol_ratio: float = 0.0,
+    candle_strength: float = 0.0,
+    breakout_quality: str = "",
+) -> bool:
+    try:
+        names = {str(x) for x in (extra_setup_names or []) if x}
+        if primary_extra_setup:
+            names.add(str(primary_extra_setup))
+        elite_names = {
+            "vwap_reclaim",
+            "retest_breakout_confirmed",
+            "relative_strength_vs_btc",
+            "higher_low_continuation",
+            "support_bounce_confirmed",
+            "failed_breakdown_trap",
+            "liquidity_sweep_reclaim",
+            "wave_3",
+        }
+        if bool(has_extra_strong_setup) and names.intersection(elite_names):
+            return True
+        if float(vol_ratio or 0.0) >= 1.55 and float(candle_strength or 0.0) >= 0.58:
+            return True
+        if str(breakout_quality or "").lower() == "strong":
+            return True
+        return False
+    except Exception:
+        return False
 
 def build_market_engine_context(market_guard: dict, market_state: str, btc_mode: str, alt_snapshot: dict) -> dict:
     """Separate slow trend from 15m intraday stress for v202 mode decisions.
@@ -11659,6 +11945,13 @@ def run_scanner_loop():
                 candles_map_15m=guard_candles_map,
                 btc_zone=btc_zone,
             )
+            market_mix_profile = detect_market_mix_profile(
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+                market_guard=market_guard,
+                market_info=market_info,
+                btc_zone=btc_zone,
+            )
             current_mode = r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG
             if not current_mode:
                 current_mode = MODE_NORMAL_LONG
@@ -11677,6 +11970,8 @@ def run_scanner_loop():
                 allow_state_writes=True,
             )
             mode_result = apply_fast_intraday_override(mode_result, market_engine_context, current_mode)
+            mode_result["market_mix_profile"] = market_mix_profile
+            mode_result.setdefault("reason_metrics", {})["market_mix_profile"] = market_mix_profile
             current_mode = handle_market_mode_transition(mode_result)
 
             try:
@@ -11752,6 +12047,7 @@ def run_scanner_loop():
                 "alt_snapshot": alt_snapshot,
                 "market_info": market_info,
                 "market_guard": market_guard,
+                "market_mix_profile": market_mix_profile,
                 "market_engine_context": market_engine_context,
                 "ranked_pairs_count": len(ranked_pairs),
                 "suggested_mode": mode_result.get("mode", current_mode),
@@ -11767,6 +12063,7 @@ def run_scanner_loop():
                 alt_snapshot=alt_snapshot,
                 ranked_pairs=ranked_pairs,
                 market_guard=market_guard,
+                market_mix_profile=market_mix_profile,
             )
 
             global_cooldown_active = is_global_cooldown_active()
@@ -11778,6 +12075,7 @@ def run_scanner_loop():
                     alt_snapshot=alt_snapshot,
                     ranked_pairs=ranked_pairs,
                     market_guard=market_guard,
+                    market_mix_profile=market_mix_profile,
                 )
                 logger.info(
                     f"GLOBAL COOLDOWN active - market mode checked, skipping normal/strong signal sending | mode={current_mode}"
@@ -14152,6 +14450,65 @@ def run_scanner_loop():
                 if current_mode == MODE_STRONG_LONG_ONLY and final_threshold_min is not None:
                     final_threshold = max(final_threshold, final_threshold_min)
 
+                market_mix_level = str((market_mix_profile or {}).get("level") or "CLEAR")
+                market_mix_exception = _market_mix_allows_mtf_no_exception(
+                    has_extra_strong_setup=has_extra_strong_setup,
+                    extra_setup_names=extra_setup_names,
+                    primary_extra_setup=primary_extra_setup,
+                    vol_ratio=vol_ratio,
+                    candle_strength=candle_strength,
+                    breakout_quality=breakout_quality,
+                )
+                if (not mtf_confirmed) and not is_reverse and market_mix_level in ("MIXED", "CHOPPY"):
+                    if current_mode == MODE_NORMAL_LONG and market_mix_level == "MIXED" and not market_mix_exception:
+                        if final_threshold < 7.8:
+                            adjustments_log.append({
+                                "name": "market_mix_mtf_no_threshold",
+                                "value": round(7.8 - final_threshold, 2),
+                                "reason": "mixed_market_mtf_no_requires_higher_quality",
+                                "market_mix_level": market_mix_level,
+                            })
+                        final_threshold = max(final_threshold, 7.8)
+                    elif market_mix_level == "CHOPPY" and not market_mix_exception:
+                        log_long_rejection(
+                            symbol=symbol,
+                            reason="choppy_mixed_no_mtf",
+                            candle_time=candle_time,
+                            score=score_result.get("score"),
+                            raw_score=raw_score,
+                            final_threshold=final_threshold,
+                            market_state=market_state,
+                            current_mode=current_mode,
+                            entry_timing=entry_timing,
+                            opportunity_type=opportunity_type,
+                            dist_ma=dist_ma,
+                            rsi_now=rsi_now,
+                            vol_ratio=vol_ratio,
+                            vwap_distance=vwap_distance,
+                            mtf_confirmed=mtf_confirmed,
+                            breakout=breakout,
+                            pre_breakout=pre_breakout,
+                            is_reverse=is_reverse,
+                            extra={
+                                "market_mix_profile": market_mix_profile,
+                                "has_extra_strong_setup": has_extra_strong_setup,
+                                "extra_setup_names": extra_setup_names,
+                                "primary_extra_setup": primary_extra_setup,
+                                "extra_setup_bonus": extra_setup_bonus,
+                            },
+                        )
+                        logger.info(f"{symbol} --> skipped (CHOPPY market mix + mtf_no)")
+                        continue
+                    elif current_mode == MODE_STRONG_LONG_ONLY and market_mix_level == "MIXED" and not market_mix_exception:
+                        if final_threshold < (STRONG_ONLY_MIN_SCORE + 0.20):
+                            adjustments_log.append({
+                                "name": "strong_mode_mixed_mtf_no_quality_lift",
+                                "value": round((STRONG_ONLY_MIN_SCORE + 0.20) - final_threshold, 2),
+                                "reason": "strong_mode_mixed_market_no_mtf",
+                                "market_mix_level": market_mix_level,
+                            })
+                        final_threshold = max(final_threshold, STRONG_ONLY_MIN_SCORE + 0.20)
+
                 final_threshold = round(final_threshold, 2)
 
                 if (not mtf_confirmed) and "🔴" in entry_timing and not is_reverse:
@@ -14531,6 +14888,9 @@ def run_scanner_loop():
                     "market_state": market_state,
                     "market_state_label": market_state_label,
                     "market_bias_label": market_bias_label,
+                    "market_mix_level": str((market_mix_profile or {}).get("level") or "CLEAR"),
+                    "market_mix_score": int(_arch_float((market_mix_profile or {}).get("score"), 0.0)),
+                    "market_mix_profile": market_mix_profile,
                     "alt_mode": alt_mode,
                     "early_priority": early_priority,
                     "breakout_quality": breakout_quality,
