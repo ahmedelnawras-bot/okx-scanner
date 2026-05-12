@@ -1,9 +1,9 @@
-# Version: main_final_v01_analysis_packages_routing.py
-# Date: 2026-05-11
-# Base: main_v203_open_trades_help_ui.py
-# Changes: Final v01 routing fix for profit/loss analysis + AI JSON analysis packages; no trading logic changes.
-# Preserved: Trading logic, market modes, reports, tracking/performance integration, execution modules.
-# Fixed: /open_trades chunking safety and BLOCK exception setup tag consistency.
+# Version: main_final_v02_execution_loss_tuning.py
+# Date: 2026-05-12
+# Base: main_final_v01_analysis_packages_routing.py
+# Changes: Final v02 applies execution-only loss-reduction tuning for VWAP Reclaim, Higher Low, mid-move, and risk-off contexts.
+# Preserved: Normal signal flow, scoring engine, market modes, TP/SL, whitelist content, risk manager, reporting UI.
+# Fixed previously: /open_trades chunking safety, BLOCK exception setup tag consistency, analysis package routing.
 
 import os 
 import sys 
@@ -10148,10 +10148,13 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             strict_setup_allowed = _has_normal_long_execution_setup(planned)
         block_mode_allowed = _is_block_mode_execution_candidate(planned)
         has_complete_plan = _candidate_has_complete_execution_plan(planned)
+        loss_tuning = _apply_execution_loss_reduction_tuning(planned)
+        execution_loss_tuning_passed = bool(loss_tuning.get("passed", True))
         weak_drift_passed = _candidate_passes_weak_drift_execution_quality(planned)
         base_execution_allowed = bool(
             (strict_setup_allowed or block_mode_allowed)
             and has_complete_plan
+            and execution_loss_tuning_passed
             and weak_drift_passed
         )
         gate = decide_long_execution_gate(
@@ -10162,14 +10165,20 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             block_mode_allowed=block_mode_allowed,
             has_complete_plan=has_complete_plan,
             weak_drift_passed=weak_drift_passed,
+            execution_loss_tuning_passed=execution_loss_tuning_passed,
+            execution_loss_tuning_reason=loss_tuning.get("reason", ""),
             mutate=mutate,
         )
+        if not execution_loss_tuning_passed and gate.get("reason") in ("fallback_base_execution_rejected", "base_execution_rejected", "", None):
+            gate["reason"] = loss_tuning.get("reason") or "execution_loss_tuning_blocked"
+            gate["path"] = "execution_loss_tuning"
         if (not gate.get("allowed")) and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "EXEC REJECT | "
                 f"symbol={planned.get('symbol', '?')} | mode={mode} | reason={gate.get('reason')} | "
                 f"path={gate.get('path')} | tags={planned.get('execution_setup_tags', [])} | "
-                f"strict={strict_setup_allowed} | block={block_mode_allowed} | plan={has_complete_plan} | weak_drift={weak_drift_passed}"
+                f"strict={strict_setup_allowed} | block={block_mode_allowed} | plan={has_complete_plan} | "
+                f"loss_tuning={execution_loss_tuning_passed}:{loss_tuning.get('reason', '')} | weak_drift={weak_drift_passed}"
             )
         if mutate:
             candidate.update(planned)
@@ -10202,6 +10211,164 @@ def is_candidate_for_execution(candidate: dict) -> bool:
         return bool(gate.get("allowed"))
     except Exception:
         return False
+
+
+# =====================
+# EXECUTION-ONLY LOSS REDUCTION TUNING (Final v02)
+# =====================
+def _execution_context_text(data: dict) -> str:
+    """Collect market/setup context text for execution-only quality tuning."""
+    try:
+        diagnostics = data.get("diagnostics", {}) or {}
+        values = []
+        for key in (
+            "market_state", "market_state_label", "market_bias_label", "alt_mode", "btc_mode",
+            "current_mode", "market_mode", "mode", "setup_type", "setup_type_base",
+            "entry_timing", "entry_maturity", "entry_maturity_label", "wave_label", "fib_position",
+        ):
+            values.append(str(data.get(key, "") or ""))
+            values.append(str(diagnostics.get(key, "") or ""))
+        return "|".join(values).lower()
+    except Exception:
+        return ""
+
+
+def _execution_is_mixed_context(data: dict) -> bool:
+    text = _execution_context_text(data)
+    return any(token in text for token in ("mixed", "سوق مختلط", "مختلط"))
+
+
+def _execution_is_risk_off_context(data: dict) -> bool:
+    text = _execution_context_text(data)
+    return any(token in text for token in ("risk_off", "risk-off", "defensive", "دفاعي", "سوق دفاعي"))
+
+
+def _execution_is_mid_move_context(data: dict) -> bool:
+    text = _execution_context_text(data)
+    return any(token in text for token in ("نص الحركة", "متوسط", "mid_move", "mid-move", "middle"))
+
+
+def _execution_has_relative_strength(data: dict, tags: set = None) -> bool:
+    try:
+        tags = tags or set(_collect_execution_setup_tags(data))
+        rel_short = _safe_trade_float_value(_trade_field(data, "relative_strength_short", 0.0), 0.0) or 0.0
+        rel_24 = _safe_trade_float_value(_trade_field(data, "relative_strength_24", 0.0), 0.0) or 0.0
+        return (
+            bool(_trade_field(data, "relative_strength_vs_btc", False))
+            or "relative_strength_vs_btc" in tags
+            or rel_short >= 1.5
+            or rel_24 >= 2.0
+        )
+    except Exception:
+        return False
+
+
+def _execution_has_breakout_confirmation(data: dict, tags: set = None) -> bool:
+    try:
+        tags = tags or set(_collect_execution_setup_tags(data))
+        quality = str(_trade_field(data, "breakout_quality", "") or "").strip().lower()
+        setup_type = str(_trade_field(data, "setup_type", "") or "").lower()
+        return (
+            bool(_trade_field(data, "is_breakout", False))
+            or bool(_trade_field(data, "breakout", False))
+            or "retest_breakout_confirmed" in tags
+            or "breakout" in tags
+            or "اختراق" in setup_type
+            or quality in ("ok", "good", "strong")
+        )
+    except Exception:
+        return False
+
+
+def _apply_execution_loss_reduction_tuning(candidate: dict) -> dict:
+    """Execution-only conservative tuning based on live loss analytics.
+
+    This is deliberately NOT a normal-signal filter:
+    - Normal Telegram alerts and tracking remain unchanged.
+    - The tuning only affects execution candidate eligibility / execution preview.
+    - No TP/SL, risk manager, market-mode, or whitelist content is changed.
+    """
+    result = {"passed": True, "reason": "", "adjustments": []}
+    try:
+        if not isinstance(candidate, dict):
+            result.update({"passed": False, "reason": "invalid_candidate"})
+            return result
+
+        _ensure_execution_setup_tags(candidate)
+        tags = set(_collect_execution_setup_tags(candidate))
+        is_vwap = "vwap_reclaim" in tags
+        is_higher_low = "higher_low_continuation" in tags
+        is_mixed = _execution_is_mixed_context(candidate)
+        is_risk_off = _execution_is_risk_off_context(candidate)
+        is_mid_move = _execution_is_mid_move_context(candidate)
+        mtf = bool(_trade_field(candidate, "mtf_confirmed", False))
+        vol_ratio = _safe_trade_float_value(_trade_field(candidate, "vol_ratio", 0.0), 0.0) or 0.0
+        has_rs = _execution_has_relative_strength(candidate, tags)
+        has_breakout = _execution_has_breakout_confirmation(candidate, tags)
+        is_recovery = bool(_trade_field(candidate, "is_recovery", False)) or "recovery_long" in tags or "recovery_scout" in tags
+        reasons = []
+
+        # 1) VWAP Reclaim inside mixed/risk-off was the clearest loss signature.
+        if is_vwap and (is_mixed or is_risk_off):
+            if not mtf:
+                reasons.append("vwap_reclaim_mixed_or_risk_off_mtf_no")
+            else:
+                penalty = 0.25 if is_risk_off else 0.20
+                old_score = _safe_trade_float_value(_trade_field(candidate, "effective_score", None), None)
+                if old_score is None:
+                    old_score = _safe_trade_float_value(candidate.get("score", 0.0), 0.0) or 0.0
+                new_score = max(0.0, float(old_score) - penalty)
+                candidate["effective_score"] = round(new_score, 2)
+                candidate["score"] = round(new_score, 2)
+                adj = {
+                    "name": "execution_vwap_context_penalty",
+                    "penalty": -round(penalty, 2),
+                    "context": "risk_off" if is_risk_off else "mixed",
+                    "old_score": round(float(old_score), 2),
+                    "new_score": round(new_score, 2),
+                }
+                candidate.setdefault("execution_quality_adjustments", []).append(adj)
+                candidate.setdefault("adjustments_log", []).append("execution_vwap_context_penalty")
+                result["adjustments"].append(adj)
+
+        # 2) Risk-off execution tightening: only clear RS/recovery/breakout strength is allowed.
+        if is_risk_off and (is_vwap or is_higher_low) and not (has_rs or is_recovery or (has_breakout and mtf and vol_ratio >= 1.20)):
+            reasons.append("risk_off_plain_reclaim_or_higher_low")
+
+        # 3) Higher Low execution needs existing confirmation; no new detector/filter is added.
+        if is_higher_low and not (has_rs or has_breakout or (vol_ratio >= 1.35 and mtf)):
+            reasons.append("higher_low_needs_rs_breakout_or_vol_high_mtf")
+
+        # 4) Mid-move execution gets only a light execution score penalty.
+        if is_mid_move:
+            penalty = 0.15
+            old_score = _safe_trade_float_value(_trade_field(candidate, "effective_score", None), None)
+            if old_score is None:
+                old_score = _safe_trade_float_value(candidate.get("score", 0.0), 0.0) or 0.0
+            new_score = max(0.0, float(old_score) - penalty)
+            candidate["effective_score"] = round(new_score, 2)
+            candidate["score"] = round(new_score, 2)
+            adj = {
+                "name": "execution_mid_move_penalty",
+                "penalty": -0.15,
+                "old_score": round(float(old_score), 2),
+                "new_score": round(new_score, 2),
+            }
+            candidate.setdefault("execution_quality_adjustments", []).append(adj)
+            candidate.setdefault("adjustments_log", []).append("execution_mid_move_penalty")
+            result["adjustments"].append(adj)
+
+        if reasons:
+            result.update({"passed": False, "reason": ",".join(reasons)})
+            candidate["execution_loss_tuning_blocked"] = True
+            candidate["execution_loss_tuning_reason"] = result["reason"]
+        else:
+            candidate["execution_loss_tuning_blocked"] = False
+            candidate["execution_loss_tuning_reason"] = ""
+        return result
+    except Exception as e:
+        logger.warning(f"_apply_execution_loss_reduction_tuning error: {e}")
+        return {"passed": True, "reason": "tuning_error_ignored", "adjustments": []}
 
 def build_execution_badge_line(candidate: dict) -> str:
     _ensure_execution_setup_tags(candidate)
