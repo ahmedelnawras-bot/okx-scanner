@@ -7,15 +7,37 @@ LIGHT_LINE = "┄┄┄┄┄┄┄┄"
 TITLE_LINE = "━━━━━━━━━━━━"
 
 
+_MODE_AR_STATUS = {
+    MODE_NORMAL_LONG: "السوق يسمح بإشارات Long عادية مع فلترة الجودة.",
+    MODE_STRONG_LONG_ONLY: "السوق غير ممنوع، لكن يحتاج فرص أقوى فقط.",
+    MODE_BLOCK_LONGS: "فتح Long جديد متوقف بسبب ضغط واضح في السوق.",
+    MODE_RECOVERY_LONG: "ارتداد سريع بعد ضغط قوي، وفرص الريكفري فقط تحت المتابعة.",
+}
+
+_MODE_AR_REASON = {
+    MODE_NORMAL_LONG: "اتساع السوق مقبول ولا يوجد ضغط كافي لإيقاف اللونج.",
+    MODE_STRONG_LONG_ONLY: "السوق متذبذب أو غير واضح، لذلك يتم رفع جودة القبول.",
+    MODE_BLOCK_LONGS: "نسبة الهبوط أو ضعف السوق أعلى من المسموح للونج العادي.",
+    MODE_RECOVERY_LONG: "ظهر ارتداد سريع بعد ضغط، لكن السوق لم يرجع طبيعي بالكامل.",
+}
+
+_MODE_AR_EXECUTION = {
+    MODE_NORMAL_LONG: "التنفيذ مسار منفصل بعد الإشارة، ويمر عبر whitelist + quality gates.",
+    MODE_STRONG_LONG_ONLY: "التنفيذ متاح فقط للفرص الأقوى عبر whitelist / elite.",
+    MODE_BLOCK_LONGS: "التنفيذ العادي متوقف؛ الاستثناءات القوية فقط هي المسموحة.",
+    MODE_RECOVERY_LONG: "مسار الريكفري فعال بحد أقصى 3 فرص في الدورة.",
+}
+
+
 def _mix_action(mode: str, context: dict) -> str:
     mix = str(context.get("market_mix", "")).upper()
     if mode == MODE_BLOCK_LONGS:
         return "🚫 الضعيف ممنوع — استثناءات قوية فقط"
     if mode == MODE_RECOVERY_LONG:
         return "🔄 ارتداد سريع — Recovery path فقط"
-    if "CHOPPY" in mix:
-        return "⚠️ mtf_no يحتاج جودة أعلى"
-    if "MIXED" in mix:
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "⚠️ قبول أقوى فقط — لا يعتبر Block"
+    if "CHOPPY" in mix or "MIXED" in mix:
         return "⚠️ جودة أعلى قبل التنفيذ"
     return "✅ القواعد العادية فعالة"
 
@@ -31,7 +53,7 @@ def _signal_rules(mode: str, context: dict) -> list[str]:
         return [
             "Recovery signals: ON",
             "Max recovery trades/cycle: 3",
-            "Normal strong routing لا يخنق الريكافر",
+            "Normal routing: محدود حتى استقرار السوق",
         ]
     if mode == MODE_STRONG_LONG_ONLY:
         return [
@@ -46,6 +68,17 @@ def _signal_rules(mode: str, context: dict) -> list[str]:
     ]
 
 
+def _mode_color_identity(mode: str) -> str:
+    emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
+    names = {
+        MODE_NORMAL_LONG: "Normal",
+        MODE_STRONG_LONG_ONLY: "Strong — light yellow",
+        MODE_BLOCK_LONGS: "Block",
+        MODE_RECOVERY_LONG: "Recovery",
+    }
+    return f"{emoji} {names.get(mode, mode)}"
+
+
 def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
     """Unified market-mode message builder.
 
@@ -53,6 +86,8 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
     - status: /mood
     - transition: mode change alert
     - reminder: periodic market reminder
+
+    UI-only. No scoring/filter/execution behavior is changed here.
     """
     mode_emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
     lines: list[str] = []
@@ -60,39 +95,50 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
     if variant == "transition":
         lines.append(f"{mode_emoji} Market Mode Update")
         lines.append(f"🔁 {context.get('old_mode', '?')} → {mode}")
+        lines.append(LIGHT_LINE)
     elif variant == "reminder":
         lines.append(f"{mode_emoji} Market Reminder #{context.get('reminder_count', 1)}")
         lines.append(f"⏱ {context.get('minutes_in_mode', 0)}m in {mode}")
+        lines.append(LIGHT_LINE)
 
     lines.append(MODE_TITLE_MAP.get(mode, f"{mode_emoji} Market Mode: {mode}"))
-    lines.append(TITLE_LINE)
-    lines.append(f"🧩 Mode Color: {mode_emoji} {mode}")
+    lines.append(TITLE_LINE if variant == "status" else LIGHT_LINE)
+    lines.append(f"🧩 Mode Color: {_mode_color_identity(mode)}")
 
-    market_mix = context.get("market_mix", "N/A")
     lines.extend([
         "",
+        "📌 الحالة العامة",
+        _MODE_AR_STATUS.get(mode, "حالة السوق تحت المتابعة."),
+        "",
         "🌗 Market Mix",
-        f"Status: {market_mix}",
+        f"Status: {context.get('market_mix', 'N/A')}",
         f"Action: {_mix_action(mode, context)}",
         "",
         "🌐 Market State",
         str(context.get("market_state", "N/A")),
     ])
 
-    if context.get("trigger"):
-        lines.extend(["", "⚡ Trigger", str(context["trigger"])])
+    trigger = context.get("trigger")
+    if trigger:
+        lines.extend([
+            "",
+            "⚡ Trigger",
+            str(trigger),
+        ])
 
     lines.extend([
         "",
-        "🧠 Mode Reason",
-        str(context.get("mode_reason", "core market breadth decision")),
+        "🧠 سبب المود",
+        _MODE_AR_REASON.get(mode, str(context.get("mode_reason", "core market breadth decision"))),
+        f"Reason: {context.get('mode_reason', 'core market breadth decision')}",
         "",
-        "📌 Signal Rules",
+        "📈 قواعد الإشارات",
         *[f"• {line}" for line in _signal_rules(mode, context)],
         "",
-        "⚙️ Execution Notes",
+        "⚙️ التنفيذ",
+        _MODE_AR_EXECUTION.get(mode, "التنفيذ يتبع إعدادات الجودة الحالية."),
         f"Execution candidates: {context.get('execution_notes', 'whitelist + quality gates')}",
-        "OKX Paper Orders: controlled by Railway",
+        "OKX Orders: حسب إعداد Railway الحالي",
         "Live Trading: BLOCKED unless explicitly enabled",
     ])
 
@@ -103,9 +149,9 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
         lines.extend([
             "",
             "🛡 Protection Plan",
-            "• Level 1 → Monitor only",
-            "• Level 2 → Soft Protection",
-            "• Level 3 → Defensive Protection",
+            "• Level 1 → مراقبة فقط",
+            "• Level 2 → حماية أرباح",
+            "• Level 3 → حماية دفاعية",
             "",
             f"Protection: {current}",
         ])
@@ -120,10 +166,11 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
             "🪟 Recovery Window",
             "Duration: 90m",
             f"Remaining slots: {context.get('recovery_remaining', 3)}",
+            "Max trades: 3 per cycle",
             "",
             "📌 Recovery Rules",
             "• Fast rebound only",
-            "• Max 3 recovery trades/cycle",
+            "• مسار Recovery مستقل ولا يخنقه Strong routing",
             "• Special recovery path active",
         ])
 
