@@ -20,6 +20,7 @@ class Settings:
     min_execution_score: float = float(os.getenv("MIN_EXECUTION_SCORE", "6.6"))
     request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
     scan_interval_seconds: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
+    market_mode_guard_interval_seconds: int = int(os.getenv("MARKET_MODE_GUARD_INTERVAL_SECONDS", "300"))
     max_execution_positions: int = int(os.getenv("MAX_OPEN_POSITIONS", str(MAX_EXECUTION_POSITIONS)))
     telegram_enabled: bool = os.getenv("TELEGRAM_ENABLED", "1").lower() in ("1", "true", "yes", "on")
     send_normal_signals: bool = os.getenv("SEND_NORMAL_SIGNALS", "1").lower() in ("1", "true", "yes", "on")
