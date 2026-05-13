@@ -2,7 +2,9 @@
 
 Safety rules:
 - Requires OKX_SIMULATED=1 for order placement.
-- Requires caller-side confirmation flags before execution.
+- Compatible with both:
+  1) OKXTradeClient(credentials=OKXCredentials(...))
+  2) OKXTradeClient(api_key=..., api_secret=..., passphrase=..., simulated=True)
 """
 from __future__ import annotations
 
@@ -19,21 +21,42 @@ import requests
 
 @dataclass
 class OKXCredentials:
-    api_key: str
-    api_secret: str
-    passphrase: str
+    api_key: str = ""
+    api_secret: str = ""
+    passphrase: str = ""
     simulated: bool = True
 
 
 class OKXTradeClient:
-    def __init__(self, credentials: OKXCredentials, base_url: str = "https://www.okx.com", timeout: int = 15):
+    def __init__(
+        self,
+        credentials: OKXCredentials | None = None,
+        api_key: str = "",
+        api_secret: str = "",
+        passphrase: str = "",
+        simulated: bool = True,
+        base_url: str = "https://www.okx.com",
+        timeout: int = 15,
+    ):
+        if credentials is None:
+            credentials = OKXCredentials(
+                api_key=api_key,
+                api_secret=api_secret,
+                passphrase=passphrase,
+                simulated=simulated,
+            )
+
         self.credentials = credentials
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
     @property
     def configured(self) -> bool:
-        return bool(self.credentials.api_key and self.credentials.api_secret and self.credentials.passphrase)
+        return bool(
+            self.credentials.api_key
+            and self.credentials.api_secret
+            and self.credentials.passphrase
+        )
 
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -62,8 +85,10 @@ class OKXTradeClient:
     def get_balance(self) -> dict[str, Any]:
         if not self.configured:
             return {"ok": False, "error": "okx_not_configured"}
+
         path = "/api/v5/account/balance"
         ts = self._timestamp()
+
         try:
             response = requests.get(
                 f"{self.base_url}{path}",
@@ -94,8 +119,9 @@ class OKXTradeClient:
             "tdMode": td_mode,
             "side": side,
             "ordType": "market",
-            "sz": sz,
+            "sz": str(sz),
         }
+
         if pos_side:
             payload["posSide"] = pos_side
 
