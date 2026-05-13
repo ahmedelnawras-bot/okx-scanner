@@ -1,8 +1,8 @@
 # tracking/performance.py
-# Version: performance_v63_recovery_pnl_support
-# Base: performance_v49_report_command_html_fix
-# Changes: add Recovery 50/25/25 reporting support without changing core tracking decisions.
-# Fix: header/version corrected; dashboard context fields are displayed in the report.
+# Version: performance_v64_tracking_report_state_fix
+# Base: performance_v63_recovery_pnl_support
+# Changes: fix central tracking/report state reconciliation so closed SL/TP trades cannot remain counted as open.
+# Preserved: strategy logic, scoring, filters, execution, TP/SL levels, market modes.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
 
@@ -61,6 +61,12 @@ estimate_wallet_pnl تستخدم margin_per_trade كأساس للحساب.
 - Breakeven بعد TP1 يعتبر فوز جزئي وليس خسارة.
 - Full Wins TP2 = عدد صفقات tp2_win الحقيقية.
 - حقل alert_id/trade_id لتجنب التكرار.
+
+**إصدار 3.8 – إصلاح مركزي لحالة الصفقات في التقارير**
+- result النهائي يغلب status القديم في loaders والتقارير.
+- closed/history يغلب open key عند وجود نسخة مكررة لنفس alert/trade.
+- تنظيف open_trades set من المفاتيح التي لها نسخة history مغلقة.
+- منع ظهور صفقات SL/TP/Trailing المغلقة كصفقات مفتوحة في Normal/Execution reports.
 
 **إصدار 3.7 – تثبيت حقول التنفيذ والتحليل**
 - حفظ execution_entry/execution_sl/execution_tp1/execution_tp2 top-level وداخل diagnostics/history.
@@ -2254,8 +2260,11 @@ def update_open_trades(
 # ------------------------------------------------------------
 def _trade_dedupe_key(trade: dict):
     """مفتاح فريد لمنع التكرار عند دمج active + history."""
+    if not isinstance(trade, dict):
+        return ("invalid", id(trade))
+    diagnostics = trade.get("diagnostics", {}) or {}
     # الأولوية لـ alert_id
-    alert_id = str(trade.get("alert_id") or "").strip()
+    alert_id = str(trade.get("alert_id") or diagnostics.get("alert_id") or "").strip()
     if alert_id:
         return ("alert_id", alert_id)
     # ثم trade_id
@@ -2267,6 +2276,111 @@ def _trade_dedupe_key(trade: dict):
     side = normalize_side(trade.get("side", "long"))
     ctime = safe_timestamp(trade.get("candle_time"), 0)
     return ("symbol_side_time", f"{symbol}:{side}:{ctime}")
+
+
+_TERMINAL_RESULTS = {
+    "tp1_win", "tp2_win", "trailing_win",
+    "loss", "expired", "breakeven", "pending_expired",
+}
+_OPEN_STATUSES = {"open", "partial", "pending_pullback", "tp2_partial", "trailing_open", "trailing"}
+
+
+def _trade_terminal_result(trade: dict) -> str:
+    if not isinstance(trade, dict):
+        return ""
+    return str(trade.get("result") or "").strip().lower()
+
+
+def _trade_status_norm(trade: dict) -> str:
+    if not isinstance(trade, dict):
+        return "unknown"
+    result = _trade_terminal_result(trade)
+    # result النهائي يغلب status القديم دائمًا.
+    if result in _TERMINAL_RESULTS:
+        return "closed" if result != "expired" else "expired"
+    status = str(trade.get("status") or "").strip().lower()
+    if status == "trailing":
+        return "trailing_open"
+    return status or "unknown"
+
+
+def _trade_is_closed_record(trade: dict) -> bool:
+    if not isinstance(trade, dict):
+        return False
+    result = _trade_terminal_result(trade)
+    status = str(trade.get("status") or "").strip().lower()
+    return result in _TERMINAL_RESULTS or status in ("closed", "expired")
+
+
+def _trade_recency_score(trade: dict) -> int:
+    if not isinstance(trade, dict):
+        return 0
+    values = [
+        safe_timestamp(trade.get("closed_at"), 0),
+        safe_timestamp(trade.get("updated_at"), 0),
+        safe_timestamp(trade.get("last_processed_candle_ts"), 0),
+        safe_timestamp(trade.get("created_at"), 0),
+        safe_timestamp(trade.get("candle_time"), 0),
+    ]
+    return max(values or [0])
+
+
+def _prefer_trade_record(current: dict, candidate: dict) -> dict:
+    """Choose the safest/latest single source of truth for duplicated trades.
+
+    Critical rule: a terminal/closed record always wins over an open stale copy.
+    This prevents SL/TP closed trades from staying counted as open in reports.
+    """
+    if not current:
+        return candidate
+    if not candidate:
+        return current
+
+    cur_closed = _trade_is_closed_record(current)
+    cand_closed = _trade_is_closed_record(candidate)
+
+    if cand_closed and not cur_closed:
+        return candidate
+    if cur_closed and not cand_closed:
+        return current
+
+    cand_hist = normalize_bool(candidate.get("history_snapshot", False)) or str(candidate.get("_source", "")).startswith("history")
+    cur_hist = normalize_bool(current.get("history_snapshot", False)) or str(current.get("_source", "")).startswith("history")
+
+    if cand_closed and cur_closed:
+        if cand_hist and not cur_hist:
+            return candidate
+        if cur_hist and not cand_hist:
+            return current
+
+    return candidate if _trade_recency_score(candidate) >= _trade_recency_score(current) else current
+
+
+def _build_closed_dedupe_keys_from_history(redis_client, market_type: str = None, side: str = None) -> set:
+    """Build dedupe keys for trades already closed in history.
+
+    Used by open reports to ignore stale active keys left in open_trades set.
+    """
+    closed_keys = set()
+    if redis_client is None:
+        return closed_keys
+    mt = normalize_market_type(market_type) if market_type else "*"
+    sd = normalize_side(side) if side else "*"
+    pattern_history = f"trade_history:{mt}:{sd}:*"
+    try:
+        for key in redis_client.scan_iter(pattern_history):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                trade = json.loads(raw)
+            except Exception:
+                continue
+            if _trade_is_closed_record(trade):
+                closed_keys.add(_trade_dedupe_key(trade))
+    except Exception as e:
+        logger.error(f"_build_closed_dedupe_keys_from_history error: {e}")
+    return closed_keys
 
 
 def load_trades(
@@ -2337,15 +2451,17 @@ def load_trades_with_history(
     pattern_trade = f"trade:{mt}:{sd}:*"
     pattern_history = f"trade_history:{mt}:{sd}:*"
 
-    seen = set()
-    trades = []
+    # map بدل list حتى نقدر نختار النسخة الصحيحة عند التكرار.
+    # قاعدة مهمة: history/closed يغلب active/open القديم.
+    by_key = {}
 
-    def _add_if_new(trade_dict):
-        dk = _trade_dedupe_key(trade_dict)
-        if dk in seen:
+    def _add_or_prefer(trade_dict, source: str):
+        if not isinstance(trade_dict, dict):
             return
-        seen.add(dk)
-        trades.append(trade_dict)
+        trade_dict = dict(trade_dict)
+        trade_dict["_source"] = source
+        dk = _trade_dedupe_key(trade_dict)
+        by_key[dk] = _prefer_trade_record(by_key.get(dk), trade_dict)
 
     try:
         for key in redis_client.scan_iter(pattern_trade):
@@ -2356,7 +2472,7 @@ def load_trades_with_history(
                 trade = json.loads(raw)
             except Exception:
                 continue
-            _add_if_new(trade)
+            _add_or_prefer(trade, "active")
     except Exception as e:
         logger.error(f"load_trades_with_history trade scan error: {e}")
 
@@ -2369,13 +2485,13 @@ def load_trades_with_history(
                 trade = json.loads(raw)
             except Exception:
                 continue
-            _add_if_new(trade)
+            _add_or_prefer(trade, "history")
     except Exception as e:
         logger.error(f"load_trades_with_history history scan error: {e}")
 
     # فلترة حسب الوقت والحالة
     filtered = []
-    for trade in trades:
+    for trade in by_key.values():
         if since_ts is not None:
             ts = get_trade_created_ts(trade)
             if not ts:
@@ -2384,8 +2500,8 @@ def load_trades_with_history(
                 continue
 
         if not include_open:
-            status = str(trade.get("status", "") or "").strip().lower()
-            if status in ("open", "partial", "pending_pullback", "tp2_partial", "trailing_open"):
+            status = _trade_status_norm(trade)
+            if status in _OPEN_STATUSES:
                 continue
 
         filtered.append(trade)
@@ -2399,7 +2515,6 @@ def load_trades_with_history(
 
     return filtered
 
-
 def load_all_trades_for_report(
     redis_client,
     market_type: Optional[str] = None,
@@ -2411,6 +2526,10 @@ def load_all_trades_for_report(
     مصدر موحد لتحميل كل الصفقات للتقارير.
     يمنع التكرار بين trade:* و trade_history:*.
     كل التقارير يجب أن تستخدم هذه الدالة لضمان تطابق الأعداد.
+
+    إصلاح v64:
+    - إذا وُجدت نسخة open ونسخة closed لنفس الصفقة، نستخدم closed.
+    - result النهائي يغلب status القديم.
     """
     trades = load_trades_with_history(
         redis_client=redis_client,
@@ -2420,9 +2539,7 @@ def load_all_trades_for_report(
         include_open=include_open,
     )
 
-    # dedupe بـ alert_id أو symbol+candle_time+side
-    seen = set()
-    deduped = []
+    by_key = {}
     for trade in trades:
         diagnostics = trade.get("diagnostics", {}) or {}
         alert_id = (
@@ -2437,20 +2554,15 @@ def load_all_trades_for_report(
             sd    = normalize_side(trade.get("side", "long"))
             key   = f"{sym}:{ct}:{sd}"
 
-        if key in seen:
-            continue
-        seen.add(key)
-
         # فلتر pending_pullback من الإحصائيات المالية لو مش include_open
         if not include_open:
-            status = str(trade.get("status", "") or "").lower()
+            status = _trade_status_norm(trade)
             if status == "pending_pullback":
                 continue
 
-        deduped.append(trade)
+        by_key[key] = _prefer_trade_record(by_key.get(key), trade)
 
-    return deduped
-
+    return list(by_key.values())
 
 def get_all_trades_data(
     redis_client,
@@ -2467,16 +2579,10 @@ def get_all_trades_data(
     except Exception:
         pass
 
-    if use_history:
-        return load_trades_with_history(
-            redis_client=redis_client,
-            market_type=market_type,
-            side=side,
-            since_ts=since_ts,
-            include_open=True,
-        )
-
-    return load_trades(
+    # v64: كل التقارير والتحليلات يجب أن تستخدم المصدر الموحد الذي يدمج
+    # active + history ويجعل السجل المغلق يغلب النسخة المفتوحة القديمة.
+    # ترك load_trades(active only) هنا كان سبب ظهور SL/TP closed كـ Open.
+    return load_all_trades_for_report(
         redis_client=redis_client,
         market_type=market_type,
         side=side,
@@ -3031,8 +3137,8 @@ def build_trade_summary_from_trades(
 
     open_report_trades = [
         t for t in filtered_trades
-        if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")
-        and str(t.get("result", "") or "").lower() not in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven")
+        if _trade_status_norm(t) in ("open", "partial", "trailing_open", "tp2_partial")
+        and _trade_terminal_result(t) not in _TERMINAL_RESULTS
     ]
     summary["open_report_winners"] = sorted(
         [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) >= 0],
@@ -3170,8 +3276,8 @@ def get_trade_summary(
 
     open_report_trades = [
         t for t in filtered_trades
-        if str(t.get("status", "") or "").lower() in ("open", "partial", "trailing", "trailing_open", "tp2_partial")
-        and str(t.get("result", "") or "").lower() not in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven")
+        if _trade_status_norm(t) in ("open", "partial", "trailing_open", "tp2_partial")
+        and _trade_terminal_result(t) not in _TERMINAL_RESULTS
     ]
     summary["open_report_winners"] = sorted(
         [t for t in open_report_trades if _period_report_trade_pnl_pct(t, is_open=True) >= 0],
@@ -4174,12 +4280,20 @@ def get_open_trades_summary(
 
     open_trades = []
     now_ts = int(time.time())
+    closed_history_keys = _build_closed_dedupe_keys_from_history(redis_client, market_type, side_norm)
 
     for trade_key in trade_keys:
         trade = load_trade(redis_client, trade_key)
         if not trade:
             continue
-        if trade.get("status") == "closed":
+
+        # إصلاح مركزي: لو فيه نسخة history مغلقة لنفس الصفقة، لا تظهر في Open أبداً.
+        # وننظف open set لتقليل تكرار المشكلة في التقارير القادمة.
+        if _trade_dedupe_key(trade) in closed_history_keys or _trade_is_closed_record(trade):
+            try:
+                redis_client.srem(open_set_key, trade_key)
+            except Exception:
+                pass
             continue
 
         symbol         = trade.get("symbol", "")
