@@ -128,11 +128,19 @@ def _slot_lines(decision: dict) -> list:
         plan = decision.get("position_plan", {}) or {}
         margin = plan.get("margin_per_trade")
         capital = plan.get("max_capital_in_use")
-        lines = [
-            f"📊 <b>حد الصفقات:</b> {_fmt(max_pos)}",
-            f"📂 <b>المفتوح المحسوب:</b> {_fmt(active)}",
-            f"✅ <b>المتبقي:</b> {_fmt(remaining)}",
-        ]
+        pool = str(decision.get("block_exception_pool") or plan.get("pool") or "").lower()
+        if pool == "block_exception":
+            lines = [
+                f"🧱 <b>Block Exception Slots:</b> {_fmt(active)} / {_fmt(max_pos)}",
+                f"✅ <b>المتبقي:</b> {_fmt(remaining)}",
+                "ℹ️ TP2 runners لا تُحسب ضمن حد استثناءات البلوك.",
+            ]
+        else:
+            lines = [
+                f"📊 <b>حد الصفقات:</b> {_fmt(max_pos)}",
+                f"📂 <b>المفتوح المحسوب:</b> {_fmt(active)}",
+                f"✅ <b>المتبقي:</b> {_fmt(remaining)}",
+            ]
         if margin is not None and capital is not None:
             lines.append(f"💰 <b>Capital:</b> {_fmt(capital)}$ | <b>Margin/Trade:</b> {_fmt(margin)}$")
         return lines
@@ -144,6 +152,8 @@ def build_execution_rejected_message(symbol: str, decision: dict, setup_type: st
     reason = str((decision or {}).get("reason") or "")
     if reason == "max_positions_reached":
         reason_ar = "تم الوصول للحد الأقصى للصفقات"
+    elif reason == "block_exception_max_open_reached":
+        reason_ar = "تم الوصول للحد الأقصى لاستثناءات البلوك المفتوحة (3)"
     elif reason == "same_symbol_open":
         reason_ar = "توجد صفقة تنفيذ مفتوحة لنفس الزوج قبل TP2"
     else:
@@ -301,6 +311,11 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "slot_active_count": decision.get("active_count"),
         "slot_max_positions": decision.get("max_positions"),
         "slot_remaining": decision.get("remaining_slots"),
+        "block_exception": bool(candidate.get("block_exception")),
+        "block_longs_execution_candidate": bool(candidate.get("block_longs_execution_candidate")),
+        "block_exception_direct_execution": bool(candidate.get("block_exception_direct_execution")),
+        "execution_path": candidate.get("execution_path", "block_exception" if candidate.get("block_exception") else ""),
+        "block_exception_pool": bool(decision.get("block_exception_pool")),
         "created_ts": int(time.time()),
     }
 
@@ -317,6 +332,11 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
             "symbol": symbol,
             "status": result_status,
             "setup_type": setup_decision.get("setup_type"),
+            "block_exception": bool(candidate.get("block_exception")),
+            "block_longs_execution_candidate": bool(candidate.get("block_longs_execution_candidate")),
+            "block_exception_direct_execution": bool(candidate.get("block_exception_direct_execution")),
+            "execution_path": candidate.get("execution_path", "block_exception" if candidate.get("block_exception") else ""),
+            "block_exception_pool": bool(decision.get("block_exception_pool")),
             "entry_mode": order.get("entry_mode", "market"),
             "entry": order.get("entry"),
             "execution_entry": order.get("execution_entry"),
@@ -354,4 +374,5 @@ def process_trade_candidate(redis_client, symbol: str, candidate: dict) -> dict:
         "max_positions": decision.get("max_positions"),
         "remaining_slots": decision.get("remaining_slots"),
         "position_plan": decision.get("position_plan"),
+        "block_exception_pool": decision.get("block_exception_pool", False),
     }
