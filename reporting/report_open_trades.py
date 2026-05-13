@@ -2,71 +2,98 @@ from __future__ import annotations
 
 from tracking.models import TrackedTrade
 from utils.constants import LEVERAGE_NOTE_AR
+from reporting.report_format import (
+    SEP,
+    THIN_SEP,
+    OPEN_STATUSES,
+    append_trade_cards,
+    open_trades,
+    trade_effective_pnl,
+    wallet_impact_lines,
+)
+
+
+def _is_execution_trade(t: TrackedTrade) -> bool:
+    return bool(getattr(t, "execution_trade", False) or getattr(t, "tracking_bucket", "") == "execution")
 
 
 def _filter_open(trades: list[TrackedTrade], execution_only: bool = False) -> list[TrackedTrade]:
-    items = [t for t in trades if t.status in {"open", "tp1_partial", "tp2_partial", "runner"}]
+    items = [t for t in trades if t.status in OPEN_STATUSES]
     if execution_only:
-        items = [t for t in items if t.execution_setup_tags]
+        items = [t for t in items if _is_execution_trade(t)]
     return items
 
 
-def _clean_setup_label(t: TrackedTrade) -> str:
-    tags = ", ".join(t.execution_setup_tags[:2]) if t.execution_setup_tags else "normal"
-    return f"{t.setup_type} | {tags}"
-
-
-def _card_lines(t: TrackedTrade) -> list[str]:
-    extras = []
-    if t.protected_on_block:
-        extras.append("🛡 Protected")
-    if t.trailing_tightened:
-        extras.append("🔧 Tightened")
-    extra_tail = f" | {' | '.join(extras)}" if extras else ""
-    return [
-        f"• {t.symbol} | {t.pnl_pct:+.2f}%",
-        f"⏱ {t.stage_label} | ⭐ Score: {t.score:.2f}{extra_tail}",
-        f"🎯 TP1: {t.tp1:.6f} | 🏁 TP2: {t.tp2:.6f}",
-        f"🛡 SL: {t.sl:.6f}",
-        f"🧠 {_clean_setup_label(t)}",
-    ]
+def _avg_score(items: list[TrackedTrade]) -> float:
+    return sum(float(t.score or 0.0) for t in items) / max(1, len(items))
 
 
 def build_open_trades_report(
     trades: list[TrackedTrade],
-    title: str = "📂 الصفقات المفتوحة",
+    title: str = "📂 الصفقات العادية المفتوحة",
     execution_only: bool = False,
 ) -> str:
-    open_trades = _filter_open(trades, execution_only=execution_only)
-    winners = sorted([t for t in open_trades if t.pnl_pct >= 0], key=lambda t: t.pnl_pct, reverse=True)
-    losers = sorted([t for t in open_trades if t.pnl_pct < 0], key=lambda t: t.pnl_pct)
-    protected = sum(1 for t in open_trades if t.protected_on_block)
-    tightened = sum(1 for t in open_trades if t.trailing_tightened)
-    tp1 = sum(1 for t in open_trades if t.tp1_hit)
-    tp2 = sum(1 for t in open_trades if t.tp2_hit)
-    runner = sum(1 for t in open_trades if t.runner_active or t.tp2_hit)
-    floating = sum(t.pnl_pct for t in open_trades)
-    avg_score = sum(t.score for t in open_trades) / max(1, len(open_trades))
-    wr = (len(winners) / max(1, len(open_trades))) * 100 if open_trades else 0.0
+    opened = _filter_open(trades, execution_only=execution_only)
 
-    lines = [title, "━━━━━━━━━━━━", LEVERAGE_NOTE_AR]
-    lines.append(f"📊 Open: {len(open_trades)} | Winners: {len(winners)} | Losers: {len(losers)}")
-    lines.append(f"✅ Win Rate: {wr:.0f}% | ⚖️ Net Floating: {floating:+.2f}%")
-    lines.append(f"🎯 TP1: {tp1} | 🏁 TP2: {tp2} | 🏃 Runner: {runner}")
-    lines.append(f"🛡 Protected: {protected} | 🔧 Tightened: {tightened} | ⭐ Avg Score: {avg_score:.2f}")
+    if execution_only and not opened:
+        rejected_count = sum(
+            1 for t in trades
+            if getattr(t, "execution_checked", False)
+            and not getattr(t, "execution_trade", False)
+            and str(getattr(t, "execution_status", "")).startswith("rejected")
+        )
+        lines = [
+            title,
+            "📅 Since Start",
+            SEP,
+            LEVERAGE_NOTE_AR,
+            "",
+            "📊 <b>Quick Stats</b>",
+            "• Open Execution Trades: 0",
+            "• Winners: 0 | Losers: 0",
+            "🏆 Open Win Rate: 0.0%",
+            "⚖️ Net Floating: +0.00% Exposure",
+            "",
+            "لا توجد صفقات تنفيذ مفتوحة حاليًا.",
+            "📌 الإشارات العادية المرفوضة من التنفيذ لا تُحسب هنا.",
+        ]
+        if rejected_count:
+            lines.append(f"⚙️ Execution rejected checks: {rejected_count}")
+        return "\n".join(lines)
 
-    if winners:
-        lines.append("📈 Open Winners — Top 5")
-        for t in winners[:5]:
-            lines.extend(_card_lines(t))
-        if len(winners) > 5:
-            lines.append(f"📂 +{len(winners)-5} more winning trades...")
+    winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
+    losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    protected = sum(1 for t in opened if t.protected_on_block)
+    tightened = sum(1 for t in opened if t.trailing_tightened)
+    tp1 = sum(1 for t in opened if t.tp1_hit)
+    tp2 = sum(1 for t in opened if t.tp2_hit)
+    runner = sum(1 for t in opened if t.runner_active or t.tp2_hit)
+    danger = sum(1 for t in opened if trade_effective_pnl(t) < -1.0)
+    floating = sum(trade_effective_pnl(t) for t in opened)
+    wr = len(winners) / max(1, len(opened)) * 100.0 if opened else 0.0
 
-    if losers:
-        lines.append("📉 Open Losers — Top 5")
-        for t in losers[:5]:
-            lines.extend(_card_lines(t))
-        if len(losers) > 5:
-            lines.append(f"📂 +{len(losers)-5} more losing trades...")
+    lines = [title, "📅 Since Start", SEP, LEVERAGE_NOTE_AR, ""]
+    lines.extend([
+        "📊 <b>Quick Stats</b>",
+        f"• Open: {len(opened)}",
+        f"• Winners: {len(winners)} | Losers: {len(losers)}",
+        f"🏆 Open Win Rate: {wr:.1f}%",
+        f"⚖️ Net Floating: {floating:+.2f}% Exposure",
+        f"⭐ Avg Score: {_avg_score(opened):.2f}",
+    ])
+    lines.extend([SEP, *wallet_impact_lines(opened, title="Wallet Impact")])
+    lines.extend([
+        SEP,
+        "📊 <b>Trade Stages</b>",
+        f"🎯 TP1 Hit: {tp1}",
+        f"🏁 TP2 Active: {tp2}",
+        f"🏃 Runner: {runner}",
+        f"🔒 Protected: {protected}",
+        f"🛠 Tightened: {tightened}",
+        f"⚠️ Danger: {danger}",
+    ])
 
+    append_trade_cards(lines, "📈 <b>Open Winners — Top 5</b>", winners, limit=5)
+    append_trade_cards(lines, "📉 <b>Open Losers — Top 5</b>", losers, limit=5)
+    lines.extend([SEP, "💡 يعتمد على نظام إدارة 40/40/20"])
     return "\n".join(lines)
