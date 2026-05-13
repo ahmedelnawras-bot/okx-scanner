@@ -513,6 +513,7 @@ def live_worker() -> None:
     telegram_offset: int | None = None
     reminder_tracker: dict = {}
     next_mode_guard_ts: float = 0.0
+    last_result: dict | None = None
 
     startup_lines = [
         "✅ OKX Long Bot v125 started",
@@ -528,6 +529,7 @@ def live_worker() -> None:
     while True:
         try:
             result = run_once(previous_state=state, settings=settings)
+            last_result = result
             state = result["state"]
             print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
             if sender.enabled and settings.telegram_enabled:
@@ -550,11 +552,12 @@ def live_worker() -> None:
             if sender.enabled and settings.telegram_enabled:
                 try:
                     now_ts = time.time()
-                    if now_ts >= next_mode_guard_ts:
-                        state = _run_market_mode_guard(sender, result, settings, state, reminder_tracker)
-                        next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
-                    _maybe_send_mode_reminder(sender, result, reminder_tracker)
-                    telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
+                    if last_result is not None:
+                        if now_ts >= next_mode_guard_ts:
+                            state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
+                            next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
+                        _maybe_send_mode_reminder(sender, last_result, reminder_tracker)
+                        telegram_offset = _answer_commands(sender, last_result, telegram_offset, settings)
                 except Exception as exc:
                     print(f"telegram command polling error: {exc}", flush=True)
             time.sleep(3)
