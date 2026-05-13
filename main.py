@@ -1,4 +1,4 @@
-"""OKX Long Bot clean rebuild v119 live Telegram + OKX paper worker.
+"""OKX Long Bot clean rebuild v120 fast Telegram commands worker.
 
 Preserved design:
 - main.py orchestrates only
@@ -191,29 +191,72 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         sender.send_message(text)
 
 
-def _answer_commands(sender: TelegramSender, result: dict, offset: int | None) -> int | None:
+def _build_fast_status(result: dict, settings: Settings) -> str:
+    execution_results = result.get("execution_results", []) or []
+    last_rejection = next(
+        (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
+        None,
+    )
+    rejection_reason = "none"
+    if last_rejection:
+        rejection_reason = f"{last_rejection.get('status')} | {last_rejection.get('reason', 'unknown')}"
+
+    return "\n".join([
+        "🟢 Bot Status",
+        "━━━━━━━━━━━━",
+        f"📈 Market Mode: {result.get('mode', 'UNKNOWN')}",
+        f"⚡ Execution Engine: {'ON' if settings.execution_enabled else 'OFF'}",
+        f"🧪 OKX Paper Orders: {'ON' if settings.okx_place_orders else 'OFF'}",
+        f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
+        "",
+        f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
+        f"⏱ Scan Interval: {settings.scan_interval_seconds}s",
+        "",
+        "🧠 آخر حالة تنفيذ:",
+        f"{rejection_reason}",
+        "",
+        "✅ الأوامر تعمل بسرعة — ربط OKX مؤجل حاليًا" if not settings.okx_place_orders else "✅ OKX paper order placement enabled",
+    ])
+
+
+def _extract_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    for line in str(text or "").splitlines():
+        for token in line.strip().split():
+            if token.startswith("/"):
+                commands.append(token.split("@", 1)[0])
+                break
+    return commands
+
+
+def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
         return offset
+
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
         offset = int(update.get("update_id", 0)) + 1
         message = update.get("message") or update.get("channel_post") or {}
-        text = str(message.get("text") or "").strip().split()[0]
-        if not text.startswith("/"):
+        text = str(message.get("text") or "")
+        commands = _extract_commands(text)
+        if not commands:
             continue
-        command = text.split("@", 1)[0]
-        if command in ("/start", "/help"):
-            reply = result.get("help") or "OKX Long Bot is running."
-        elif command == "/mood":
-            reply = result.get("mode_message", "No mode yet")
-        elif command == "/help_execution":
-            reply = result.get("help_execution", "")
-        elif command == "/help_normal":
-            reply = result.get("help_normal", "")
-        else:
-            reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v119 بعد."
-        sender.send_message(reply)
+
+        for command in commands:
+            if command in ("/start", "/help"):
+                reply = result.get("help") or "OKX Long Bot is running."
+            elif command == "/status":
+                reply = _build_fast_status(result, settings)
+            elif command == "/mood":
+                reply = result.get("mode_message", "No mode yet")
+            elif command == "/help_execution":
+                reply = result.get("help_execution", "")
+            elif command == "/help_normal":
+                reply = result.get("help_normal", "")
+            else:
+                reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v120 بعد."
+            sender.send_message(reply)
     return offset
 
 
@@ -234,7 +277,7 @@ def live_worker() -> None:
     telegram_offset: int | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v119 started",
+        "✅ OKX Long Bot v120 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
@@ -253,13 +296,23 @@ def live_worker() -> None:
                 if settings.send_mode_status_each_scan:
                     sender.send_message(result.get("mode_message", ""))
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None)
-                telegram_offset = _answer_commands(sender, result, telegram_offset)
+                telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
         except Exception as exc:
             error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
             print(error_text, flush=True)
             if sender.enabled and settings.telegram_enabled:
                 sender.send_message(error_text)
-        time.sleep(max(30, int(settings.scan_interval_seconds)))
+
+        # Keep Telegram commands responsive during the scan wait window.
+        # Instead of sleeping 15 minutes in one block, poll commands every few seconds.
+        wait_until = time.time() + max(30, int(settings.scan_interval_seconds))
+        while time.time() < wait_until:
+            if sender.enabled and settings.telegram_enabled:
+                try:
+                    telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
+                except Exception as exc:
+                    print(f"telegram command polling error: {exc}", flush=True)
+            time.sleep(3)
 
 
 if __name__ == "__main__":
