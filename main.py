@@ -86,9 +86,22 @@ def _build_snapshot(ranked_pairs) -> MarketSnapshot:
 
 
 def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protection: dict) -> dict:
+    """Build display context for /mood and reminders.
+
+    v127 keeps all details but passes numeric Market Mix fields separately so
+    the UI can format them safely. This also avoids text like avg=21.03% when
+    the raw source was an OKX reference price rather than a percent.
+    """
+    avg15m = float(snapshot.avg_change_15m or 0.0)
+    red_ratio_pct = float(snapshot.red_ratio_15m or 0.0) * 100.0
+    strong_coins = int(snapshot.strong_coins_count or 0)
     return {
-        "market_mix": f"avg={snapshot.avg_change_15m:.2f}% | strong={snapshot.strong_coins_count} | red={snapshot.red_ratio_15m:.0%}",
-        "market_state": f"strong_coins={snapshot.strong_coins_count} | avg15m={snapshot.avg_change_15m:.2f}% | red_ratio={snapshot.red_ratio_15m:.2f}",
+        "mode": state.mode,
+        "strong_coins": strong_coins,
+        "red_ratio": red_ratio_pct,
+        "avg15m": avg15m,
+        "market_mix": f"Strong Coins: {strong_coins} | Red Ratio: {red_ratio_pct:.0f}% | Avg 15m Move: {avg15m:.2f}%",
+        "market_state": f"strong_coins={strong_coins} | avg15m={avg15m:.2f}% | red_ratio={red_ratio_pct:.0f}%",
         "trigger": "fast rebound" if state.mode == MODE_RECOVERY_LONG else ("risk-off breadth" if state.mode == MODE_BLOCK_LONGS else "balanced scan"),
         "mode_reason": "fast rebound path" if state.mode == MODE_RECOVERY_LONG else "core market breadth decision",
         "signal_rules": "normal signal first → execution later",
@@ -516,7 +529,7 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v125 started",
+        "✅ OKX Long Bot v127 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
