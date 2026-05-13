@@ -1,4 +1,4 @@
-"""OKX Long Bot clean rebuild v122 message/buttons worker.
+"""OKX Long Bot clean rebuild v125 mode-guard/report-style worker.
 
 Preserved design:
 - main.py orchestrates only
@@ -33,10 +33,12 @@ from tracking.open_trades_updater import update_open_trades
 from reporting.report_router import build_report_bundle, build_command_outputs
 from reporting.help_menus import (
     build_main_menu_layout,
-    build_main_reply_keyboard,
+    build_main_inline_keyboard,
     build_execution_help,
     build_normal_help,
     build_master_help,
+    build_okx_control_help,
+    build_admin_help,
 )
 from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
@@ -83,24 +85,80 @@ def _build_snapshot(ranked_pairs) -> MarketSnapshot:
     )
 
 
-def _build_mode_message(state: MarketModeState, snapshot: MarketSnapshot, protection: dict) -> str:
-    return build_market_mode_sections(
-        state.mode,
-        {
-            "market_mix": f"avg={snapshot.avg_change_15m:.2f}% | strong={snapshot.strong_coins_count} | red={snapshot.red_ratio_15m:.0%}",
-            "market_state": f"strong_coins={snapshot.strong_coins_count} | avg15m={snapshot.avg_change_15m:.2f}% | red_ratio={snapshot.red_ratio_15m:.2f}",
-            "trigger": "fast rebound" if state.mode == MODE_RECOVERY_LONG else ("risk-off breadth" if state.mode == MODE_BLOCK_LONGS else "balanced scan"),
-            "mode_reason": "fast rebound path" if state.mode == MODE_RECOVERY_LONG else "core market breadth decision",
-            "signal_rules": "normal signal first → execution later",
-            "requirements": "quality up" if state.mode != MODE_NORMAL_LONG else "balanced normal scanning",
-            "execution_notes": "whitelist / elite / recovery / block-exception",
-            "protection_current": protection.get("current", "inactive"),
-            "protection_next": protection.get("next", "inactive"),
-            "remaining_minutes": protection.get("remaining_minutes", 0),
-            "recovery_remaining": recovery_slots_remaining(state),
-        },
-        variant="status",
+def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protection: dict) -> dict:
+    return {
+        "market_mix": f"avg={snapshot.avg_change_15m:.2f}% | strong={snapshot.strong_coins_count} | red={snapshot.red_ratio_15m:.0%}",
+        "market_state": f"strong_coins={snapshot.strong_coins_count} | avg15m={snapshot.avg_change_15m:.2f}% | red_ratio={snapshot.red_ratio_15m:.2f}",
+        "trigger": "fast rebound" if state.mode == MODE_RECOVERY_LONG else ("risk-off breadth" if state.mode == MODE_BLOCK_LONGS else "balanced scan"),
+        "mode_reason": "fast rebound path" if state.mode == MODE_RECOVERY_LONG else "core market breadth decision",
+        "signal_rules": "normal signal first → execution later",
+        "requirements": "quality up" if state.mode != MODE_NORMAL_LONG else "balanced normal scanning",
+        "execution_notes": "whitelist / elite / recovery / block-exception",
+        "protection_current": protection.get("current", "inactive"),
+        "protection_next": protection.get("next", "inactive"),
+        "remaining_minutes": protection.get("remaining_minutes", 0),
+        "recovery_remaining": recovery_slots_remaining(state),
+    }
+
+
+def _build_mode_message(state: MarketModeState, snapshot: MarketSnapshot, protection: dict, variant: str = "status", reminder_count: int = 1) -> str:
+    context = _build_mode_context(state, snapshot, protection)
+    if variant == "reminder":
+        minutes_in_mode = int((datetime.now(timezone.utc) - state.changed_at).total_seconds() // 60)
+        context.update({"reminder_count": reminder_count, "minutes_in_mode": minutes_in_mode})
+    return build_market_mode_sections(state.mode, context, variant=variant)
+
+
+def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot) -> dict:
+    """Update only the mode-related fields after a lightweight Market Mode Guard run.
+
+    This avoids a full pair scan/signal rebuild while keeping /mood, /status,
+    reminders, and logs aligned with fast BTC/breadth risk changes.
+    """
+    protection = block_protection_status(state)
+    result["state"] = state
+    result["mode"] = state.mode
+    result["mode_context"] = _build_mode_context(state, snapshot, protection)
+    result["mode_message"] = _build_mode_message(state, snapshot, protection)
+    result["block_alert_preview"] = (
+        build_block_escalation_alert(
+            state,
+            affected=len(result.get("trades", [])),
+            protected=sum(1 for t in result.get("trades", []) if getattr(t, "pnl_pct", 0) > 0),
+            tightened=sum(1 for t in result.get("trades", []) if getattr(t, "tp2_hit", False)),
+        )
+        if state.mode == MODE_BLOCK_LONGS else None
     )
+    return result
+
+
+def _run_market_mode_guard(
+    sender: TelegramSender,
+    result: dict,
+    settings: Settings,
+    state: MarketModeState | None,
+    reminder_tracker: dict,
+) -> MarketModeState | None:
+    """Fast mode-only guard.
+
+    Full Scan remains on SCAN_INTERVAL_SECONDS. This guard runs between full scans
+    and checks only lightweight ticker breadth/BTC risk so NORMAL can move to
+    STRONG/BLOCK faster during sudden market weakness without rescanning all
+    signal logic or touching scoring/filters.
+    """
+    if state is None:
+        return state
+    tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
+    ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
+    snapshot = _build_snapshot(ranked_pairs)
+    previous_mode = state.mode
+    guarded_state = decide_market_mode(snapshot, previous=state)
+    _refresh_mode_outputs(result, guarded_state, snapshot)
+    if guarded_state.mode != previous_mode:
+        # Reset reminder state on transition so the next reminder starts from #1.
+        reminder_tracker.clear()
+        sender.send_message(result.get("mode_message", ""))
+    return guarded_state
 
 
 def run_once(previous_state: MarketModeState | None = None, settings: Settings | None = None) -> dict:
@@ -135,12 +193,13 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
                 recovery_remaining = recovery_slots_remaining(state)
         signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
         execution_results.append(exec_result)
-        trades.append(register_trade(signal))
+        trades.append(register_trade(signal, exec_result))
 
     price_map = {pair.symbol: pair.last_price * (1.012 if "momentum" in pair.tags else 0.996) for pair in ranked_pairs[:20]}
     protection = block_protection_status(state)
     trades = update_open_trades(trades, price_map, protection_level=protection.get("level", 0))
     mode_message = _build_mode_message(state, snapshot, protection)
+    mode_context = _build_mode_context(state, snapshot, protection)
     reports = build_report_bundle(trades, execution_results, signal_items)
     command_outputs = build_command_outputs(trades, execution_results, signal_items)
 
@@ -150,7 +209,8 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         "mode_message": mode_message,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "menu_keyboard": build_main_reply_keyboard(),
+        "menu_keyboard": build_main_inline_keyboard(),
+        "mode_context": mode_context,
         "help": build_master_help(
             mode=state.mode,
             execution_enabled=settings.execution_enabled,
@@ -222,7 +282,8 @@ def _build_fast_status(result: dict, settings: Settings) -> str:
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
-        f"⏱ Scan Interval: {settings.scan_interval_seconds}s",
+        f"⏱ Full Scan: {settings.scan_interval_seconds}s",
+        f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         "",
         "🧠 آخر حالة تنفيذ:",
         f"{rejection_reason}",
@@ -241,24 +302,48 @@ def _extract_commands(text: str) -> list[str]:
     return commands
 
 
-def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict) -> None:
+def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None) -> None:
+    parse_mode = "HTML" if "<b>" in str(text or "") else None
+    sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None) -> None:
     callback_id = str(callback_query.get("id") or "")
     data = str(callback_query.get("data") or "")
     if callback_id:
-        sender.answer_callback_query(callback_id, "Tracking opened")
+        sender.answer_callback_query(callback_id, "Opened")
 
-    if not data.startswith("track:"):
+    if data.startswith("track:"):
+        symbol = data.split(":", 1)[1]
+        for item in result.get("signal_items", []):
+            signal = item.get("signal")
+            if signal and signal.symbol == symbol:
+                sender.send_message(build_track_message(signal, item.get("execution")))
+                return
+        sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan.")
         return
 
-    symbol = data.split(":", 1)[1]
-    for item in result.get("signal_items", []):
-        signal = item.get("signal")
-        if signal and signal.symbol == symbol:
-            sender.send_message(build_track_message(signal, item.get("execution")))
-            return
+    if data.startswith("menu:"):
+        key = data.split(":", 1)[1]
+        if key == "execution":
+            _send_text(sender, result.get("help_execution", ""))
+        elif key == "normal":
+            _send_text(sender, result.get("help_normal", ""))
+        elif key == "okx_control":
+            _send_text(sender, build_okx_control_help())
+        elif key == "admin":
+            _send_text(sender, build_admin_help())
+        elif key == "system_info":
+            _send_text(sender, _build_fast_status(result, settings or get_settings()))
+        else:
+            sender.send_message("القسم غير متاح حاليًا.")
+        return
 
-    sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan.")
-
+    if data.startswith("cmd:"):
+        command = data.split(":", 1)[1]
+        reply = result.get("command_outputs", {}).get(command) or "الأمر غير متاح في هذه النسخة."
+        _send_text(sender, reply)
+        return
 
 def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
@@ -270,7 +355,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         offset = int(update.get("update_id", 0)) + 1
         callback_query = update.get("callback_query")
         if callback_query:
-            _handle_callback_query(sender, result, callback_query)
+            _handle_callback_query(sender, result, callback_query, settings)
             continue
 
         message = update.get("message") or update.get("channel_post") or {}
@@ -310,6 +395,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         for command in commands:
             if command in ("/start", "/help"):
                 reply = result.get("help") or "OKX Long Bot is running."
+                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
                 sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
                 continue
             elif command == "/status":
@@ -322,8 +408,92 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = result.get("help_normal", "")
             else:
                 reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v123 بعد."
-            sender.send_message(reply)
+            _send_text(sender, reply)
     return offset
+
+
+
+def _block_protection_alert_for_level(level: int, affected: int = 0, protected: int = 0, tightened: int = 0) -> str:
+    if level <= 1:
+        return "\n".join([
+            "🛡 متابعة حماية البلوك",
+            "┄┄┄┄┄┄┄┄",
+            "🟡 المستوى 1 — مراقبة فقط",
+            f"📊 الصفقات المتأثرة: {affected}",
+            "⚙️ الإجراء: مراقبة بدون تعديل SL أو trailing",
+            "⏭ Soft Protection بعد ~15m إذا استمر BLOCK_LONGS",
+        ])
+    if level == 2:
+        return "\n".join([
+            "🛡 تفعيل حماية البلوك",
+            "┄┄┄┄┄┄┄┄",
+            "🟠 المستوى 2 — حماية مرنة",
+            f"📊 الصفقات المتأثرة: {affected}",
+            f"✅ الأرباح المحمية: {protected}",
+            f"🔧 Runners تحت حماية أخف: {tightened}",
+            "⚪ الصفقات السلبية ما زالت على SL الأصلي",
+            "⚙️ الإجراء: حماية الأرباح الحالية بدون إغلاق عشوائي",
+            "⏭ Defensive Protection بعد ~10m إذا استمر BLOCK_LONGS",
+        ])
+    return "\n".join([
+        "🛡 تصعيد حماية البلوك",
+        "┄┄┄┄┄┄┄┄",
+        "🔴 المستوى 3 — حماية دفاعية",
+        f"📊 الصفقات المتأثرة: {affected}",
+        f"✅ الأرباح المحمية: {protected}",
+        f"🔧 Runners تحت حماية مشددة: {tightened}",
+        "⚪ الصفقات السلبية ما زالت على SL الأصلي",
+        "⚙️ الإجراء: حماية دفاعية بدون إغلاق عشوائي",
+        "✅ أقصى مستوى حماية مفعل",
+    ])
+
+
+def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict) -> None:
+    state = result.get("state")
+    if not state:
+        return
+    mode = state.mode
+    now = datetime.now(timezone.utc)
+    changed_at = state.changed_at
+    minutes_in_mode = int((now - changed_at).total_seconds() // 60)
+
+    if tracker.get("mode") != mode or tracker.get("changed_at") != changed_at:
+        tracker.clear()
+        tracker.update({"mode": mode, "changed_at": changed_at, "general_sent": 0, "block_levels_sent": set()})
+
+    protection = block_protection_status(state, now=now)
+
+    if mode == MODE_BLOCK_LONGS:
+        thresholds = [(15, 1), (30, 2), (40, 3)]
+        for threshold, level in thresholds:
+            if minutes_in_mode >= threshold and level not in tracker["block_levels_sent"]:
+                tracker["block_levels_sent"].add(level)
+                context = dict(result.get("mode_context", {}))
+                context.update({
+                    "reminder_count": level,
+                    "minutes_in_mode": minutes_in_mode,
+                    "protection_current": f"LEVEL {level} — " + ("Monitor Only" if level == 1 else "Soft Protection" if level == 2 else "Defensive Protection"),
+                    "protection_next": "Soft Protection" if level == 1 else "Defensive Protection" if level == 2 else "Max protection active",
+                    "remaining_minutes": 15 if level == 1 else 10 if level == 2 else 0,
+                })
+                sender.send_message(build_market_mode_sections(mode, context, variant="reminder"))
+                trades = result.get("trades", [])
+                sender.send_message(_block_protection_alert_for_level(
+                    level,
+                    affected=len(trades),
+                    protected=sum(1 for t in trades if getattr(t, "pnl_pct", 0) > 0),
+                    tightened=sum(1 for t in trades if getattr(t, "tp2_hit", False)),
+                ))
+                break
+        return
+
+    # Normal / Strong / Recovery: compact reminder every 30 minutes while same mode continues.
+    expected_count = minutes_in_mode // 30
+    if expected_count > tracker.get("general_sent", 0):
+        tracker["general_sent"] = expected_count
+        context = dict(result.get("mode_context", {}))
+        context.update({"reminder_count": expected_count, "minutes_in_mode": minutes_in_mode})
+        sender.send_message(build_market_mode_sections(mode, context, variant="reminder"))
 
 
 def live_worker() -> None:
@@ -341,13 +511,15 @@ def live_worker() -> None:
     state: MarketModeState | None = None
     sent_fingerprints: set[str] = set()
     telegram_offset: int | None = None
+    reminder_tracker: dict = {}
+    next_mode_guard_ts: float = 0.0
 
     startup_lines = [
-        "✅ OKX Long Bot v122 started",
+        "✅ OKX Long Bot v125 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
-        f"Scan interval: {settings.scan_interval_seconds}s",
+        f"Full scan: {settings.scan_interval_seconds}s | Mode guard: {settings.market_mode_guard_interval_seconds}s",
     ]
     print("\n".join(startup_lines), flush=True)
     if sender.enabled and settings.telegram_enabled:
@@ -361,6 +533,8 @@ def live_worker() -> None:
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     sender.send_message(result.get("mode_message", ""))
+                next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
+                _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None)
                 telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
         except Exception as exc:
@@ -375,6 +549,11 @@ def live_worker() -> None:
         while time.time() < wait_until:
             if sender.enabled and settings.telegram_enabled:
                 try:
+                    now_ts = time.time()
+                    if now_ts >= next_mode_guard_ts:
+                        state = _run_market_mode_guard(sender, result, settings, state, reminder_tracker)
+                        next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
+                    _maybe_send_mode_reminder(sender, result, reminder_tracker)
                     telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
                 except Exception as exc:
                     print(f"telegram command polling error: {exc}", flush=True)
