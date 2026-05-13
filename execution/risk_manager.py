@@ -142,14 +142,95 @@ def _load_open_execution_trades_from_tracking(redis_client) -> list:
     return trades
 
 
+def _is_block_exception_candidate(candidate: dict) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    mode = str(candidate.get("current_mode") or candidate.get("market_mode") or candidate.get("mode") or "").upper()
+    path = str(candidate.get("execution_path") or candidate.get("execution_gate_path") or "").lower()
+    return bool(
+        candidate.get("block_exception")
+        or candidate.get("block_longs_execution_candidate")
+        or candidate.get("block_exception_direct_execution")
+        or path == "block_exception"
+        or "block_exception" in path
+        or mode == "BLOCK_LONGS"
+    )
+
+
+def _is_block_exception_trade(trade: dict) -> bool:
+    if not isinstance(trade, dict):
+        return False
+    diag = trade.get("diagnostics", {}) or {}
+    path = str(trade.get("execution_path") or diag.get("execution_path") or trade.get("execution_gate_path") or diag.get("execution_gate_path") or "").lower()
+    return bool(
+        trade.get("block_exception")
+        or diag.get("block_exception")
+        or trade.get("block_longs_execution_candidate")
+        or diag.get("block_longs_execution_candidate")
+        or trade.get("block_exception_direct_execution")
+        or diag.get("block_exception_direct_execution")
+        or path == "block_exception"
+        or "block_exception" in path
+    )
+
+
+def _configured_block_exception_max_open() -> int:
+    try:
+        return int(os.getenv("BLOCK_EXCEPTION_MAX_OPEN_TRADES", "3"))
+    except Exception:
+        return 3
+
+
+def _load_block_exception_states(redis_client) -> list:
+    """Fallback: read lightweight execution states when tracking has not registered yet."""
+    out = []
+    if redis_client is None:
+        return out
+    try:
+        for key in redis_client.scan_iter("exec:state:*"):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = ast.literal_eval(str(raw)) if str(raw).strip().startswith("{") else {}
+            if isinstance(data, dict) and _is_block_exception_trade(data):
+                out.append(data)
+    except Exception:
+        return []
+    return out
+
+
 def count_counted_execution_trades(redis_client) -> int:
+    """General execution slot count.
+
+    BLOCK_LONGS exception trades have their own independent 3-open pool,
+    so they do not consume the normal execution slots. TP2 runners do not count.
+    """
     trades = _load_open_execution_trades_from_tracking(redis_client)
     if trades:
-        return sum(1 for t in trades if not _is_tp2_protected_runner(t))
+        return sum(1 for t in trades if (not _is_block_exception_trade(t)) and (not _is_tp2_protected_runner(t)))
     try:
+        # Fallback may include block exceptions in older state, but only used when tracking is unavailable.
         return int(count_active_execution_trades(redis_client))
     except Exception:
         return 0
+
+
+def count_active_block_exception_trades(redis_client) -> int:
+    """Count active BLOCK_LONGS exception trades before TP2 only.
+
+    Business rule: max 3 open block-exception trades. Once TP2 is reached,
+    the trade is treated as out of the block-exception slot count even if its runner remains open.
+    """
+    trades = _load_open_execution_trades_from_tracking(redis_client)
+    if trades:
+        return sum(1 for t in trades if _is_block_exception_trade(t) and not _is_tp2_protected_runner(t))
+    states = _load_block_exception_states(redis_client)
+    return sum(1 for t in states if not _is_tp2_protected_runner(t))
 
 
 def is_symbol_blocking_execution_dynamic(redis_client, symbol: str) -> bool:
@@ -164,6 +245,24 @@ def is_symbol_blocking_execution_dynamic(redis_client, symbol: str) -> bool:
         return bool(is_symbol_blocking_execution(redis_client, symbol))
     except Exception:
         return False
+
+
+def is_symbol_blocking_block_exception(redis_client, symbol: str) -> bool:
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return False
+    trades = _load_open_execution_trades_from_tracking(redis_client)
+    if trades:
+        for t in trades:
+            if not _is_block_exception_trade(t):
+                continue
+            if str(t.get("symbol") or "").upper().strip() == symbol and not _is_tp2_protected_runner(t):
+                return True
+        return False
+    for t in _load_block_exception_states(redis_client):
+        if str(t.get("symbol") or "").upper().strip() == symbol and not _is_tp2_protected_runner(t):
+            return True
+    return False
 
 
 def _candidate_score(candidate: dict) -> float:
@@ -193,6 +292,50 @@ def can_execute_trade(redis_client, symbol: str, candidate: dict, market_mode: s
     # No score/risk/market-mode block here: main.py already decided the signal is an Execution Candidate.
 
     position_plan = _build_dynamic_position_plan(redis_client)
+
+    # BLOCK_LONGS exceptions use an independent pool, not the normal daily/general execution slots.
+    # They still respect execution enabled/mode, manual pause/Daily DD handled in main.py,
+    # same-symbol-before-TP2, and a dedicated max of 3 active block exceptions.
+    if _is_block_exception_candidate(candidate):
+        max_positions = _configured_block_exception_max_open()
+        active_count = count_active_block_exception_trades(redis_client)
+        remaining_slots = max(0, max_positions - active_count)
+        block_plan = dict(position_plan or {})
+        block_plan.update({
+            "max_positions": max_positions,
+            "pool": "block_exception",
+            "independent_from_general_execution_slots": True,
+        })
+        if is_symbol_blocking_block_exception(redis_client, symbol):
+            return {
+                "allowed": False,
+                "reason": "same_symbol_open",
+                "active_count": active_count,
+                "max_positions": max_positions,
+                "remaining_slots": remaining_slots,
+                "position_plan": block_plan,
+                "block_exception_pool": True,
+            }
+        if active_count >= max_positions:
+            return {
+                "allowed": False,
+                "reason": "block_exception_max_open_reached",
+                "active_count": active_count,
+                "max_positions": max_positions,
+                "remaining_slots": 0,
+                "position_plan": block_plan,
+                "block_exception_pool": True,
+            }
+        return {
+            "allowed": True,
+            "reason": "ok_block_exception_pool",
+            "active_count": active_count,
+            "max_positions": max_positions,
+            "remaining_slots": remaining_slots,
+            "position_plan": block_plan,
+            "block_exception_pool": True,
+        }
+
     max_positions = int(position_plan.get("max_positions", _configured_max_positions(redis_client)))
     active_count = count_counted_execution_trades(redis_client)
     remaining_slots = max(0, max_positions - active_count)
