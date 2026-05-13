@@ -3363,6 +3363,25 @@ NORMAL_LONG_EXECUTION_EXTRA_WHITELIST = {
     "liquidity_sweep_reclaim",
 }
 
+# v09: One canonical set for execution-candidate preservation.
+# These are not new detectors; they are the same tags already used by the
+# alert Tag Badge / whitelist / strong setup system. The purpose is to stop
+# pre-execution momentum/ranking gates from treating strong tagged signals
+# as plain normal-only alerts.
+EXECUTION_CORE_TAGS = set(EXECUTION_SETUP_WHITELIST) | set(STRONG_ONLY_ALLOWED_SETUPS) | {
+    "vwap_reclaim",
+    "retest_breakout_confirmed",
+    "relative_strength_vs_btc",
+    "higher_low_continuation",
+    "support_bounce_confirmed",
+    "liquidity_sweep_reclaim",
+    "failed_breakdown_trap",
+    "recovery_long",
+    "recovery_scout",
+    "post_crash",
+    "block_exception",
+}
+
 
 def _normalize_execution_tag(value) -> str:
     """Normalize setup/context tags for execution whitelist matching."""
@@ -3469,6 +3488,22 @@ def _ensure_execution_setup_tags(candidate: dict) -> dict:
         return candidate
     except Exception:
         return candidate
+
+
+def _has_core_execution_tag(data: dict) -> bool:
+    """True when the candidate already carries a known execution/core setup tag.
+
+    This does not create a new signal. It only preserves candidates whose existing
+    Tag Badge / detector tags are already part of the execution universe.
+    """
+    try:
+        if not isinstance(data, dict):
+            return False
+        _ensure_execution_setup_tags(data)
+        tags = {_normalize_execution_tag(x) for x in (data.get("execution_setup_tags") or [])}
+        return bool(tags & {_normalize_execution_tag(x) for x in EXECUTION_CORE_TAGS})
+    except Exception:
+        return False
 
 
 def _has_strict_execution_setup(data: dict) -> bool:
@@ -9285,9 +9320,11 @@ def apply_top_momentum_filter(candidates):
             "entry_timing", "entry_maturity", "entry_maturity_label", "wave_label", "fib_position"
         )).lower()
         hard_late_or_danger = any(token in entry_text for token in (
-            "danger", "danger_late", "hard_late", "overextended", "wave_5",
-            "متأخر جدًا", "موجة خامسة", "نهاية الحركة"
+            "danger", "danger_late", "hard_late", "overextended"
         ))
+        # v09: Arabic late labels like "متأخر جدًا" / "موجة خامسة" are common in
+        # winning continuation data. Do not let them alone remove a strong tagged
+        # execution candidate from the ranking pool. True danger/hard_late still blocks.
         if hard_late_or_danger:
             return False
 
@@ -10261,28 +10298,36 @@ def format_entry_maturity_block(entry_maturity_data: dict) -> str:
 # =====================
 def _candidate_has_complete_execution_plan(candidate: dict) -> bool:
     try:
-        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
-        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
-        if has_pullback:
-            required = (candidate.get("execution_entry"), candidate.get("execution_sl"), candidate.get("execution_tp1"))
-            return all(_safe_trade_float_value(v) is not None for v in required)
-        # Market execution can use the normal signal plan.
-        required = (candidate.get("entry"), candidate.get("sl"), candidate.get("tp1"))
+        candidate = _apply_market_execution_fallback(candidate)
+        # Existing signal/execution plan is enough for preview; TP2 may be absent in
+        # some legacy snapshots but entry/SL/TP1 must be valid.
+        required = (candidate.get("execution_entry"), candidate.get("execution_sl"), candidate.get("execution_tp1"))
         return all(_safe_trade_float_value(v) is not None for v in required)
     except Exception:
         return False
 
 
 def _apply_market_execution_fallback(candidate: dict) -> dict:
-    """Fill execution_* for market entries so preview/report never shows None."""
+    """Fill execution_* from the existing signal plan when missing.
+
+    v09: this applies to both market and pending-pullback candidates. In several
+    strong normal signals the alert displayed a valid Pending Pullback plan, but
+    execution_* was partially empty, causing the execution badge/gate to fail before
+    the candidate reached executor/risk_manager. The signal plan is already
+    validated later, so using it as a fallback preserves the same route without
+    inventing new TP/SL logic.
+    """
     try:
-        entry_mode = str(candidate.get("entry_mode", "market") or "market").lower()
-        has_pullback = bool(candidate.get("has_pullback_plan")) or entry_mode in ("pullback_pending", "pullback_triggered")
-        if not has_pullback:
-            candidate["execution_entry"] = candidate.get("execution_entry") or candidate.get("recommended_entry") or candidate.get("market_entry") or candidate.get("entry")
-            candidate["execution_sl"] = candidate.get("execution_sl") or candidate.get("sl")
-            candidate["execution_tp1"] = candidate.get("execution_tp1") or candidate.get("tp1")
-            candidate["execution_tp2"] = candidate.get("execution_tp2") or candidate.get("tp2")
+        candidate["execution_entry"] = (
+            candidate.get("execution_entry")
+            or candidate.get("recommended_entry")
+            or candidate.get("pullback_entry")
+            or candidate.get("market_entry")
+            or candidate.get("entry")
+        )
+        candidate["execution_sl"] = candidate.get("execution_sl") or candidate.get("sl")
+        candidate["execution_tp1"] = candidate.get("execution_tp1") or candidate.get("tp1")
+        candidate["execution_tp2"] = candidate.get("execution_tp2") or candidate.get("tp2")
         return candidate
     except Exception:
         return candidate
@@ -10310,8 +10355,13 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             or MODE_NORMAL_LONG
         )
         strict_setup_allowed = _has_strict_execution_setup(planned)
+        core_tag_allowed = _has_core_execution_tag(planned)
         if mode == MODE_NORMAL_LONG and not strict_setup_allowed:
-            strict_setup_allowed = _has_normal_long_execution_setup(planned)
+            strict_setup_allowed = _has_normal_long_execution_setup(planned) or core_tag_allowed
+        elif mode == MODE_STRONG_LONG_ONLY and core_tag_allowed:
+            # Keep the existing strong/elite gate, but do not lose a candidate just
+            # because the tag was displayed via the unified Tag Badge source.
+            strict_setup_allowed = True
         block_mode_allowed = _is_block_mode_execution_candidate(planned)
         has_complete_plan = _candidate_has_complete_execution_plan(planned)
 
@@ -14668,6 +14718,7 @@ def run_scanner_loop():
                             or breakout
                             or primary_extra_setup
                             or bool(extra_setup_names)
+                            or bool(set(early_execution_setup_tags or []) & {_normalize_execution_tag(x) for x in EXECUTION_CORE_TAGS})
                         )
                         and vol_ratio >= (1.00 if current_mode == MODE_STRONG_LONG_ONLY else 1.05)
                         and (mtf_confirmed or _pre_score_market_supportive)
@@ -17191,7 +17242,21 @@ def run_scanner_loop():
                         )
 
                     try:
+                        _ensure_execution_setup_tags(candidate)
+                        logger.info(
+                            "EXEC CANDIDATE CHECK | "
+                            f"symbol={symbol} | mode={candidate.get('market_mode') or candidate.get('current_mode')} | "
+                            f"tags={candidate.get('execution_setup_tags', [])} | "
+                            f"plan={_candidate_has_complete_execution_plan(candidate)} | "
+                            f"core_tag={_has_core_execution_tag(candidate)} | "
+                            f"strict={_has_strict_execution_setup(candidate)} | normal_extra={_has_normal_long_execution_setup(candidate)}"
+                        )
                         gate_decision = _decide_long_execution_candidate(candidate, mutate=True)
+                        logger.info(
+                            "EXEC GATE RESULT | "
+                            f"symbol={symbol} | allowed={gate_decision.get('allowed')} | "
+                            f"path={gate_decision.get('path')} | reason={gate_decision.get('reason')}"
+                        )
                         if not gate_decision.get("allowed"):
                             gate_reason = gate_decision.get("reason", "not_execution_candidate")
                             update_execution_status_for_candidate(candidate, "not_candidate", gate_reason, message_sent=False)
