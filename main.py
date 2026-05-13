@@ -1,4 +1,4 @@
-"""OKX Long Bot clean rebuild v120 fast Telegram commands worker.
+"""OKX Long Bot clean rebuild v122 message/buttons worker.
 
 Preserved design:
 - main.py orchestrates only
@@ -31,8 +31,14 @@ from execution.okx_trade_client import OKXTradeClient
 from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
 from reporting.report_router import build_report_bundle, build_command_outputs
-from reporting.help_menus import build_main_menu_layout, build_execution_help, build_normal_help, build_master_help
-from ui.telegram_signals import build_signal_message
+from reporting.help_menus import (
+    build_main_menu_layout,
+    build_main_reply_keyboard,
+    build_execution_help,
+    build_normal_help,
+    build_master_help,
+)
+from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 from services.telegram_sender import TelegramSender
 
@@ -144,7 +150,13 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         "mode_message": mode_message,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "help": build_master_help(),
+        "menu_keyboard": build_main_reply_keyboard(),
+        "help": build_master_help(
+            mode=state.mode,
+            execution_enabled=settings.execution_enabled,
+            risk_enabled=True,
+            okx_orders=settings.okx_place_orders,
+        ),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
         "signals": [item["message"] for item in signal_items[:8]],
@@ -188,7 +200,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 f"Simulated: {order_result.get('simulated')}",
                 f"Result: {order_result.get('reason') or order_result.get('response', {}).get('msg') or order_result.get('response', {}).get('code')}",
             ])
-        sender.send_message(text)
+        sender.send_message(text, reply_markup=build_signal_buttons(signal))
 
 
 def _build_fast_status(result: dict, settings: Settings) -> str:
@@ -229,6 +241,25 @@ def _extract_commands(text: str) -> list[str]:
     return commands
 
 
+def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict) -> None:
+    callback_id = str(callback_query.get("id") or "")
+    data = str(callback_query.get("data") or "")
+    if callback_id:
+        sender.answer_callback_query(callback_id, "Tracking opened")
+
+    if not data.startswith("track:"):
+        return
+
+    symbol = data.split(":", 1)[1]
+    for item in result.get("signal_items", []):
+        signal = item.get("signal")
+        if signal and signal.symbol == symbol:
+            sender.send_message(build_track_message(signal, item.get("execution")))
+            return
+
+    sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan.")
+
+
 def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
@@ -237,15 +268,50 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
         offset = int(update.get("update_id", 0)) + 1
+        callback_query = update.get("callback_query")
+        if callback_query:
+            _handle_callback_query(sender, result, callback_query)
+            continue
+
         message = update.get("message") or update.get("channel_post") or {}
         text = str(message.get("text") or "")
         commands = _extract_commands(text)
+        plain_text = text.strip()
+
+        # Reply-keyboard buttons from the approved /help dashboard.
+        if not commands and plain_text:
+            button_map = {
+                "🚀 Execution": "/help_execution",
+                "Execution": "/help_execution",
+                "📊 Normal Trades": "/help_normal",
+                "Normal Trades": "/help_normal",
+                "🧠🚀 Execution Intelligence": "/report_execution_intelligence",
+                "Exec Intelligence": "/report_execution_intelligence",
+                "🧠📊 Market Intelligence": "/report_intelligence",
+                "Market Intelligence": "/report_intelligence",
+                "💼 Wallet Impact": "/report_execution_wallet",
+                "Wallet Impact": "/report_execution_wallet",
+                "🧠 Diagnostics": "/report_diagnostics",
+                "Diagnostics": "/report_diagnostics",
+                "🤖 OKX Control": "/status",
+                "OKX Control": "/status",
+                "⚙️ Admin": "/status",
+                "Admin": "/status",
+                "📘 System Info": "/help",
+                "System Info": "/help",
+            }
+            mapped = button_map.get(plain_text)
+            if mapped:
+                commands = [mapped]
+
         if not commands:
             continue
 
         for command in commands:
             if command in ("/start", "/help"):
                 reply = result.get("help") or "OKX Long Bot is running."
+                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
+                continue
             elif command == "/status":
                 reply = _build_fast_status(result, settings)
             elif command == "/mood":
@@ -255,7 +321,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/help_normal":
                 reply = result.get("help_normal", "")
             else:
-                reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v120 بعد."
+                reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v123 بعد."
             sender.send_message(reply)
     return offset
 
@@ -277,7 +343,7 @@ def live_worker() -> None:
     telegram_offset: int | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v120 started",
+        "✅ OKX Long Bot v122 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
