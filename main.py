@@ -10222,7 +10222,7 @@ def is_candidate_for_execution(candidate: dict) -> bool:
 
 
 # =====================
-# EXECUTION-ONLY LOSS REDUCTION TUNING (Final v02)
+# EXECUTION-ONLY LOSS REDUCTION TUNING (v02.1 Old Engine + Smart Soft Protection)
 # =====================
 def _execution_context_text(data: dict) -> str:
     """Collect market/setup context text for execution-only quality tuning."""
@@ -10289,12 +10289,16 @@ def _execution_has_breakout_confirmation(data: dict, tags: set = None) -> bool:
 
 
 def _apply_execution_loss_reduction_tuning(candidate: dict) -> dict:
-    """Execution-only conservative tuning based on live loss analytics.
+    """Execution-only v02.1 soft protection.
 
-    This is deliberately NOT a normal-signal filter:
-    - Normal Telegram alerts and tracking remain unchanged.
-    - The tuning only affects execution candidate eligibility / execution preview.
-    - No TP/SL, risk manager, market-mode, or whitelist content is changed.
+    Purpose:
+    - Restore the older execution engine behaviour that captured continuation,
+      bounce/recovery and runners.
+    - Keep only a light safety layer to reduce the worst losses without killing
+      execution candidates.
+    - This function intentionally stays inside the existing execution gate path;
+      it does not affect normal signals, scoring detectors, market modes,
+      whitelist/setup tags, risk manager, order builder, or tracking.
     """
     result = {"passed": True, "reason": "", "adjustments": []}
     try:
@@ -10314,70 +10318,134 @@ def _apply_execution_loss_reduction_tuning(candidate: dict) -> dict:
         has_rs = _execution_has_relative_strength(candidate, tags)
         has_breakout = _execution_has_breakout_confirmation(candidate, tags)
         is_recovery = bool(_trade_field(candidate, "is_recovery", False)) or "recovery_long" in tags or "recovery_scout" in tags
-        reasons = []
 
-        # 1) VWAP Reclaim inside mixed/risk-off was the clearest loss signature.
+        # Context strength: these are the same existing signals/tags, not new detectors.
+        strong_context = bool(
+            is_recovery
+            or has_rs
+            or has_breakout
+            or (mtf and vol_ratio >= 1.20)
+            or ("retest_breakout_confirmed" in tags and mtf)
+        )
+
+        ctx_text = _execution_context_text(candidate)
+        warnings_text = "|".join(str(x) for x in (
+            candidate.get("reasons", []),
+            candidate.get("warning_reasons", []),
+            candidate.get("warnings", []),
+            candidate.get("diagnostics", {}),
+        )).lower()
+        all_text = f"{ctx_text}|{warnings_text}"
+
+        score_now = _safe_trade_float_value(_trade_field(candidate, "effective_score", None), None)
+        if score_now is None:
+            score_now = _safe_trade_float_value(candidate.get("score", 0.0), 0.0) or 0.0
+        rsi_now = _safe_trade_float_value(_trade_field(candidate, "rsi_now", None), None)
+        if rsi_now is None:
+            rsi_now = _safe_trade_float_value(_trade_field(candidate, "rsi", None), None)
+        vwap_distance = _safe_trade_float_value(_trade_field(candidate, "vwap_distance", 0.0), 0.0) or 0.0
+        dist_ma = _safe_trade_float_value(_trade_field(candidate, "dist_ma", 0.0), 0.0) or 0.0
+
+        weak_rsi = any(token in all_text for token in ("rsi_momentum_weak", "rsi weak", "الزخم يضعف"))
+        macd_negative = any(token in all_text for token in ("macd_negative", "macd سلبي", "macd negative"))
+        near_resistance = any(token in all_text for token in ("near_resistance_before_tp1", "مقاومة قريبة قبل الهدف", "مقاومة قريبة جدًا"))
+        no_breakout = not has_breakout
+        weak_volume = vol_ratio > 0 and vol_ratio < 0.85
+        combo_weakness = bool(weak_rsi and macd_negative and no_breakout and weak_volume and not strong_context)
+        parabolic_extension = bool(
+            (rsi_now is not None and rsi_now >= 78 and vol_ratio >= 2.50)
+            or vwap_distance >= 3.20
+            or dist_ma >= 3.50
+        )
+
+        hard_reasons = []
+
+        # Keep risk-off defensive, but only hard-block plain reclaim/higher-low when
+        # there is no real strength/recovery/breakout support.
+        if is_risk_off and (is_vwap or is_higher_low) and not strong_context:
+            hard_reasons.append("hard_block_combo_weakness:risk_off_plain_reclaim_or_higher_low")
+
+        # Do not let single RSI/MACD/VWAP warnings kill execution. Only a true combo
+        # of weak momentum + no breakout + weak volume blocks the candidate.
+        if combo_weakness:
+            hard_reasons.append("hard_block_combo_weakness:momentum_no_breakout_weak_volume")
+
+        # Parabolic / extreme exhaustion remains a true protection case.
+        if parabolic_extension and not (is_recovery or has_rs or (has_breakout and mtf)):
+            hard_reasons.append("hard_block_combo_weakness:parabolic_or_extreme_extension")
+
+        # Near resistance is a hard block only when it is not backed by a strong
+        # breakout/RS/recovery context. Otherwise it remains a warning/soft issue.
+        if near_resistance and not strong_context:
+            hard_reasons.append("hard_block_combo_weakness:near_resistance_no_strength")
+
+        if hard_reasons:
+            result.update({"passed": False, "reason": ",".join(hard_reasons)})
+            candidate["execution_loss_tuning_blocked"] = True
+            candidate["execution_loss_tuning_reason"] = result["reason"]
+            candidate.setdefault("adjustments_log", []).append("hard_block_combo_weakness")
+            return result
+
+        # Soft protection only. The old engine stays alive: VWAP/Higher-Low/mid-move
+        # are allowed unless they hit the hard combo above.
+        soft_penalty = 0.0
+        soft_notes = []
+
         if is_vwap and (is_mixed or is_risk_off):
-            if not mtf:
-                reasons.append("vwap_reclaim_mixed_or_risk_off_mtf_no")
+            if is_risk_off:
+                soft_penalty += 0.05
+                soft_notes.append("v02_rollback_soft_allow:vwap_risk_off_strength_ok")
             else:
-                penalty = 0.25 if is_risk_off else 0.20
-                old_score = _safe_trade_float_value(_trade_field(candidate, "effective_score", None), None)
-                if old_score is None:
-                    old_score = _safe_trade_float_value(candidate.get("score", 0.0), 0.0) or 0.0
-                new_score = max(0.0, float(old_score) - penalty)
-                candidate["effective_score"] = round(new_score, 2)
-                candidate["score"] = round(new_score, 2)
-                adj = {
-                    "name": "execution_vwap_context_penalty",
-                    "penalty": -round(penalty, 2),
-                    "context": "risk_off" if is_risk_off else "mixed",
-                    "old_score": round(float(old_score), 2),
-                    "new_score": round(new_score, 2),
-                }
-                candidate.setdefault("execution_quality_adjustments", []).append(adj)
-                candidate.setdefault("adjustments_log", []).append("execution_vwap_context_penalty")
-                result["adjustments"].append(adj)
+                soft_notes.append("v02_rollback_soft_allow:vwap_mixed_allowed")
 
-        # 2) Risk-off execution tightening: only clear RS/recovery/breakout strength is allowed.
-        if is_risk_off and (is_vwap or is_higher_low) and not (has_rs or is_recovery or (has_breakout and mtf and vol_ratio >= 1.20)):
-            reasons.append("risk_off_plain_reclaim_or_higher_low")
+        if is_higher_low:
+            if not strong_context:
+                soft_penalty += 0.05
+                soft_notes.append("soft_penalty_only:higher_low_light_confirmation_gap")
+            else:
+                soft_notes.append("v02_rollback_soft_allow:higher_low_context_ok")
 
-        # 3) Higher Low execution needs existing confirmation; no new detector/filter is added.
-        if is_higher_low and not (has_rs or has_breakout or (vol_ratio >= 1.35 and mtf)):
-            reasons.append("higher_low_needs_rs_breakout_or_vol_high_mtf")
-
-        # 4) Mid-move execution gets only a light execution score penalty.
         if is_mid_move:
-            penalty = 0.15
-            old_score = _safe_trade_float_value(_trade_field(candidate, "effective_score", None), None)
-            if old_score is None:
-                old_score = _safe_trade_float_value(candidate.get("score", 0.0), 0.0) or 0.0
-            new_score = max(0.0, float(old_score) - penalty)
+            # mid-move was a profitable continuation signature in the data, so do not
+            # reject it. If a pullback plan already exists, mark preference only.
+            if bool(candidate.get("has_pullback_plan")) or str(candidate.get("entry_mode", "")).lower() in ("pullback_pending", "pullback_triggered"):
+                soft_notes.append("pullback_first_instead_of_reject")
+            else:
+                soft_notes.append("soft_penalty_only:mid_move_allowed")
+                if not strong_context:
+                    soft_penalty += 0.05
+
+        if weak_rsi or macd_negative:
+            soft_notes.append("soft_penalty_only:rsi_macd_warning_not_blocking")
+
+        # Cap total penalty very low: the goal is ~10% loss reduction, not killing candidates.
+        soft_penalty = min(soft_penalty, 0.10)
+        if soft_penalty > 0:
+            old_score = float(score_now or 0.0)
+            new_score = max(0.0, old_score - soft_penalty)
             candidate["effective_score"] = round(new_score, 2)
             candidate["score"] = round(new_score, 2)
             adj = {
-                "name": "execution_mid_move_penalty",
-                "penalty": -0.15,
-                "old_score": round(float(old_score), 2),
+                "name": "execution_v02_1_soft_protection_penalty",
+                "penalty": -round(soft_penalty, 2),
+                "old_score": round(old_score, 2),
                 "new_score": round(new_score, 2),
             }
             candidate.setdefault("execution_quality_adjustments", []).append(adj)
-            candidate.setdefault("adjustments_log", []).append("execution_mid_move_penalty")
             result["adjustments"].append(adj)
 
-        if reasons:
-            result.update({"passed": False, "reason": ",".join(reasons)})
-            candidate["execution_loss_tuning_blocked"] = True
-            candidate["execution_loss_tuning_reason"] = result["reason"]
-        else:
-            candidate["execution_loss_tuning_blocked"] = False
-            candidate["execution_loss_tuning_reason"] = ""
+        if soft_notes:
+            for note in soft_notes:
+                candidate.setdefault("adjustments_log", []).append(note)
+            candidate.setdefault("execution_quality_notes", []).extend(soft_notes)
+
+        candidate["execution_loss_tuning_blocked"] = False
+        candidate["execution_loss_tuning_reason"] = ""
+        candidate["execution_loss_tuning_version"] = "v02_1_old_engine_soft_protection"
         return result
     except Exception as e:
         logger.warning(f"_apply_execution_loss_reduction_tuning error: {e}")
         return {"passed": True, "reason": "tuning_error_ignored", "adjustments": []}
-
 
 def _display_tag_label(tag: str) -> str:
     """Human-friendly short tag labels for Telegram badges."""
