@@ -1919,8 +1919,11 @@ def build_help_inline_keyboard() -> dict:
             {"text": "📊 Normal Trades", "callback_data": "help:normal"},
         ],
         [
-            {"text": "🧠 Exec Intelligence", "callback_data": "help:exec_intelligence"},
-            {"text": "🧠 Market Intelligence", "callback_data": "help:market_intelligence"},
+            {"text": "🧠🚀 Execution Intelligence", "callback_data": "help:exec_intelligence"},
+            {"text": "🧠📊 Market Intelligence", "callback_data": "help:market_intelligence"},
+        ],
+        [
+            {"text": "💼 Wallet Impact", "callback_data": "help:wallet"},
         ],
         [
             {"text": "🧠 Diagnostics", "callback_data": "help:diagnostics"},
@@ -16009,6 +16012,148 @@ def _market_reminder_mode_icon(mode: str) -> str:
 
 
 
+
+# =========================
+# MARKET MIX UI COMPAT HELPERS
+# =========================
+def detect_market_mix_profile(btc_mode: str = "", alt_snapshot: dict = None, market_guard: dict = None, market_info: dict = None) -> dict:
+    """Compatibility helper for the unified Market Mode UI.
+
+    v302 did not have the later Market Mix helper, so this builds a lightweight
+    profile from existing BTC/Alt/Market Guard fields. UI only: it does not
+    change mode decisions, scoring, execution, or filtering.
+    """
+    alt_snapshot = alt_snapshot or {}
+    market_guard = market_guard or {}
+    market_info = market_info or {}
+    try:
+        red_ratio = float(market_guard.get("red_ratio_15m", 0.0) or 0.0)
+        avg15m = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+        btc15m = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+    except Exception:
+        red_ratio, avg15m, btc15m = 0.0, 0.0, 0.0
+
+    alt_mode = str((alt_snapshot or {}).get("alt_mode") or "")
+    state_label = str((market_info or {}).get("market_state_label") or "")
+    bias_label = str((market_info or {}).get("market_bias_label") or "")
+
+    score = 0
+    if abs(btc15m) < 0.35:
+        score += 1
+    if 0.45 <= red_ratio <= 0.60:
+        score += 1
+    if abs(avg15m) < 0.35:
+        score += 1
+    if "mixed" in state_label.lower() or "مختلط" in state_label or "محايد" in alt_mode:
+        score += 1
+    if "ضعيف" in bias_label or "weak" in bias_label.lower():
+        score += 1
+    if red_ratio >= 0.68 or avg15m <= -0.75 or btc15m <= -0.45:
+        mix = "CHOPPY"
+        emoji = "🌪"
+        action = "🚫 weak mtf_no filtered"
+    elif score >= 2:
+        mix = "MIXED"
+        emoji = "🌗"
+        action = "⚠️ mtf_no يحتاج جودة أعلى"
+    else:
+        mix = "CLEAR"
+        emoji = "🌤"
+        action = "✅ القواعد العادية فعالة"
+    return {
+        "mix": mix,
+        "state": mix,
+        "label": mix,
+        "emoji": emoji,
+        "score": max(0, min(6, int(score))),
+        "score_max": 6,
+        "action": action,
+        "red_ratio": red_ratio,
+        "avg15m": avg15m,
+        "btc15m": btc15m,
+        "btc_mode": btc_mode,
+        "alt_mode": alt_mode,
+        "market_state_label": state_label,
+        "market_bias_label": bias_label,
+    }
+
+
+def _market_mix_line(profile: dict, compact: bool = False) -> str:
+    profile = profile or {}
+    emoji = profile.get("emoji") or "🌤"
+    mix = profile.get("mix") or profile.get("state") or profile.get("label") or "CLEAR"
+    action = profile.get("action") or "✅ القواعد العادية فعالة"
+    if compact:
+        return f"{emoji} <b>Mix:</b> {html.escape(str(mix))} | {html.escape(str(action))}"
+    score = profile.get("score", "")
+    max_score = profile.get("score_max", 6)
+    score_txt = f" | Score {score}/{max_score}" if score != "" else ""
+    return f"{emoji} <b>Market Mix:</b> {html.escape(str(mix))}{html.escape(score_txt)}\n{html.escape(str(action))}"
+
+
+def _mode_market_state_line(mode: str, profile: dict = None) -> str:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return "السوق تحت ضغط واضح — أولوية الحماية قبل أي دخول"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "السوق انتقائي — فرص الجودة العالية فقط"
+    if mode == MODE_RECOVERY_LONG:
+        return "السوق في ارتداد سريع بعد ضغط — Recovery محدود"
+    return "السوق قابل للتداول — القواعد العادية فعالة"
+
+
+def _market_breadth_line(profile: dict = None, market_guard: dict = None, alt_snapshot: dict = None) -> str:
+    profile = profile or {}
+    market_guard = market_guard or {}
+    try:
+        red_ratio = float(market_guard.get("red_ratio_15m", profile.get("red_ratio", 0.0)) or 0.0) * 100.0
+    except Exception:
+        red_ratio = 0.0
+    return f"🌐 Red Market: {red_ratio:.0f}%"
+
+
+def _mode_trigger_lines(mode: str, profile: dict = None) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• ضغط أو هبوط جماعي", "• Breadth ضعيف", "• حماية الصفقات لها الأولوية"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• سوق مختلط أو زخم غير كافٍ", "• فرص الجودة العالية فقط"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• خروج من ضغط/بلوك", "• ارتداد سريع يحتاج انتقاء"]
+    return ["• السوق مستقر نسبيًا", "• الإشارات العادية مسموحة"]
+
+
+def _mode_signal_rules_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• New longs paused", "• Strong exceptions only", "• Protection tightened on runners"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• Strong setups only", "• Score/Volume/MTF quality required", "• Execution uses whitelist quality filters"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• Recovery candidates only", "• Max 3 recovery trades", "• TP model 50/25/25"]
+    return ["• Normal signals allowed", "• Execution uses whitelist quality filters"]
+
+
+def _mode_requirements_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• لا دخولات جديدة إلا استثناء قوي", "• حماية الأرباح المفتوحة", "• مراقبة الخطر اللحظي"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return [f"• Score ≥ {STRONG_ONLY_MIN_SCORE}", f"• Volume ≥ {STRONG_ONLY_MIN_VOL_RATIO}", "• MTF أو setup قوي واضح"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• ارتداد سريع بعد ضغط", "• تأكيد BTC/Alts", "• حد أقصى 3 صفقات Recovery"]
+    return ["• Score ≥ 6.2", "• Volume confirmation preferred", "• MTF helpful"]
+
+
+def _mode_execution_notes_lines(mode: str) -> list:
+    mode = normalize_market_mode(mode)
+    if mode == MODE_BLOCK_LONGS:
+        return ["• Execution paused", "• Existing trades monitored", "• Protection escalation active"]
+    if mode == MODE_STRONG_LONG_ONLY:
+        return ["• Whitelist / quality filters active", "• Weak Drift may restrict weak execution"]
+    if mode == MODE_RECOVERY_LONG:
+        return ["• Recovery execution path", "• Not mixed with normal whitelist", "• TP2 removes from recovery slot count"]
+    return ["• Execution path active", "• Whitelist quality filters active"]
 
 def _block_protection_stage(reminder_count: int) -> dict:
     """Display/timing helper for BLOCK_LONGS protection escalation.
