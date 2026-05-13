@@ -1,7 +1,7 @@
 # tracking/performance.py
-# Version: performance_v64_tracking_report_state_fix
-# Base: performance_v63_recovery_pnl_support
-# Changes: fix central tracking/report state reconciliation so closed SL/TP trades cannot remain counted as open.
+# Version: performance_v65_tracking_report_state_fix_open_trades
+# Base: performance_v64_tracking_report_state_fix
+# Changes: fix missing report exit weights helper used by open trades reports after tracking state reconciliation.
 # Preserved: strategy logic, scoring, filters, execution, TP/SL levels, market modes.
 """
 وحدة تتبع الأداء والتقارير المالية لبوت OKX Scanner.
@@ -133,6 +133,55 @@ TP1_CLOSE_PCT = 40.0
 TP2_CLOSE_PCT = 40.0
 TRAILING_PCT = 2.5   # نسبة التراجع للـ trailing stop بعد TP2 — موحد مع main.py
 TP2_PROTECTED_SL_BUFFER_PCT = 0.0  # بعد TP2: حماية آخر 20% عند TP1 أو TP1+buffer
+
+
+def _trade_exit_weights_for_report(trade: dict) -> tuple[float, float, float]:
+    """Return TP1/TP2/runner close weights as normalized ratios.
+
+    Reporting helper only. It supports the standard 40/40/20 model and
+    Recovery custom plans such as 50/25/25 through either top-level fields
+    or diagnostics fields. Values may be stored as percentages (40) or
+    ratios (0.40); the function normalizes safely to a total of 1.0.
+    """
+    try:
+        trade = trade if isinstance(trade, dict) else {}
+        diagnostics = trade.get("diagnostics", {}) or {}
+
+        def _get_number(keys, default):
+            for key in keys:
+                value = trade.get(key)
+                if value is None:
+                    value = diagnostics.get(key)
+                if value is not None:
+                    return safe_float(value, default)
+            return safe_float(default, 0.0)
+
+        tp1 = _get_number(("tp1_close_pct", "tp1_plan_pct"), TP1_CLOSE_PCT)
+        tp2 = _get_number(("tp2_close_pct", "tp2_plan_pct"), TP2_CLOSE_PCT)
+        runner_default = max(0.0, 100.0 - safe_float(tp1, 0.0) - safe_float(tp2, 0.0))
+        if runner_default <= 0:
+            runner_default = max(0.0, 1.0 - safe_float(tp1, 0.0) - safe_float(tp2, 0.0))
+        runner = _get_number(("trailing_position_pct", "runner_close_pct", "runner_plan_pct"), runner_default)
+
+        values = [safe_float(tp1, 0.0), safe_float(tp2, 0.0), safe_float(runner, 0.0)]
+
+        # Percent-style storage: 40 / 40 / 20. Ratio-style storage: 0.4 / 0.4 / 0.2.
+        if max(values or [0.0]) > 1.0:
+            values = [v / 100.0 for v in values]
+
+        total = sum(v for v in values if v > 0)
+        if total <= 0:
+            return 0.40, 0.40, 0.20
+
+        if abs(total - 1.0) > 0.01:
+            values = [max(0.0, v) / total for v in values]
+        else:
+            values = [max(0.0, v) for v in values]
+
+        return round(values[0], 6), round(values[1], 6), round(values[2], 6)
+    except Exception:
+        return 0.40, 0.40, 0.20
+
 
 # Dedup index
 ALERT_ID_INDEX_PREFIX = "alert_id_index:"
