@@ -2,23 +2,50 @@ from __future__ import annotations
 
 
 def build_main_menu_layout() -> list[list[str]]:
+    """Official main Telegram reply keyboard layout."""
     return [
-        ["Execution", "Normal Trades"],
-        ["Exec Intelligence", "Market Intelligence"],
-        ["Wallet Impact", "Diagnostics"],
-        ["OKX Control", "Admin"],
-        ["System Info"],
+        ["🚀 Execution", "📊 Normal Trades"],
+        ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence"],
+        ["💼 Wallet Impact"],
+        ["🧠 Diagnostics", "🤖 OKX Control"],
+        ["⚙️ Admin", "📘 System Info"],
     ]
 
 
-def _system_status_block() -> list[str]:
+def build_main_reply_keyboard() -> dict:
+    """Telegram ReplyKeyboardMarkup matching the approved dashboard layout."""
+    return {
+        "keyboard": [[{"text": item} for item in row] for row in build_main_menu_layout()],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True,
+    }
+
+
+def _mode_line(mode: str | None = None) -> str:
+    mode = mode or "NORMAL_LONG"
+    if mode == "STRONG_LONG_ONLY":
+        return "📈 Market Mode: 🟡 STRONG_LONG_ONLY"
+    if mode == "BLOCK_LONGS":
+        return "📈 Market Mode: 🔴 BLOCK_LONGS"
+    if mode == "RECOVERY_LONG":
+        return "📈 Market Mode: 🔵 RECOVERY_LONG"
+    return "📈 Market Mode: 🟢 NORMAL_LONG"
+
+
+def _system_status_block(
+    mode: str | None = None,
+    execution_enabled: bool = True,
+    risk_enabled: bool = True,
+    okx_orders: bool = False,
+) -> list[str]:
     return [
         "🧭 System Status",
         "",
-        "📈 Market Mode: 🟢 NORMAL_LONG | 🟨 STRONG_LONG_ONLY | 🔴 BLOCK_LONGS | 🔵 RECOVERY_LONG",
-        "⚡ Execution Engine: ACTIVE",
-        "🛡 Risk Protection: ENABLED",
-        "🎨 Mode Colors: 🟢 Normal | 🟨 Strong (light yellow) | 🔴 Block | 🔵 Recovery",
+        _mode_line(mode),
+        f"⚡ Execution Engine: {'ACTIVE' if execution_enabled else 'PAUSED'}",
+        f"🛡 Risk Protection: {'ENABLED' if risk_enabled else 'DISABLED'}",
+        f"🧪 OKX Orders: {'ON' if okx_orders else 'OFF'}",
         "",
     ]
 
@@ -28,7 +55,6 @@ def build_execution_help() -> str:
         "🚀 صفقات التنفيذ",
         "📘 /help_execution",
         "━━━━━━━━━━━━",
-        * _system_status_block(),
         "📊 التقرير العام",
         "/report_execution",
         "/report_execution_7d",
@@ -76,10 +102,9 @@ def build_execution_help() -> str:
 
 def build_normal_help() -> str:
     lines = [
-        "📈 الصفقات العادية",
+        "📊 الصفقات العادية",
         "📘 /help_normal",
         "━━━━━━━━━━━━",
-        *_system_status_block(),
         "📊 التقرير العام",
         "/report_all",
         "/report_all_7d",
@@ -119,26 +144,31 @@ def build_normal_help() -> str:
     return "\n".join(lines)
 
 
-def build_master_help() -> str:
-    menu_rows = build_main_menu_layout()
+def build_master_help(
+    mode: str | None = None,
+    execution_enabled: bool = True,
+    risk_enabled: bool = True,
+    okx_orders: bool = False,
+) -> str:
+    """Approved compact /help dashboard.
+
+    The visual button grid is supplied separately as Telegram ReplyKeyboardMarkup.
+    This text stays short and status-focused, matching the old approved dashboard style.
+    """
     lines = [
         "🤖 OKX Long Bot Dashboard",
         "━━━━━━━━━━━━",
-        "🧭 Main Buttons",
+        *_system_status_block(
+            mode=mode,
+            execution_enabled=execution_enabled,
+            risk_enabled=risk_enabled,
+            okx_orders=okx_orders,
+        ),
+        "━━━━━━━━━━━━",
+        "📝 ملاحظات",
+        "• الأزرار بالأسفل تفتح أقسام الأوامر مباشرة.",
+        "• /open_trades يعرض كل الصفقات المتابعة.",
+        "• /report_execution خاص بصفقات التنفيذ المرشحة.",
+        "• أوامر OKX تعتمد على وضع التنفيذ الحالي.",
     ]
-    for row in menu_rows:
-        lines.append(" | ".join(row))
-    lines.extend([
-        "",
-        "📘 Quick Access",
-        "/help_execution",
-        "/help_normal",
-        "",
-        "🧠 Notes",
-        "• normal signal first",
-        "• execution is a separate path",
-        "• mode color stays visible in status / reminder / execution",
-        "• execution candidate keeps execution style + current mode color",
-        "• STRONG_LONG_ONLY uses light yellow identity in status / reminders / execution",
-    ])
     return "\n".join(lines)
