@@ -1,4 +1,4 @@
-# Version: main_final_v08_block_exception_direct_execution
+# Version: main_final_v10_near_resistance_final_softening
 # Date: 2026-05-13
 # Base: main_final_v07_okx_command_aliases_fix
 # Changes: v08 makes BLOCK_LONGS exceptions direct execution-preview candidates once they pass the normal signal/exception path; preserves v07 OKX command aliases.
@@ -15809,6 +15809,8 @@ def run_scanner_loop():
                 # classified it as noise / warning-only.
                 smart_resistance_balance_checked = False
                 smart_resistance_warning_only = False
+                _strong_execution_resistance_flex = False
+                _res_is_previous_rejection = False
 
                 try:
                     _risk_for_quality = float(entry_price_for_trade) - float(stop_loss)
@@ -15866,7 +15868,11 @@ def run_scanner_loop():
                             market_state in ("bull_market", "alt_season")
                             or current_mode in (MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY)
                         )
-                        _res_is_ultra_close = (_res_dist_pct < 0.08 or _res_r < 0.10)
+                        # v10: avoid treating every small nearby level as a kill-switch.
+                        # For strong continuation / execution setups, a level should be a hard stop
+                        # only when both distance and reward are extremely bad. Previous rejection
+                        # remains protected separately below.
+                        _res_is_ultra_close = (_res_dist_pct < 0.05 and _res_r < 0.05)
                         _normal_dynamic_hint_warning_only = (
                             current_mode == MODE_NORMAL_LONG
                             and _res_is_dynamic_hint
@@ -15888,23 +15894,45 @@ def run_scanner_loop():
                         # candidates on a tiny/noise round level. A confirmed previous-rejection
                         # remains a hard structural wall; round levels are warning-only when the
                         # setup has real strength (MTF + volume + whitelist/relaxed setup).
+                        _res_execution_tags = set(_collect_execution_setup_tags({
+                            "setup_type": setup_type,
+                            "primary_extra_setup": primary_extra_setup,
+                            "extra_setup_names": extra_setup_names,
+                            "execution_setup_tags": locals().get("execution_setup_tags", []),
+                            "relative_strength_vs_btc": locals().get("relative_strength_vs_btc", False),
+                            "wave_estimate": locals().get("wave_estimate", None),
+                        }))
+                        _core_resistance_execution_tags = {
+                            "vwap_reclaim",
+                            "retest_breakout_confirmed",
+                            "relative_strength_vs_btc",
+                            "higher_low_continuation",
+                            "support_bounce_confirmed",
+                            "failed_breakdown_trap",
+                            "liquidity_sweep_reclaim",
+                            "compression_before_expansion",
+                            "block_exception",
+                            "recovery",
+                            "recovery_long",
+                        }
+                        _has_core_resistance_tag = bool(_res_execution_tags & _core_resistance_execution_tags)
                         _strong_execution_resistance_flex = (
                             _strong_market_for_resistance
                             and bool(mtf_confirmed)
                             and float(vol_ratio or 0.0) >= 1.05
-                            and _score_for_resistance >= 7.0
-                            and (_res_relaxed_setup or breakout or pre_breakout)
+                            and _score_for_resistance >= 6.5
+                            and (_res_relaxed_setup or breakout or pre_breakout or _has_core_resistance_tag)
                             and not _res_is_previous_rejection
                         )
                         _round_level_soft_allow = (
                             _res_is_round_level
                             and _strong_execution_resistance_flex
-                            and (_res_dist_pct >= 0.03 or _res_r >= 0.02)
+                            and (_res_dist_pct >= 0.025 or _res_r >= 0.02)
                         )
                         _minor_structural_soft_allow = (
                             _res_is_minor_structural
                             and _strong_execution_resistance_flex
-                            and not (_res_dist_pct < 0.06 and _res_r < 0.06)
+                            and not (_res_dist_pct < 0.04 and _res_r < 0.04)
                         )
 
                         if (
@@ -15939,11 +15967,11 @@ def run_scanner_loop():
                                     _hard_dist_limit = 0.35
                                     _hard_r_limit = 0.25
                                 elif _res_is_round_level:
-                                    _hard_dist_limit = 0.06
-                                    _hard_r_limit = 0.04
+                                    _hard_dist_limit = 0.035
+                                    _hard_r_limit = 0.03
                                 else:
-                                    _hard_dist_limit = 0.12
-                                    _hard_r_limit = 0.08
+                                    _hard_dist_limit = 0.08
+                                    _hard_r_limit = 0.06
                             elif _res_is_major_structural:
                                 _hard_dist_limit = 0.50
                                 _hard_r_limit = 0.35
@@ -16023,8 +16051,9 @@ def run_scanner_loop():
                         _tp1_unrewarding_structural = (
                             _tp1_structure < _min_tp1
                             and _res_is_structural
-                            and not ((_res_relaxed_setup or _bull_mtf_flex) and _res_r >= 0.10 and _res_dist_pct >= 0.15)
+                            and not ((_res_relaxed_setup or _bull_mtf_flex or _strong_execution_resistance_flex) and _res_r >= 0.06 and _res_dist_pct >= 0.08)
                             and not _bull_mtf_flex
+                            and not _strong_execution_resistance_flex
                         )
 
                         if _tp1_unrewarding_structural:
@@ -16112,6 +16141,7 @@ def run_scanner_loop():
                 _near_resistance_soft_context = bool(
                     relaxed_pre_score_setup
                     or has_extra_strong_setup
+                    or _strong_execution_resistance_flex
                     or primary_extra_setup
                     or extra_setup_names
                     or (mtf_confirmed and (breakout or pre_breakout) and vol_ratio >= 1.05)
@@ -16129,7 +16159,7 @@ def run_scanner_loop():
                     soft_warning = True
                     entry_warning = True
                     warning_reasons.append("قرب مقاومة لكن setup/MTF داعم؛ تحذير بدل رفض")
-                    logger.info(f"{symbol} --> near resistance softened to warning (v201)")
+                    logger.info(f"{symbol} --> near resistance softened to warning (v10 final softening)")
                 if should_reject_near_resistance:
                     log_long_rejection(
                         symbol=symbol,
