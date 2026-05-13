@@ -16,6 +16,17 @@ class TrackedTrade:
     score: float = 0.0
     execution_setup_tags: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    # v124 path separation metadata.
+    # Normal signals are always tracked in the normal path even when execution is checked/rejected.
+    trade_source: str = "normal"          # normal | execution
+    tracking_bucket: str = "normal"      # normal | execution
+    execution_checked: bool = False
+    execution_status: str = "normal_signal_only"
+    execution_reason: str = ""
+    execution_path: str = ""
+    execution_trade: bool = False
+
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     tp1_hit: bool = False
     tp2_hit: bool = False
