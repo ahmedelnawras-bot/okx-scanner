@@ -2,65 +2,84 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from tracking.models import TrackedTrade
-
-
-def _trade_effective_pnl(trade: TrackedTrade) -> float:
-    if trade.status in {"closed_loss", "trailing_hit", "breakeven_after_tp1", "closed_win"}:
-        return trade.realized_pnl_pct
-    return trade.realized_pnl_pct + trade.runner_pnl_pct if trade.tp2_hit else max(trade.pnl_pct, trade.realized_pnl_pct)
+from reporting.report_format import SEP, behavior_summary_lines, trade_effective_pnl
 
 
 def build_intelligence_report(trades: list[TrackedTrade], title: str) -> str:
-    per_setup = defaultdict(list)
-    filter_counts = Counter()
-    exit_counts = Counter()
+    setup_groups: dict[str, list[TrackedTrade]] = defaultdict(list)
+    warning_counter = Counter()
+    close_counter = Counter()
     for trade in trades:
-        per_setup[trade.setup_type].append(trade)
-        for warning in trade.warnings:
-            filter_counts[warning] += 1
-        if trade.tp2_hit:
-            exit_counts['tp2_reached'] += 1
-        elif trade.tp1_hit:
-            exit_counts['tp1_reached'] += 1
-        if trade.status == 'trailing_hit':
-            exit_counts['trailing_exit'] += 1
-        if trade.status == 'closed_loss':
-            exit_counts['sl_exit'] += 1
-    ranked = []
+        setup_groups[trade.setup_type].append(trade)
+        for warning in trade.warnings or []:
+            warning_counter[warning] += 1
+        close_counter[trade.status] += 1
+
+    focus = []
     caution = []
-    for setup, items in per_setup.items():
-        n = len(items)
-        wins = sum(1 for t in items if _trade_effective_pnl(t) > 0)
-        avg = sum(_trade_effective_pnl(t) for t in items) / max(1, n)
-        wr = (wins / n) * 100 if n else 0.0
-        entry = (setup, n, wr, avg)
-        if wr >= 50 or avg > 0:
-            ranked.append(entry)
+    for setup, items in setup_groups.items():
+        wins = sum(1 for t in items if trade_effective_pnl(t) > 0)
+        avg = sum(trade_effective_pnl(t) for t in items) / max(1, len(items))
+        wr = wins / max(1, len(items)) * 100.0
+        row = (setup, len(items), wr, avg)
+        if wr >= 50.0 or avg > 0:
+            focus.append(row)
         else:
-            caution.append(entry)
-    ranked.sort(key=lambda x: (x[2], x[3], x[1]), reverse=True)
+            caution.append(row)
+    focus.sort(key=lambda x: (x[2], x[3], x[1]), reverse=True)
     caution.sort(key=lambda x: (x[2], x[3], -x[1]))
-    tp1_rate = (exit_counts['tp1_reached'] / max(1, len(trades))) * 100
-    tp2_conv = (exit_counts['tp2_reached'] / max(1, exit_counts['tp1_reached'])) * 100 if exit_counts['tp1_reached'] else 0.0
-    lines = [title, '━━━━━━━━━━━━', '✅ أقوى Setups']
-    for setup, n, wr, avg in ranked[:4]:
-        lines.append(f"• {setup} — WR {wr:.0f}% | Avg {avg:+.2f}% | n={n}")
-    if caution:
-        lines.append('⚠️ Setups تحتاج حذر')
-        for setup, n, wr, avg in caution[:4]:
+
+    net = sum(trade_effective_pnl(t) for t in trades)
+    winners = sum(1 for t in trades if trade_effective_pnl(t) > 0)
+    losers = sum(1 for t in trades if trade_effective_pnl(t) < 0)
+    win_rate = winners / max(1, winners + losers) * 100.0 if (winners or losers) else 0.0
+    tp1 = sum(1 for t in trades if t.tp1_hit)
+    tp2 = sum(1 for t in trades if t.tp2_hit)
+    direct_sl = sum(1 for t in trades if t.status == "closed_loss")
+
+    lines: list[str] = [title, "📅 Since Start", SEP]
+    lines.extend([
+        "📊 <b>Executive Summary</b>",
+        f"• Trades: {len(trades)}",
+        f"• Win Rate: {win_rate:.1f}%",
+        f"• Net Impact: {net:+.2f}% Exposure",
+        f"• Direct SL: {direct_sl}",
+        f"• TP1 Rate: {tp1 / max(1, len(trades)) * 100:.1f}%",
+        f"• TP2 Rate: {tp2 / max(1, len(trades)) * 100:.1f}%",
+    ])
+
+    lines.extend([SEP, "🎯 <b>Focus Setups</b>"])
+    if focus:
+        for setup, n, wr, avg in focus[:5]:
             lines.append(f"• {setup} — WR {wr:.0f}% | Avg {avg:+.2f}% | n={n}")
-    if filter_counts:
-        lines.append('🧱 Filters Review')
-        for name, count in filter_counts.most_common(4):
-            lines.append(f"• {name} — seen {count}")
-    lines.append('🎯 Exit Quality')
-    lines.append(f"• TP1 Rate — {tp1_rate:.0f}%")
-    lines.append(f"• TP2 Conversion — {tp2_conv:.0f}%")
-    lines.append(f"• Trailing Exit — {exit_counts['trailing_exit']}")
-    if len(trades) < 8:
-        lines.append('⚠️ العينة صغيرة — القرار غير مؤكد')
     else:
-        suggestion = 'keep strongest whitelist / recovery flow active' if ranked else 'review filters and weak setups'
-        lines.append('🧠 توصية مؤقتة')
-        lines.append(f"• {suggestion}")
+        lines.append("• لا توجد setup قوية كفاية حتى الآن.")
+
+    lines.extend([SEP, "⚠️ <b>Watch Carefully</b>"])
+    if caution:
+        for setup, n, wr, avg in caution[:5]:
+            lines.append(f"• {setup} — WR {wr:.0f}% | Avg {avg:+.2f}% | n={n}")
+    elif warning_counter:
+        for warning, count in warning_counter.most_common(5):
+            lines.append(f"• {warning} — {count}")
+    else:
+        lines.append("• لا توجد تحذيرات كافية حتى الآن.")
+
+    lines.extend([SEP, "🧪 <b>Recommended Tuning</b>"])
+    if direct_sl > winners:
+        lines.append("• راقب Direct SL قبل توسيع التنفيذ.")
+        lines.append("• mid/late entries يفضل Pullback-first.")
+    elif focus:
+        lines.append("• حافظ على أقوى setups بدون توسيع عشوائي للـ whitelist.")
+        lines.append("• راقب التحويل من TP1 إلى TP2 قبل زيادة المخاطرة.")
+    else:
+        lines.append("• العينة ما زالت صغيرة؛ لا تغيّر الفلاتر الأساسية الآن.")
+
+    lines.extend([SEP, "💡 <b>Decision</b>"])
+    if not trades:
+        lines.append("لا توجد صفقات كافية لإصدار قرار ذكي.")
+    elif net >= 0 and win_rate >= 45:
+        lines.append("التنفيذ قابل للاستمرار، لكن يفضل تضييق انتقائي وليس فتح كامل.")
+    else:
+        lines.append("الأداء يحتاج مراقبة وتضييق جودة قبل أي توسع في التنفيذ.")
     return "\n".join(lines)
