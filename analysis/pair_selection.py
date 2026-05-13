@@ -37,9 +37,23 @@ def _base_candidate(raw: dict) -> PairCandidate | None:
 
     last_price = safe_float(raw.get("last") or raw.get("lastPrice"))
     turnover = safe_float(raw.get("volCcy24h") or raw.get("turnover_usdt") or raw.get("quoteVolume"))
-    change_pct = safe_float(raw.get("change_pct") or raw.get("changePercent") or raw.get("_rank_change_24h") or raw.get("sodUtc8"))
-    if abs(change_pct) > 100:
-        change_pct = change_pct / 100.0
+
+    # OKX tickers do not provide a ready percent field in the same shape as many
+    # exchanges. ``sodUtc8`` / ``sodUtc0`` are reference prices, not percentages.
+    # The rebuild previously treated sodUtc8 as change_pct, producing impossible
+    # values such as avg15m=21.03%. Keep explicit percent fields when present,
+    # otherwise compute percent from last/reference price.
+    explicit_change = raw.get("change_pct") or raw.get("changePercent") or raw.get("_rank_change_24h")
+    if explicit_change is not None and explicit_change != "":
+        change_pct = safe_float(explicit_change)
+        # Some APIs send ratios like 0.073 for +7.3%. Convert likely ratios only.
+        if -1.0 <= change_pct <= 1.0 and any(k in raw for k in ("changePercent", "chgPct")):
+            change_pct *= 100.0
+        elif abs(change_pct) > 100:
+            change_pct = change_pct / 100.0
+    else:
+        ref_price = safe_float(raw.get("open24h") or raw.get("sodUtc8") or raw.get("sodUtc0") or raw.get("open"))
+        change_pct = ((last_price - ref_price) / ref_price * 100.0) if ref_price > 0 and last_price > 0 else 0.0
 
     score_hint = min(turnover / 2_500_000.0, 10.0)
     score_hint += max(change_pct, 0.0) * 0.60
