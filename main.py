@@ -1,7 +1,7 @@
-# Version: main_final_v04_alert_ui_badge_core.py
+# Version: main_final_v06_smart_resistance_softening
 # Date: 2026-05-13
 # Base: main_final_v03_recovery_universe_period_ui_FIXED_HEADER.py
-# Changes: Final v04 unifies normal/execution alert UI, adds framed Tag Badge, and standardizes Core Trade Block.
+# Changes: v06 softens Smart Resistance hard blocks for strong execution candidates without changing execution paths.
 # Preserved: Trading logic, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and reporting calculations.
 # Fixed previously: Recovery universe, period UI/routing, Profit/Loss analysis wording, /open_trades chunking safety.
 
@@ -15596,6 +15596,8 @@ def run_scanner_loop():
                         _res_is_major_structural = _res_source in _major_structural_sources
                         _res_is_minor_structural = _res_source in _minor_structural_sources
                         _res_is_dynamic_hint = _res_source in _dynamic_hint_sources
+                        _res_is_round_level = _res_source == "round_level_confirmed"
+                        _res_is_previous_rejection = _res_source == "previous_rejection"
                         _res_is_structural = _res_is_major_structural or _res_is_minor_structural
                         _res_is_micro_noise = (_res_source in _weak_micro_res_sources) and (_res_dist_pct < 0.25 or _res_r < 0.20)
 
@@ -15642,20 +15644,67 @@ def run_scanner_loop():
                             and not _res_is_ultra_close
                         )
 
-                        if _res_is_micro_noise or _normal_dynamic_hint_warning_only or _bull_mtf_flex:
+                        # v06 Smart Resistance Softening:
+                        # Keep the same signal/execution path, but avoid killing strong execution
+                        # candidates on a tiny/noise round level. A confirmed previous-rejection
+                        # remains a hard structural wall; round levels are warning-only when the
+                        # setup has real strength (MTF + volume + whitelist/relaxed setup).
+                        _strong_execution_resistance_flex = (
+                            _strong_market_for_resistance
+                            and bool(mtf_confirmed)
+                            and float(vol_ratio or 0.0) >= 1.05
+                            and _score_for_resistance >= 7.0
+                            and (_res_relaxed_setup or breakout or pre_breakout)
+                            and not _res_is_previous_rejection
+                        )
+                        _round_level_soft_allow = (
+                            _res_is_round_level
+                            and _strong_execution_resistance_flex
+                            and (_res_dist_pct >= 0.03 or _res_r >= 0.02)
+                        )
+                        _minor_structural_soft_allow = (
+                            _res_is_minor_structural
+                            and _strong_execution_resistance_flex
+                            and not (_res_dist_pct < 0.06 and _res_r < 0.06)
+                        )
+
+                        if (
+                            _res_is_micro_noise
+                            or _normal_dynamic_hint_warning_only
+                            or _bull_mtf_flex
+                            or _round_level_soft_allow
+                            or _minor_structural_soft_allow
+                        ):
                             smart_resistance_warning_only = True
                             early_resistance_warning = ""
-                            _res_note = "normal_bull_flex_resistance_warning" if _bull_mtf_flex else ("normal_dynamic_resistance_hint" if _normal_dynamic_hint_warning_only else "tiny/micro resistance ignored")
+                            if _round_level_soft_allow:
+                                _res_note = "round_level_warning_only"
+                            elif _minor_structural_soft_allow:
+                                _res_note = "minor_structural_resistance_warning_only"
+                            elif _bull_mtf_flex:
+                                _res_note = "normal_bull_flex_resistance_warning"
+                            elif _normal_dynamic_hint_warning_only:
+                                _res_note = "normal_dynamic_resistance_hint"
+                            else:
+                                _res_note = "tiny/micro resistance ignored"
                             logger.info(
                                 f"⚪ {symbol} {_res_note} | "
-                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f}"
+                                f"source={_res_source} | dist={_res_dist_pct:.2f}% | R={_res_r:.2f} | "
+                                f"strong_flex={_strong_execution_resistance_flex}"
                             )
                         else:
-                            if _res_relaxed_setup or _bull_mtf_flex:
-                                # v202: strong/whitelist/Bull+MTF setups should not die on normal nearby resistance.
-                                # Hard reject only for truly ultra-close resistance.
-                                _hard_dist_limit = 0.15
-                                _hard_r_limit = 0.10
+                            if _res_relaxed_setup or _bull_mtf_flex or _strong_execution_resistance_flex:
+                                # v06: strong/whitelist/Bull+MTF setups should not die on normal nearby resistance.
+                                # Hard reject only for real supply walls or extremely bad RR.
+                                if _res_is_previous_rejection:
+                                    _hard_dist_limit = 0.35
+                                    _hard_r_limit = 0.25
+                                elif _res_is_round_level:
+                                    _hard_dist_limit = 0.06
+                                    _hard_r_limit = 0.04
+                                else:
+                                    _hard_dist_limit = 0.12
+                                    _hard_r_limit = 0.08
                             elif _res_is_major_structural:
                                 _hard_dist_limit = 0.50
                                 _hard_r_limit = 0.35
@@ -15664,10 +15713,23 @@ def run_scanner_loop():
                                 _hard_r_limit = 0.25
 
                             _should_hard_reject_resistance = (
-                                _res_is_ultra_close
+                                (
+                                    _res_is_previous_rejection
+                                    and (_res_dist_pct < _hard_dist_limit or _res_r < _hard_r_limit)
+                                )
                                 or (
-                                    (_res_dist_pct < _hard_dist_limit or _res_r < _hard_r_limit)
+                                    not _strong_execution_resistance_flex
                                     and not _bull_mtf_flex
+                                    and (
+                                        _res_is_ultra_close
+                                        or _res_dist_pct < _hard_dist_limit
+                                        or _res_r < _hard_r_limit
+                                    )
+                                )
+                                or (
+                                    _strong_execution_resistance_flex
+                                    and _res_dist_pct < _hard_dist_limit
+                                    and _res_r < _hard_r_limit
                                 )
                             )
 
@@ -15701,6 +15763,9 @@ def run_scanner_loop():
                                         "major_structural": _res_is_major_structural,
                                         "minor_structural": _res_is_minor_structural,
                                         "bull_flex": _bull_mtf_flex,
+                                        "strong_execution_resistance_flex": _strong_execution_resistance_flex,
+                                        "round_level_soft_allow": _round_level_soft_allow,
+                                        "minor_structural_soft_allow": _minor_structural_soft_allow,
                                         "ultra_close": _res_is_ultra_close,
                                         "limits": f"dist<{_hard_dist_limit}/R<{_hard_r_limit}",
                                         "category": "trade_quality",
