@@ -12,6 +12,11 @@
 - حساب PnL هنا يتم كنسبة مئوية فقط.
 - حسابات الدولار تتم داخل tracking/performance.py حسب خطة إدارة رأس المال.
 
+**إصدار 2.1 - إصلاح State Classification للتقارير:**
+- result النهائي يغلب status القديم دائمًا.
+- صفقة status=open + result=loss/tp1_win/tp2_win لا تُحسب Open.
+- منع ظهور SL/TP مغلقة كصفقات مفتوحة في كل تقارير البوت.
+
 **إصدار 2.0 - إصلاحات شاملة:**
 - دعم trailing_win / breakeven / tp2_partial / trailing_open
 - calc_trade_result_pct يدعم 40/40/20 و trailing_exit_price
@@ -378,9 +383,21 @@ def normalize_trade_status(trade: Optional[Dict]) -> str:
     القيم المدعومة:
     open, partial, tp2_partial, trailing_open,
     pending_pullback, closed, expired, unknown
+
+    مهم جدًا للتقارير:
+    النتيجة النهائية result تغلب status القديم دائمًا.
+    أحيانًا تبقى الصفقة محفوظة status=open في key قديم،
+    لكن result=loss/tp1_win/tp2_win موجود في history أو نفس السجل.
+    في الحالة دي لا يجوز أن تُحسب Open.
     """
     if not isinstance(trade, dict):
         return "unknown"
+
+    result = str(trade.get("result") or "").strip().lower()
+    if result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven", "pending_expired"):
+        return "closed"
+    if result == "expired":
+        return "expired"
 
     status = str(trade.get("status") or "").strip().lower()
 
@@ -392,14 +409,6 @@ def normalize_trade_status(trade: Optional[Dict]) -> str:
         if status == "trailing":
             return "trailing_open"
         return status
-
-    result = str(trade.get("result") or "").strip().lower()
-    if result in ("tp1_win", "tp2_win", "trailing_win", "loss", "breakeven"):
-        return "closed"
-    if result == "expired":
-        return "expired"
-    if result == "pending_expired":
-        return "closed"
 
     return "unknown"
 
