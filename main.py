@@ -11815,6 +11815,25 @@ def determine_long_market_mode(
                     r.delete(MARKET_MODE_NORMAL_CANDIDATE_KEY)
                 except Exception:
                     pass
+            # v12: RECOVERY_LONG is the fast-rebound alternative to STRONG_LONG_ONLY.
+            # Before falling back to STRONG mode after BLOCK exit, re-check whether
+            # BTC/market rebound has enough speed to justify a 90m Recovery window.
+            try:
+                btc_recovery_exit = _btc_recovery_fast_snapshot(red_ratio=red_ratio, avg_change=avg_change)
+            except Exception:
+                btc_recovery_exit = {}
+            fast_rebound_edge = bool(
+                (btc_recovery_exit.get("edge") and is_market_recovery_ready(red_ratio, avg_change, btc_change, alt_mode))
+                or (
+                    btc_recovery_exit.get("recovery")
+                    and red_ratio < 0.64
+                    and avg_change > -0.45
+                    and btc_change > -0.35
+                    and alt_mode != "🔴 ضعيف"
+                )
+            )
+            if fast_rebound_edge:
+                return {"mode": MODE_RECOVERY_LONG, "reason": "ارتداد سريع بعد BLOCK → RECOVERY_LONG بدل STRONG_LONG_ONLY"}
             return {"mode": MODE_STRONG_LONG_ONLY, "reason": f"السوق لم يعد كراشًا لمدة {safe_duration}s، خروج احتياطي إلى STRONG_LONG_ONLY"}
         return {"mode": MODE_BLOCK_LONGS, "reason": f"السوق أهدأ لكن ننتظر تأكيد الخروج الآمن ({safe_duration}s/{BLOCK_EXIT_CONFIRM_DURATION}s)"}
     if allow_state_writes and r:
@@ -11947,7 +11966,7 @@ def _market_mode_label(mode: str) -> str:
         MODE_NORMAL_LONG: "🟢 NORMAL LONG",
         MODE_STRONG_LONG_ONLY: "🟡 STRONG LONG ONLY",
         MODE_BLOCK_LONGS: "🔴 BLOCK LONGS",
-        MODE_RECOVERY_LONG: "🟠 RECOVERY LONG",
+        MODE_RECOVERY_LONG: "🔵 RECOVERY LONG",
     }.get(mode, html.escape(str(mode)))
 
 def get_market_mode_action_text(mode: str) -> str:
@@ -12237,6 +12256,89 @@ def _market_reminder_mode_icon(mode: str) -> str:
     return "🧭"
 
 
+
+
+def _block_protection_stage(reminder_count: int) -> dict:
+    """Display/timing helper for BLOCK_LONGS protection escalation.
+
+    Reminder #1: Monitor only after 15m
+    Reminder #2: Soft Protection after another 15m
+    Reminder #3: Defensive Protection after another 10m
+    Later reminders keep max protection active and use the normal reminder cadence.
+    """
+    try:
+        n = int(reminder_count or 0)
+    except Exception:
+        n = 0
+    if n <= 1:
+        return {
+            "level": 1,
+            "title": "LEVEL 1 — Monitor Only",
+            "arabic_title": "المستوى 1 — مراقبة فقط",
+            "next_title": "Soft Protection",
+            "next_arabic": "الحماية المرنة",
+            "next_minutes": 15,
+            "max_active": False,
+        }
+    if n == 2:
+        return {
+            "level": 2,
+            "title": "LEVEL 2 — Soft Protection",
+            "arabic_title": "المستوى 2 — حماية مرنة",
+            "next_title": "Defensive Protection",
+            "next_arabic": "الحماية الدفاعية",
+            "next_minutes": 10,
+            "max_active": False,
+        }
+    return {
+        "level": 3,
+        "title": "LEVEL 3 — Defensive Protection",
+        "arabic_title": "المستوى 3 — حماية دفاعية",
+        "next_title": "Max protection active",
+        "next_arabic": "أقصى حماية مفعلة",
+        "next_minutes": 0,
+        "max_active": True,
+    }
+
+
+def _block_reminder_required_interval(reminder_count: int) -> int:
+    """Return required seconds before the next BLOCK_LONGS reminder.
+
+    Count is the number of reminders already sent for the current BLOCK cycle.
+    """
+    try:
+        n = int(reminder_count or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return 15 * 60  # Reminder #1
+    if n == 1:
+        return 15 * 60  # Reminder #2
+    if n == 2:
+        return 10 * 60  # Reminder #3
+    return MARKET_REMINDER_INTERVAL  # After max protection is active, avoid spam.
+
+
+def _block_protection_footer_lines(reminder_count: int, last_reminder_ts: int = 0, now_ts: int = None) -> list:
+    """Small footer for BLOCK reminders: current protection + next escalation."""
+    now_ts = int(now_ts or time.time())
+    stage = _block_protection_stage(reminder_count)
+    lines = [f"🛡 Protection: {stage['title']}"]
+    if stage.get("max_active"):
+        lines.append("✅ Max protection active")
+        return lines
+    # Remaining time is based on the next reminder interval after the current reminder.
+    total = _block_reminder_required_interval(int(reminder_count or 0))
+    remaining = total
+    try:
+        if last_reminder_ts:
+            remaining = max(0, total - (now_ts - int(last_reminder_ts)))
+    except Exception:
+        remaining = total
+    remaining_m = max(1, int(round(remaining / 60.0)))
+    lines.append(f"⏭ {stage['next_title']} in ~{remaining_m}m")
+    return lines
+
 def build_compact_market_mode_reminder(
     reminder_count: int,
     current_mode: str,
@@ -12290,15 +12392,10 @@ def build_compact_market_mode_reminder(
     # Mode-specific focus/protection line. This preserves BLOCK_LONGS protection escalation.
     if normalized_mode == MODE_BLOCK_LONGS:
         focus_line = "🚫 New longs paused"
-        if int(reminder_count or 0) <= 1:
-            protection_level = "🛡 Protection Level 1 — Monitoring"
-            protection_note = "Monitor only | لا تعديل SL / Trailing"
-        elif int(reminder_count or 0) == 2:
-            protection_level = "🛡 Protection Level 2 — Soft Protection"
-            protection_note = "Tightening weak runners | لا Panic close للخاسرين"
-        else:
-            protection_level = "🛡 Protection Level 3 — Defensive Protection"
-            protection_note = "Aggressive profit protection | Emergency compression only"
+        stage = _block_protection_stage(reminder_count)
+        focus_line = "🚫 New longs paused"
+        protection_level = f"🛡 Protection: {stage['title']}"
+        protection_note = "✅ Max protection active" if stage.get("max_active") else f"⏭ {stage['next_title']} in ~{stage.get('next_minutes', 0)}m"
     elif normalized_mode == MODE_STRONG_LONG_ONLY:
         focus_line = "🎯 Focus: reclaim / retest / wave_3"
         protection_level = "🛡 Protection: ENABLED"
@@ -12382,12 +12479,17 @@ def maybe_send_market_mode_reminder(
             reminder_count = 0
             last_reminder = 0
 
-        # v202 cadence: first reminder after 15m, then every 30m.
+        # Reminder cadence:
+        # - Normal/Strong/Recovery: first after 15m, then every 30m.
+        # - BLOCK_LONGS only: 15m -> 15m -> 10m to accelerate protection escalation.
         if last_reminder <= 0:
             r.set(MARKET_MODE_LAST_REMINDER_KEY, str(now_ts_local))
             r.set(MARKET_MODE_REMINDER_MODE_KEY, current_mode)
             return False
-        required_interval = MARKET_REMINDER_FIRST_INTERVAL if reminder_count <= 0 else MARKET_REMINDER_INTERVAL
+        if normalize_market_mode(current_mode) == MODE_BLOCK_LONGS:
+            required_interval = _block_reminder_required_interval(reminder_count)
+        else:
+            required_interval = MARKET_REMINDER_FIRST_INTERVAL if reminder_count <= 0 else MARKET_REMINDER_INTERVAL
         if now_ts_local - last_reminder < required_interval:
             return False
 
@@ -12423,8 +12525,12 @@ def maybe_send_market_mode_reminder(
                     )
                     r.set(MARKET_MODE_BLOCK_PROTECTION_APPLIED_KEY, f"{reminder_count}:{now_ts_local}")
                     block_protection_active = True
+                    try:
+                        send_telegram_message(format_block_protection_summary_message(protection_summary, reminder_count=reminder_count))
+                    except Exception as _notify_exc:
+                        logger.warning(f"BLOCK protection alert send error: {_notify_exc}")
             except Exception as _protect_exc:
-                logger.warning(f"BLOCK first-reminder protection error: {_protect_exc}")
+                logger.warning(f"BLOCK reminder protection error: {_protect_exc}")
 
         strong_coins_count = _estimate_strong_coins_for_reminder(alt_snapshot, len(ranked_pairs))
         reminder_msg = build_compact_market_mode_reminder(
@@ -12450,37 +12556,69 @@ def maybe_send_market_mode_reminder(
         logger.warning(f"Market mode reminder error: {e}")
         return False
 
-def format_block_protection_summary_message(summary: dict) -> str:
-    """Format one compact Telegram message after BLOCK_LONGS reminder protection."""
+def format_block_protection_summary_message(summary: dict, reminder_count: int = 2) -> str:
+    """Arabic Telegram alert when BLOCK protection is actually applied/escalated."""
     summary = summary or {}
+    stage = _block_protection_stage(reminder_count)
+    level = int(stage.get("level") or 2)
     protected = int(summary.get("protected_winners") or 0)
     compressed = int(summary.get("risk_compressed") or 0)
     monitoring = int(summary.get("monitoring_only") or 0)
-    ignored = int(summary.get("ignored_tracking_only") or 0)
     already = int(summary.get("already_protected") or 0)
     close_to_sl = int(summary.get("skipped_close_to_sl") or 0)
     execution_seen = int(summary.get("execution_seen") or 0)
-    okx_line = (
-        "🧪 <b>Protection:</b> Simulation / Tracking only"
-        if int(summary.get("platform_updates_sent") or 0) == 0 and bool(summary.get("tracking_only", True))
-        else f"⚙️ <b>OKX Protection:</b> sent={int(summary.get('platform_updates_sent') or 0)} | failed={int(summary.get('platform_updates_failed') or 0)}"
+    platform_sent = int(summary.get("platform_updates_sent") or 0)
+    platform_failed = int(summary.get("platform_updates_failed") or 0)
+    tracking_only = bool(summary.get("tracking_only", True)) and platform_sent == 0
+
+    affected = protected + compressed + already
+    runners_tightened = compressed
+    negative_unchanged = monitoring + close_to_sl
+
+    if level >= 3:
+        title = "🛡 <b>تصعيد حماية البلوك</b>"
+        level_line = "🔴 <b>المستوى 3 — حماية دفاعية</b>"
+        next_line = "✅ أقصى مستوى حماية مفعل"
+        actions = [
+            "• تفعيل الحماية الدفاعية",
+            "• تشديد الـ trailing للـ runners",
+            "• مراقبة الأرباح المحمية",
+            "• بدون إغلاق عشوائي للصفقات",
+        ]
+    else:
+        title = "🛡 <b>تفعيل حماية البلوك</b>"
+        level_line = "🟠 <b>المستوى 2 — حماية مرنة</b>"
+        next_line = "⏭ الحماية التالية خلال ~10m"
+        actions = [
+            "• حماية الأرباح الحالية",
+            "• تشديد حماية الـ runners",
+            "• الحفاظ على SL الأصلي للصفقات السلبية",
+        ]
+
+    platform_line = (
+        "🧪 <b>الوضع:</b> محاكاة / Tracking فقط"
+        if tracking_only
+        else f"⚙️ <b>OKX:</b> تم إرسال {platform_sent} | فشل {platform_failed}"
     )
 
-    return "\n".join([
-        "🛡️ <b>BLOCK Protection Applied</b>",
+    lines = [
+        title,
+        "━━━━━━━━━━━━",
+        level_line,
         "",
-        "تم تنفيذ تقييم حماية صفقات التنفيذ المفتوحة بسبب استمرار BLOCK_LONGS.",
+        f"📂 <b>الصفقات المتأثرة:</b> {affected}",
+        f"✅ <b>صفقات محمية:</b> {protected + already}",
+        f"🏃 <b>تشديد حماية الـ Runner:</b> {runners_tightened}",
+        f"⚠️ <b>الصفقات الخاسرة:</b> بدون تعديل ({negative_unchanged})",
+        f"📊 <b>صفقات التنفيذ المفحوصة:</b> {execution_seen}",
         "",
-        f"✅ <b>Protected winners:</b> {protected}",
-        f"🟡 <b>Risk compressed:</b> {compressed}",
-        f"⏸ <b>Monitoring only:</b> {monitoring}",
-        f"🔒 <b>Already protected:</b> {already}",
-        f"📍 <b>Close to SL skipped:</b> {close_to_sl}",
-        f"🚫 <b>Ignored tracking-only:</b> {ignored}",
-        f"📊 <b>Execution trades checked:</b> {execution_seen}",
+        "🔧 <b>الإجراءات</b>",
+        *actions,
         "",
-        okx_line,
-    ])
+        platform_line,
+        next_line,
+    ]
+    return "\n".join(lines)
 
 def format_market_mode_reason_for_message(reason: str = "", metrics: dict = None) -> str:
     """Turn internal mode reasons into human Telegram text."""
@@ -12907,6 +13045,240 @@ def _mode_execution_notes_lines(mode: str) -> list:
     if mode == MODE_RECOVERY_LONG:
         return ["• Limited execution active", "• Risk protection still enabled", "• Weak setups filtered aggressively"]
     return ["• Long execution active", "• Weak Drift still enabled", "• Quality filters remain active"]
+
+
+
+
+# =========================
+# v12 UNIFIED MARKET MODE MESSAGES
+# =========================
+def build_market_mode_sections(
+    mode: str,
+    context: dict | None = None,
+    variant: str = "status",
+    old_mode: str = "",
+    reminder_count: int = 0,
+    duration_text: str = "",
+    protection_summary: dict | None = None,
+) -> str:
+    """Single UI source for /mood, transition messages and reminders.
+
+    UI/formatting only. Does not change trading, scoring, execution, tracking or risk.
+    """
+    try:
+        context = context or {}
+        mode = normalize_market_mode(mode)
+        old_mode = normalize_market_mode(old_mode) if old_mode else ""
+        variant = str(variant or "status").lower()
+        label = _market_mode_label(mode)
+        icon = _market_reminder_mode_icon(mode)
+        market_mix_profile = context.get("market_mix_profile") or {}
+        market_guard = context.get("market_guard") or context.get("reason_metrics") or {}
+        alt_snapshot = context.get("alt_snapshot") or {}
+        btc_mode = context.get("btc_mode", "")
+        alt_mode = context.get("alt_mode") or alt_snapshot.get("alt_mode", "")
+        market_state_label = context.get("market_state_label") or context.get("market_state", "")
+        market_bias_label = context.get("market_bias_label", "")
+        reason = context.get("human_reason") or context.get("reason") or context.get("mode_reason") or ""
+        reason_display = format_market_mode_reason_for_message(reason, market_guard) if reason else get_market_mode_reason_text(mode, "")
+        if not market_mix_profile:
+            market_mix_profile = detect_market_mix_profile(
+                btc_mode=btc_mode,
+                alt_snapshot=alt_snapshot,
+                market_guard=market_guard,
+                market_info={"market_state_label": market_state_label, "market_bias_label": market_bias_label},
+            )
+        try:
+            red_ratio_pct = float(market_guard.get("red_ratio_15m", 0.0) or 0.0) * 100.0
+            avg15m = float(market_guard.get("avg_change_15m", 0.0) or 0.0)
+            btc15m = float(market_guard.get("btc_change_15m", 0.0) or 0.0)
+        except Exception:
+            red_ratio_pct, avg15m, btc15m = 0.0, 0.0, 0.0
+
+        if variant == "transition":
+            title_lines = [f"{icon} <b>Market Mode: {html.escape(mode)}</b>", "━━━━━━━━━━━━", "", f"🔁 {html.escape(old_mode or '?')} → {html.escape(mode)}"]
+        elif variant == "reminder":
+            title_lines = [f"{icon} <b>Market Reminder #{int(reminder_count or 0)}</b>", f"⏱ {html.escape(duration_text or get_market_mode_duration_text(mode))} in {html.escape(mode)}"]
+        else:
+            title_lines = [f"{icon} <b>Market Mode: {html.escape(mode)}</b>", "━━━━━━━━━━━━"]
+
+        lines = list(title_lines) + [
+            "",
+            _market_mix_line(market_mix_profile, compact=(variant == "reminder")),
+            "",
+            "📊 <b>Market State</b>",
+            html.escape(_mode_market_state_line(mode, market_mix_profile)),
+            html.escape(_market_breadth_line(market_mix_profile, market_guard, alt_snapshot)),
+            f"• BTC: {html.escape(str(btc_mode or 'N/A'))}",
+            f"• Alts: {html.escape(str(alt_mode or 'N/A'))}",
+            f"• Red: {red_ratio_pct:.0f}% | Avg: {avg15m:+.2f}% | BTC 15m: {btc15m:+.2f}%",
+            "",
+            "🧠 <b>Trigger</b>",
+        ]
+        lines.extend([html.escape(x) for x in _mode_trigger_lines(mode, market_mix_profile)])
+        lines.extend([
+            "",
+            "📌 <b>Mode Reason</b>",
+            reason_display,
+            "",
+            "🎯 <b>Signal Rules</b>",
+        ])
+        lines.extend([html.escape(x) for x in _mode_signal_rules_lines(mode)])
+        lines.extend(["", "✅ <b>Requirements</b>"])
+        lines.extend([html.escape(x) for x in _mode_requirements_lines(mode)])
+        if mode == MODE_BLOCK_LONGS:
+            lines.extend([
+                "",
+                "🛡 <b>Protection Plan</b>",
+                "⏱ 15m → 15m → 10m",
+                "• Reminder #1 → Monitor",
+                "• Reminder #2 → Soft Protection",
+                "• Reminder #3 → Defensive Protection",
+            ])
+            if variant == "reminder":
+                lines.append("")
+                lines.extend([html.escape(x) for x in _block_protection_footer_lines(reminder_count)])
+            if protection_summary:
+                lines.extend([
+                    "",
+                    "🛡 <b>Protection Check</b>",
+                    f"• Protected winners: {int((protection_summary or {}).get('protected_winners') or 0)}",
+                    f"• Risk compressed: {int((protection_summary or {}).get('risk_compressed') or 0)}",
+                ])
+        if mode == MODE_RECOVERY_LONG:
+            lines.extend([
+                "",
+                "🔵 <b>Recovery Window</b>",
+                "• مدة الدورة: 90m",
+                "• Max Recovery trades: 3",
+                "• TP Model: 50/25/25",
+                "• بعد TP2 تخرج الصفقة من عداد Recovery",
+            ])
+        lines.extend(["", "⚡ <b>Execution Notes</b>"])
+        lines.extend([html.escape(x) for x in _mode_execution_notes_lines(mode)])
+        try:
+            drift = get_weak_drift_display_status(mode, btc_mode, market_state_label, alt_mode, market_bias_label)
+            lines.extend(["", html.escape(str(drift.get("label", "🟢 Weak Drift: OFF"))), html.escape(str(drift.get("note", "")))])
+        except Exception:
+            pass
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.warning(f"build_market_mode_sections error: {exc}")
+        return f"{_market_reminder_mode_icon(mode)} <b>Market Mode: {html.escape(normalize_market_mode(mode))}</b>"
+
+
+def _market_mode_context_from_snapshot_or_live() -> dict:
+    """Collect the shared context used by all Market Mode message variants."""
+    snapshot = load_market_status_snapshot(max_age_seconds=300)
+    if snapshot:
+        current_mode = normalize_market_mode(snapshot.get("current_mode", MODE_NORMAL_LONG))
+        alt_snapshot = snapshot.get("alt_snapshot", {}) or {}
+        market_info = snapshot.get("market_info", {}) or {}
+        market_guard = snapshot.get("market_guard", {}) or {}
+        btc_mode = snapshot.get("btc_mode", "")
+        return {
+            "current_mode": current_mode,
+            "mode_reason": snapshot.get("mode_reason", "") or snapshot.get("suggested_reason", ""),
+            "btc_mode": btc_mode,
+            "alt_snapshot": alt_snapshot,
+            "alt_mode": alt_snapshot.get("alt_mode", ""),
+            "market_info": market_info,
+            "market_state_label": market_info.get("market_state_label", ""),
+            "market_bias_label": market_info.get("market_bias_label", ""),
+            "market_guard": market_guard,
+            "market_mix_profile": snapshot.get("market_mix_profile") or detect_market_mix_profile(
+                btc_mode=btc_mode, alt_snapshot=alt_snapshot, market_guard=market_guard, market_info=market_info
+            ),
+        }
+    current_mode = normalize_market_mode(r.get(MARKET_MODE_KEY) if r else MODE_NORMAL_LONG)
+    btc_mode = get_btc_mode()
+    ranked_pairs = get_ranked_pairs()
+    alt_snapshot = get_alt_market_snapshot(ranked_pairs)
+    market_info = get_market_state(btc_mode, alt_snapshot)
+    btc_zone = get_btc_range_zone(timeframe="1H", lookback=50)
+    market_guard = get_market_guard_snapshot(ranked_pairs, btc_mode, alt_snapshot, btc_zone=btc_zone)
+    market_mix_profile = detect_market_mix_profile(
+        btc_mode=btc_mode, alt_snapshot=alt_snapshot, market_guard=market_guard, market_info=market_info, btc_zone=btc_zone
+    )
+    return {
+        "current_mode": current_mode,
+        "mode_reason": "",
+        "btc_mode": btc_mode,
+        "alt_snapshot": alt_snapshot,
+        "alt_mode": alt_snapshot.get("alt_mode", ""),
+        "market_info": market_info,
+        "market_state_label": market_info.get("market_state_label", ""),
+        "market_bias_label": market_info.get("market_bias_label", ""),
+        "market_guard": market_guard,
+        "market_mix_profile": market_mix_profile,
+    }
+
+
+def build_market_status_message() -> str:
+    try:
+        ctx = _market_mode_context_from_snapshot_or_live()
+        return build_market_mode_sections(ctx.get("current_mode", MODE_NORMAL_LONG), ctx, variant="status")
+    except Exception as e:
+        logger.error(f"build_market_status_message v12 error: {e}")
+        return f"❌ حصل خطأ أثناء بناء حالة السوق\n{html.escape(str(e))}"
+
+
+def build_compact_market_mode_reminder(
+    reminder_count: int,
+    current_mode: str,
+    btc_mode: str = "",
+    market_state_label: str = "",
+    alt_mode: str = "",
+    market_bias_label: str = "",
+    strong_coins_count: int = 0,
+    ranked_pairs_count: int = 0,
+    block_protection_active: bool = False,
+    protection_summary: dict = None,
+    market_guard: dict = None,
+    market_mix_profile: dict = None,
+) -> str:
+    mode = normalize_market_mode(current_mode)
+    ctx = {
+        "btc_mode": btc_mode,
+        "alt_mode": alt_mode,
+        "market_state_label": market_state_label,
+        "market_bias_label": market_bias_label,
+        "market_guard": market_guard or {},
+        "market_mix_profile": market_mix_profile or {},
+        "reason": "Market reminder update",
+    }
+    return build_market_mode_sections(
+        mode,
+        ctx,
+        variant="reminder",
+        reminder_count=reminder_count,
+        duration_text=get_market_mode_duration_text(mode),
+        protection_summary=protection_summary if block_protection_active or protection_summary else None,
+    )
+
+
+def format_mode_transition_message(
+    old_mode: str,
+    new_mode: str,
+    reason: str = "",
+    reason_metrics: dict = None,
+    human_reason: str = "",
+    market_mix_profile: dict = None,
+) -> str:
+    new_mode = normalize_market_mode(new_mode)
+    old_mode = normalize_market_mode(old_mode)
+    metrics = reason_metrics or {}
+    ctx = {
+        "reason": human_reason or reason,
+        "human_reason": human_reason,
+        "market_guard": metrics,
+        "market_mix_profile": market_mix_profile or metrics.get("market_mix_profile") or {},
+        "btc_mode": metrics.get("btc_mode", ""),
+        "alt_mode": metrics.get("alt_mode", ""),
+        "market_state_label": metrics.get("market_state_label", ""),
+        "market_bias_label": metrics.get("market_bias_label", ""),
+    }
+    return build_market_mode_sections(new_mode, ctx, variant="transition", old_mode=old_mode)
 
 
 def _market_mix_allows_mtf_no_exception(
@@ -17338,52 +17710,80 @@ def run_scanner_loop():
                                 f"EXEC SKIP: {symbol} is not an execution candidate | "
                                 f"gate_path={gate_decision.get('path')} | reason={gate_reason}"
                             )
-                        elif is_execution_paused():
-                            exec_status = "execution_paused"
-                            exec_reason = "execution_paused_manual_or_daily_dd"
-                            already_sent = _execution_message_already_sent(candidate, exec_status)
-                            update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=True)
-                            if not already_sent:
-                                send_telegram_message(build_execution_paused_message(symbol))
-                            logger.info(f"EXEC PAUSED: {symbol} | message_sent={not already_sent}")
                         else:
-                            dd_guard = enforce_execution_daily_drawdown_guard()
-                            if dd_guard.get("locked"):
-                                exec_status = "daily_drawdown_lock"
-                                exec_reason = dd_guard.get("reason", "daily_drawdown_lock")
+                            # v12 final mode sync guard: prevent stale STRONG execution
+                            # messages after the market has already transitioned to BLOCK_LONGS.
+                            final_mode_now = current_mode
+                            try:
+                                if r:
+                                    final_mode_now = normalize_market_mode(r.get(MARKET_MODE_KEY) or current_mode)
+                            except Exception:
+                                final_mode_now = current_mode
+                            candidate["final_mode_recheck"] = final_mode_now
+                            if final_mode_now == MODE_BLOCK_LONGS and not bool(candidate.get("block_exception")):
+                                exec_status = "blocked_by_final_mode_guard"
+                                exec_reason = "market_changed_to_BLOCK_LONGS_before_execution_send"
                                 update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
-                                send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
-                                logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
-                            elif EXECUTION_AVAILABLE:
-                                candidate = _apply_market_execution_fallback(candidate)
-                                _ensure_execution_setup_tags(candidate)
-                                if not _candidate_has_complete_execution_plan(candidate):
-                                    exec_status = "rejected_invalid_order"
-                                    exec_reason = "missing_or_invalid_entry_sl_tp"
+                                logger.info(
+                                    f"EXEC FINAL MODE SKIP: {symbol} | signal_mode={candidate.get('market_mode')} | "
+                                    f"final_mode={final_mode_now} | reason={exec_reason}"
+                                )
+                                continue
+                            if final_mode_now == MODE_BLOCK_LONGS and bool(candidate.get("block_exception")):
+                                candidate["market_mode"] = MODE_BLOCK_LONGS
+                                candidate["current_mode"] = MODE_BLOCK_LONGS
+                                candidate["execution_path"] = "block_exception"
+                                candidate["block_longs_execution_candidate"] = True
+                            elif str(candidate.get("execution_path") or "") != "recovery":
+                                candidate["market_mode"] = final_mode_now
+                                candidate["current_mode"] = final_mode_now
+                            
+                            if is_execution_paused():
+                                exec_status = "execution_paused"
+                                exec_reason = "execution_paused_manual_or_daily_dd"
+                                already_sent = _execution_message_already_sent(candidate, exec_status)
+                                update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=True)
+                                if not already_sent:
+                                    send_telegram_message(build_execution_paused_message(symbol))
+                                logger.info(f"EXEC PAUSED: {symbol} | message_sent={not already_sent}")
+                            else:
+                                dd_guard = enforce_execution_daily_drawdown_guard()
+                                if dd_guard.get("locked"):
+                                    exec_status = "daily_drawdown_lock"
+                                    exec_reason = dd_guard.get("reason", "daily_drawdown_lock")
                                     update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
                                     send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
                                     logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
-                                else:
-                                    exec_result = process_trade_candidate(r, symbol, candidate)
-                                    raw_status = exec_result.get("status")
-                                    raw_reason = exec_result.get("reason", "")
-                                    exec_status = _normalize_execution_status(raw_status, raw_reason)
-                                    execution_message = exec_result.get("execution_message")
-                                    has_message = bool(execution_message)
-                                    if exec_status in ("accepted_preview", "pending_pullback_preview"):
-                                        if execution_message:
-                                            send_telegram_message(execution_message)
-                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
+                                elif EXECUTION_AVAILABLE:
+                                    candidate = _apply_market_execution_fallback(candidate)
+                                    _ensure_execution_setup_tags(candidate)
+                                    if not _candidate_has_complete_execution_plan(candidate):
+                                        exec_status = "rejected_invalid_order"
+                                        exec_reason = "missing_or_invalid_entry_sl_tp"
+                                        update_execution_status_for_candidate(candidate, exec_status, exec_reason, message_sent=False)
+                                        send_telegram_message(build_execution_rejection_message(symbol, exec_status, exec_reason))
+                                        logger.info(f"EXEC RESULT: {symbol} | status={exec_status} | reason={exec_reason} | has_message=True")
                                     else:
-                                        rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
-                                        send_telegram_message(rejection_message)
-                                        has_message = True
-                                        update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
-                                    logger.info(
-                                        f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
-                                    )
-                            else:
-                                update_execution_status_for_candidate(candidate, "preview_rejected", "execution_module_not_available", message_sent=False)
+                                        exec_result = process_trade_candidate(r, symbol, candidate)
+                                        raw_status = exec_result.get("status")
+                                        raw_reason = exec_result.get("reason", "")
+                                        exec_status = _normalize_execution_status(raw_status, raw_reason)
+                                        execution_message = exec_result.get("execution_message")
+                                        has_message = bool(execution_message)
+                                        if exec_status in ("accepted_preview", "pending_pullback_preview"):
+                                            if execution_message:
+                                                send_telegram_message(execution_message)
+                                            update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=has_message)
+                                        else:
+                                            rejection_message = build_execution_rejection_message(symbol, exec_status, raw_reason)
+                                            send_telegram_message(rejection_message)
+                                            has_message = True
+                                            update_execution_status_for_candidate(candidate, exec_status, raw_reason, message_sent=True)
+                                        logger.info(
+                                            f"EXEC RESULT: {symbol} | status={exec_status} | reason={raw_reason} | has_message={has_message}"
+                                        )
+                                else:
+                                    update_execution_status_for_candidate(candidate, "preview_rejected", "execution_module_not_available", message_sent=False)
                     except Exception as _exec_e:
                         logger.error(f"Execution preview error for {symbol}: {_exec_e}")
                     logger.info(f"✅ SENT LONG ---> {symbol}")
