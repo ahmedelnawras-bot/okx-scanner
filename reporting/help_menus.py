@@ -2,7 +2,11 @@ from __future__ import annotations
 
 
 def build_main_menu_layout() -> list[list[str]]:
-    """Official main Telegram reply keyboard layout."""
+    """Official main Telegram menu layout.
+
+    v124: This is used as InlineKeyboardMarkup, not ReplyKeyboardMarkup,
+    so it does not open the big persistent Telegram keyboard.
+    """
     return [
         ["🚀 Execution", "📊 Normal Trades"],
         ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence"],
@@ -13,19 +17,45 @@ def build_main_menu_layout() -> list[list[str]]:
 
 
 def build_main_reply_keyboard() -> dict:
-    """Telegram ReplyKeyboardMarkup matching the approved dashboard layout."""
+    """Deprecated compatibility helper.
+
+    Kept so older imports do not break, but /help should NOT use this anymore.
+    Returning remove_keyboard prevents the old persistent keyboard from staying open.
+    """
+    return {"remove_keyboard": True}
+
+
+def build_main_inline_keyboard() -> dict:
+    """Inline buttons under /help dashboard, matching the old approved style."""
     return {
-        "keyboard": [[{"text": item} for item in row] for row in build_main_menu_layout()],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-        "is_persistent": True,
+        "inline_keyboard": [
+            [
+                {"text": "🚀 Execution", "callback_data": "menu:execution"},
+                {"text": "📊 Normal Trades", "callback_data": "menu:normal"},
+            ],
+            [
+                {"text": "🧠🚀 Execution Intelligence", "callback_data": "cmd:/report_execution_intelligence"},
+                {"text": "🧠📊 Market Intelligence", "callback_data": "cmd:/report_intelligence"},
+            ],
+            [
+                {"text": "💼 Wallet Impact", "callback_data": "cmd:/report_execution_wallet"},
+            ],
+            [
+                {"text": "🧠 Diagnostics", "callback_data": "cmd:/report_diagnostics"},
+                {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
+            ],
+            [
+                {"text": "⚙️ Admin", "callback_data": "menu:admin"},
+                {"text": "📘 System Info", "callback_data": "menu:system_info"},
+            ],
+        ]
     }
 
 
 def _mode_line(mode: str | None = None) -> str:
     mode = mode or "NORMAL_LONG"
     if mode == "STRONG_LONG_ONLY":
-        return "📈 Market Mode: 🟡 STRONG_LONG_ONLY"
+        return "📈 Market Mode: 🟨 STRONG_LONG_ONLY"
     if mode == "BLOCK_LONGS":
         return "📈 Market Mode: 🔴 BLOCK_LONGS"
     if mode == "RECOVERY_LONG":
@@ -54,7 +84,7 @@ def build_execution_help() -> str:
     lines = [
         "🚀 صفقات التنفيذ",
         "📘 /help_execution",
-        "━━━━━━━━━━━━",
+        "┄┄┄┄┄┄┄┄",
         "📊 التقرير العام",
         "/report_execution",
         "/report_execution_7d",
@@ -104,7 +134,7 @@ def build_normal_help() -> str:
     lines = [
         "📊 الصفقات العادية",
         "📘 /help_normal",
-        "━━━━━━━━━━━━",
+        "┄┄┄┄┄┄┄┄",
         "📊 التقرير العام",
         "/report_all",
         "/report_all_7d",
@@ -144,6 +174,31 @@ def build_normal_help() -> str:
     return "\n".join(lines)
 
 
+def build_okx_control_help() -> str:
+    return "\n".join([
+        "🤖 OKX Control",
+        "┄┄┄┄┄┄┄┄",
+        "/status — حالة البوت والتنفيذ",
+        "/mood — حالة السوق الحالية",
+        "/report_execution_open — صفقات التنفيذ المفتوحة",
+        "",
+        "🧪 OKX Orders يتم التحكم فيه من Railway Variables.",
+        "🔒 Live Trading يظل BLOCKED إلا لو تم تفعيله صراحة.",
+    ])
+
+
+def build_admin_help() -> str:
+    return "\n".join([
+        "⚙️ Admin",
+        "┄┄┄┄┄┄┄┄",
+        "/status — فحص سريع للبوت",
+        "/mood — حالة المود",
+        "/help — القائمة الرئيسية",
+        "",
+        "📌 أوامر الإيقاف/التفعيل الحقيقي سيتم ربطها لاحقًا قبل OKX paper/live.",
+    ])
+
+
 def build_master_help(
     mode: str | None = None,
     execution_enabled: bool = True,
@@ -152,19 +207,18 @@ def build_master_help(
 ) -> str:
     """Approved compact /help dashboard.
 
-    The visual button grid is supplied separately as Telegram ReplyKeyboardMarkup.
-    This text stays short and status-focused, matching the old approved dashboard style.
+    v124: buttons are InlineKeyboardMarkup sent under this message only.
+    This avoids the large persistent Reply Keyboard that looked cheap and stayed open.
     """
     lines = [
         "🤖 OKX Long Bot Dashboard",
-        "━━━━━━━━━━━━",
+        "┄┄┄┄┄┄┄┄",
         *_system_status_block(
             mode=mode,
             execution_enabled=execution_enabled,
             risk_enabled=risk_enabled,
             okx_orders=okx_orders,
         ),
-        "━━━━━━━━━━━━",
         "📝 ملاحظات",
         "• الأزرار بالأسفل تفتح أقسام الأوامر مباشرة.",
         "• /open_trades يعرض كل الصفقات المتابعة.",
