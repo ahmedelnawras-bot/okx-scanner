@@ -20,28 +20,37 @@ PERIOD_LABELS = [
 
 def _with_period_title(text: str, label: str) -> str:
     lines = text.splitlines()
+    if len(lines) >= 2 and lines[1].startswith("📅"):
+        lines[1] = f"📅 {label}"
+        return "\n".join(lines)
     if len(lines) >= 2:
         return "\n".join([lines[0], f"📅 {label}", *lines[1:]])
     return f"{text}\n📅 {label}"
 
 
+def _execution_trades(trades):
+    # v124/v125: execution reporting uses explicit execution_trade identity only.
+    # Normal signals with rejected execution checks are excluded from execution open/wallet/PnL.
+    return [t for t in trades if bool(getattr(t, "execution_trade", False) or getattr(t, "tracking_bucket", "") == "execution")]
+
+
 def build_report_bundle(trades, execution_results, signal_items):
-    execution_trades = [t for t in trades if t.execution_setup_tags]
+    execution_trades = _execution_trades(trades)
     return {
-        "general": build_general_report(trades),
-        "open_trades": build_open_trades_report(trades),
+        "general": build_general_report(trades, title="📊 تقرير الصفقات العادية"),
+        "open_trades": build_open_trades_report(trades, title="📂 الصفقات العادية المفتوحة"),
         "execution_open_trades": build_open_trades_report(
             trades, title="🚀📂 صفقات التنفيذ المفتوحة", execution_only=True
         ),
-        "execution": build_execution_report(execution_results),
-        "wallet": build_wallet_report(trades),
+        "execution": build_execution_report(execution_results, execution_trades, title="🚀 تقرير أداء التنفيذ"),
+        "wallet": build_wallet_report(trades, title="💼 Wallet Impact"),
         "execution_wallet": build_wallet_report(execution_trades, title="💼 Wallet Impact — Execution"),
-        "profit_analysis": build_profit_analysis_report(trades),
+        "profit_analysis": build_profit_analysis_report(trades, title="📈 تحليل أسباب الأرباح"),
         "execution_profit_analysis": build_profit_analysis_report(execution_trades, title="📈 تحليل أسباب أرباح التنفيذ"),
-        "losses_analysis": build_losses_analysis_report(trades),
+        "losses_analysis": build_losses_analysis_report(trades, title="📉 تحليل أسباب الخسائر"),
         "execution_losses_analysis": build_losses_analysis_report(execution_trades, title="📉 تحليل أسباب خسائر التنفيذ"),
-        "execution_intelligence": build_intelligence_report(execution_trades, "🧠🚀 Execution Intelligence"),
-        "market_intelligence": build_intelligence_report(trades, "🧠📊 Market Intelligence"),
+        "execution_intelligence": build_intelligence_report(execution_trades, "🧠🚀 ذكاء صفقات التنفيذ"),
+        "market_intelligence": build_intelligence_report(trades, "🧠📊 ذكاء الصفقات العادية"),
         "diagnostics": build_diagnostics_report(signal_items, execution_results),
     }
 
