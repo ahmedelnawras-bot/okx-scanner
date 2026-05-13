@@ -1,7 +1,7 @@
-# Version: main_final_v10_near_resistance_final_softening
+# Version: main_final_v11_execution_routing_final
 # Date: 2026-05-13
 # Base: main_final_v07_okx_command_aliases_fix
-# Changes: v08 makes BLOCK_LONGS exceptions direct execution-preview candidates once they pass the normal signal/exception path; preserves v07 OKX command aliases.
+# Changes: v11 fixes execution routing so strong execution tags reach process_trade_candidate; preserves Recovery and BLOCK exception special paths.
 # Preserved: Trading logic, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and reporting calculations.
 # Fixed previously: Recovery universe, period UI/routing, Profit/Loss analysis wording, /open_trades chunking safety, v06 Smart Resistance softening.
 
@@ -10394,6 +10394,49 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
                 )
             return gate
 
+        # v11: Execution routing fix.
+        # If a signal already carries a canonical execution tag (the same tags shown
+        # in Tag Badge / whitelist / recovery / block-exception paths), it must reach
+        # process_trade_candidate(). The executor/risk layer then decides acceptance,
+        # limits, daily DD, same-symbol and order validity. This prevents strong
+        # VWAP/Retest/RS/Higher-Low signals from staying Normal-only just because a
+        # pre-execution warning such as MACD/near-resistance existed.
+        tags_now = set(_collect_execution_setup_tags(planned))
+        recovery_route = bool(mode == MODE_RECOVERY_LONG or tags_now.intersection({"recovery_long", "recovery_scout", "post_crash"}))
+        core_route = bool(core_tag_allowed or strict_setup_allowed or _has_normal_long_execution_setup(planned))
+        if recovery_route:
+            gate = {
+                "allowed": bool(has_complete_plan),
+                "path": "recovery_direct_execution" if has_complete_plan else "recovery_missing_plan",
+                "reason": "recovery_direct_execution" if has_complete_plan else "missing_or_invalid_entry_sl_tp",
+                "recovery": True,
+            }
+            if mutate:
+                planned["execution_path"] = "recovery"
+                planned["execution_gate_path"] = gate.get("path")
+                planned["execution_gate_reason"] = gate.get("reason")
+                planned["execution_candidate_route"] = "recovery"
+                planned["v11_execution_routing"] = True
+                candidate.update(planned)
+            return gate
+
+        if core_route:
+            gate = {
+                "allowed": bool(has_complete_plan),
+                "path": "core_tag_direct_execution" if has_complete_plan else "core_tag_missing_plan",
+                "reason": "core_tag_direct_execution" if has_complete_plan else "missing_or_invalid_entry_sl_tp",
+                "core_tag": True,
+            }
+            if mutate:
+                planned["execution_path"] = planned.get("execution_path") or ("strong" if mode == MODE_STRONG_LONG_ONLY else "normal")
+                planned["execution_gate_path"] = gate.get("path")
+                planned["execution_gate_reason"] = gate.get("reason")
+                planned["execution_candidate_route"] = "core_tag"
+                planned["v11_execution_routing"] = True
+                planned.setdefault("execution_routing_note", "core execution tag routed to process_trade_candidate")
+                candidate.update(planned)
+            return gate
+
         loss_tuning = _apply_execution_loss_reduction_tuning(planned)
         execution_loss_tuning_passed = bool(loss_tuning.get("passed", True))
         weak_drift_passed = _candidate_passes_weak_drift_execution_quality(planned)
@@ -17279,7 +17322,8 @@ def run_scanner_loop():
                             f"tags={candidate.get('execution_setup_tags', [])} | "
                             f"plan={_candidate_has_complete_execution_plan(candidate)} | "
                             f"core_tag={_has_core_execution_tag(candidate)} | "
-                            f"strict={_has_strict_execution_setup(candidate)} | normal_extra={_has_normal_long_execution_setup(candidate)}"
+                            f"strict={_has_strict_execution_setup(candidate)} | normal_extra={_has_normal_long_execution_setup(candidate)} | "
+                            f"route={candidate.get('execution_candidate_route', '')} | block={candidate.get('block_exception', False)} | recovery={candidate.get('execution_path') == 'recovery'}"
                         )
                         gate_decision = _decide_long_execution_candidate(candidate, mutate=True)
                         logger.info(
