@@ -34,6 +34,17 @@ def _clean_name(value: str | None) -> str:
     return " ".join(part.capitalize() if part.islower() else part for part in text.split())
 
 
+def _mode_theme(mode: str) -> str:
+    emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
+    names = {
+        MODE_NORMAL_LONG: "Normal",
+        MODE_STRONG_LONG_ONLY: "Strong",
+        MODE_BLOCK_LONGS: "Block",
+        MODE_RECOVERY_LONG: "Recovery",
+    }
+    return f"{emoji} {names.get(mode, mode)}"
+
+
 def _execution_header(mode: str) -> str:
     emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
     if mode == MODE_STRONG_LONG_ONLY:
@@ -46,7 +57,7 @@ def _execution_header(mode: str) -> str:
 
 
 def _normal_header(mode: str) -> str:
-    # Keep normal alerts calm: no rocket, no oversized badge.
+    # Calm normal alert. Mode color appears in the Market section, not in the header.
     return "📈 LONG SIGNAL"
 
 
@@ -65,22 +76,72 @@ def _execution_path(signal: SignalCandidate, execution_result: dict | None) -> s
     return "normal_check"
 
 
+def _tradingview_symbol(symbol: str) -> str:
+    """Convert OKX instrument id to a TradingView-friendly symbol."""
+    raw = str(symbol or "").upper()
+    if raw.endswith("-USDT-SWAP"):
+        base = raw.replace("-USDT-SWAP", "USDT")
+        return f"OKX:{base}.P"
+    compact = raw.replace("-", "")
+    return f"OKX:{compact}"
+
+
+def build_tradingview_url(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={_tradingview_symbol(symbol)}"
+
+
+def build_signal_buttons(signal: SignalCandidate) -> dict:
+    """Unified inline buttons under every trade message.
+
+    Track is a callback button like the old bot style.
+    TradingView is a URL button with a unified link format.
+    """
+    return {
+        "inline_keyboard": [[
+            {"text": "📊 Track", "callback_data": f"track:{signal.symbol}"[:64]},
+            {"text": "🔗 TradingView", "url": build_tradingview_url(signal.symbol)},
+        ]]
+    }
+
+
+def build_track_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
+    status = (execution_result or {}).get("status") or "normal_signal_only"
+    reason = (execution_result or {}).get("reason") or "-"
+    setup_clean = _clean_name(signal.setup_type)
+    entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
+    return "\n".join([
+        f"📊 Track | {signal.symbol}",
+        LIGHT_LINE,
+        f"Mode: {_mode_theme(signal.market_mode)}",
+        f"Score: {signal.score:.2f} | TF: 15m",
+        f"Entry Type: {entry_label}",
+        f"Entry: {_fmt_price(signal.entry)}",
+        f"TP1: {_fmt_price(signal.tp1)} | TP2: {_fmt_price(signal.tp2)}",
+        f"SL: {_fmt_price(signal.sl)}",
+        f"Setup: {setup_clean}",
+        f"Execution: {status}",
+        f"Reason: {reason}",
+        "📌 Tracking only while OKX paper orders are OFF" if status not in {"accepted_preview", "pending_pullback_preview"} else "⚡ Execution preview available",
+    ])
+
+
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build the official compact Telegram signal message.
 
     UI-only formatting:
     - Normal signals stay calm and never look like execution failures.
     - Execution candidates keep a premium header with the current mode color.
-    - If OKX orders are disabled, the message clearly says tracking/preview only.
+    - Track/TradingView buttons are attached by main.py via build_signal_buttons().
     """
     mode_emoji = MODE_COLOR_EMOJI.get(signal.market_mode, "⚪")
+    mode_theme = _mode_theme(signal.market_mode)
     status = (execution_result or {}).get("status")
     reason = (execution_result or {}).get("reason")
     is_execution = status in {"accepted_preview", "pending_pullback_preview"}
 
     entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
     setup_clean = _clean_name(signal.setup_type)
-    tags_clean = ", ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
+    tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
 
     if is_execution:
         lines = [
@@ -90,9 +151,8 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "🧠 Quality Filters: PASS",
             "⚡ Preview Ready",
             "",
-            f"🪙 Symbol: {signal.symbol}",
-            "⏱ TF: 15m",
-            f"⭐ Score: {signal.score:.2f}",
+            f"💎 {signal.symbol}",
+            f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}: {_fmt_price(signal.entry)}",
             f"🎯 TP1: {_fmt_price(signal.tp1)}",
@@ -103,8 +163,8 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "┌─ 🚀 Tag Badge ─┐",
             f"Setup: {setup_clean}",
             f"Path: {_execution_path(signal, execution_result)}",
-            f"Tags: {tags_clean}",
-            "└───────────────┘",
+            f"Context: {tags_clean}",
+            "└──────────────┘",
             "",
             "📊 Trade Details",
             f"Setup: {setup_clean}",
@@ -115,7 +175,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "",
             "🌐 Market",
             f"Mode: {mode_emoji} {signal.market_mode}",
-            f"Theme: {mode_emoji} current mode color",
+            f"Theme: {mode_theme}",
             "",
             "⚙️ Execution",
             f"Status: {status}",
@@ -136,11 +196,10 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     lines = [
         _normal_header(signal.market_mode),
         LIGHT_LINE,
-        "📍 إشارة عادية — التنفيذ مسار منفصل عند التأهل فقط",
+        "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
-        f"🪙 Symbol: {signal.symbol}",
-        "⏱ TF: 15m",
-        f"⭐ Score: {signal.score:.2f}",
+        f"💎 {signal.symbol}",
+        f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}: {_fmt_price(signal.entry)}",
         f"🎯 TP1: {_fmt_price(signal.tp1)}",
@@ -151,7 +210,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         "┌─ 🏷 Tag Badge ─┐",
         f"Setup: {setup_clean}",
         f"Context: {tags_clean}",
-        "└───────────────┘",
+        "└──────────────┘",
         "",
         "📊 Trade Details",
         f"Setup: {setup_clean}",
@@ -162,14 +221,13 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         "",
         "🌐 Market",
         f"Mode: {mode_emoji} {signal.market_mode}",
-        f"Theme: {mode_emoji} current mode color",
+        f"Theme: {mode_theme}",
     ]
 
     if signal.warnings:
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
     if execution_result:
-        # Do not make normal alerts look failed. It is only the execution check.
         lines.extend([
             "",
             "⚙️ Execution Check",
