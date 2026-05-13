@@ -1,9 +1,9 @@
-# Version: main_final_v06_smart_resistance_softening
+# Version: main_final_v08_block_exception_direct_execution
 # Date: 2026-05-13
-# Base: main_final_v03_recovery_universe_period_ui_FIXED_HEADER.py
-# Changes: v06 softens Smart Resistance hard blocks for strong execution candidates without changing execution paths.
+# Base: main_final_v07_okx_command_aliases_fix
+# Changes: v08 makes BLOCK_LONGS exceptions direct execution-preview candidates once they pass the normal signal/exception path; preserves v07 OKX command aliases.
 # Preserved: Trading logic, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and reporting calculations.
-# Fixed previously: Recovery universe, period UI/routing, Profit/Loss analysis wording, /open_trades chunking safety.
+# Fixed previously: Recovery universe, period UI/routing, Profit/Loss analysis wording, /open_trades chunking safety, v06 Smart Resistance softening.
 
 import os 
 import sys 
@@ -6068,6 +6068,158 @@ def _send_open_trades(chat_id: str, period: str = "all"):
     send_telegram_reply(chat_id, f"❌ خطأ في جلب الصفقات: {html.escape(str(e))}")
 
 
+
+
+def _html_bool(v) -> str:
+    return "✅" if bool(v) else "❌"
+
+
+def _safe_import_okx_trade_client():
+    try:
+        from execution.okx_trade_client import OKXTradeClient
+        return OKXTradeClient
+    except Exception as e:
+        logger.warning(f"OKXTradeClient import unavailable: {e}")
+        return None
+
+
+def build_okx_positions_message() -> str:
+    """Safe /positions command reply.
+
+    UI/ops only. Does not change execution state or trading logic.
+    """
+    try:
+        Client = _safe_import_okx_trade_client()
+        if Client is None:
+            return "⚠️ <b>OKX Positions</b>\nوحدة OKXTradeClient غير متاحة داخل السيرفر."
+        client = Client()
+        res = client.get_positions(inst_type="SWAP")
+        if not res.get("ok"):
+            return (
+                "⚠️ <b>OKX Positions</b>\n"
+                f"code: <code>{html.escape(str(res.get('code', '')))}</code>\n"
+                f"msg: <code>{html.escape(str(res.get('msg', ''))[:500])}</code>"
+            )
+        positions = []
+        for p in (res.get("data") or []):
+            try:
+                pos = float(p.get("pos") or 0)
+            except Exception:
+                pos = 0.0
+            if abs(pos) <= 0:
+                continue
+            inst = html.escape(str(p.get("instId") or "?"))
+            side = html.escape(str(p.get("posSide") or p.get("side") or ""))
+            upl = str(p.get("upl") or p.get("uplRatio") or "0")
+            avg_px = str(p.get("avgPx") or "-")
+            mark_px = str(p.get("markPx") or "-")
+            positions.append(
+                f"• <b>{inst}</b> | {side} | pos=<code>{pos:g}</code>\n"
+                f"  Avg: <code>{html.escape(avg_px)}</code> | Mark: <code>{html.escape(mark_px)}</code> | UPL: <code>{html.escape(upl)}</code>"
+            )
+        if not positions:
+            return "📭 <b>OKX Positions</b>\nلا توجد مراكز SWAP مفتوحة على OKX."
+        body = "\n".join(positions[:20])
+        more = "" if len(positions) <= 20 else f"\n📂 +{len(positions)-20} more positions..."
+        return f"📌 <b>OKX Positions</b>\n━━━━━━━━━━━━\n{body}{more}"
+    except Exception as e:
+        logger.exception(f"build_okx_positions_message error: {e}")
+        return f"❌ خطأ في جلب مراكز OKX: {html.escape(str(e))}"
+
+
+def build_okx_open_orders_message() -> str:
+    """Safe /open_orders command reply.
+
+    Supports clients with get_open_orders when available; otherwise calls OKX pending orders endpoint defensively.
+    """
+    try:
+        Client = _safe_import_okx_trade_client()
+        if Client is None:
+            return "⚠️ <b>OKX Open Orders</b>\nوحدة OKXTradeClient غير متاحة داخل السيرفر."
+        client = Client()
+        if hasattr(client, "get_open_orders"):
+            res = client.get_open_orders(inst_type="SWAP")
+        elif hasattr(client, "_request"):
+            res = client._request("GET", "/api/v5/trade/orders-pending", params={"instType": "SWAP"})
+        else:
+            return "⚠️ <b>OKX Open Orders</b>\nOKX client لا يدعم جلب الأوامر المفتوحة."
+        if not res.get("ok"):
+            return (
+                "⚠️ <b>OKX Open Orders</b>\n"
+                f"code: <code>{html.escape(str(res.get('code', '')))}</code>\n"
+                f"msg: <code>{html.escape(str(res.get('msg', ''))[:500])}</code>"
+            )
+        orders = res.get("data") or []
+        if not orders:
+            return "📭 <b>OKX Open Orders</b>\nلا توجد أوامر مفتوحة على OKX."
+        lines = []
+        for o in orders[:20]:
+            inst = html.escape(str(o.get("instId") or "?"))
+            side = html.escape(str(o.get("side") or ""))
+            ord_type = html.escape(str(o.get("ordType") or ""))
+            sz = html.escape(str(o.get("sz") or ""))
+            px = html.escape(str(o.get("px") or o.get("triggerPx") or "market"))
+            lines.append(f"• <b>{inst}</b> | {side} | {ord_type} | sz=<code>{sz}</code> | px=<code>{px}</code>")
+        more = "" if len(orders) <= 20 else f"\n📂 +{len(orders)-20} more orders..."
+        return "📌 <b>OKX Open Orders</b>\n━━━━━━━━━━━━\n" + "\n".join(lines) + more
+    except Exception as e:
+        logger.exception(f"build_okx_open_orders_message error: {e}")
+        return f"❌ خطأ في جلب أوامر OKX المفتوحة: {html.escape(str(e))}"
+
+
+def build_execution_max_positions_message() -> str:
+    try:
+        plan = {}
+        max_pos = _get_configured_max_positions_safe()
+        try:
+            from execution.risk_manager import _build_dynamic_position_plan, count_counted_execution_trades
+            plan = _build_dynamic_position_plan(r)
+            max_pos = int(plan.get("max_positions", max_pos))
+            counted = int(count_counted_execution_trades(r))
+        except Exception as e:
+            logger.warning(f"max_positions dynamic plan unavailable: {e}")
+            counted = 0
+        remaining = max(0, int(max_pos) - int(counted))
+        margin = plan.get("margin_per_trade") or plan.get("margin_per_trade_usd") or "-"
+        max_cap = plan.get("max_capital_in_use") or plan.get("max_capital_in_use_usd") or "-"
+        start_balance = plan.get("start_of_day_balance") or plan.get("start_balance") or "-"
+        return (
+            "📊 <b>Execution Max Positions</b>\n"
+            "━━━━━━━━━━━━\n"
+            f"📌 Start Balance: <code>{html.escape(str(start_balance))}</code>\n"
+            f"💼 Max Capital In Use: <code>{html.escape(str(max_cap))}</code>\n"
+            f"📊 حد الصفقات: <b>{int(max_pos)}</b>\n"
+            f"📂 المفتوح المحسوب: <b>{int(counted)}</b>\n"
+            f"✅ المتبقي: <b>{int(remaining)}</b>\n"
+            f"💵 Margin / Trade: <code>{html.escape(str(margin))}</code>"
+        )
+    except Exception as e:
+        logger.exception(f"build_execution_max_positions_message error: {e}")
+        return f"❌ خطأ في جلب الحد الأقصى للصفقات: {html.escape(str(e))}"
+
+
+def build_execution_daily_dd_message() -> str:
+    try:
+        snap = get_execution_daily_guard_snapshot()
+        dd_pct = float(snap.get("daily_dd_pct", 0.0) or 0.0)
+        net_usd = float(snap.get("daily_net_usd", 0.0) or snap.get("wallet_net_usd", 0.0) or 0.0)
+        limit_pct = float(snap.get("limit_pct", EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT) or EXECUTION_DAILY_DRAWDOWN_LIMIT_PCT)
+        locked = bool(snap.get("locked")) or is_execution_paused()
+        reason = html.escape(str(snap.get("reason") or ("manual_pause" if is_execution_paused() else "ok")))
+        emoji = "🔴" if locked else "🟢"
+        return (
+            "🛡 <b>Daily Drawdown Guard</b>\n"
+            "━━━━━━━━━━━━\n"
+            f"{emoji} Status: <b>{'LOCKED/PAUSED' if locked else 'ACTIVE'}</b>\n"
+            f"📉 Daily DD: <b>{dd_pct:+.2f}%</b>\n"
+            f"💰 Daily Net: <b>{net_usd:+.2f}$</b>\n"
+            f"⛔ Limit: <b>-{abs(limit_pct):.2f}%</b>\n"
+            f"📌 Reason: <code>{reason}</code>"
+        )
+    except Exception as e:
+        logger.exception(f"build_execution_daily_dd_message error: {e}")
+        return f"❌ خطأ في جلب Daily DD: {html.escape(str(e))}"
+
 def _build_open_trades_report_context() -> dict:
     try:
         snapshot = load_market_status_snapshot(max_age_seconds=600) or {}
@@ -6140,6 +6292,12 @@ COMMAND_HANDLERS = {
  "/weekly_normal_analysis": lambda chat_id: send_ai_analysis_snapshot(chat_id, "normal", "7d"),
  "/okx_execution": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
  "/help_okx": lambda chat_id: send_telegram_reply(chat_id, build_help_okx_message()),
+ "/execution_status": lambda chat_id: send_telegram_reply(chat_id, build_exec_status_message()),
+ "/execution_mode": lambda chat_id: send_telegram_reply(chat_id, build_exec_mode_message()),
+ "/positions": lambda chat_id: send_telegram_reply(chat_id, build_okx_positions_message()),
+ "/open_orders": lambda chat_id: send_telegram_reply(chat_id, build_okx_open_orders_message()),
+ "/max_positions": lambda chat_id: send_telegram_reply(chat_id, build_execution_max_positions_message()),
+ "/daily_dd": lambda chat_id: send_telegram_reply(chat_id, build_execution_daily_dd_message()),
  "/admin_help": lambda chat_id: send_telegram_reply(chat_id, build_help_admin_message()),
  "/help_admin": lambda chat_id: send_telegram_reply(chat_id, build_help_admin_message()),
  "/system_info": lambda chat_id: send_telegram_reply(chat_id, build_help_info_message()),
@@ -10156,11 +10314,41 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             strict_setup_allowed = _has_normal_long_execution_setup(planned)
         block_mode_allowed = _is_block_mode_execution_candidate(planned)
         has_complete_plan = _candidate_has_complete_execution_plan(planned)
+
+        # v08: BLOCK_LONGS Exception is a deliberate execution exception.
+        # If the alert survived BLOCK_LONGS and reached the send path, it should not be killed
+        # again by normal execution-only quality gates (whitelist, weak drift, v02 loss tuning,
+        # MACD/RSI/near-resistance gates). It still requires a complete plan here; manual pause,
+        # Daily DD, same-symbol/max-position/risk checks remain enforced later by the execution layer.
+        if block_mode_allowed:
+            gate = {
+                "allowed": bool(has_complete_plan),
+                "path": "block_exception_direct_execution" if has_complete_plan else "block_exception_missing_plan",
+                "reason": "block_exception_direct_execution" if has_complete_plan else "missing_or_invalid_entry_sl_tp",
+                "block_exception": True,
+                "bypass_normal_execution_filters": bool(has_complete_plan),
+            }
+            if mutate:
+                planned["execution_path"] = "block_exception"
+                planned["execution_gate_path"] = gate.get("path")
+                planned["execution_gate_reason"] = gate.get("reason")
+                planned["block_exception_direct_execution"] = bool(has_complete_plan)
+                planned["bypass_normal_execution_filters"] = bool(has_complete_plan)
+                planned.setdefault("execution_reject_reason", "" if has_complete_plan else "missing_or_invalid_entry_sl_tp")
+                candidate.update(planned)
+            if (not has_complete_plan) and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "EXEC REJECT | "
+                    f"symbol={planned.get('symbol', '?')} | mode={mode} | reason=missing_or_invalid_entry_sl_tp | "
+                    "path=block_exception_missing_plan | block=True | plan=False"
+                )
+            return gate
+
         loss_tuning = _apply_execution_loss_reduction_tuning(planned)
         execution_loss_tuning_passed = bool(loss_tuning.get("passed", True))
         weak_drift_passed = _candidate_passes_weak_drift_execution_quality(planned)
         base_execution_allowed = bool(
-            (strict_setup_allowed or block_mode_allowed)
+            strict_setup_allowed
             and has_complete_plan
             and execution_loss_tuning_passed
             and weak_drift_passed
@@ -10170,7 +10358,7 @@ def _decide_long_execution_candidate(candidate: dict, mutate: bool = False) -> d
             mode,
             base_execution_allowed=base_execution_allowed,
             strict_setup_allowed=strict_setup_allowed,
-            block_mode_allowed=block_mode_allowed,
+            block_mode_allowed=False,
             has_complete_plan=has_complete_plan,
             weak_drift_passed=weak_drift_passed,
             execution_loss_tuning_passed=execution_loss_tuning_passed,
@@ -16971,6 +17159,10 @@ def run_scanner_loop():
                         "execution_tp2": candidate.get("execution_tp2"),
                         "block_exception": candidate.get("block_exception", False),
                         "block_longs_execution_candidate": candidate.get("block_longs_execution_candidate", False),
+                        "execution_path": candidate.get("execution_path", "block_exception" if candidate.get("block_exception") else ""),
+                        "block_exception_direct_execution": bool(candidate.get("block_exception_direct_execution", False)),
+                        "bypass_normal_execution_filters": bool(candidate.get("bypass_normal_execution_filters", False)),
+                        "block_protection_sl_exempt": bool(candidate.get("block_exception", False)),
                         "current_mode": current_mode,
                         "market_mode": current_mode,
                         "relative_strength_short": candidate.get("relative_strength_short"),
