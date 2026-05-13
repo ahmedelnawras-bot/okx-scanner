@@ -1,9 +1,9 @@
-# Version: main_final_v03_recovery_universe_period_ui.py
-# Date: 2026-05-12
-# Base: main_final_v02_execution_loss_tuning.py
-# Changes: Final v03 expands RECOVERY_LONG universe, adds Recovery Score ordering, unifies period ordering, and fixes Profit/Loss Analysis period wording.
-# Preserved: Normal signal flow, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and existing reporting calculations.
-# Fixed previously: /open_trades chunking safety, BLOCK exception setup tag consistency, analysis package routing, and execution-only loss-reduction tuning.
+# Version: main_final_v04_alert_ui_badge_core.py
+# Date: 2026-05-13
+# Base: main_final_v03_recovery_universe_period_ui_FIXED_HEADER.py
+# Changes: Final v04 unifies normal/execution alert UI, adds framed Tag Badge, and standardizes Core Trade Block.
+# Preserved: Trading logic, scoring engine, execution tuning, market modes, TP/SL, whitelist content, risk manager, and reporting calculations.
+# Fixed previously: Recovery universe, period UI/routing, Profit/Loss analysis wording, /open_trades chunking safety.
 
 import os 
 import sys 
@@ -10378,18 +10378,122 @@ def _apply_execution_loss_reduction_tuning(candidate: dict) -> dict:
         logger.warning(f"_apply_execution_loss_reduction_tuning error: {e}")
         return {"passed": True, "reason": "tuning_error_ignored", "adjustments": []}
 
+
+def _display_tag_label(tag: str) -> str:
+    """Human-friendly short tag labels for Telegram badges."""
+    try:
+        raw = str(tag or "").strip()
+        key = raw.lower().strip()
+        mapping = {
+            "relative_strength_vs_btc": "RS vs BTC", "rs_vs_btc": "RS vs BTC",
+            "vwap_reclaim": "VWAP Reclaim", "higher_low_continuation": "Higher Low",
+            "retest_breakout_confirmed": "Retest Breakout", "breakout_context": "Breakout",
+            "wave_3": "Wave 3", "wave_5_late": "Wave 5 Late",
+            "recovery_long": "Recovery Long", "recovery_scout": "Recovery Long", "post_crash": "Post Crash",
+            "block_exception": "Block Exception", "strong_setup": "Strong Setup", "elite_long_opportunity": "Elite Setup",
+            "failed_breakdown_trap": "Breakdown Trap", "liquidity_sweep_reclaim": "Liquidity Reclaim",
+            "support_bounce_confirmed": "Support Bounce",
+        }
+        if key in mapping: return mapping[key]
+        if not raw: return "Clean Setup"
+        return raw.replace("_", " ").title()[:22]
+    except Exception:
+        return "Clean Setup"
+
+
+def _collect_display_tag_badge_items(*sources, max_items: int = 3) -> list:
+    items = []
+    try:
+        def add(value):
+            if value is None: return
+            if isinstance(value, (list, tuple, set)):
+                for v in value: add(v)
+                return
+            text = str(value or "").strip()
+            if not text: return
+            if "|" in text:
+                for part in text.split("|"): add(part)
+                return
+            label = _display_tag_label(text)
+            if label and label not in items: items.append(label)
+        for src in sources: add(src)
+        return items[:max_items] or ["Clean Setup"]
+    except Exception:
+        return ["Clean Setup"]
+
+
+def _format_tag_badge(items: list, execution: bool = False) -> str:
+    try:
+        icon = "🚀" if execution else "🏷"
+        clean = [str(x).strip() for x in (items or []) if str(x).strip()]
+        clean = clean[:3] or ["Clean Setup"]
+        top = f"┌─ {icon} Tag Badge ─┐"
+        inner_width = max(14, len(top) - 4)
+        for item in clean: inner_width = max(inner_width, len(item[:22]))
+        body = ["│ " + item[:22].ljust(inner_width) + " │" for item in clean]
+        bottom = "└" + "─" * (inner_width + 2) + "┘"
+        return "\n".join([top] + body + [bottom])
+    except Exception:
+        return "┌─ 🏷 Tag Badge ─┐\n│ Clean Setup    │\n└────────────────┘"
+
+
+def _entry_type_label(has_pullback_plan: bool = False, execution_entry=None, market_price=None) -> str:
+    try:
+        return "Pending Pullback" if has_pullback_plan else "Market Entry"
+    except Exception:
+        return "Market Entry"
+
+
+def _execution_header_for_candidate(candidate: dict) -> str:
+    try:
+        mode = str((candidate or {}).get("market_mode") or (candidate or {}).get("current_mode") or (candidate or {}).get("mode") or "").upper()
+        if (candidate or {}).get("block_exception") or mode == "BLOCK_LONGS": return "🔥🔴 <b>BLOCK EXCEPTION</b>"
+        if mode == "RECOVERY_LONG" or "recovery_long" in set(_collect_execution_setup_tags(candidate or {})): return "🔥🔵 <b>RECOVERY EXECUTION</b>"
+        if mode == "STRONG_LONG_ONLY": return "🔥🟡 <b>STRONG EXECUTION</b>"
+        return "🔥🟢 <b>EXECUTION PRIORITY</b>"
+    except Exception:
+        return "🔥🟢 <b>EXECUTION PRIORITY</b>"
+
+
+def _arabic_clean_reason(text: str) -> str:
+    try:
+        raw = str(text or "").strip(); key = raw.lower().strip()
+        mapping = {
+            "macd_hist_falling": "ضعف بسيط في الزخم", "macd_hist_negative": "زخم السوق سلبي نسبيًا",
+            "rsi_slope_weak": "ضعف تدريجي في RSI", "resistance_penalty_only": "مقاومة قريبة نسبيًا",
+            "near_resistance_before_tp1": "مقاومة قريبة قبل الهدف الأول", "far_from_vwap": "السعر بعيد نسبيًا عن VWAP",
+            "late breakout warning": "اختراق متأخر يحتاج حذر", "weak historical setup": "نوع الإشارة ضعيف تاريخيًا",
+            "momentum exhaustion trap": "احتمال ضعف الزخم بعد الحركة", "شمعة قوية لكن احتمال مطاردة": "شمعة قوية لكن يوجد احتمال مطاردة",
+            "زخم macd يتراجع": "ضعف بسيط في الزخم", "macd سلبي": "زخم السوق سلبي نسبيًا",
+        }
+        if key in mapping: return mapping[key]
+        if any('؀' <= ch <= 'ۿ' for ch in raw): return raw
+        if "resistance" in key: return "مقاومة قريبة نسبيًا"
+        if "macd" in key or "momentum" in key: return "ضعف بسيط في الزخم"
+        if "vwap" in key: return "السعر قريب من مستوى VWAP"
+        if "breakout" in key: return "تأكيد اختراق الهيكل السعري"
+        if "relative" in key or "rs" in key: return "قوة شرائية واضحة ضد BTC"
+        return raw.replace("_", " ")
+    except Exception:
+        return str(text or "").strip()
+
+
+def _format_arabic_bullet_list(items, limit: int = 6, fallback: str = "زخم إيجابي مبكر") -> str:
+    try:
+        clean = []
+        for item in items or []:
+            text = _arabic_clean_reason(item)
+            if text and text not in clean: clean.append(text)
+        if not clean: clean = [fallback]
+        return "\n".join(f"• {html.escape(x)}" for x in clean[:limit])
+    except Exception:
+        return f"• {html.escape(fallback)}"
+
 def build_execution_badge_line(candidate: dict) -> str:
     _ensure_execution_setup_tags(candidate)
     if not is_candidate_for_execution(candidate):
         return ""
-    return (
-        "🚀🔥 <b>EXECUTION PRIORITY</b>\n"
-        "══════════════\n\n"
-        "🔥 <b>مرشحة للتنفيذ التجريبي</b>\n"
-        "✅ <b>Whitelist ACTIVE</b>\n"
-        "🧠 <b>Quality Filters: PASS</b>\n"
-        "⚡ <b>Preview Ready</b>"
-    )
+    return _execution_header_for_candidate(candidate) + "\n━━━━━━━━━━━━"
 
 
 # =====================
@@ -10568,29 +10672,60 @@ def build_message(
  else:
     price_line = f"💰 <b>السعر:</b> {fmt_num(price, 6)} | ⏱ <b>الفريم:</b> {safe_15m}"
 
+ tag_items = _collect_display_tag_badge_items(primary_extra_setup, extra_setup_names, context_setups, wave_context)
+ tag_badge_block = _format_tag_badge(tag_items, execution=False)
+ entry_label = _entry_type_label(has_pullback_plan=has_pullback_plan, execution_entry=execution_entry, market_price=market_price)
+ entry_value = execution_entry if (has_pullback_plan and execution_entry is not None) else price
+ trade_details_setup = html.escape(str(opportunity_type or "Continuation"))
+ trade_details_timing = html.escape(str(entry_timing or "Unknown"))
+ trade_details_wave = html.escape(str(wave_context or "Unknown"))
+ vol_state = "High" if any("فوليوم" in str(x) and ("قوي" in str(x) or "انفجاري" in str(x)) for x in bullish + warnings) else "Normal"
+ htf_confirm_text = "Yes" if any("تأكيد فريم الساعة" in str(x) for x in bullish + warnings) else "No"
+ arabic_warnings_text = _format_arabic_bullet_list(warnings, limit=4, fallback="لا توجد ملاحظات مهمة") if warnings else ""
+ arabic_bullish_text = _format_arabic_bullet_list(bullish, limit=5, fallback="زخم إيجابي مبكر")
+ notes_section = f"\n\n⚠️ <b>ملاحظات</b>\n{arabic_warnings_text}" if arabic_warnings_text else ""
+ resistance_note = _arabic_clean_reason(resistance_warning) if resistance_warning else ""
+ if resistance_note and resistance_note not in notes_section:
+    notes_section += f"\n• {html.escape(resistance_note)}" if notes_section else f"\n\n⚠️ <b>ملاحظات</b>\n• {html.escape(resistance_note)}"
+ target_extra = ""
+ if target_method and target_method != "rr":
+    target_extra += f"\n🎯 <b>Target Method:</b> {html.escape(str(target_method))}"
+ if nearest_resistance:
+    target_extra += f"\n🧱 <b>أقرب مقاومة:</b> {fmt_num(nearest_resistance, 6)}"
+ market_mode_display = html.escape(str(market_state_label or market_state or "NORMAL_LONG"))
+ market_mix_display = html.escape(str(market_bias_label or "CLEAR"))
  return f"""{header_block}📈 <b>LONG SIGNAL</b>
-┄┄┄┄┄┄┄┄┄┄┄┄
+━━━━━━━━━━━━
 
-📊 <b>لونج فيوتشر | {safe_symbol}</b>
-{price_line}
-⭐ <b>السكور:</b> {rtl_fix(f"{float(score_result['score']):.1f} / 10")}
-🏷 <b>التصنيف:</b> {safe_rating}
-{pullback_text}
+🪙 <b>{safe_symbol}</b>
+⏰ <b>فريم {safe_15m}</b> | ⭐ <b>Score:</b> {rtl_fix(f"{float(score_result['score']):.1f}")}
+
+💰 <b>{entry_label}:</b> {fmt_num(entry_value, 6)}
 🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق 40%)
 🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق 40%)
-🔄 <b>بعد TP2:</b> 20% trailing stop ({TRAILING_PCT}% تحت الـ high)
-🛡 <b>بعد TP1:</b> نقل SL إلى Entry
-🛑 <b>SL:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")}){sl_method_text}
-🧠 <b>نوع الفرصة:</b> {safe_opportunity_type}{reverse_block}{reversal_4h_block}{breakout_quality_block}{extra_setup_text}{context_text}
-🌍 <b>السوق:</b> {safe_market}
-💸 <b>التمويل:</b> {safe_funding}
-📈 <b>تغير {safe_24h}:</b> {fmt_pct(change_24h)}{new_tag}
-📊 <b>أسباب الدخول:</b>
-{bullish_text}{warnings_block}{news_block}{penalty_text}{resistance_text}{target_text}{wave_text}
-📍 <b>الدخول:</b> {safe_entry_timing}
-{entry_maturity_block}
-⚖️ <b>المخاطرة:</b> {safe_display_risk}
-🔗 <a href="{safe_tv_link}">Open Chart ({safe_15m} / {safe_1h})</a>"""
+🔄 <b>Runner:</b> 20% Trailing ({TRAILING_PCT}% تحت الـ high)
+🛡 <b>وقف الخسارة:</b> {fmt_num(stop_loss, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
+🧠 <b>SL Method:</b> {html.escape(sl_method or "Smart Structure + ATR")}
+
+{tag_badge_block}
+
+📊 <b>Trade Details</b>
+• Setup: {trade_details_setup}
+• Entry Timing: {trade_details_timing}
+• Current Wave: {trade_details_wave}
+• Volume State: {vol_state}
+• 1H Confirmation: {htf_confirm_text}
+
+🌍 <b>حالة السوق</b>
+• Market Mode: {market_mode_display}
+• Market Mix: {market_mix_display}
+• حالة BTC: {html.escape(str(btc_mode or "محايد"))}
+• مستوى الخطورة: {safe_display_risk or "منخفض"}{notes_section}
+
+💡 <b>أسباب الدخول</b>
+{arabic_bullish_text}{news_block}{penalty_text}{target_extra}
+
+🔗 <a href="{safe_tv_link}">TradingView</a>"""
 
 # =========================
 # BUILD RECOVERY LONG MESSAGE
@@ -10619,45 +10754,47 @@ def build_recovery_long_message(
  red_ratio_pct = round(float(red_ratio or 0) * 100, 1)
  safe_symbol = html.escape(symbol_clean)
  safe_tv_link = html.escape(tv_link, quote=True)
- return f"""⚡ <b>RECOVERY CANDIDATE</b>
+ tag_badge_block = _format_tag_badge(["Recovery Long", "Post Crash"], execution=True)
+ return f"""🔥🔵 <b>RECOVERY EXECUTION</b>
+━━━━━━━━━━━━
+
 🪙 <b>{safe_symbol}</b>
+⏰ <b>فريم 15m</b> | ⭐ <b>Score:</b> Recovery
 
-📉 <b>السياق:</b>
-السوق خارج من ضغط/كراش، والفرصة محاولة صيد ارتداد بحجم صغير
+💰 <b>Pending Pullback:</b> {fmt_num(avg_entry, 6)}
+🎯 <b>TP1:</b> {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق {RECOVERY_TP1_CLOSE_PCT}%)
+🏁 <b>TP2:</b> {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق {RECOVERY_TP2_CLOSE_PCT}%)
+🔄 <b>Runner:</b> {RECOVERY_RUNNER_PCT}% Trailing ({TRAILING_PCT}% تحت الـ high)
+🛡 <b>وقف الخسارة:</b> {fmt_num(sl, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
+🧠 <b>SL Method:</b> Recovery ATR × {RECOVERY_SL_ATR_MULT}
 
-📊 <b>حجم الصفقة:</b> {RECOVERY_TOTAL_SIZE_PCT}% من الصفقة العادية
-• Entry 1: {RECOVERY_ENTRY1_SIZE_PCT}% عند {fmt_num(entry1, 6)}
-• Entry 2: {RECOVERY_ENTRY2_SIZE_PCT}% عند {fmt_num(entry2, 6)}
-• متوسط الدخول المخطط: {fmt_num(avg_entry, 6)}
+{tag_badge_block}
 
-🎯 <b>الأهداف:</b>
-• TP1: {fmt_num(tp1, 6)} ({fmt_pct(tp1_pct)} | {rtl_fix(f"{rr1}R")} | إغلاق {RECOVERY_TP1_CLOSE_PCT}%)
-• TP2: {fmt_num(tp2, 6)} ({fmt_pct(tp2_pct)} | {rtl_fix(f"{rr2}R")} | إغلاق {RECOVERY_TP2_CLOSE_PCT}%)
-• بعد TP2: {RECOVERY_RUNNER_PCT}% trailing ({TRAILING_PCT}% تحت الـ high)
-• بعد TP2: نقل SL إلى Entry
+📊 <b>Trade Details</b>
+• Setup: Recovery
+• Entry Timing: Post Crash
+• Current Wave: Recovery
+• Volume State: Improving
+• 1H Confirmation: Recovery Mode
 
-🛑 <b>وقف الخسارة:</b>
-• SL: {fmt_num(sl, 6)} ({rtl_fix(f"-{abs(float(sl_pct)):.2f}%")})
-• ملاحظة: SL أقرب من العادي لأن المود Recovery سريع (ATR × {RECOVERY_SL_ATR_MULT})
-
-📈 <b>سبب الدخول:</b>
-• هبوط/امتداد زائد
-• RSI منخفض أو بدأ يرتد
-• تحسن شمعة 15m
-• الفوليوم يدعم الارتداد
-• BTC لم يعد ينهار
-
-🌍 <b>حالة السوق:</b>
+🌍 <b>حالة السوق</b>
+• Market Mode: 🔵 RECOVERY_LONG
 • Red Ratio 15m: {red_ratio_pct}%
 • Avg Market Change 15m: {fmt_pct(avg_change)}
 • BTC 15m: {fmt_pct(btc_change)}
 • Alt Mode: {html.escape(alt_mode)}
 
-⚠️ <b>تحذير:</b>
-هذه ليست إشارة Long عادية.
-هذه محاولة Recovery عالية المخاطر بحجم صغير.
+⚠️ <b>ملاحظات</b>
+• محاولة ارتداد عالية المخاطر بحجم صغير
+• الصفقة مخصصة للخروج الذكي من حالة الضغط
 
-🔗 <a href="{safe_tv_link}">Open Chart</a>"""
+💡 <b>أسباب الدخول</b>
+• السوق بدأ يتعافى بعد ضغط قوي
+• RSI منخفض أو بدأ يرتد
+• الفوليوم يدعم محاولة الارتداد
+• BTC لم يعد ينهار
+
+🔗 <a href="{safe_tv_link}">TradingView</a>"""
 
 # =========================
 # MARKET GUARD
@@ -16585,8 +16722,10 @@ def run_scanner_loop():
                 if badge:
                     # Execution candidates have their own premium hero header;
                     # remove the calmer normal-signal header to avoid visual duplication.
-                    message = message.replace("📈 <b>LONG SIGNAL</b>\n┄┄┄┄┄┄┄┄┄┄┄┄\n\n", "", 1)
+                    message = message.replace("📈 <b>LONG SIGNAL</b>\n━━━━━━━━━━━━\n\n", "", 1)
+                    message = message.replace("┌─ 🏷 Tag Badge ─┐", "┌─ 🚀 Tag Badge ─┐", 1)
                     message = badge + "\n\n" + message
+
 
                 sent_data = send_telegram_message(
                     message,
