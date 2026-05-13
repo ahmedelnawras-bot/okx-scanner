@@ -1900,6 +1900,35 @@ def _is_severe_block_pressure(kwargs: dict) -> bool:
     return False
 
 
+def _is_block_exception_trade(trade: dict) -> bool:
+    """Trades opened as BLOCK_LONGS exceptions keep their original SL.
+
+    They are intentionally entered during BLOCK mode, so generic BLOCK protection
+    must not tighten/compress their SL. Normal lifecycle still applies: TP1 closes
+    its partial, TP2 enables runner/trailing handling according to the trade model.
+    Recovery trades keep their own recovery-specific behaviour.
+    """
+    try:
+        data = trade or {}
+        diagnostics = data.get("diagnostics", {}) or {}
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        if bool(data.get("recovery_trade")) or bool(data.get("recovery_long")) or str(data.get("entry_timing", "")).lower() == "recovery entry":
+            return False
+        return bool(
+            data.get("block_exception")
+            or data.get("block_longs_execution_candidate")
+            or data.get("block_exception_direct_execution")
+            or diagnostics.get("block_exception")
+            or diagnostics.get("block_longs_execution_candidate")
+            or diagnostics.get("block_exception_direct_execution")
+            or str(data.get("execution_path", "")).lower() == "block_exception"
+            or str(diagnostics.get("execution_path", "")).lower() == "block_exception"
+        )
+    except Exception:
+        return False
+
+
 def _set_block_protection_fields(trade: dict, diagnostics: dict, *, now_ts: int, new_sl: float, old_sl: float,
                                  reason: str, protection_type: str, note: str = "") -> None:
     trade["protected_on_block"] = True
@@ -2157,7 +2186,21 @@ def update_open_trades(
                     try:
                         block_protection_summary["open_seen"] += 1
 
-                        if not _is_execution_managed_trade_for_block_protection(trade):
+                        if _is_block_exception_trade(trade):
+                            block_protection_summary["ignored_tracking_only"] += 1
+                            diagnostics = trade.get("diagnostics", {}) or {}
+                            if not isinstance(diagnostics, dict):
+                                diagnostics = {}
+                            trade["block_protection_sl_exempt"] = True
+                            trade["block_protection_exempt_reason"] = "block_exception_fixed_original_sl"
+                            diagnostics["block_protection_sl_exempt"] = True
+                            diagnostics["block_protection_exempt_reason"] = "block_exception_fixed_original_sl"
+                            trade["diagnostics"] = diagnostics
+                            save_trade(redis_client, trade_key, trade)
+                            update_trade_history_snapshot(redis_client, trade)
+                            state_changed = True
+                            logger.info(f"{symbol} → BLOCK protection skipped: block exception keeps original SL")
+                        elif not _is_execution_managed_trade_for_block_protection(trade):
                             block_protection_summary["ignored_tracking_only"] += 1
                         else:
                             block_protection_summary["execution_seen"] += 1
