@@ -1,10 +1,9 @@
 """Minimal OKX REST client for paper/simulated trading.
 
 Safety rules:
-- Requires OKX_SIMULATED=1 for order placement.
-- Compatible with both:
-  1) OKXTradeClient(credentials=OKXCredentials(...))
-  2) OKXTradeClient(api_key=..., api_secret=..., passphrase=..., simulated=True)
+- Paper/simulated orders only by default.
+- Live orders are blocked unless allow_live_trading=True and simulated=False.
+- Compatible with main.py v119 constructor arguments.
 """
 from __future__ import annotations
 
@@ -35,6 +34,7 @@ class OKXTradeClient:
         api_secret: str = "",
         passphrase: str = "",
         simulated: bool = True,
+        allow_live_trading: bool = False,
         base_url: str = "https://www.okx.com",
         timeout: int = 15,
     ):
@@ -47,6 +47,7 @@ class OKXTradeClient:
             )
 
         self.credentials = credentials
+        self.allow_live_trading = bool(allow_live_trading)
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -78,8 +79,10 @@ class OKXTradeClient:
             "OK-ACCESS-PASSPHRASE": self.credentials.passphrase,
             "Content-Type": "application/json",
         }
+
         if self.credentials.simulated:
             headers["x-simulated-trading"] = "1"
+
         return headers
 
     def get_balance(self) -> dict[str, Any]:
@@ -110,8 +113,11 @@ class OKXTradeClient:
         if not self.configured:
             return {"ok": False, "error": "okx_not_configured"}
 
-        if not self.credentials.simulated:
-            return {"ok": False, "error": "live_trading_blocked_set_OKX_SIMULATED_1"}
+        if not self.credentials.simulated and not self.allow_live_trading:
+            return {
+                "ok": False,
+                "error": "live_trading_blocked_ALLOW_LIVE_TRADING_0",
+            }
 
         path = "/api/v5/trade/order"
         payload = {
