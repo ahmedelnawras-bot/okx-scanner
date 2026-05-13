@@ -29,15 +29,38 @@ _MODE_AR_EXECUTION = {
 }
 
 
+def _fmt_pct(value, decimals: int = 2) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return str(value or "0%")
+    # Defensive display fix: if a tiny internal ratio sneaks in, show it as percent.
+    # If value already looks like percent, keep it. This prevents duplicated ×100.
+    if -1.0 < v < 1.0 and abs(v) > 0:
+        return f"{v:.{decimals}f}%"
+    return f"{v:.{decimals}f}%"
+
+
+def _mode_color_identity(mode: str) -> str:
+    emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
+    names = {
+        MODE_NORMAL_LONG: "Normal",
+        MODE_STRONG_LONG_ONLY: "Strong — light yellow",
+        MODE_BLOCK_LONGS: "Block",
+        MODE_RECOVERY_LONG: "Recovery",
+    }
+    return f"{emoji} {names.get(mode, mode)}"
+
+
 def _mix_action(mode: str, context: dict) -> str:
-    mix = str(context.get("market_mix", "")).upper()
+    mix_label = str(context.get("mix_label", "") or context.get("market_mix", "")).upper()
     if mode == MODE_BLOCK_LONGS:
         return "🚫 الضعيف ممنوع — استثناءات قوية فقط"
     if mode == MODE_RECOVERY_LONG:
         return "🔄 ارتداد سريع — Recovery path فقط"
     if mode == MODE_STRONG_LONG_ONLY:
         return "⚠️ قبول أقوى فقط — لا يعتبر Block"
-    if "CHOPPY" in mix or "MIXED" in mix:
+    if "CHOPPY" in mix_label or "MIXED" in mix_label:
         return "⚠️ جودة أعلى قبل التنفيذ"
     return "✅ القواعد العادية فعالة"
 
@@ -62,33 +85,34 @@ def _signal_rules(mode: str, context: dict) -> list[str]:
             "Execution: whitelist / elite only",
         ]
     return [
-        "Normal signals: ON",
-        "Execution check: separate path",
-        "Weak drift: execution-only",
+        "Normal Signals: ON",
+        "Execution Check: مسار منفصل بعد الإشارة",
+        "Weak Drift: خاص بالتنفيذ فقط",
     ]
 
 
-def _mode_color_identity(mode: str) -> str:
-    emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
-    names = {
-        MODE_NORMAL_LONG: "Normal",
-        MODE_STRONG_LONG_ONLY: "Strong — light yellow",
-        MODE_BLOCK_LONGS: "Block",
-        MODE_RECOVERY_LONG: "Recovery",
-    }
-    return f"{emoji} {names.get(mode, mode)}"
+def _market_mix_lines(context: dict) -> list[str]:
+    if any(k in context for k in ("strong_coins", "red_ratio", "avg15m")):
+        return [
+            f"• Strong Coins: {context.get('strong_coins', 0)}",
+            f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
+            f"• Avg 15m Move: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
+            f"• Action: {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• Action: {context.get('action', '') or _mix_action('', context)}",
+        ]
+    return [
+        f"Status: {context.get('market_mix', 'N/A')}",
+        f"Action: {_mix_action('', context)}",
+    ]
 
 
 def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
     """Unified market-mode message builder.
 
-    Variants:
-    - status: /mood
-    - transition: mode change alert
-    - reminder: periodic market reminder
-
-    UI-only. No scoring/filter/execution behavior is changed here.
+    UI-only. v127 keeps the full /mood details but organizes the lower section
+    and fixes Market Mix percent display.
     """
+    context = dict(context or {})
+    context.setdefault("mode", mode)
     mode_emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
     lines: list[str] = []
 
@@ -111,20 +135,17 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
         _MODE_AR_STATUS.get(mode, "حالة السوق تحت المتابعة."),
         "",
         "🌗 Market Mix",
-        f"Status: {context.get('market_mix', 'N/A')}",
-        f"Action: {_mix_action(mode, context)}",
+        *_market_mix_lines(context),
         "",
         "🌐 Market State",
-        str(context.get("market_state", "N/A")),
+        f"• Strong Coins: {context.get('strong_coins', 0)}",
+        f"• Avg 15m: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
+        f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
     ])
 
     trigger = context.get("trigger")
     if trigger:
-        lines.extend([
-            "",
-            "⚡ Trigger",
-            str(trigger),
-        ])
+        lines.extend(["", "⚡ Trigger", str(trigger)])
 
     lines.extend([
         "",
@@ -136,10 +157,10 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
         *[f"• {line}" for line in _signal_rules(mode, context)],
         "",
         "⚙️ التنفيذ",
-        _MODE_AR_EXECUTION.get(mode, "التنفيذ يتبع إعدادات الجودة الحالية."),
-        f"Execution candidates: {context.get('execution_notes', 'whitelist + quality gates')}",
-        "OKX Orders: حسب إعداد Railway الحالي",
-        "Live Trading: BLOCKED unless explicitly enabled",
+        f"• الحالة: {_MODE_AR_EXECUTION.get(mode, 'التنفيذ يتبع إعدادات الجودة الحالية.')}",
+        f"• Execution Candidates: {context.get('execution_notes', 'whitelist + quality gates')}",
+        "• OKX Orders: حسب إعداد Railway الحالي",
+        "• Live Trading: BLOCKED unless explicitly enabled",
     ])
 
     if mode == MODE_BLOCK_LONGS:
