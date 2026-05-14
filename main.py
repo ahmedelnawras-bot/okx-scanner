@@ -492,8 +492,14 @@ def _extract_commands(text: str) -> list[str]:
 
 
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None) -> None:
-    parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
-    sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    text = str(text or "").strip()
+    if not text:
+        sender.send_message("⚠️ التقرير فارغ أو غير متاح حاليًا.")
+        return
+    parse_mode = "HTML" if ("<b>" in text or "<a " in text) else None
+    result = sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    if not result.get("ok"):
+        sender.send_message("⚠️ حدثت مشكلة أثناء إرسال التقرير. التقرير طويل أو تعذر إرساله من Telegram.")
 
 
 def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None) -> None:
