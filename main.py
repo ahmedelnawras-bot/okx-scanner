@@ -45,6 +45,10 @@ from ui.market_mode_messages import build_market_mode_sections, build_block_esca
 from services.telegram_sender import TelegramSender
 
 
+MARKET_MODE_SAMPLE_SIZE = 100
+MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE = 1
+
+
 def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
     url = f"{base_url}/api/v5/market/tickers?instType=SWAP"
     try:
@@ -67,16 +71,33 @@ def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
 
 
 def _build_snapshot(ranked_pairs) -> MarketSnapshot:
-    red_count = sum(1 for p in ranked_pairs[:20] if p.change_pct < 0)
-    avg_change = (sum(p.change_pct for p in ranked_pairs[:20]) / max(1, min(20, len(ranked_pairs)))) if ranked_pairs else 0.0
-    strong_count = sum(1 for p in ranked_pairs[:20] if p.change_pct >= 1.5)
-    btc_change = next((p.change_pct for p in ranked_pairs if p.symbol.startswith("BTC-")), avg_change)
-    fast_rebound = avg_change > 0.35 and strong_count >= 5
-    btc_reclaim = btc_change > 0.2
-    breadth_improving = red_count <= 8 and avg_change > -0.1
+    """Build a market-mode snapshot from a broad Market Guard sample.
+
+    v128 widened signal scanning, but mode decision was still based on the
+    first 20 ranked pairs. That made BLOCK_LONGS too sensitive to a narrow,
+    biased top slice. v129 restores the old core idea: market mode is decided
+    from a wider guard sample, not the signal top-20.
+    """
+    sample_size = max(20, min(MARKET_MODE_SAMPLE_SIZE, len(ranked_pairs))) if ranked_pairs else 0
+    sample = list(ranked_pairs[:sample_size]) if sample_size else []
+    if not sample:
+        return MarketSnapshot()
+
+    red_count = sum(1 for p in sample if float(getattr(p, "change_pct", 0.0) or 0.0) < 0)
+    avg_change = sum(float(getattr(p, "change_pct", 0.0) or 0.0) for p in sample) / max(1, len(sample))
+    strong_count = sum(1 for p in sample if float(getattr(p, "change_pct", 0.0) or 0.0) >= 1.5)
+    btc_change = next((float(getattr(p, "change_pct", 0.0) or 0.0) for p in ranked_pairs if p.symbol.startswith("BTC-")), avg_change)
+    red_ratio = red_count / max(1, len(sample))
+
+    # Fast recovery is stricter than simple stabilization. It is the temporary
+    # alternative to STRONG_LONG_ONLY only when a real rebound appears.
+    fast_rebound = bool(avg_change > 0.20 and strong_count >= 6 and red_ratio <= 0.58)
+    btc_reclaim = bool(btc_change > -0.15)
+    breadth_improving = bool(red_ratio <= 0.62 and avg_change > -0.55)
+
     return MarketSnapshot(
         btc_change_15m=btc_change,
-        red_ratio_15m=(red_count / max(1, min(20, len(ranked_pairs)))) if ranked_pairs else 0.5,
+        red_ratio_15m=red_ratio,
         avg_change_15m=avg_change,
         strong_coins_count=strong_count,
         fast_rebound=fast_rebound,
@@ -88,7 +109,7 @@ def _build_snapshot(ranked_pairs) -> MarketSnapshot:
 def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protection: dict) -> dict:
     """Build display context for /mood and reminders.
 
-    v127 keeps all details but passes numeric Market Mix fields separately so
+    v129 keeps all details but passes numeric Market Mix fields separately so
     the UI can format them safely. This also avoids text like avg=21.03% when
     the raw source was an OKX reference price rather than a percent.
     """
@@ -220,6 +241,8 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         flush=True,
     )
 
+    block_exception_accepted = 0
+
     for pair in filtered_pairs:
         # Dynamic metadata for recovery relative bounce. PairCandidate is a dataclass
         # without slots, so attaching this is safe and avoids changing model schema.
@@ -237,6 +260,27 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
             min_execution_score=settings.min_execution_score,
             recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
         )
+
+        # BLOCK_LONGS exceptions are intentionally rare. Keep the existing
+        # block-exception logic unchanged, but cap accepted previews per scan so
+        # BLOCK remains a protection mode rather than a parallel execution mode.
+        if (
+            state.mode == MODE_BLOCK_LONGS
+            and exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}
+            and exec_result.get("path") == "block_exception"
+        ):
+            if block_exception_accepted >= MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE:
+                exec_result = {
+                    **exec_result,
+                    "allowed": False,
+                    "status": "rejected_limit",
+                    "reason": "block_exception_cycle_limit",
+                    "path": "block_exception",
+                    "max_block_exception_trades_per_cycle": MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
+                }
+            else:
+                block_exception_accepted += 1
+
         if exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}:
             open_position_count += 1
             if state.mode == MODE_RECOVERY_LONG:
@@ -568,7 +612,7 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v127 started",
+        "✅ OKX Long Bot v129 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
