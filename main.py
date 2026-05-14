@@ -25,6 +25,7 @@ from analysis.market_modes import (
     register_recovery_trade,
 )
 from analysis.pair_selection import select_ranked_pairs
+from analysis.market_guard import build_market_guard_snapshot
 from analysis.scoring import build_signal_candidate
 from execution.execution_processor import process_trade_candidate
 from execution.okx_trade_client import OKXTradeClient
@@ -45,7 +46,6 @@ from ui.market_mode_messages import build_market_mode_sections, build_block_esca
 from services.telegram_sender import TelegramSender
 
 
-MARKET_MODE_SAMPLE_SIZE = 100
 MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE = 1
 
 
@@ -70,39 +70,22 @@ def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
         ]
 
 
-def _build_snapshot(ranked_pairs) -> MarketSnapshot:
-    """Build a market-mode snapshot from a broad Market Guard sample.
+def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
+    """Build market-mode snapshot from real 15m candles.
 
-    v128 widened signal scanning, but mode decision was still based on the
-    first 20 ranked pairs. That made BLOCK_LONGS too sensitive to a narrow,
-    biased top slice. v129 restores the old core idea: market mode is decided
-    from a wider guard sample, not the signal top-20.
+    v130 restores the old core Market Guard calculation: Market Mode is based
+    on the last closed 15m candle for a liquid sample, not ticker/day change
+    values from ranked pairs. This prevents false BLOCK_LONGS caused by
+    24h/reference-price change fields being displayed as Avg 15m.
     """
-    sample_size = max(20, min(MARKET_MODE_SAMPLE_SIZE, len(ranked_pairs))) if ranked_pairs else 0
-    sample = list(ranked_pairs[:sample_size]) if sample_size else []
-    if not sample:
-        return MarketSnapshot()
-
-    red_count = sum(1 for p in sample if float(getattr(p, "change_pct", 0.0) or 0.0) < 0)
-    avg_change = sum(float(getattr(p, "change_pct", 0.0) or 0.0) for p in sample) / max(1, len(sample))
-    strong_count = sum(1 for p in sample if float(getattr(p, "change_pct", 0.0) or 0.0) >= 1.5)
-    btc_change = next((float(getattr(p, "change_pct", 0.0) or 0.0) for p in ranked_pairs if p.symbol.startswith("BTC-")), avg_change)
-    red_ratio = red_count / max(1, len(sample))
-
-    # Fast recovery is stricter than simple stabilization. It is the temporary
-    # alternative to STRONG_LONG_ONLY only when a real rebound appears.
-    fast_rebound = bool(avg_change > 0.20 and strong_count >= 6 and red_ratio <= 0.58)
-    btc_reclaim = bool(btc_change > -0.15)
-    breadth_improving = bool(red_ratio <= 0.62 and avg_change > -0.55)
-
-    return MarketSnapshot(
-        btc_change_15m=btc_change,
-        red_ratio_15m=red_ratio,
-        avg_change_15m=avg_change,
-        strong_coins_count=strong_count,
-        fast_rebound=fast_rebound,
-        btc_reclaim=btc_reclaim,
-        breadth_improving=breadth_improving,
+    return build_market_guard_snapshot(
+        ranked_pairs,
+        base_url=settings.okx_base_url,
+        timeout=settings.request_timeout,
+        sample_size=50,
+        min_valid=20,
+        timeframe="15m",
+        debug=True,
     )
 
 
@@ -184,7 +167,7 @@ def _run_market_mode_guard(
         return state
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
-    snapshot = _build_snapshot(ranked_pairs)
+    snapshot = _build_snapshot(ranked_pairs, settings)
     previous_mode = state.mode
     guarded_state = decide_market_mode(snapshot, previous=state)
     _refresh_mode_outputs(result, guarded_state, snapshot)
@@ -223,7 +206,7 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
     settings = settings or get_settings()
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
-    snapshot = _build_snapshot(ranked_pairs)
+    snapshot = _build_snapshot(ranked_pairs, settings)
     initial_mode = previous_state or MarketModeState(mode=MODE_NORMAL_LONG, changed_at=datetime.now(timezone.utc))
     state = decide_market_mode(snapshot, previous=initial_mode)
 
@@ -612,7 +595,7 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v129 started",
+        "✅ OKX Long Bot v130 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
