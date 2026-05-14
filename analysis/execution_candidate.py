@@ -327,6 +327,13 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
     recovery_soft_passed = bool(recovery_allowed and recovery_quality_passed)
     late_risky = _is_late_risky_execution_context(signal)
 
+    # v142 quality gates need these normalized metadata values inside this scope.
+    # Keep safe fallbacks so old Redis/tracking records do not crash execution checks.
+    meta = signal.meta or {}
+    vol_ratio = float(meta.get("vol_ratio") or 1.0)
+    mtf_confirmed = bool(meta.get("mtf_confirmed") or str(meta.get("htf_confirmation") or "").lower() == "yes")
+    setup_weight = _setup_weight(signal)
+
     allowed = False
     path = "candidate_only"
     reason = "not_whitelisted"
