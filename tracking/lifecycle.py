@@ -34,7 +34,8 @@ def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
         trade.daily_open_risk_exempt = True
         trade.same_symbol_block_exempt = True
         trade.slot_exempt_reason = "tp2_protected_runner"
-        trade.protected_sl = max(float(trade.protected_sl or 0.0), float(trade.entry or 0.0))
+        buffered_entry = trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0)
+        trade.protected_sl = max(float(trade.protected_sl or 0.0), float(buffered_entry or trade.entry or 0.0))
     return trade
 
 
@@ -46,17 +47,16 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
         trade.protection_level = max(trade.protection_level, 2)
         trade.protected_reason = "market_mode_block_longs"
         buffered_entry = trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0)
+        # v135 lifecycle: TP1 alone does not move SL to entry. BLOCK soft protection
+        # tightens only TP2 protected runners; no panic move for TP1-only trades.
         if trade.tp2_hit:
             trade.trailing_tightened = True
             trade.protected_sl = max(trade.protected_sl or 0.0, buffered_entry)
-        elif not trade.tp1_hit:
-            trade.protected_sl = max(trade.protected_sl or 0.0, trade.entry)
-        else:
-            trade.protected_sl = max(trade.protected_sl or 0.0, buffered_entry)
     if protection_level >= 3 and trade.pnl_pct > 0:
         trade.protection_level = 3
-        trade.trailing_tightened = trade.tp2_hit or trade.trailing_tightened
-        trade.protected_sl = max(trade.protected_sl or 0.0, trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0))
+        if trade.tp2_hit:
+            trade.trailing_tightened = True
+            trade.protected_sl = max(trade.protected_sl or 0.0, trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0))
     return trade
 
 
@@ -89,19 +89,21 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
 
     if not trade.tp1_hit and current_price >= trade.tp1:
         trade.tp1_hit = True
-        # Keep the old protection behavior after TP1; slot exemption still waits for TP2.
-        trade.sl_moved_to_entry = True
+        # v135 official lifecycle: TP1 closes 40% only. SL is NOT moved to entry here.
+        trade.sl_moved_to_entry = False
         trade.closed_portion_pct = tp1_close_pct
         trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
         trade.status = "tp1_partial"
 
-    post_tp1_sl = max(active_sl, trade.entry if trade.sl_moved_to_entry else active_sl)
+    post_tp1_sl = active_sl
     if trade.tp1_hit and not trade.tp2_hit and current_price <= post_tp1_sl:
         trade.closed_portion_pct = 100.0
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
-        trade.realized_pnl_pct += max(0.0, _pnl_pct(trade.entry, post_tp1_sl)) * (remaining_pct / 100.0)
+        # TP1-only then original SL = partial win + remaining loss, not breakeven.
+        trade.realized_pnl_pct += _pnl_pct(trade.entry, post_tp1_sl) * (remaining_pct / 100.0)
         trade.runner_pnl_pct = 0.0
-        return _mark_closed(trade, "breakeven_after_tp1")
+        final_status = "closed_win" if float(trade.realized_pnl_pct or 0.0) > 0 else "closed_loss"
+        return _mark_closed(trade, final_status)
 
     if trade.tp1_hit and not trade.tp2_hit and current_price >= trade.tp2:
         trade.tp2_hit = True
