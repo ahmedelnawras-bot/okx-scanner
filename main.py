@@ -15,7 +15,7 @@ import requests
 from datetime import datetime, timezone
 
 from utils.config import get_settings, Settings
-from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG
+from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG, MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE, MAX_RECOVERY_TRADES_PER_CYCLE
 from analysis.market_modes import (
     MarketSnapshot,
     MarketModeState,
@@ -31,6 +31,7 @@ from execution.execution_processor import process_trade_candidate
 from execution.okx_trade_client import OKXTradeClient
 from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
+from tracking.persistence import RedisTradeStore
 from reporting.report_router import build_report_bundle, build_command_outputs
 from reporting.help_menus import (
     build_main_menu_layout,
@@ -44,9 +45,6 @@ from reporting.help_menus import (
 from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 from services.telegram_sender import TelegramSender
-
-
-MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE = 1
 
 
 def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
@@ -202,8 +200,59 @@ def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
         return False
 
 
-def run_once(previous_state: MarketModeState | None = None, settings: Settings | None = None) -> dict:
+
+def _is_trade_closed(trade) -> bool:
+    return bool(getattr(trade, "is_closed", False))
+
+
+def _is_counted_open_trade(trade) -> bool:
+    return bool(not _is_trade_closed(trade) and not getattr(trade, "slot_exempt", False))
+
+
+def _trade_slot_path(trade) -> str:
+    path = str(getattr(trade, "execution_path", "") or "")
+    if path == "block_exception":
+        return "block_exception"
+    if path == "recovery":
+        return "recovery"
+    return "general"
+
+
+def _execution_slot_counts(trades) -> dict[str, int]:
+    counts = {"general": 0, "block_exception": 0, "recovery": 0}
+    for trade in trades or []:
+        if not getattr(trade, "execution_trade", False):
+            continue
+        if not _is_counted_open_trade(trade):
+            continue
+        counts[_trade_slot_path(trade)] = counts.get(_trade_slot_path(trade), 0) + 1
+    return counts
+
+
+def _has_active_same_symbol(trades, candidate_trade) -> bool:
+    """Avoid duplicate active tracking, but allow new entry after TP2 protected runner."""
+    symbol = getattr(candidate_trade, "symbol", "")
+    bucket = getattr(candidate_trade, "tracking_bucket", "normal")
+    path = getattr(candidate_trade, "execution_path", "")
+    for trade in trades or []:
+        if getattr(trade, "symbol", "") != symbol:
+            continue
+        if getattr(trade, "tracking_bucket", "normal") != bucket:
+            continue
+        if path and getattr(trade, "execution_path", "") != path:
+            continue
+        if _is_counted_open_trade(trade):
+            return True
+    return False
+
+def run_once(
+    previous_state: MarketModeState | None = None,
+    settings: Settings | None = None,
+    trade_store: RedisTradeStore | None = None,
+) -> dict:
     settings = settings or get_settings()
+    persisted_trades = trade_store.load_trades() if trade_store else []
+
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
     snapshot = _build_snapshot(ranked_pairs, settings)
@@ -211,10 +260,10 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
     state = decide_market_mode(snapshot, previous=initial_mode)
 
     signal_items = []
-    execution_results = []
-    trades = []
-    open_position_count = 0
-    recovery_remaining = recovery_slots_remaining(state)
+    current_execution_results = []
+    new_trades = []
+    slot_counts = _execution_slot_counts(persisted_trades)
+    recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
 
     scan_pairs = ranked_pairs
     filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
@@ -223,8 +272,6 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
         flush=True,
     )
-
-    block_exception_accepted = 0
 
     for pair in filtered_pairs:
         # Dynamic metadata for recovery relative bounce. PairCandidate is a dataclass
@@ -236,50 +283,55 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         signal = build_signal_candidate(pair, state.mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
             continue
+
         exec_result = process_trade_candidate(
             signal,
-            current_open_positions=open_position_count,
+            current_open_positions=slot_counts.get("general", 0),
             max_open_positions=settings.max_execution_positions,
             min_execution_score=settings.min_execution_score,
             recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
+            block_open_positions=slot_counts.get("block_exception", 0),
+            max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
+            recovery_open_positions=slot_counts.get("recovery", 0),
+            max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
         )
 
-        # BLOCK_LONGS exceptions are intentionally rare. Keep the existing
-        # block-exception logic unchanged, but cap accepted previews per scan so
-        # BLOCK remains a protection mode rather than a parallel execution mode.
-        if (
-            state.mode == MODE_BLOCK_LONGS
-            and exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}
-            and exec_result.get("path") == "block_exception"
-        ):
-            if block_exception_accepted >= MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE:
-                exec_result = {
-                    **exec_result,
-                    "allowed": False,
-                    "status": "rejected_limit",
-                    "reason": "block_exception_cycle_limit",
-                    "path": "block_exception",
-                    "max_block_exception_trades_per_cycle": MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
-                }
-            else:
-                block_exception_accepted += 1
-
         if exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}:
-            open_position_count += 1
-            if state.mode == MODE_RECOVERY_LONG:
-                state = register_recovery_trade(state)
-                recovery_remaining = recovery_slots_remaining(state)
-        signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
-        execution_results.append(exec_result)
-        trades.append(register_trade(signal, exec_result))
+            path = str(exec_result.get("path") or "general")
+            if path == "block_exception":
+                slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
+            elif path == "recovery":
+                slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
+                recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
+                if state.mode == MODE_RECOVERY_LONG:
+                    state = register_recovery_trade(state)
+            else:
+                slot_counts["general"] = slot_counts.get("general", 0) + 1
 
+        signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
+        current_execution_results.append(exec_result)
+
+        candidate_trade = register_trade(signal, exec_result)
+        # Persist accepted execution trades and normal tracked signals without duplicating the same active symbol.
+        if not _has_active_same_symbol([*persisted_trades, *new_trades], candidate_trade):
+            new_trades.append(candidate_trade)
+
+    all_trades = [*persisted_trades, *new_trades]
     price_map = {pair.symbol: pair.last_price * (1.012 if "momentum" in pair.tags else 0.996) for pair in filtered_pairs}
     protection = block_protection_status(state)
-    trades = update_open_trades(trades, price_map, protection_level=protection.get("level", 0))
+    trades = update_open_trades(all_trades, price_map, protection_level=protection.get("level", 0))
+
+    if trade_store:
+        trade_store.save_trades(trades)
+        trade_store.append_execution_checks(current_execution_results)
+        execution_results_for_reports = trade_store.load_execution_checks() or current_execution_results
+    else:
+        execution_results_for_reports = current_execution_results
+
     mode_message = _build_mode_message(state, snapshot, protection)
     mode_context = _build_mode_context(state, snapshot, protection)
-    reports = build_report_bundle(trades, execution_results, signal_items)
-    command_outputs = build_command_outputs(trades, execution_results, signal_items)
+    reports = build_report_bundle(trades, execution_results_for_reports, signal_items)
+    command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items)
 
     return {
         "state": state,
@@ -300,7 +352,8 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         "help_normal": build_normal_help(),
         "signals": [item["message"] for item in signal_items[:8]],
         "signal_items": signal_items,
-        "execution_results": execution_results,
+        "execution_results": execution_results_for_reports,
+        "current_execution_results": current_execution_results,
         "trades": trades,
         "command_outputs": command_outputs,
         **reports,
@@ -394,12 +447,21 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
 
     if data.startswith("track:"):
         symbol = data.split(":", 1)[1]
+        matching_trade = None
+        for trade in result.get("trades", []):
+            if getattr(trade, "symbol", "") == symbol:
+                matching_trade = trade
+                if not getattr(trade, "is_closed", False):
+                    break
         for item in result.get("signal_items", []):
             signal = item.get("signal")
             if signal and signal.symbol == symbol:
-                sender.send_message(build_track_message(signal, item.get("execution")))
+                sender.send_message(build_track_message(signal, item.get("execution"), trade=matching_trade))
                 return
-        sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan.")
+        if matching_trade is not None:
+            sender.send_message(build_track_message(None, None, trade=matching_trade))
+            return
+        sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan أو في سجل Redis.")
         return
 
     if data.startswith("menu:"):
@@ -587,6 +649,7 @@ def live_worker() -> None:
         allow_live_trading=settings.allow_live_trading,
         timeout=settings.request_timeout,
     )
+    trade_store = RedisTradeStore(settings.redis_url)
     state: MarketModeState | None = None
     sent_fingerprints: set[str] = set()
     telegram_offset: int | None = None
@@ -595,11 +658,12 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v130 started",
+        "✅ OKX Long Bot v131 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
         f"Full scan: {settings.scan_interval_seconds}s | Mode guard: {settings.market_mode_guard_interval_seconds}s",
+        trade_store.soft_restart_safe_note(),
     ]
     print("\n".join(startup_lines), flush=True)
     if sender.enabled and settings.telegram_enabled:
@@ -607,7 +671,7 @@ def live_worker() -> None:
 
     while True:
         try:
-            result = run_once(previous_state=state, settings=settings)
+            result = run_once(previous_state=state, settings=settings, trade_store=trade_store)
             last_result = result
             state = result["state"]
             print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
