@@ -496,6 +496,79 @@ def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = No
     sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
+
+
+
+def _format_clean_preview(stats: dict, title: str, confirm_command: str) -> str:
+    if not stats.get("enabled"):
+        return "⚠️ Redis غير متاح حاليًا — لا يمكن تنفيذ التنظيف."
+    lines = [
+        title,
+        "┄┄┄┄┄┄┄┄",
+        f"Prefix: {stats.get('prefix', 'n/a')}",
+        f"Open set: {stats.get('open_set', 0)}",
+        f"History set: {stats.get('history_set', 0)}",
+        f"Trade keys: {stats.get('trade_keys', 0)}",
+        f"Execution checks: {stats.get('execution_checks', 0)}",
+    ]
+    if stats.get("mode") == "deep":
+        lines += [
+            f"Keys to delete: {stats.get('keys_to_delete', 0)}",
+            "",
+            "⚠️ Deep Clean سيمسح بيانات البوت تحت نفس Prefix ويبدأ baseline جديد.",
+            f"للتأكيد أرسل: {confirm_command}",
+        ]
+    else:
+        lines += [
+            f"Stale open candidates: {stats.get('stale_open_candidates', 0)}",
+            f"Old execution checks: {stats.get('old_execution_checks', 0)}",
+            "",
+            "🧹 Soft Clean ينظف القديم/المعطوب فقط ولا يمسح كل التاريخ.",
+            f"للتأكيد أرسل: {confirm_command}",
+        ]
+    if stats.get("error"):
+        lines.append(f"Error: {stats.get('error')}")
+    return "\n".join(lines)
+
+
+def _format_clean_result(stats: dict, title: str) -> str:
+    if not stats.get("enabled"):
+        return "⚠️ Redis غير متاح حاليًا — لم يتم تنفيذ التنظيف."
+    lines = [title, "┄┄┄┄┄┄┄┄"]
+    if stats.get("mode") == "deep":
+        lines += [
+            f"Deleted keys: {stats.get('deleted_keys', 0)}",
+            "✅ تم بدء baseline جديد للتجربة.",
+        ]
+    else:
+        lines += [
+            f"Removed open members: {stats.get('removed_open_members', 0)}",
+            f"Deleted stale trade keys: {stats.get('deleted_trade_keys', 0)}",
+            f"Removed old checks: {stats.get('removed_execution_checks', 0)}",
+            f"Kept checks: {stats.get('kept_execution_checks', 0)}",
+            "✅ تم تنظيف البيانات القديمة/المعطوبة فقط.",
+        ]
+    if stats.get("error"):
+        lines.append(f"⚠️ Error: {stats.get('error')}")
+    return "\n".join(lines)
+
+
+def _handle_admin_clean_command(command: str, trade_store: RedisTradeStore | None) -> str | None:
+    if command in {"/soft_clean", "/soft_clean_preview"}:
+        stats = trade_store.clean_preview("soft") if trade_store else {"enabled": False}
+        return _format_clean_preview(stats, "🧹 Soft Clean Preview", "/soft_clean_confirm")
+    if command == "/soft_clean_confirm":
+        stats = trade_store.soft_clean() if trade_store else {"enabled": False, "mode": "soft"}
+        return _format_clean_result(stats, "🧹 Soft Clean Done")
+    if command in {"/deep_clean", "/deep_clean_preview"}:
+        stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
+        return _format_clean_preview(stats, "🧨 Deep Clean Preview", "/deep_clean_confirm")
+    if command == "/deep_clean_confirm":
+        stats = trade_store.deep_clean() if trade_store else {"enabled": False, "mode": "deep"}
+        return _format_clean_result(stats, "🧨 Deep Clean Done")
+    return None
+
+
 def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None) -> None:
     callback_id = str(callback_query.get("id") or "")
     data = str(callback_query.get("data") or "")
@@ -543,7 +616,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         _send_text(sender, reply)
         return
 
-def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings) -> int | None:
+def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings, trade_store: RedisTradeStore | None = None) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
         return offset
@@ -591,6 +664,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
+            clean_reply = _handle_admin_clean_command(command, trade_store)
+            if clean_reply is not None:
+                _send_text(sender, clean_reply)
+                continue
             if command in ("/start", "/help"):
                 reply = result.get("help") or "OKX Long Bot is running."
                 sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
@@ -765,7 +842,7 @@ def live_worker() -> None:
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None)
-                telegram_offset = _answer_commands(sender, result, telegram_offset, settings)
+                telegram_offset = _answer_commands(sender, result, telegram_offset, settings, trade_store)
         except Exception as exc:
             error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
             print(error_text, flush=True)
@@ -784,7 +861,7 @@ def live_worker() -> None:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
                         _maybe_send_mode_reminder(sender, last_result, reminder_tracker)
-                        telegram_offset = _answer_commands(sender, last_result, telegram_offset, settings)
+                        telegram_offset = _answer_commands(sender, last_result, telegram_offset, settings, trade_store)
                 except Exception as exc:
                     print(f"telegram command polling error: {exc}", flush=True)
             time.sleep(3)
