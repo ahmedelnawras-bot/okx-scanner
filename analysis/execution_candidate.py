@@ -269,6 +269,118 @@ def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> b
 
 
 
+
+
+def _normal_long_execution_timing_gate(signal: SignalCandidate) -> tuple[bool, dict]:
+    """NORMAL_LONG execution-only entry timing gate.
+
+    This does not block normal Telegram signals. It only decides whether a
+    NORMAL_LONG whitelisted setup is ready for execution preview now.
+
+    The current rebuild has ticker/proxy metadata rather than full candle
+    objects inside this function, so the gate uses the safest available
+    real-time proxies: MTF confirmation, volume expansion, breakout/reclaim
+    quality, setup weight, distance/chase risk, and resistance warning.
+    """
+    meta = signal.meta or {}
+    tags = _signal_tags(signal)
+    score = float(meta.get("effective_score") or signal.score or 0.0)
+    vol_ratio = float(meta.get("vol_ratio") or 1.0)
+    mtf_confirmed = bool(meta.get("mtf_confirmed") or str(meta.get("htf_confirmation") or "").lower() == "yes")
+    breakout_quality = str(meta.get("breakout_quality") or "").strip().lower()
+    setup_weight = _setup_weight(signal)
+    dist_ma = float(meta.get("dist_ma") or 0.0)
+    resistance_warning = bool(meta.get("resistance_warning") or meta.get("rejection_context") == "near_resistance_warning")
+    entry_text = "|".join([
+        str(signal.entry_timing or ""),
+        str(meta.get("entry_maturity") or ""),
+        str(meta.get("wave_context") or ""),
+        str(meta.get("maturity_label") or ""),
+    ]).lower()
+
+    strong_tags = bool(tags & {"wave_3", "relative_strength_vs_btc", "rs_btc", "retest_breakout_confirmed", "vwap_reclaim"})
+    extra_tags = bool(tags & NORMAL_LONG_EXTRA_WHITELIST)
+    reclaim_or_breakout = breakout_quality in {"good", "strong"} or bool(tags & {"vwap_reclaim", "retest_breakout_confirmed", "liquidity_sweep_reclaim"})
+    support_or_bounce = bool(tags & {"support_bounce_confirmed", "higher_low_continuation", "failed_breakdown_trap"})
+
+    hard_bad_timing = any(token in entry_text for token in (
+        "danger", "danger_late", "hard_late", "overextended", "wave_5_late", "متأخر جدًا", "موجة خامسة"
+    ))
+    chase_risk = bool(dist_ma >= 3.8 and not reclaim_or_breakout and vol_ratio < 1.35)
+    weak_confirmation = bool((not mtf_confirmed) and vol_ratio < 1.30 and breakout_quality not in {"strong"})
+
+    checks = {
+        "strong_setup_tag": strong_tags,
+        "extra_setup_tag": extra_tags,
+        "mtf_confirmed": mtf_confirmed,
+        "volume_expansion": vol_ratio >= 1.18,
+        "strong_volume": vol_ratio >= 1.45,
+        "reclaim_or_breakout": reclaim_or_breakout,
+        "support_or_bounce": support_or_bounce,
+        "setup_weight_ok": setup_weight >= 2,
+        "score_ready": score >= 6.70,
+        "premium_score": score >= 7.25,
+        "no_hard_bad_timing": not hard_bad_timing,
+        "not_chasing_without_force": not chase_risk,
+        "confirmation_not_weak": not weak_confirmation,
+        "resistance_manageable": (not resistance_warning) or (score >= 7.25 and vol_ratio >= 1.25),
+    }
+
+    # Strong whitelisted normal setups should still be execution-ready only when
+    # entry timing is supported by confirmation, not by the setup name alone.
+    core_ready = bool(
+        checks["no_hard_bad_timing"]
+        and checks["not_chasing_without_force"]
+        and checks["confirmation_not_weak"]
+        and checks["resistance_manageable"]
+        and checks["strong_setup_tag"]
+        and checks["setup_weight_ok"]
+        and checks["score_ready"]
+        and (
+            (checks["mtf_confirmed"] and checks["volume_expansion"])
+            or (checks["reclaim_or_breakout"] and vol_ratio >= 1.22)
+            or (checks["premium_score"] and checks["strong_volume"])
+        )
+    )
+
+    # Extra NORMAL_LONG setups need a cleaner confirmation stack because they are
+    # broader than the core execution whitelist.
+    extra_ready = bool(
+        checks["no_hard_bad_timing"]
+        and checks["not_chasing_without_force"]
+        and checks["confirmation_not_weak"]
+        and checks["resistance_manageable"]
+        and checks["extra_setup_tag"]
+        and score >= 6.95
+        and mtf_confirmed
+        and vol_ratio >= 1.25
+        and (checks["support_or_bounce"] or checks["reclaim_or_breakout"])
+    )
+
+    passed = bool(core_ready or extra_ready)
+    reason = "normal_execution_timing_pass" if passed else "normal_execution_timing_not_ready"
+    if hard_bad_timing:
+        reason = "normal_execution_timing_hard_late"
+    elif chase_risk:
+        reason = "normal_execution_timing_chase_risk"
+    elif weak_confirmation:
+        reason = "normal_execution_timing_weak_confirmation"
+    elif resistance_warning and not checks["resistance_manageable"]:
+        reason = "normal_execution_timing_resistance_wait"
+
+    return passed, {
+        "passed": passed,
+        "reason": reason,
+        "score": round(score, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "mtf_confirmed": mtf_confirmed,
+        "breakout_quality": breakout_quality,
+        "setup_weight": setup_weight,
+        "dist_ma": dist_ma,
+        "tags": sorted(tags),
+        "checks": checks,
+    }
+
 def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
     """RECOVERY_LONG-only quality gate.
 
@@ -322,6 +434,7 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
     near_resistance_warning = bool(signal.meta.get("rejection_context") == "near_resistance_warning" or signal.meta.get("resistance_warning"))
     weak_drift_passed = _candidate_passes_weak_drift_execution_quality(signal)
     recovery_quality_passed, recovery_quality = _recovery_quality_gate(signal) if recovery_allowed else (False, {})
+    normal_timing_passed, normal_timing = _normal_long_execution_timing_gate(signal) if signal.market_mode == MODE_NORMAL_LONG else (True, {})
     # Recovery has a softened weak-drift rule: real rebound quality can override
     # normal weak drift, but only in RECOVERY_LONG and only for recovery tags.
     recovery_soft_passed = bool(recovery_allowed and recovery_quality_passed)
@@ -353,6 +466,8 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
             "near_resistance_warning": near_resistance_warning,
             "weak_drift_passed": weak_drift_passed,
             "weak_drift": get_weak_trend_drift_status(signal),
+            "normal_timing_passed": normal_timing_passed,
+            "normal_timing": normal_timing,
             "recovery_quality_passed": recovery_quality_passed,
             "recovery_quality": recovery_quality,
         }
@@ -362,13 +477,16 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
             signal.score >= 6.50
             or (signal.score >= 6.25 and mtf_confirmed and vol_ratio >= 1.12 and setup_weight >= 2)
         )
-        if normal_quality_ok:
+        if normal_quality_ok and normal_timing_passed:
             allowed, path, reason = True, "whitelist", "normal_whitelist_pass"
             if normal_extra_allowed and not strict_allowed:
                 reason = "normal_extra_whitelist_pass"
             if near_resistance_warning and signal.score < 7.2:
                 pending_pullback = True
                 reason = "pullback_first_instead_of_reject"
+        elif normal_quality_ok and not normal_timing_passed:
+            pending_pullback = True
+            path, reason = "blocked", str(normal_timing.get("reason") or "normal_execution_timing_not_ready")
         else:
             path, reason = "blocked", "normal_quality_gate_not_enough"
     elif signal.market_mode == MODE_STRONG_LONG_ONLY and complete_plan and weak_drift_passed:
@@ -432,6 +550,8 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
         "near_resistance_warning": near_resistance_warning,
         "weak_drift_passed": weak_drift_passed,
         "weak_drift": get_weak_trend_drift_status(signal),
+        "normal_timing_passed": normal_timing_passed,
+        "normal_timing": normal_timing,
         "recovery_quality_passed": recovery_quality_passed,
         "recovery_quality": recovery_quality,
     }
