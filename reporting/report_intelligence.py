@@ -83,3 +83,27 @@ def build_intelligence_report(trades: list[TrackedTrade], title: str) -> str:
     else:
         lines.append("الأداء يحتاج مراقبة وتضييق جودة قبل أي توسع في التنفيذ.")
     return "\n".join(lines)
+
+
+
+def build_execution_intelligence_report(trades: list[TrackedTrade], execution_results: list[dict], title: str = "🧠🚀 ذكاء صفقات التنفيذ") -> str:
+    base = build_intelligence_report(trades, title)
+    rejected = [r for r in execution_results if str(r.get("status", "")).startswith("rejected") or r.get("status") == "candidate_only"]
+    if not rejected:
+        return base + "\n" + SEP + "\n📌 لا توجد صفقات مرفوضة محفوظة للتحليل حتى الآن."
+    reason_counter = Counter(r.get("reason", "unknown") for r in rejected)
+    status_counter = Counter(r.get("status", "unknown") for r in rejected)
+    path_counter = Counter(r.get("path", "unknown") for r in rejected)
+    lines = [base, SEP, "📉 <b>Rejected After Check — Diagnostics</b>"]
+    lines.append("📌 ملاحظة: الصفقات المرفوضة محفوظة للتحليل ولا تُحسب كصفقات مفتوحة.")
+    lines.append(f"• Rejected Checks: {len(rejected)}")
+    lines.append("⚠️ Top Reasons")
+    for reason, count in reason_counter.most_common(7):
+        lines.append(f"• {reason}: {count}")
+    lines.append("📊 Status Mix")
+    for status, count in status_counter.most_common(5):
+        lines.append(f"• {status}: {count}")
+    lines.append("🛣 Path Mix")
+    for path, count in path_counter.most_common(5):
+        lines.append(f"• {path}: {count}")
+    return "\n".join(lines)
