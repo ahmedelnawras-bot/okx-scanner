@@ -84,6 +84,7 @@ def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
         min_valid=20,
         timeframe="15m",
         debug=True,
+        verbose=settings.verbose_logs,
     )
 
 
@@ -365,6 +366,60 @@ def _plain_result(result: dict) -> dict:
     return {k: v for k, v in result.items() if k not in {"state", "signal_items", "trades"}}
 
 
+def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None) -> None:
+    """Small Railway-safe scan summary.
+
+    Do not print command_outputs, full reports, full execution result objects,
+    or Telegram message bodies here. Those can exceed Railway's log rate limit.
+    """
+    scan = result.get("scan_stats", {}) or {}
+    ctx = result.get("mode_context", {}) or {}
+    execution_results = result.get("current_execution_results") or result.get("execution_results") or []
+    trades = result.get("trades", []) or []
+
+    checked = len(execution_results)
+    accepted = sum(1 for r in execution_results if r.get("status") in {"accepted_preview", "pending_pullback_preview"})
+    rejected = sum(1 for r in execution_results if str(r.get("status", "")).startswith("rejected"))
+    candidate_only = sum(1 for r in execution_results if r.get("status") == "candidate_only")
+    open_trades = sum(1 for t in trades if not getattr(t, "is_closed", False))
+    protected = sum(1 for t in trades if getattr(t, "protected_runner", False))
+
+    print(
+        " | ".join([
+            f"📊 Scan ranked={scan.get('ranked_pairs', 0)}",
+            f"prefilter={scan.get('after_prefilter', 0)}",
+            f"scanned={scan.get('scanned_pairs', 0)}",
+        ]),
+        flush=True,
+    )
+    print(
+        " | ".join([
+            f"🧭 Mode={result.get('mode', 'UNKNOWN')}",
+            f"Avg15m={float(ctx.get('avg15m', 0) or 0):+.2f}%",
+            f"Red={float(ctx.get('red_ratio', 0) or 0):.0f}%",
+            f"Strong={int(ctx.get('strong_coins', 0) or 0)}",
+        ]),
+        flush=True,
+    )
+    print(
+        " | ".join([
+            f"⚡ Execution checked={checked}",
+            f"accepted={accepted}",
+            f"rejected={rejected}",
+            f"candidate_only={candidate_only}",
+        ]),
+        flush=True,
+    )
+    print(
+        " | ".join([
+            f"📂 Open trades={open_trades}",
+            f"protected runners={protected}",
+            f"Redis={'ON' if trade_store and trade_store.enabled else 'OFF'}",
+        ]),
+        flush=True,
+    )
+
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: set[str], okx_client: OKXTradeClient | None = None) -> None:
     for item in result.get("signal_items", [])[:8]:
         signal = item["signal"]
@@ -435,7 +490,7 @@ def _extract_commands(text: str) -> list[str]:
 
 
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None) -> None:
-    parse_mode = "HTML" if "<b>" in str(text or "") else None
+    parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
     sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
@@ -456,10 +511,10 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         for item in result.get("signal_items", []):
             signal = item.get("signal")
             if signal and signal.symbol == symbol:
-                sender.send_message(build_track_message(signal, item.get("execution"), trade=matching_trade))
+                _send_text(sender, build_track_message(signal, item.get("execution"), trade=matching_trade))
                 return
         if matching_trade is not None:
-            sender.send_message(build_track_message(None, None, trade=matching_trade))
+            _send_text(sender, build_track_message(None, None, trade=matching_trade))
             return
         sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan أو في سجل Redis.")
         return
@@ -658,11 +713,12 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v131 started",
+        "✅ OKX Long Bot v132 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
         f"Full scan: {settings.scan_interval_seconds}s | Mode guard: {settings.market_mode_guard_interval_seconds}s",
+        f"Verbose logs: {'ON' if settings.verbose_logs else 'OFF'}",
         trade_store.soft_restart_safe_note(),
     ]
     print("\n".join(startup_lines), flush=True)
@@ -674,7 +730,10 @@ def live_worker() -> None:
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store)
             last_result = result
             state = result["state"]
-            print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
+            if settings.verbose_logs:
+                print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
+            else:
+                _print_scan_summary(result, trade_store)
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     sender.send_message(result.get("mode_message", ""))
