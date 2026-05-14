@@ -186,5 +186,163 @@ class RedisTradeStore:
             print(f"⚠️ Redis load_execution_checks failed: {exc}", flush=True)
             return []
 
+
+    def _parse_execution_check_ts(self, item: dict[str, Any]) -> datetime | None:
+        return _parse_dt(item.get("ts") or item.get("created_at") or item.get("time"))
+
+    def clean_preview(self, mode: str = "soft") -> dict[str, Any]:
+        """Return a safe preview for Redis cleanup commands.
+
+        soft: removes stale open trades and old rejected/check rows only.
+        deep: deletes all Redis keys under this bot prefix and starts a clean baseline.
+        """
+        stats: dict[str, Any] = {
+            "enabled": bool(self.enabled and self.client),
+            "mode": mode,
+            "prefix": PREFIX,
+            "open_set": 0,
+            "history_set": 0,
+            "trade_keys": 0,
+            "execution_checks": 0,
+            "stale_open_candidates": 0,
+            "old_execution_checks": 0,
+            "keys_to_delete": 0,
+        }
+        if not self.enabled or not self.client:
+            return stats
+        try:
+            open_ids = set(self.client.smembers(OPEN_SET) or [])
+            history_ids = set(self.client.smembers(HISTORY_SET) or [])
+            stats["open_set"] = len(open_ids)
+            stats["history_set"] = len(history_ids)
+            stats["trade_keys"] = sum(1 for _ in self.client.scan_iter(f"{PREFIX}:trade:*"))
+            rows = self.client.lrange(EXEC_CHECKS_LIST, 0, -1) or []
+            stats["execution_checks"] = len(rows)
+            now = datetime.now(timezone.utc)
+            stale_cutoff = now.timestamp() - (24 * 60 * 60)
+            old_check_cutoff = now.timestamp() - (7 * 24 * 60 * 60)
+            stale = 0
+            for trade_id in open_ids:
+                raw = self.client.get(self._trade_key(trade_id))
+                if not raw:
+                    stale += 1
+                    continue
+                try:
+                    trade = trade_from_dict(json.loads(raw))
+                except Exception:
+                    trade = None
+                if not trade:
+                    stale += 1
+                    continue
+                opened = _parse_dt(getattr(trade, "opened_at", None)) or _parse_dt(getattr(trade, "updated_at", None))
+                if opened and opened.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
+                    stale += 1
+            old_checks = 0
+            for raw in rows:
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    old_checks += 1
+                    continue
+                ts = self._parse_execution_check_ts(item)
+                if ts and ts.timestamp() < old_check_cutoff:
+                    old_checks += 1
+            stats["stale_open_candidates"] = stale
+            stats["old_execution_checks"] = old_checks
+            if mode == "deep":
+                stats["keys_to_delete"] = sum(1 for _ in self.client.scan_iter(f"{PREFIX}:*"))
+        except Exception as exc:
+            stats["error"] = str(exc)
+        return stats
+
+    def soft_clean(self) -> dict[str, Any]:
+        """Clean stale test data without wiping the whole history.
+
+        - removes malformed/dangling open set members
+        - removes non-protected open trades older than 24h
+        - trims old execution checks older than 7d
+        """
+        preview = self.clean_preview("soft")
+        stats = dict(preview)
+        stats.update({"deleted_trade_keys": 0, "removed_open_members": 0, "kept_execution_checks": 0, "removed_execution_checks": 0})
+        if not self.enabled or not self.client:
+            return stats
+        try:
+            now = datetime.now(timezone.utc)
+            stale_cutoff = now.timestamp() - (24 * 60 * 60)
+            old_check_cutoff = now.timestamp() - (7 * 24 * 60 * 60)
+            open_ids = set(self.client.smembers(OPEN_SET) or [])
+            pipe = self.client.pipeline()
+            for trade_id in open_ids:
+                key = self._trade_key(trade_id)
+                raw = self.client.get(key)
+                remove = False
+                delete_key = False
+                if not raw:
+                    remove = True
+                else:
+                    try:
+                        trade = trade_from_dict(json.loads(raw))
+                    except Exception:
+                        trade = None
+                    if not trade:
+                        remove = True
+                        delete_key = True
+                    else:
+                        opened = _parse_dt(getattr(trade, "opened_at", None)) or _parse_dt(getattr(trade, "updated_at", None))
+                        if opened and opened.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
+                            remove = True
+                            delete_key = True
+                if remove:
+                    pipe.srem(OPEN_SET, trade_id)
+                    stats["removed_open_members"] += 1
+                if delete_key:
+                    pipe.delete(key)
+                    stats["deleted_trade_keys"] += 1
+            rows = self.client.lrange(EXEC_CHECKS_LIST, 0, -1) or []
+            kept: list[str] = []
+            removed = 0
+            for raw in rows:
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    removed += 1
+                    continue
+                ts = self._parse_execution_check_ts(item)
+                if ts and ts.timestamp() < old_check_cutoff:
+                    removed += 1
+                else:
+                    kept.append(raw)
+            pipe.delete(EXEC_CHECKS_LIST)
+            if kept:
+                # lrange returns newest -> oldest. Preserve the same order.
+                for raw in reversed(kept):
+                    pipe.lpush(EXEC_CHECKS_LIST, raw)
+                pipe.ltrim(EXEC_CHECKS_LIST, 0, 9999)
+                pipe.expire(EXEC_CHECKS_LIST, RETENTION_SECONDS)
+            pipe.execute()
+            stats["kept_execution_checks"] = len(kept)
+            stats["removed_execution_checks"] = removed
+        except Exception as exc:
+            stats["error"] = str(exc)
+        return stats
+
+    def deep_clean(self) -> dict[str, Any]:
+        """Delete all Redis keys for this bot prefix. Use only after explicit confirmation."""
+        preview = self.clean_preview("deep")
+        stats = dict(preview)
+        stats.update({"deleted_keys": 0})
+        if not self.enabled or not self.client:
+            return stats
+        try:
+            keys = list(self.client.scan_iter(f"{PREFIX}:*"))
+            if keys:
+                for i in range(0, len(keys), 500):
+                    self.client.delete(*keys[i:i + 500])
+            stats["deleted_keys"] = len(keys)
+        except Exception as exc:
+            stats["error"] = str(exc)
+        return stats
+
     def soft_restart_safe_note(self) -> str:
         return f"Redis persistence: {'ON' if self.enabled else 'OFF'} | retention {RETENTION_DAYS}d"
