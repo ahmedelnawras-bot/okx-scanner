@@ -104,24 +104,189 @@ def build_signal_buttons(signal: SignalCandidate) -> dict:
     }
 
 
-def build_track_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
+def _profit_state(total_usd: float, protected: bool = False) -> str:
+    if total_usd > 0.01:
+        return "🟢 رابحة"
+    if total_usd < -0.01:
+        return "🔴 خاسرة"
+    return "⚪ تعادل / Protected" if protected else "⚪ تعادل"
+
+
+def _money_from_pct(pct: float, margin: float = 35.0) -> float:
+    return (float(pct or 0.0) / 100.0) * margin
+
+
+def _trade_effective_pnl_pct(trade) -> float:
+    if getattr(trade, "tp2_hit", False):
+        return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0)
+    if getattr(trade, "tp1_hit", False):
+        remaining_pct = max(0.0, 100.0 - float(getattr(trade, "tp1_close_pct", 40.0) or 40.0))
+        return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + max(0.0, float(getattr(trade, "pnl_pct", 0.0) or 0.0)) * (remaining_pct / 100.0)
+    return float(getattr(trade, "pnl_pct", 0.0) or 0.0)
+
+
+def build_trade_track_message(trade) -> str:
+    path = getattr(trade, "execution_path", "") or ("Execution" if getattr(trade, "execution_trade", False) else "Normal")
+    mode = getattr(trade, "market_mode", "-")
+    status = getattr(trade, "status", "open")
+    protected = bool(getattr(trade, "protected_runner", False))
+    title_status = "PROTECTED RUNNER" if protected else str(status).replace("_", " ").upper()
+    total_pct = _trade_effective_pnl_pct(trade)
+    total_usd = _money_from_pct(total_pct)
+    locked_pct = float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0)
+    locked_usd = _money_from_pct(locked_pct)
+    floating_label = "Floating Runner" if getattr(trade, "tp2_hit", False) else "Floating PnL"
+    floating_pct = float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0) if getattr(trade, "tp2_hit", False) else float(getattr(trade, "pnl_pct", 0.0) or 0.0)
+    floating_usd = _money_from_pct(floating_pct)
+    tp1_pct = float(getattr(trade, "tp1_close_pct", 40.0) or 40.0)
+    tp2_pct = float(getattr(trade, "tp2_close_pct", 40.0) or 40.0)
+    runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
+
+    lines = [
+        f"📊 Track — {getattr(trade, 'symbol', '-')}",
+        "━━━━━━━━━━━━",
+        f"🟢 Status: {title_status}",
+        f"🚀 Path: {_clean_name(path)}",
+        f"📈 Mode: {mode}",
+        f"⏱ TF: 15m | ⭐ Score: {float(getattr(trade, 'score', 0.0) or 0.0):.2f}",
+        "",
+        LIGHT_LINE,
+        "📍 Position",
+        f"• Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
+        f"• Effective Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
+        f"• Current: {_fmt_price(getattr(trade, 'current_price', 0.0) or getattr(trade, 'entry', 0.0))}",
+        f"• Entry Type: {getattr(trade, 'entry_type', 'Market') if hasattr(trade, 'entry_type') else 'Market'}",
+        "",
+        LIGHT_LINE,
+        "🎯 Targets",
+        f"• TP1: {_fmt_price(getattr(trade, 'tp1', 0.0))} | Close {tp1_pct:.0f}%",
+        f"• TP2: {_fmt_price(getattr(trade, 'tp2', 0.0))} | Close {tp2_pct:.0f}%",
+        f"• Runner: {runner_pct:.0f}%",
+        f"• SL: {_fmt_price(getattr(trade, 'sl', 0.0))}",
+        "",
+        LIGHT_LINE,
+        "📌 Stage",
+        f"• TP1: {'✅ Hit' if getattr(trade, 'tp1_hit', False) else '⏳ Waiting'}",
+        f"• TP2: {'✅ Hit' if getattr(trade, 'tp2_hit', False) else '⏳ Waiting'}",
+        f"• Runner: {'🏃 Active' if getattr(trade, 'runner_active', False) else 'Not Active'}",
+        f"• SL Moved: {'✅ Entry / Better' if getattr(trade, 'sl_moved_to_entry', False) else 'No'}",
+        f"• Protected: {'✅ Yes' if protected else 'No'}",
+        "",
+        LIGHT_LINE,
+        f"💰 Profit Status — {_profit_state(total_usd, protected)}",
+        f"• Locked Profit: {locked_usd:+.2f}$",
+        f"• {floating_label}: {floating_usd:+.2f}$",
+        f"• Total Impact Now: {total_usd:+.2f}$",
+        f"• 15x Performance: {total_pct:+.2f}% | {total_usd:+.2f}$",
+    ]
+    if protected:
+        lines.extend([
+            "",
+            LIGHT_LINE,
+            "🛡 Slot Status",
+            "• General Slots: Exempt",
+            "• Daily Open Risk: Exempt",
+            "• Same Symbol Block: Exempt after TP2",
+            "• Still counted in reports: Yes",
+        ])
+    lines.extend([
+        "",
+        LIGHT_LINE,
+        "🧠 Setup",
+        f"• {_clean_name(getattr(trade, 'setup_type', '-'))}",
+        f"• Quality: {'PASS' if getattr(trade, 'execution_trade', False) else 'Normal Tracking'}",
+        "",
+        "🔗 TradingView",
+        build_tradingview_url(getattr(trade, "symbol", "")),
+    ])
+    return "\n".join(lines)
+
+
+def build_rejected_track_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
+    execution_result = execution_result or {}
+    reason = execution_result.get("reason") or "unknown"
+    status = execution_result.get("status") or "candidate_only"
+    gate = execution_result.get("gate") or {}
+    return "\n".join([
+        f"📊 Track — {signal.symbol}",
+        "━━━━━━━━━━━━",
+        "⚪ Status: EXECUTION CHECKED",
+        "📍 Signal: Normal Signal",
+        f"🚀 Execution: {str(status).replace('_', ' ').title()}",
+        "",
+        LIGHT_LINE,
+        "❌ Rejection",
+        f"• Reason: {reason}",
+        f"• Category: {_clean_name(status)}",
+        f"• Score: {signal.score:.2f}",
+        f"• Required: {gate.get('min_score', 'by gate')}",
+        f"• Setup: {_clean_name(signal.setup_type)}",
+        "",
+        "📌 ملاحظة: الصفقة محفوظة للتحليل ولا تُحسب كصفقة مفتوحة.",
+        "",
+        "🔗 TradingView",
+        build_tradingview_url(signal.symbol),
+    ])
+
+
+def build_track_message(signal: SignalCandidate, execution_result: dict | None = None, trade=None) -> str:
+    if trade is not None:
+        return build_trade_track_message(trade)
     status = (execution_result or {}).get("status") or "normal_signal_only"
+    if status not in {"accepted_preview", "pending_pullback_preview", "executed", "open", "tp1", "tp2", "trailing"}:
+        return build_rejected_track_message(signal, execution_result)
+
     reason = (execution_result or {}).get("reason") or "-"
     setup_clean = _clean_name(signal.setup_type)
-    entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
+    entry_label = "Market" if signal.entry_timing == "market" else "Pullback"
+    path = _execution_path(signal, execution_result)
+    tp1_pct, tp2_pct, runner_pct = (50, 25, 25) if path == "recovery" else (40, 40, 20)
     return "\n".join([
-        f"📊 Track | {signal.symbol}",
+        f"📊 Track — {signal.symbol}",
+        "━━━━━━━━━━━━",
+        "🟢 Status: OPEN / ACTIVE",
+        f"🚀 Path: {_clean_name(path)}",
+        f"📈 Mode: {signal.market_mode}",
+        f"⏱ TF: 15m | ⭐ Score: {signal.score:.2f}",
+        "",
         LIGHT_LINE,
-        f"Mode: {_mode_theme(signal.market_mode)}",
-        f"Score: {signal.score:.2f} | TF: 15m",
-        f"Entry Type: {entry_label}",
-        f"Entry: {_fmt_price(signal.entry)}",
-        f"TP1: {_fmt_price(signal.tp1)} | TP2: {_fmt_price(signal.tp2)}",
-        f"SL: {_fmt_price(signal.sl)}",
-        f"Setup: {setup_clean}",
-        f"Execution: {status}",
-        f"Reason: {reason}",
-        "📌 Tracking only while OKX paper orders are OFF" if status not in {"accepted_preview", "pending_pullback_preview"} else "⚡ Execution preview available",
+        "📍 Position",
+        f"• Entry: {_fmt_price(signal.entry)}",
+        f"• Effective Entry: {_fmt_price(signal.entry)}",
+        f"• Current: {_fmt_price(signal.entry)}",
+        f"• Entry Type: {entry_label}",
+        "",
+        LIGHT_LINE,
+        "🎯 Targets",
+        f"• TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
+        f"• TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
+        f"• Runner: {runner_pct}%",
+        f"• SL: {_fmt_price(signal.sl)}",
+        "",
+        LIGHT_LINE,
+        "📌 Stage",
+        "• TP1: ⏳ Waiting",
+        "• TP2: ⏳ Waiting",
+        "• Runner: Not Active",
+        "• SL Moved: No",
+        "• Protected: No",
+        "",
+        LIGHT_LINE,
+        "💰 Profit Status — ⚪ تعادل",
+        "• Locked Profit: +0.00$",
+        "• Floating PnL: +0.00$",
+        "• Total Impact Now: +0.00$",
+        "• 15x Performance: +0.00% | +0.00$",
+        "",
+        LIGHT_LINE,
+        "🧠 Setup",
+        f"• {setup_clean}",
+        f"• Quality: PASS",
+        f"• Execution: {status}",
+        f"• Reason: {reason}",
+        "",
+        "🔗 TradingView",
+        build_tradingview_url(signal.symbol),
     ])
 
 
