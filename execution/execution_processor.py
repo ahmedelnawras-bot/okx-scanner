@@ -7,6 +7,22 @@ from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
 
 
+def _effective_min_execution_score(signal: SignalCandidate, default_min: float) -> float:
+    """v135 aggressive execution threshold: 6.5 normally, 6.2 only for clean RS/volume entries."""
+    meta = signal.meta or {}
+    tags = {str(t).lower() for t in (signal.execution_setup_tags or [])}
+    tags.update(str(t).lower() for t in (meta.get("pair_tags", []) or []))
+    score = float(signal.score or 0.0)
+    vol_ratio = float(meta.get("vol_ratio") or 1.0)
+    clean_entry = str(meta.get("entry_maturity") or "").lower() in {"healthy", "pullback_first"}
+    rs = bool({"relative_strength_vs_btc", "rs_btc"} & tags)
+    has_volume = vol_ratio >= 1.15
+    strong_setup = bool({"wave_3", "retest_breakout_confirmed", "vwap_reclaim"} & tags)
+    if score >= 6.2 and rs and has_volume and clean_entry and strong_setup:
+        return min(float(default_min or 6.5), 6.2)
+    return float(default_min or 6.5)
+
+
 def process_trade_candidate(
     signal: SignalCandidate,
     current_open_positions: int = 0,
@@ -33,12 +49,13 @@ def process_trade_candidate(
         }
 
     path = str(gate.get("path") or "")
+    effective_min_score = _effective_min_execution_score(signal, min_execution_score)
     if path == "block_exception":
         risk = evaluate_execution_risk(
             signal.score,
             max_open_positions=max_block_positions,
             current_open_positions=block_open_positions,
-            min_execution_score=min_execution_score,
+            min_execution_score=effective_min_score,
         )
         slot_scope = "block_exception"
     elif path == "recovery":
@@ -46,7 +63,7 @@ def process_trade_candidate(
             signal.score,
             max_open_positions=max_recovery_positions,
             current_open_positions=recovery_open_positions,
-            min_execution_score=min_execution_score,
+            min_execution_score=effective_min_score,
         )
         slot_scope = "recovery"
     else:
@@ -54,7 +71,7 @@ def process_trade_candidate(
             signal.score,
             max_open_positions=max_open_positions,
             current_open_positions=current_open_positions,
-            min_execution_score=min_execution_score,
+            min_execution_score=effective_min_score,
         )
         slot_scope = "general"
 
