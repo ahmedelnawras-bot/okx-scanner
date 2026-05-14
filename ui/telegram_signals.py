@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from analysis.models import SignalCandidate
 from utils.constants import (
+    DEFAULT_LEVERAGE,
     MODE_BLOCK_LONGS,
     MODE_COLOR_EMOJI,
     MODE_NORMAL_LONG,
@@ -116,17 +117,26 @@ def _profit_state(total_usd: float, protected: bool = False) -> str:
     return "⚪ تعادل / Protected" if protected else "⚪ تعادل"
 
 
+def _leveraged_pct(raw_pct: float) -> float:
+    return float(raw_pct or 0.0) * float(DEFAULT_LEVERAGE or 1)
+
+
 def _money_from_pct(pct: float, margin: float = 35.0) -> float:
+    """USD impact from a displayed leveraged performance percentage."""
     return (float(pct or 0.0) / 100.0) * margin
 
 
-def _trade_effective_pnl_pct(trade) -> float:
+def _trade_raw_effective_pnl_pct(trade) -> float:
     if getattr(trade, "tp2_hit", False):
         return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0)
     if getattr(trade, "tp1_hit", False):
         remaining_pct = max(0.0, 100.0 - float(getattr(trade, "tp1_close_pct", 40.0) or 40.0))
         return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + max(0.0, float(getattr(trade, "pnl_pct", 0.0) or 0.0)) * (remaining_pct / 100.0)
     return float(getattr(trade, "pnl_pct", 0.0) or 0.0)
+
+
+def _trade_effective_pnl_pct(trade) -> float:
+    return _leveraged_pct(_trade_raw_effective_pnl_pct(trade))
 
 
 def build_trade_track_message(trade) -> str:
@@ -137,10 +147,11 @@ def build_trade_track_message(trade) -> str:
     title_status = "PROTECTED RUNNER" if protected else str(status).replace("_", " ").upper()
     total_pct = _trade_effective_pnl_pct(trade)
     total_usd = _money_from_pct(total_pct)
-    locked_pct = float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0)
+    locked_pct = _leveraged_pct(float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0))
     locked_usd = _money_from_pct(locked_pct)
     floating_label = "Floating Runner" if getattr(trade, "tp2_hit", False) else "Floating PnL"
-    floating_pct = float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0) if getattr(trade, "tp2_hit", False) else float(getattr(trade, "pnl_pct", 0.0) or 0.0)
+    raw_floating_pct = float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0) if getattr(trade, "tp2_hit", False) else float(getattr(trade, "pnl_pct", 0.0) or 0.0)
+    floating_pct = _leveraged_pct(raw_floating_pct)
     floating_usd = _money_from_pct(floating_pct)
     tp1_pct = float(getattr(trade, "tp1_close_pct", 40.0) or 40.0)
     tp2_pct = float(getattr(trade, "tp2_close_pct", 40.0) or 40.0)
