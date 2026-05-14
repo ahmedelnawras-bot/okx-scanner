@@ -27,6 +27,7 @@ class Settings:
     send_mode_status_each_scan: bool = os.getenv("SEND_MODE_STATUS_EACH_SCAN", "0").lower() in ("1", "true", "yes", "on")
     execution_enabled: bool = os.getenv("EXECUTION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
     okx_place_orders: bool = os.getenv("OKX_PLACE_ORDERS", "0").lower() in ("1", "true", "yes", "on")
+    offline_test_mode: bool = os.getenv("OFFLINE_TEST_MODE", "0").lower() in ("1", "true", "yes", "on")
     okx_simulated: bool = os.getenv("OKX_SIMULATED", "1").lower() in ("1", "true", "yes", "on")
     allow_live_trading: bool = os.getenv("ALLOW_LIVE_TRADING", "0").lower() in ("1", "true", "yes", "on")
     okx_api_key: str = os.getenv("OKX_API_KEY", "")
