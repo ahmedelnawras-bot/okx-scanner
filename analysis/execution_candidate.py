@@ -351,17 +351,41 @@ def decide_execution_candidate(signal: SignalCandidate, recovery_slots_remaining
         }
 
     if signal.market_mode == MODE_NORMAL_LONG and complete_plan and weak_drift_passed and (strict_allowed or normal_extra_allowed):
-        allowed, path, reason = True, "whitelist", "normal_whitelist_pass"
-        if normal_extra_allowed and not strict_allowed:
-            reason = "normal_extra_whitelist_pass"
-        if near_resistance_warning and signal.score < 7.2:
-            pending_pullback = True
-            reason = "pullback_first_instead_of_reject"
-    elif signal.market_mode == MODE_STRONG_LONG_ONLY and complete_plan and weak_drift_passed and (elite_allowed or strict_allowed) and (signal.score >= 7.5 or (signal.score >= 7.2 and bool(tags & {"wave_3", "relative_strength_vs_btc", "rs_btc", "vwap_reclaim"}))):
-        allowed, path, reason = True, "elite_or_whitelist", "strong_execution_pass"
-        if near_resistance_warning and signal.score < 7.8:
-            pending_pullback = True
-            reason = "strong_pullback_first"
+        normal_quality_ok = bool(
+            signal.score >= 6.50
+            or (signal.score >= 6.25 and mtf_confirmed and vol_ratio >= 1.12 and setup_weight >= 2)
+        )
+        if normal_quality_ok:
+            allowed, path, reason = True, "whitelist", "normal_whitelist_pass"
+            if normal_extra_allowed and not strict_allowed:
+                reason = "normal_extra_whitelist_pass"
+            if near_resistance_warning and signal.score < 7.2:
+                pending_pullback = True
+                reason = "pullback_first_instead_of_reject"
+        else:
+            path, reason = "blocked", "normal_quality_gate_not_enough"
+    elif signal.market_mode == MODE_STRONG_LONG_ONLY and complete_plan and weak_drift_passed:
+        # STRONG mode must stay selective. Whitelist alone is not enough after
+        # opening wider test limits; require real quality stack.
+        strong_quality_stack = bool(
+            (elite_allowed or bool(tags & {"wave_3", "relative_strength_vs_btc", "rs_btc"}))
+            and mtf_confirmed
+            and vol_ratio >= 1.18
+            and setup_weight >= 3
+        )
+        strong_exception_stack = bool(
+            signal.score >= 7.55
+            and bool(tags & {"wave_3", "relative_strength_vs_btc", "rs_btc", "vwap_reclaim"})
+            and vol_ratio >= 1.28
+            and setup_weight >= 2
+        )
+        if (elite_allowed or strict_allowed) and (signal.score >= 7.85 or (strong_quality_stack and signal.score >= 7.45) or strong_exception_stack):
+            allowed, path, reason = True, "elite_or_whitelist", "strong_execution_pass"
+            if near_resistance_warning and signal.score < 8.0:
+                pending_pullback = True
+                reason = "strong_pullback_first"
+        else:
+            path, reason = "blocked", "strong_quality_gate_not_enough"
     elif recovery_allowed and complete_plan:
         if not recovery_quality_passed:
             path, reason = "recovery", "recovery_quality_not_confirmed"
