@@ -145,6 +145,7 @@ def build_market_guard_snapshot(
     min_valid: int = MARKET_GUARD_MIN_VALID,
     timeframe: str = MARKET_GUARD_TIMEFRAME,
     debug: bool = True,
+    verbose: bool = False,
 ) -> MarketSnapshot:
     """Build a MarketSnapshot from real candle changes."""
     sample = select_market_guard_sample(ranked_pairs, limit=sample_size)
@@ -207,7 +208,8 @@ def build_market_guard_snapshot(
             f"FastRebound={fast_rebound} | BTCReclaim={btc_reclaim} | BreadthImproving={breadth_improving}",
             flush=True,
         )
-        print(f"ðŸ“ˆ Guard top gainers: {gainers_txt}", flush=True)
-        print(f"ðŸ“‰ Guard top losers: {losers_txt}", flush=True)
+        if verbose:
+            print(f"ðŸ“ˆ Guard top gainers: {gainers_txt}", flush=True)
+            print(f"ðŸ“‰ Guard top losers: {losers_txt}", flush=True)
 
     return snap
