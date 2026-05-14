@@ -20,7 +20,16 @@ except Exception:  # pragma: no cover
 
 RETENTION_DAYS = 35
 RETENTION_SECONDS = RETENTION_DAYS * 24 * 60 * 60
+
+# Current namespace used by this build.
 PREFIX = "okx:longbot:v130"
+
+# Deep clean should wipe all historical OKX long-bot namespaces created by prior builds.
+# This prevents old v123/v134/v147 execution checks/trades from leaking into fresh reports.
+DEEP_CLEAN_PATTERNS = [
+    "okx:longbot:*",
+]
+
 OPEN_SET = f"{PREFIX}:trades:open"
 HISTORY_SET = f"{PREFIX}:trades:history"
 EXEC_CHECKS_LIST = f"{PREFIX}:execution:checks"
@@ -94,6 +103,19 @@ class RedisTradeStore:
 
     def _trade_key(self, trade_id: str) -> str:
         return f"{PREFIX}:trade:{trade_id}"
+
+    def _scan_keys_for_patterns(self, patterns: list[str]) -> list[str]:
+        """Return unique Redis keys matching one or more scan patterns."""
+        if not self.enabled or not self.client:
+            return []
+        keys: set[str] = set()
+        for pattern in patterns:
+            try:
+                for key in self.client.scan_iter(pattern):
+                    keys.add(str(key))
+            except Exception:
+                continue
+        return sorted(keys)
 
     def load_trades(self) -> list[TrackedTrade]:
         if not self.enabled or not self.client:
@@ -186,7 +208,6 @@ class RedisTradeStore:
             print(f"⚠️ Redis load_execution_checks failed: {exc}", flush=True)
             return []
 
-
     def _parse_execution_check_ts(self, item: dict[str, Any]) -> datetime | None:
         return _parse_dt(item.get("ts") or item.get("created_at") or item.get("time"))
 
@@ -194,12 +215,13 @@ class RedisTradeStore:
         """Return a safe preview for Redis cleanup commands.
 
         soft: removes stale open trades and old rejected/check rows only.
-        deep: deletes all Redis keys under this bot prefix and starts a clean baseline.
+        deep: deletes all Redis keys under all okx:longbot namespaces and starts a clean baseline.
         """
         stats: dict[str, Any] = {
             "enabled": bool(self.enabled and self.client),
             "mode": mode,
             "prefix": PREFIX,
+            "deep_patterns": ", ".join(DEEP_CLEAN_PATTERNS),
             "open_set": 0,
             "history_set": 0,
             "trade_keys": 0,
@@ -250,7 +272,7 @@ class RedisTradeStore:
             stats["stale_open_candidates"] = stale
             stats["old_execution_checks"] = old_checks
             if mode == "deep":
-                stats["keys_to_delete"] = sum(1 for _ in self.client.scan_iter(f"{PREFIX}:*"))
+                stats["keys_to_delete"] = len(self._scan_keys_for_patterns(DEEP_CLEAN_PATTERNS))
         except Exception as exc:
             stats["error"] = str(exc)
         return stats
@@ -328,14 +350,19 @@ class RedisTradeStore:
         return stats
 
     def deep_clean(self) -> dict[str, Any]:
-        """Delete all Redis keys for this bot prefix. Use only after explicit confirmation."""
+        """Delete all Redis keys for all OKX long-bot namespaces.
+
+        This is intentionally wider than PREFIX because older deployments used
+        different namespaces such as okx:longbot:v123/v134/v147. Use only after
+        explicit confirmation.
+        """
         preview = self.clean_preview("deep")
         stats = dict(preview)
         stats.update({"deleted_keys": 0})
         if not self.enabled or not self.client:
             return stats
         try:
-            keys = list(self.client.scan_iter(f"{PREFIX}:*"))
+            keys = self._scan_keys_for_patterns(DEEP_CLEAN_PATTERNS)
             if keys:
                 for i in range(0, len(keys), 500):
                     self.client.delete(*keys[i:i + 500])
