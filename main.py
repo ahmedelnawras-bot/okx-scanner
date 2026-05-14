@@ -47,15 +47,20 @@ from ui.market_mode_messages import build_market_mode_sections, build_block_esca
 from services.telegram_sender import TelegramSender
 
 
-def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
+def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool = False) -> list[dict]:
     url = f"{base_url}/api/v5/market/tickers?instType=SWAP"
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         payload = resp.json()
         return payload.get("data", [])
-    except Exception:
-        # Offline fallback keeps the worker testable if OKX is temporarily unavailable.
+    except Exception as exc:
+        if not offline_test_mode:
+            print(f"⚠️ OKX tickers fetch failed; live fake fallback disabled: {exc}", flush=True)
+            return []
+
+        # Offline fallback is allowed only when OFFLINE_TEST_MODE=1.
+        # This keeps local tests possible without generating fake live signals.
         return [
             {"instId": "BTC-USDT-SWAP", "last": "103250", "volCcy24h": "250000000", "change_pct": 1.4},
             {"instId": "ETH-USDT-SWAP", "last": "4980", "volCcy24h": "180000000", "change_pct": 2.2},
@@ -66,6 +71,34 @@ def fetch_okx_tickers(base_url: str, timeout: int = 15) -> list[dict]:
             {"instId": "LINK-USDT-SWAP", "last": "18.45", "volCcy24h": "21000000", "change_pct": 0.4},
             {"instId": "AVAX-USDT-SWAP", "last": "42.4", "volCcy24h": "42000000", "change_pct": 2.8},
         ]
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[str, float]:
+    """Build current symbol prices from OKX ticker data for open-trade tracking.
+
+    Uses real OKX last prices when available. Fallback pairs are used only for
+    symbols already scanned in this same cycle, never for synthetic price moves.
+    """
+    price_map: dict[str, float] = {}
+    for raw in raw_tickers or []:
+        symbol = str(raw.get("instId") or raw.get("symbol") or "")
+        price = _safe_float(raw.get("last") or raw.get("lastPrice"))
+        if symbol and price > 0:
+            price_map[symbol] = price
+
+    for pair in fallback_pairs or []:
+        symbol = str(getattr(pair, "symbol", "") or "")
+        price = _safe_float(getattr(pair, "last_price", 0.0))
+        if symbol and price > 0 and symbol not in price_map:
+            price_map[symbol] = price
+    return price_map
 
 
 def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
@@ -166,7 +199,7 @@ def _run_market_mode_guard(
     """
     if state is None:
         return state
-    tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
+    tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout, settings.offline_test_mode)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
     snapshot = _build_snapshot(ranked_pairs, settings)
     previous_mode = state.mode
@@ -256,7 +289,7 @@ def run_once(
     settings = settings or get_settings()
     persisted_trades = trade_store.load_trades() if trade_store else []
 
-    tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
+    tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout, settings.offline_test_mode)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
     snapshot = _build_snapshot(ranked_pairs, settings)
     initial_mode = previous_state or MarketModeState(mode=MODE_NORMAL_LONG, changed_at=datetime.now(timezone.utc))
@@ -320,7 +353,7 @@ def run_once(
             new_trades.append(candidate_trade)
 
     all_trades = [*persisted_trades, *new_trades]
-    price_map = {pair.symbol: pair.last_price * (1.012 if "momentum" in pair.tags else 0.996) for pair in filtered_pairs}
+    price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     protection = block_protection_status(state)
     trades = update_open_trades(all_trades, price_map, protection_level=protection.get("level", 0))
 
@@ -468,6 +501,7 @@ def _build_fast_status(result: dict, settings: Settings) -> str:
         f"📈 Market Mode: {result.get('mode', 'UNKNOWN')}",
         f"⚡ Execution Engine: {'ON' if settings.execution_enabled else 'OFF'}",
         f"🧪 OKX Paper Orders: {'ON' if settings.okx_place_orders else 'OFF'}",
+        f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
