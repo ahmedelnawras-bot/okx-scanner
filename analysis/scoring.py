@@ -77,25 +77,27 @@ def _volume_ratio_proxy(pair: PairCandidate, setup_type: str) -> float:
     tags = set(pair.tags or [])
     turnover = float(pair.turnover_usdt or 0.0)
     vol_ratio = 1.00
+    # Keep this proxy conservative: turnover/tags confirm interest, but should not
+    # make every hot coin look like an 8+ execution by itself.
     if "liquid" in tags:
-        vol_ratio += 0.06
+        vol_ratio += 0.04
     if turnover >= 5_000_000:
-        vol_ratio += 0.08
-    if turnover >= 20_000_000:
-        vol_ratio += 0.12
-    if turnover >= 60_000_000:
-        vol_ratio += 0.10
-    if "momentum" in tags:
-        vol_ratio += 0.12
-    if "breakout" in tags:
-        vol_ratio += 0.16
-    if "rs_btc" in tags:
-        vol_ratio += 0.10
-    if "rebound" in tags:
         vol_ratio += 0.05
-    if setup_type == "wave_3":
+    if turnover >= 20_000_000:
+        vol_ratio += 0.08
+    if turnover >= 60_000_000:
         vol_ratio += 0.06
-    return round(_clamp(vol_ratio, 0.85, 2.20), 2)
+    if "momentum" in tags:
+        vol_ratio += 0.08
+    if "breakout" in tags:
+        vol_ratio += 0.10
+    if "rs_btc" in tags:
+        vol_ratio += 0.06
+    if "rebound" in tags:
+        vol_ratio += 0.04
+    if setup_type == "wave_3":
+        vol_ratio += 0.04
+    return round(_clamp(vol_ratio, 0.85, 1.85), 2)
 
 
 def _calculate_signal_score(pair: PairCandidate, setup_type: str, entry_timing: str, market_mode: str, warnings: list[str]) -> tuple[float, dict]:
@@ -113,49 +115,49 @@ def _calculate_signal_score(pair: PairCandidate, setup_type: str, entry_timing: 
     # 8.0-point aggressive base.
     trend = 0.25
     if change > 0:
-        trend += min(change / 3.0, 0.55)
+        trend += min(change / 4.5, 0.40)
     if "continuation" in tags:
-        trend += 0.25
+        trend += 0.18
     if "momentum" in tags:
-        trend += 0.25
+        trend += 0.18
     if setup_type in {"wave_3", "retest_breakout_confirmed", "relative_strength_vs_btc"}:
-        trend += 0.20
+        trend += 0.14
     trend = _clamp(trend, 0.0, 1.25)
 
     momentum = 0.15
     if "momentum" in tags:
-        momentum += 0.45
+        momentum += 0.34
     if "breakout" in tags:
-        momentum += 0.35
+        momentum += 0.24
     if 0.75 <= change <= 5.5:
-        momentum += 0.25
+        momentum += 0.18
     elif change > 5.5:
-        momentum += 0.15
+        momentum += 0.08
     if "rebound" in tags:
-        momentum += 0.20
+        momentum += 0.16
     momentum = _clamp(momentum, 0.0, 1.25)
 
-    volume = _clamp((vol_ratio - 0.85) / 0.75 * 1.25, 0.0, 1.25)
-    rs = 1.50 if "rs_btc" in tags or setup_type == "relative_strength_vs_btc" else (0.55 if "major" in tags else 0.25)
-    rs = _clamp(rs, 0.0, 1.50)
+    volume = _clamp((vol_ratio - 0.95) / 0.70 * 1.10, 0.0, 1.10)
+    rs = 1.15 if "rs_btc" in tags or setup_type == "relative_strength_vs_btc" else (0.45 if "major" in tags else 0.18)
+    rs = _clamp(rs, 0.0, 1.20)
 
     breakout = 0.20
     if setup_type == "wave_3":
-        breakout += 0.75
+        breakout += 0.58
     elif setup_type in {"retest_breakout_confirmed", "vwap_reclaim"}:
-        breakout += 0.65
+        breakout += 0.52
     elif setup_type in {"relative_strength_vs_btc", "higher_low_continuation"}:
-        breakout += 0.40
+        breakout += 0.32
     elif setup_type == "support_bounce_confirmed":
-        breakout += 0.30
+        breakout += 0.24
     if "breakout" in tags:
-        breakout += 0.30
+        breakout += 0.20
     breakout = _clamp(breakout, 0.0, 1.25)
 
     market_context = {
         MODE_NORMAL_LONG: 0.75,
-        MODE_STRONG_LONG_ONLY: 0.48,
-        MODE_RECOVERY_LONG: 0.55,
+        MODE_STRONG_LONG_ONLY: 0.32,
+        MODE_RECOVERY_LONG: 0.48,
         MODE_BLOCK_LONGS: 0.25,
     }.get(market_mode, 0.50)
     mtf = 0.50 if mtf_confirmed else 0.15
@@ -166,20 +168,22 @@ def _calculate_signal_score(pair: PairCandidate, setup_type: str, entry_timing: 
     # Setup bonuses, capped at +1.5.
     bonus = 0.0
     if setup_type == "wave_3":
-        bonus += 0.45
+        bonus += 0.28
     if "rs_btc" in tags or setup_type == "relative_strength_vs_btc":
-        bonus += 0.40
-    if setup_type == "vwap_reclaim":
-        bonus += 0.30
-    if setup_type == "retest_breakout_confirmed":
-        bonus += 0.30
-    if setup_type == "liquidity_sweep_reclaim":
         bonus += 0.25
+    if setup_type == "vwap_reclaim":
+        bonus += 0.20
+    if setup_type == "retest_breakout_confirmed":
+        bonus += 0.22
+    if setup_type == "liquidity_sweep_reclaim":
+        bonus += 0.18
     if setup_type == "higher_low_continuation":
-        bonus += 0.20
+        bonus += 0.14
     if setup_type == "support_bounce_confirmed":
-        bonus += 0.20
-    bonus = _clamp(bonus, 0.0, 1.50)
+        bonus += 0.14
+    # Important: keep 8+ scores rare. Setup stacking confirms the signal but
+    # should not turn every whitelist/elite label into automatic execution.
+    bonus = _clamp(bonus, 0.0, 1.10)
 
     # Light penalties, capped at -1.2. These are warnings/quality shaping, not hard blocks.
     penalty = 0.0
@@ -189,13 +193,22 @@ def _calculate_signal_score(pair: PairCandidate, setup_type: str, entry_timing: 
         penalty += 0.30
     if change >= 10.0:
         penalty += 0.25  # overheated proxy
-    if market_mode == MODE_STRONG_LONG_ONLY and not mtf_confirmed:
-        penalty += 0.20
+    if market_mode == MODE_STRONG_LONG_ONLY:
+        penalty += 0.12
+        if not mtf_confirmed:
+            penalty += 0.20
     if turnover < 1_500_000:
         penalty += 0.25
     penalty = _clamp(penalty, 0.0, 1.20)
 
-    score = _clamp(base + bonus - penalty, 0.0, 10.50)
+    raw_score_value = base + bonus - penalty
+    # Diminishing returns above 7: the bot stays aggressive around 6-7,
+    # but 8+ requires genuinely exceptional combined quality.
+    if raw_score_value > 7.0:
+        raw_score_value = 7.0 + (raw_score_value - 7.0) * 0.68
+    if raw_score_value > 8.20:
+        raw_score_value = 8.20 + (raw_score_value - 8.20) * 0.45
+    score = _clamp(raw_score_value, 0.0, 10.50)
     components = {
         "attention_score": round(float(pair.score_hint or 0.0) + float(pair.rebound_hint or 0.0), 2),
         "signal_score_components": {
@@ -345,13 +358,13 @@ def build_signal_candidate(pair: PairCandidate, market_mode: str, min_normal_sco
         score = min(10.5, score + 0.20)
 
     threshold = min_normal_score
-    strong_exception = setup_type in {"wave_3", "relative_strength_vs_btc", "vwap_reclaim"} and score >= 7.2
+    strong_exception = setup_type in {"wave_3", "relative_strength_vs_btc", "vwap_reclaim"} and score >= 7.5
     aggressive_normal_exception = setup_type in {"wave_3", "relative_strength_vs_btc", "retest_breakout_confirmed", "vwap_reclaim"} and score >= 6.0
 
     if market_mode == MODE_STRONG_LONG_ONLY:
         threshold = min_strong_score
         if strong_exception:
-            threshold = min(threshold, 7.2)
+            threshold = min(threshold, 7.5)
         if setup_type not in WHITELIST_SETUPS and score < (threshold + 0.30):
             return None
     elif market_mode == MODE_RECOVERY_LONG:
