@@ -5,20 +5,32 @@ from datetime import datetime, timezone, timedelta
 from typing import Iterable
 
 from tracking.models import TrackedTrade
-from utils.constants import LEVERAGE_NOTE_AR
+from utils.constants import DEFAULT_LEVERAGE, LEVERAGE_NOTE_AR
 
 SEP = "━━━━━━━━━━━━"
 THIN_SEP = "┄┄┄┄┄┄┄┄"
 DEFAULT_STARTING_BALANCE = 1000.0
 DEFAULT_MARGIN_PER_TRADE = 35.0
+DEFAULT_REPORT_LEVERAGE = float(DEFAULT_LEVERAGE or 1)
 OPEN_STATUSES = {"open", "tp1_partial", "tp2_partial", "runner"}
 CLOSED_STATUSES = {"closed_loss", "breakeven_after_tp1", "trailing_hit", "closed_win"}
 WIN_STATUSES = {"tp1_partial", "tp2_partial", "runner", "trailing_hit", "closed_win", "breakeven_after_tp1"}
 LOSS_STATUSES = {"closed_loss"}
 
 
+def leveraged_pct(raw_pct: float, leverage: float = DEFAULT_REPORT_LEVERAGE) -> float:
+    """Convert a raw price move percentage into displayed 15x performance/exposure.
+
+    Tracking keeps raw price-move percentages for TP/SL logic. Reports and wallet
+    impact must display leveraged performance, so every visible Exposure value flows
+    through this helper.
+    """
+    return float(raw_pct or 0.0) * float(leverage or 1.0)
+
+
 def money_from_exposure_pct(pct: float, margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE) -> float:
-    return (pct / 100.0) * margin_per_trade
+    """Return wallet impact in USD from a leveraged exposure percentage."""
+    return (float(pct or 0.0) / 100.0) * margin_per_trade
 
 
 def color_signed(value: float, unit: str = "%") -> str:
@@ -39,7 +51,12 @@ def closed_trades(trades: Iterable[TrackedTrade]) -> list[TrackedTrade]:
     return [t for t in trades if t.status in CLOSED_STATUSES]
 
 
-def trade_effective_pnl(t: TrackedTrade) -> float:
+def trade_raw_effective_pnl(t: TrackedTrade) -> float:
+    """Effective PnL using raw price-move percentages.
+
+    Raw values remain useful for internal lifecycle logic and as the source of truth
+    for partial exits. Displayed performance should use trade_effective_pnl().
+    """
     if t.status in CLOSED_STATUSES:
         return float(t.realized_pnl_pct or 0.0)
     if t.tp2_hit:
@@ -48,6 +65,19 @@ def trade_effective_pnl(t: TrackedTrade) -> float:
         remaining_pct = max(0.0, 100.0 - float(getattr(t, "tp1_close_pct", 40.0) or 40.0))
         return float(t.realized_pnl_pct or 0.0) + max(0.0, float(t.pnl_pct or 0.0)) * (remaining_pct / 100.0)
     return float(t.pnl_pct or 0.0)
+
+
+def trade_effective_pnl(t: TrackedTrade) -> float:
+    """Displayed 15x performance/exposure percentage for reports."""
+    return leveraged_pct(trade_raw_effective_pnl(t))
+
+
+def trade_current_raw_pnl(t: TrackedTrade) -> float:
+    return float(t.pnl_pct or 0.0)
+
+
+def trade_current_exposure_pnl(t: TrackedTrade) -> float:
+    return leveraged_pct(trade_current_raw_pnl(t))
 
 
 def trade_stage(t: TrackedTrade) -> str:
@@ -116,7 +146,7 @@ def behavior_summary_lines(trades: list[TrackedTrade], *, label: str = "Behavior
     tp1_rate = tp1_count / total * 100.0
     tp2_rate = tp2_count / total * 100.0
     tp1_to_tp2 = tp2_count / max(1, tp1_count) * 100.0 if tp1_count else 0.0
-    floating = sum(t.pnl_pct for t in open_trades(trades))
+    floating = sum(trade_current_exposure_pnl(t) for t in open_trades(trades))
     quality = "إيجابي ✔️" if (avg_winner + avg_loser) >= 0 else "يحتاج مراجعة ⚠️"
     return [
         f"🧠 <b>{label}</b>",
