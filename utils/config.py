@@ -33,7 +33,7 @@ class Settings:
     okx_api_secret: str = os.getenv("OKX_API_SECRET", "")
     okx_passphrase: str = os.getenv("OKX_PASSPHRASE", "")
     default_leverage: int = int(os.getenv("DEFAULT_LEVERAGE", "15"))
-    paper_margin_usdt: float = float(os.getenv("PAPER_MARGIN_USDT", "20"))
+    paper_margin_usdt: float = float(os.getenv("PAPER_MARGIN_USDT", "35"))
     okx_td_mode: str = os.getenv("OKX_TD_MODE", "cross")
     reminder_first_minutes: int = 15
     reminder_second_minutes: int = 15
