@@ -90,6 +90,10 @@ def build_tradingview_url(symbol: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol={_tradingview_symbol(symbol)}"
 
 
+def build_tradingview_html_link(symbol: str) -> str:
+    return f'<a href="{build_tradingview_url(symbol)}">Open TradingView</a>'
+
+
 def build_signal_buttons(signal: SignalCandidate) -> dict:
     """Unified inline buttons under every trade message.
 
@@ -141,48 +145,44 @@ def build_trade_track_message(trade) -> str:
     tp1_pct = float(getattr(trade, "tp1_close_pct", 40.0) or 40.0)
     tp2_pct = float(getattr(trade, "tp2_close_pct", 40.0) or 40.0)
     runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
+    symbol = getattr(trade, "symbol", "-")
 
     lines = [
-        f"📊 Track — {getattr(trade, 'symbol', '-')}",
+        f"📊 Track — {symbol}",
         "━━━━━━━━━━━━",
         f"🟢 Status: {title_status}",
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {mode}",
         f"⏱ TF: 15m | ⭐ Score: {float(getattr(trade, 'score', 0.0) or 0.0):.2f}",
         "",
-        LIGHT_LINE,
         "📍 Position",
         f"• Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
         f"• Effective Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
         f"• Current: {_fmt_price(getattr(trade, 'current_price', 0.0) or getattr(trade, 'entry', 0.0))}",
         f"• Entry Type: {getattr(trade, 'entry_type', 'Market') if hasattr(trade, 'entry_type') else 'Market'}",
         "",
-        LIGHT_LINE,
+        f"💰 Current Result — {_profit_state(total_usd, protected)}",
+        f"• Locked Profit: {locked_usd:+.2f}$",
+        f"• {floating_label}: {floating_usd:+.2f}$",
+        f"• Total Impact Now: {total_usd:+.2f}$",
+        f"• 15x Performance: {total_pct:+.2f}% | {total_usd:+.2f}$",
+        "",
         "🎯 Targets",
         f"• TP1: {_fmt_price(getattr(trade, 'tp1', 0.0))} | Close {tp1_pct:.0f}%",
         f"• TP2: {_fmt_price(getattr(trade, 'tp2', 0.0))} | Close {tp2_pct:.0f}%",
         f"• Runner: {runner_pct:.0f}%",
         f"• SL: {_fmt_price(getattr(trade, 'sl', 0.0))}",
         "",
-        LIGHT_LINE,
         "📌 Stage",
         f"• TP1: {'✅ Hit' if getattr(trade, 'tp1_hit', False) else '⏳ Waiting'}",
         f"• TP2: {'✅ Hit' if getattr(trade, 'tp2_hit', False) else '⏳ Waiting'}",
         f"• Runner: {'🏃 Active' if getattr(trade, 'runner_active', False) else 'Not Active'}",
         f"• SL Moved: {'✅ Entry / Better' if getattr(trade, 'sl_moved_to_entry', False) else 'No'}",
         f"• Protected: {'✅ Yes' if protected else 'No'}",
-        "",
-        LIGHT_LINE,
-        f"💰 Profit Status — {_profit_state(total_usd, protected)}",
-        f"• Locked Profit: {locked_usd:+.2f}$",
-        f"• {floating_label}: {floating_usd:+.2f}$",
-        f"• Total Impact Now: {total_usd:+.2f}$",
-        f"• 15x Performance: {total_pct:+.2f}% | {total_usd:+.2f}$",
     ]
     if protected:
         lines.extend([
             "",
-            LIGHT_LINE,
             "🛡 Slot Status",
             "• General Slots: Exempt",
             "• Daily Open Risk: Exempt",
@@ -191,13 +191,11 @@ def build_trade_track_message(trade) -> str:
         ])
     lines.extend([
         "",
-        LIGHT_LINE,
         "🧠 Setup",
         f"• {_clean_name(getattr(trade, 'setup_type', '-'))}",
         f"• Quality: {'PASS' if getattr(trade, 'execution_trade', False) else 'Normal Tracking'}",
         "",
-        "🔗 TradingView",
-        build_tradingview_url(getattr(trade, "symbol", "")),
+        f"🔗 {build_tradingview_html_link(symbol)}",
     ])
     return "\n".join(lines)
 
@@ -224,8 +222,7 @@ def build_rejected_track_message(signal: SignalCandidate, execution_result: dict
         "",
         "📌 ملاحظة: الصفقة محفوظة للتحليل ولا تُحسب كصفقة مفتوحة.",
         "",
-        "🔗 TradingView",
-        build_tradingview_url(signal.symbol),
+        f"🔗 {build_tradingview_html_link(signal.symbol)}",
     ])
 
 
@@ -249,21 +246,24 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
         f"📈 Mode: {signal.market_mode}",
         f"⏱ TF: 15m | ⭐ Score: {signal.score:.2f}",
         "",
-        LIGHT_LINE,
         "📍 Position",
         f"• Entry: {_fmt_price(signal.entry)}",
         f"• Effective Entry: {_fmt_price(signal.entry)}",
         f"• Current: {_fmt_price(signal.entry)}",
         f"• Entry Type: {entry_label}",
         "",
-        LIGHT_LINE,
+        f"💰 Current Result — ⚪ تعادل",
+        "• Locked Profit: +0.00$",
+        "• Floating PnL: +0.00$",
+        "• Total Impact Now: +0.00$",
+        "• 15x Performance: +0.00% | +0.00$",
+        "",
         "🎯 Targets",
         f"• TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
         f"• TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
         f"• Runner: {runner_pct}%",
         f"• SL: {_fmt_price(signal.sl)}",
         "",
-        LIGHT_LINE,
         "📌 Stage",
         "• TP1: ⏳ Waiting",
         "• TP2: ⏳ Waiting",
@@ -271,22 +271,13 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
         "• SL Moved: No",
         "• Protected: No",
         "",
-        LIGHT_LINE,
-        "💰 Profit Status — ⚪ تعادل",
-        "• Locked Profit: +0.00$",
-        "• Floating PnL: +0.00$",
-        "• Total Impact Now: +0.00$",
-        "• 15x Performance: +0.00% | +0.00$",
-        "",
-        LIGHT_LINE,
         "🧠 Setup",
         f"• {setup_clean}",
         f"• Quality: PASS",
         f"• Execution: {status}",
         f"• Reason: {reason}",
         "",
-        "🔗 TradingView",
-        build_tradingview_url(signal.symbol),
+        f"🔗 {build_tradingview_html_link(signal.symbol)}",
     ])
 
 
