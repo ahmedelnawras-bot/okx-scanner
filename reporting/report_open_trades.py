@@ -81,7 +81,8 @@ def build_open_trades_report(
         f"⚖️ Net Floating: {floating:+.2f}% Exposure",
         f"⭐ Avg Score: {_avg_score(opened):.2f}",
     ])
-    lines.extend([SEP, *wallet_impact_lines(opened, title="Wallet Impact")])
+    if execution_only:
+        lines.extend([SEP, *wallet_impact_lines(opened, title="Wallet Impact")])
     lines.extend([
         SEP,
         "📊 <b>Trade Stages</b>",
