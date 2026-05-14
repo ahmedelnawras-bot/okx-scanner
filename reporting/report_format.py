@@ -45,7 +45,8 @@ def trade_effective_pnl(t: TrackedTrade) -> float:
     if t.tp2_hit:
         return float(t.realized_pnl_pct or 0.0) + float(t.runner_pnl_pct or 0.0)
     if t.tp1_hit:
-        return float(t.realized_pnl_pct or 0.0) + max(0.0, float(t.pnl_pct or 0.0)) * 0.20
+        remaining_pct = max(0.0, 100.0 - float(getattr(t, "tp1_close_pct", 40.0) or 40.0))
+        return float(t.realized_pnl_pct or 0.0) + max(0.0, float(t.pnl_pct or 0.0)) * (remaining_pct / 100.0)
     return float(t.pnl_pct or 0.0)
 
 
@@ -70,7 +71,9 @@ def trade_card_lines(t: TrackedTrade, *, exposure_label: bool = True) -> list[st
     pnl = trade_effective_pnl(t)
     pnl_label = f"{pnl:+.2f}% Exposure" if exposure_label else f"{pnl:+.2f}%"
     extra = []
-    if getattr(t, "protected_on_block", False):
+    if getattr(t, "protected_runner", False):
+        extra.append("🛡 Protected Runner")
+    elif getattr(t, "protected_on_block", False):
         extra.append("🛡 Protected")
     if getattr(t, "trailing_tightened", False):
         extra.append("🔧 Tightened")
@@ -79,6 +82,7 @@ def trade_card_lines(t: TrackedTrade, *, exposure_label: bool = True) -> list[st
         f"• <b>{t.symbol}</b> | {pnl_label}",
         f"⏱️ {trade_stage(t)} | ⭐ {float(t.score or 0):.2f}{extra_text}",
         f"🎯 TP1: {float(t.tp1 or 0):.6f} | 🏁 TP2: {float(t.tp2 or 0):.6f}",
+        f"📦 Close Plan: {float(getattr(t, 'tp1_close_pct', 40.0) or 40.0):.0f}/{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
         f"🛡 SL: {float(t.sl or 0):.6f}",
         f"🧠 {clean_setup(t)}",
         f"🔗 TradingView: {tradingview_url(t.symbol)}",
@@ -116,7 +120,7 @@ def behavior_summary_lines(trades: list[TrackedTrade], *, label: str = "Behavior
     quality = "إيجابي ✔️" if (avg_winner + avg_loser) >= 0 else "يحتاج مراجعة ⚠️"
     return [
         f"🧠 <b>{label}</b>",
-        "📦 Model: 40/40/20",
+        "📦 Model: Normal/Strong/Block 40/40/20 | Recovery 50/25/25",
         f"📈 Avg Winner: {avg_winner:+.2f}%",
         f"📉 Avg Loser: {avg_loser:+.2f}%",
         f"🎯 TP1 Rate: {tp1_rate:.1f}% | 🏁 TP2 Rate: {tp2_rate:.1f}%",
