@@ -15,7 +15,7 @@ import requests
 from datetime import datetime, timezone
 
 from utils.config import get_settings, Settings
-from utils.constants import MODE_NORMAL_LONG, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG
+from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG
 from analysis.market_modes import (
     MarketSnapshot,
     MarketModeState,
@@ -174,6 +174,30 @@ def _run_market_mode_guard(
     return guarded_state
 
 
+
+
+def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
+    """Lightweight scan-universe prefilter restored from the old core idea.
+
+    It should keep the ranked universe broad, only removing unusable/no-liquidity
+    names before signal formation. This is intentionally not an execution filter.
+    """
+    try:
+        if not pair or float(getattr(pair, "last_price", 0.0) or 0.0) <= 0:
+            return False
+        turnover = float(getattr(pair, "turnover_usdt", 0.0) or 0.0)
+        tags = set(getattr(pair, "tags", []) or [])
+        if turnover < 500_000:
+            return False
+        if current_mode == MODE_BLOCK_LONGS:
+            # In BLOCK we still scan enough to detect exceptions/recovery leaders,
+            # but avoid ultra-thin names.
+            return turnover >= 2_000_000 or bool(tags & {"rs_btc", "breakout", "rebound", "major"})
+        return True
+    except Exception:
+        return False
+
+
 def run_once(previous_state: MarketModeState | None = None, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout)
@@ -188,7 +212,21 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
     open_position_count = 0
     recovery_remaining = recovery_slots_remaining(state)
 
-    for pair in ranked_pairs[:20]:
+    scan_pairs = ranked_pairs
+    filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
+    btc_bounce_pct = float(snapshot.btc_change_15m or 0.0)
+    print(
+        f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
+        flush=True,
+    )
+
+    for pair in filtered_pairs:
+        # Dynamic metadata for recovery relative bounce. PairCandidate is a dataclass
+        # without slots, so attaching this is safe and avoids changing model schema.
+        try:
+            setattr(pair, "btc_bounce_pct", btc_bounce_pct)
+        except Exception:
+            pass
         signal = build_signal_candidate(pair, state.mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
             continue
@@ -208,7 +246,7 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         execution_results.append(exec_result)
         trades.append(register_trade(signal, exec_result))
 
-    price_map = {pair.symbol: pair.last_price * (1.012 if "momentum" in pair.tags else 0.996) for pair in ranked_pairs[:20]}
+    price_map = {pair.symbol: pair.last_price * (1.012 if "momentum" in pair.tags else 0.996) for pair in filtered_pairs}
     protection = block_protection_status(state)
     trades = update_open_trades(trades, price_map, protection_level=protection.get("level", 0))
     mode_message = _build_mode_message(state, snapshot, protection)
@@ -224,6 +262,7 @@ def run_once(previous_state: MarketModeState | None = None, settings: Settings |
         "menu": build_main_menu_layout(),
         "menu_keyboard": build_main_inline_keyboard(),
         "mode_context": mode_context,
+        "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "help": build_master_help(
             mode=state.mode,
             execution_enabled=settings.execution_enabled,
