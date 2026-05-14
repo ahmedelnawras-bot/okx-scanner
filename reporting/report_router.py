@@ -5,7 +5,7 @@ from reporting.report_general import build_general_report
 from reporting.report_open_trades import build_open_trades_report
 from reporting.report_execution import build_execution_report
 from reporting.report_wallet import build_wallet_report
-from reporting.report_intelligence import build_intelligence_report
+from reporting.report_intelligence import build_intelligence_report, build_execution_intelligence_report
 from reporting.report_diagnostics import build_diagnostics_report
 from reporting.report_profit_analysis import build_profit_analysis_report
 from reporting.report_losses_analysis import build_losses_analysis_report
@@ -49,7 +49,7 @@ def build_report_bundle(trades, execution_results, signal_items):
         "execution_profit_analysis": build_profit_analysis_report(execution_trades, title="📈 تحليل أسباب أرباح التنفيذ"),
         "losses_analysis": build_losses_analysis_report(trades, title="📉 تحليل أسباب الخسائر"),
         "execution_losses_analysis": build_losses_analysis_report(execution_trades, title="📉 تحليل أسباب خسائر التنفيذ"),
-        "execution_intelligence": build_intelligence_report(execution_trades, "🧠🚀 ذكاء صفقات التنفيذ"),
+        "execution_intelligence": build_execution_intelligence_report(execution_trades, execution_results, "🧠🚀 ذكاء صفقات التنفيذ"),
         "market_intelligence": build_intelligence_report(trades, "🧠📊 ذكاء الصفقات العادية"),
         "diagnostics": build_diagnostics_report(signal_items, execution_results),
     }
