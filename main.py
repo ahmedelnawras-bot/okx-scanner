@@ -738,7 +738,7 @@ def live_worker() -> None:
     last_result: dict | None = None
 
     startup_lines = [
-        "✅ OKX Long Bot v133 started",
+        "✅ OKX Long Bot v134 started",
         f"Telegram: {'ON' if sender.enabled and settings.telegram_enabled else 'OFF'}",
         f"Execution: {'ON' if settings.execution_enabled else 'OFF'}",
         f"OKX paper orders: {'ON' if settings.okx_place_orders else 'OFF'} | simulated={settings.okx_simulated}",
