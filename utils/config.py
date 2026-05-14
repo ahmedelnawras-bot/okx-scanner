@@ -17,7 +17,7 @@ class Settings:
     scan_limit: int = int(os.getenv("SCAN_LIMIT", "200"))
     min_normal_score: float = float(os.getenv("MIN_NORMAL_SCORE", "6.2"))
     min_strong_score: float = float(os.getenv("MIN_STRONG_SCORE", "7.5"))
-    min_execution_score: float = float(os.getenv("MIN_EXECUTION_SCORE", "6.6"))
+    min_execution_score: float = float(os.getenv("MIN_EXECUTION_SCORE", "6.5"))
     request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
     scan_interval_seconds: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
     market_mode_guard_interval_seconds: int = int(os.getenv("MARKET_MODE_GUARD_INTERVAL_SECONDS", "300"))
