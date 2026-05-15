@@ -71,6 +71,8 @@ class GateRecipe:
     require_recovery_bounce: bool = False
     require_strong_confirmation: bool = False
     require_rs_structure_hybrid: bool = False
+    require_ema_slope_close_filter: bool = False
+    reject_normal_overextension: bool = False
 
     def rules(self) -> list[str]:
         rows = [
@@ -101,6 +103,10 @@ class GateRecipe:
             rows.append("Strong/Block يحتاج relative strength أو volume/momentum confirmation.")
         if self.require_rs_structure_hybrid:
             rows.append("RS Hybrid: القوة النسبية لا تكفي وحدها؛ تحتاج structure/reclaim/breakout/MTF معها.")
+        if self.require_ema_slope_close_filter:
+            rows.append("EMA Slope + Close Position: يرفض Long إذا كان الإغلاق تحت EMA مع ميل EMA سلبي واضح.")
+        if self.reject_normal_overextension:
+            rows.append("Normal Overextension: يرفض الإشارات التي صعدت بشكل مبالغ فيه قبل الدخول أو أصبحت بعيدة جدًا فوق EMA.")
         if self.mode_key == "block":
             rows.append("BLOCK_LONGS: هذه ليست صفقات عادية؛ هي استثناءات فقط أثناء منع اللونج.")
         return rows
@@ -147,6 +153,47 @@ RECIPES: dict[str, tuple[GateRecipe, ...]] = {
             reject_near_resistance_without_breakout=True,
             reject_high_risk_without_edge=True,
             reject_extreme_score_without_confirmation=True,
+        ),
+        # Normal filter variants: same recipes, plus overextension protection. Originals remain unchanged.
+        GateRecipe(
+            name="normal_conservative_no_overextension",
+            mode_key="normal",
+            title="فلترة صارمة + منع المطاردة",
+            description="Variant للمقارنة فقط: normal_conservative مع فلتر يمنع الإشارات التي صعدت بشكل مبالغ فيه قبل الدخول.",
+            min_quality_score=72,
+            allowed_setups=tuple(sorted(GOOD_CONTINUATION_SETUPS)),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.10,
+            reject_normal_overextension=True,
+        ),
+        GateRecipe(
+            name="normal_structure_only_no_overextension",
+            mode_key="normal",
+            title="Structure فقط + منع المطاردة",
+            description="Variant للمقارنة فقط: normal_structure_only مع فلتر يمنع الدخول بعد امتداد سعري مبالغ فيه.",
+            min_quality_score=74,
+            allowed_setups=tuple(sorted({"higher_low_continuation", "support_bounce_confirmed", "vwap_reclaim"})),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.15,
+            reject_high_risk_without_edge=True,
+            reject_normal_overextension=True,
+        ),
+        GateRecipe(
+            name="normal_compact_reclaim_no_overextension",
+            mode_key="normal",
+            title="Reclaim مضغوط + منع المطاردة",
+            description="Variant للمقارنة فقط: normal_compact_reclaim مع فلتر يمنع الدخول إذا السعر بعيد جدًا فوق EMA أو الحركة السابقة ممتدة.",
+            min_quality_score=76,
+            allowed_setups=tuple(sorted({"vwap_reclaim", "higher_low_continuation"})),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.18,
+            reject_near_resistance_without_breakout=True,
+            reject_high_risk_without_edge=True,
+            reject_extreme_score_without_confirmation=True,
+            reject_normal_overextension=True,
         ),
     ),
     "recovery": (
@@ -275,6 +322,53 @@ RECIPES: dict[str, tuple[GateRecipe, ...]] = {
             reject_high_risk_without_edge=True,
             reject_extreme_score_without_confirmation=True,
             require_strong_confirmation=True,
+        ),
+        # Strong filter variants: best three recipes + EMA slope / close-position protection. Originals remain unchanged.
+        GateRecipe(
+            name="strong_strict_ema_slope_close",
+            mode_key="strong",
+            title="Baseline + EMA slope/close",
+            description="Variant للمقارنة فقط: strong_strict مع فلتر يرفض Long إذا الإغلاق تحت EMA وميل EMA سلبي بوضوح.",
+            min_quality_score=70,
+            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS)),
+            relative_strength_min_vol=1.20,
+            wave3_min_vol=1.25,
+            min_vol_ratio=1.15,
+            require_strong_confirmation=True,
+            require_ema_slope_close_filter=True,
+        ),
+        GateRecipe(
+            name="strong_runner_hunter_ema_slope_close",
+            mode_key="strong",
+            title="Runner Hunter + EMA slope/close",
+            description="Variant للمقارنة فقط: strong_runner_hunter مع فلتر يمنع مطاردة Long تحت EMA عندما يكون الميل هابطًا.",
+            min_quality_score=72,
+            allowed_setups=tuple(sorted({"wave_3", "vwap_reclaim", "relative_strength_vs_btc", "retest_breakout_confirmed"})),
+            relative_strength_min_vol=1.25,
+            wave3_min_vol=1.30,
+            min_vol_ratio=1.15,
+            reject_high_risk_without_edge=True,
+            require_strong_confirmation=True,
+            require_ema_slope_close_filter=True,
+        ),
+        GateRecipe(
+            name="strong_rs_hybrid_ema_slope_close",
+            mode_key="strong",
+            title="RS Hybrid + EMA slope/close",
+            description="Variant للمقارنة فقط: strong_rs_hybrid مع نفس شرط RS+Structure وفوقه فلتر EMA slope/close.",
+            min_quality_score=71,
+            allowed_setups=tuple(sorted({"relative_strength_vs_btc", "vwap_reclaim", "higher_low_continuation", "support_bounce_confirmed", "retest_breakout_confirmed", "wave_3"})),
+            clean_setups_only=False,
+            allow_relative_strength=True,
+            relative_strength_min_vol=1.25,
+            wave3_min_vol=1.28,
+            min_vol_ratio=1.10,
+            reject_near_resistance_without_breakout=True,
+            reject_high_risk_without_edge=True,
+            reject_extreme_score_without_confirmation=True,
+            require_strong_confirmation=True,
+            require_rs_structure_hybrid=True,
+            require_ema_slope_close_filter=True,
         ),
     ),
     "block": (
@@ -410,6 +504,103 @@ def _score(record: dict[str, Any]) -> float:
 def _vol_ratio(record: dict[str, Any]) -> float:
     features = _features(record)
     return _num(_first_existing(features, ("vol_ratio", "volume_ratio", "volume_spike_ratio"), 1.0), 1.0)
+
+
+def _ema_slope_pct(record: dict[str, Any]) -> float | None:
+    """Best-effort EMA slope reader. Missing data returns None, not bearish."""
+    features = _features(record)
+    value = _first_existing(
+        features,
+        (
+            "ema_slope_pct",
+            "ema20_slope_pct",
+            "ema_20_slope_pct",
+            "ema10_slope_pct",
+            "ema_10_slope_pct",
+            "ema5_slope_pct",
+            "ema_5_slope_pct",
+            "ema_slope",
+            "ma_slope_pct",
+            "ma5_slope_pct",
+            "ma_5_slope_pct",
+            "btc_1h_ma5_slope_pct",
+        ),
+        None,
+    )
+    if value is None:
+        return None
+    return _num(value, 0.0)
+
+
+def _close_ema_gap_pct(record: dict[str, Any]) -> float | None:
+    """Percent distance of close from EMA/MA. Positive means above EMA, negative below."""
+    features = _features(record)
+    direct = _first_existing(
+        features,
+        (
+            "close_ema_gap_pct",
+            "close_vs_ema_pct",
+            "close_to_ema_pct",
+            "price_to_ema_pct",
+            "ema_distance_pct",
+            "distance_from_ema_pct",
+            "close_ma_gap_pct",
+            "close_vs_ma_pct",
+            "close_to_ma_pct",
+            "ma_distance_pct",
+        ),
+        None,
+    )
+    if direct is not None:
+        return _num(direct, 0.0)
+
+    close = _first_existing(features, ("close", "last", "price", "entry", "entry_price"), None)
+    ema = _first_existing(features, ("ema", "ema20", "ema_20", "ema10", "ema_10", "ema5", "ema_5", "ma5", "ma_5"), None)
+    c = _num(close, 0.0)
+    e = _num(ema, 0.0)
+    if c > 0 and e > 0:
+        return ((c - e) / e) * 100.0
+    return None
+
+
+def _change_pct(record: dict[str, Any], names: tuple[str, ...]) -> float:
+    features = _features(record)
+    return _num(_first_existing(features, names, 0.0), 0.0)
+
+
+def _ema_slope_close_bearish(record: dict[str, Any]) -> bool:
+    """Balanced Strong filter: only reject when close is below EMA and EMA slope is clearly negative."""
+    slope = _ema_slope_pct(record)
+    gap = _close_ema_gap_pct(record)
+    if slope is None or gap is None:
+        return False
+    # Conservative thresholds to avoid over-filtering momentum: require both bad slope and bad close position,
+    # or a clearly hard negative slope with price not reclaiming EMA.
+    return bool((slope <= -0.05 and gap <= -0.15) or (slope <= -0.12 and gap <= 0.05))
+
+
+def _normal_overextended_before_entry(record: dict[str, Any]) -> bool:
+    """Normal filter: reject late long entries after exaggerated move far above EMA."""
+    gap = _close_ema_gap_pct(record)
+    ch15 = _change_pct(record, ("change_15m", "pct_change_15m", "change_pct_15m"))
+    ch30 = _change_pct(record, ("change_30m", "pct_change_30m", "change_pct_30m"))
+    ch1h = _change_pct(record, ("change_1h", "pct_change_1h", "change_pct_1h"))
+    extension = _num(
+        _first_existing(
+            _features(record),
+            ("overextension_pct", "price_extension_pct", "extension_pct", "distance_from_vwap_pct"),
+            0.0,
+        ),
+        0.0,
+    )
+    effective_gap = max(gap if gap is not None else 0.0, extension)
+    if effective_gap >= 3.5:
+        return True
+    if effective_gap >= 2.0 and (ch15 >= 3.5 or ch30 >= 5.0 or ch1h >= 7.0):
+        return True
+    if ch15 >= 5.0 or ch30 >= 7.5 or ch1h >= 10.0:
+        return True
+    return False
 
 
 def _setup_type(record: dict[str, Any]) -> str:
@@ -661,6 +852,10 @@ def calculate_gate_quality(record: dict[str, Any], calibration: dict[str, float]
             "mtf_confirmed": _mtf_confirmed(record),
             "relative_strength_vs_btc": _is_relative_strength(record),
             "vol_ratio": _vol_ratio(record),
+            "ema_slope_pct": _ema_slope_pct(record),
+            "close_ema_gap_pct": _close_ema_gap_pct(record),
+            "ema_slope_close_bearish": _ema_slope_close_bearish(record),
+            "normal_overextended_before_entry": _normal_overextended_before_entry(record),
             "high_risk_symbol": _is_high_risk_symbol(record),
             "btc_change_15m": _first_existing(features, ("btc_change_15m", "btc_15m_change", "btc_15m"), None),
             "btc_change_1h": _first_existing(features, ("btc_change_1h", "btc_1h_change", "btc_1h"), None),
@@ -694,6 +889,10 @@ def evaluate_recipe(record: dict[str, Any], recipe: GateRecipe, calibration: dic
         return False, "extreme_score_without_confirmation", quality
     if recipe.min_vol_ratio > 0 and vol < recipe.min_vol_ratio:
         return False, "volume_below_recipe_min", quality
+    if recipe.require_ema_slope_close_filter and _ema_slope_close_bearish(record):
+        return False, "ema_slope_close_bearish", quality
+    if recipe.reject_normal_overextension and _normal_overextended_before_entry(record):
+        return False, "normal_overextended_before_entry", quality
     if recipe.require_recovery_bounce and setup not in RECOVERY_CORE_SETUPS:
         if not (bool(_features(record).get("recovery_relative_bounce")) and vol >= recipe.relative_strength_min_vol):
             return False, "missing_recovery_bounce_or_reclaim", quality
