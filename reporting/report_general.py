@@ -30,11 +30,11 @@ def build_general_report(trades: list[TrackedTrade], title: str = "📊 تقري
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"📈 Open Winners: {len(winners)} | 📉 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚖️ Net Floating: {sum(trade_effective_pnl(t) for t in opened):+.2f}% Exposure")
+        lines.append(f"⚖️ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
     append_trade_cards(lines, "🟢 <b>Latest 3 Open Winners</b>", winners[:3], limit=3)
     append_trade_cards(lines, "🔴 <b>Latest 3 Open Losers</b>", losers[:3], limit=3)
-    append_trade_cards(lines, "🏆 <b>Closed Wins — Top 3</b>", closed_wins[:3], limit=3)
-    append_trade_cards(lines, "🛑 <b>Closed Losses — Worst 3</b>", closed_losses[:3], limit=3)
+    append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
+    append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
 
     lines.extend([SEP, "💡 Normal reports are signal/performance only — no Wallet Impact."])
     return "\n".join(lines)
