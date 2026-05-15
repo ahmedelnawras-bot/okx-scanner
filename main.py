@@ -47,7 +47,7 @@ from reporting.help_menus import (
 from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 from services.telegram_sender import TelegramSender
-from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report
+from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
     append_many_signal_snapshots,
     build_signal_snapshot,
@@ -77,6 +77,31 @@ def _snapshot_redis_client(trade_store=None):
     if trade_store and getattr(trade_store, "enabled", False):
         return getattr(trade_store, "client", None)
     return None
+
+
+_GATE_SIM_RUNNING = False
+
+
+def _send_gate_sim_artifact(sender: TelegramSender, gate: str, settings: Settings, trade_store: RedisTradeStore | None = None) -> None:
+    """Run a passive gate simulation with a visible progress notice.
+
+    This does not change execution or market behavior; it only prevents silent long waits.
+    """
+    global _GATE_SIM_RUNNING
+    if _GATE_SIM_RUNNING:
+        _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
+        return
+    _GATE_SIM_RUNNING = True
+    try:
+        _send_text(sender, f"⏳ جاري تحليل /gate_sim_{gate} على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
+        artifact = build_gate_sim_artifact(gate, settings, redis_client=_snapshot_redis_client(trade_store))
+        _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
+        if artifact.get("ok") and artifact.get("path"):
+            result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+            if not result.get("ok"):
+                _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+    finally:
+        _GATE_SIM_RUNNING = False
 
 
 def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool = False) -> list[dict]:
@@ -852,44 +877,41 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, build_gate_suggestions_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/gate_sim_normal":
-                artifact = build_gate_sim_artifact("normal", settings, redis_client=_snapshot_redis_client(trade_store))
-                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-                if artifact.get("ok") and artifact.get("path"):
-                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                _send_gate_sim_artifact(sender, "normal", settings, trade_store=trade_store)
                 continue
             if command == "/gate_sim_recovery":
-                artifact = build_gate_sim_artifact("recovery", settings, redis_client=_snapshot_redis_client(trade_store))
-                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-                if artifact.get("ok") and artifact.get("path"):
-                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                _send_gate_sim_artifact(sender, "recovery", settings, trade_store=trade_store)
                 continue
             if command == "/gate_sim_strong":
-                artifact = build_gate_sim_artifact("strong", settings, redis_client=_snapshot_redis_client(trade_store))
-                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-                if artifact.get("ok") and artifact.get("path"):
-                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                _send_gate_sim_artifact(sender, "strong", settings, trade_store=trade_store)
                 continue
             if command == "/gate_sim_block":
-                artifact = build_gate_sim_artifact("block", settings, redis_client=_snapshot_redis_client(trade_store))
-                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-                if artifact.get("ok") and artifact.get("path"):
-                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                _send_gate_sim_artifact(sender, "block", settings, trade_store=trade_store)
                 continue
             if command == "/gate_sim_all":
-                artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
-                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-                if artifact.get("ok") and artifact.get("path"):
-                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                global _GATE_SIM_RUNNING
+                if _GATE_SIM_RUNNING:
+                    _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
+                    continue
+                _GATE_SIM_RUNNING = True
+                try:
+                    _send_text(sender, "⏳ جاري تحليل /gate_sim_all على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
+                    artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
+                    _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
+                    if artifact.get("ok") and artifact.get("path"):
+                        result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+                        if not result.get("ok"):
+                            _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                finally:
+                    _GATE_SIM_RUNNING = False
+                continue
+            if command == "/score_calibration":
+                _send_text(sender, "⏳ جاري حساب Score Calibration بين replay و live snapshots...")
+                _send_text(sender, build_score_calibration_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/mode_coverage":
+                _send_text(sender, "⏳ جاري حساب Mode Coverage بين replay و live snapshots...")
+                _send_text(sender, build_mode_coverage_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/historical_report":
                 _send_text(sender, build_historical_report(settings))
