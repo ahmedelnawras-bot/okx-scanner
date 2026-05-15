@@ -466,6 +466,41 @@ def _is_duplicate_signal_fingerprint(fingerprint: str, sent_fingerprints: set[st
     return False
 
 
+def _signal_status_bucket(exec_status: str | None) -> str:
+    """Stable signal channel bucket for duplicate protection.
+
+    Do not include raw entry price in the fingerprint. Entry changes slightly on every
+    scan, which can turn the same momentum setup into repeated Telegram messages.
+    Keep execution-level upgrades separate so a normal signal can still be sent later
+    as an execution candidate during the TTL window.
+    """
+    status = str(exec_status or "").strip().lower()
+    if status == "accepted_preview":
+        return "execution_accepted"
+    if status == "pending_pullback_preview":
+        return "execution_pullback"
+    if status == "candidate_only":
+        return "execution_candidate_only"
+    return "normal_signal"
+
+
+def _build_signal_fingerprint(signal, exec_result: dict) -> str:
+    """Build a stable fingerprint for one actionable signal idea.
+
+    Stable fields prevent duplicate spam caused by tiny price movements, while setup
+    and execution-status buckets allow genuinely different opportunities/upgrades to
+    pass through. Redis TTL still controls when the same idea can be sent again.
+    """
+    return "|".join([
+        str(getattr(signal, "symbol", "")).upper(),
+        "LONG",
+        str(getattr(signal, "setup_type", "unknown") or "unknown"),
+        str(getattr(signal, "entry_timing", "unknown") or "unknown"),
+        str(getattr(signal, "market_mode", "unknown") or "unknown"),
+        _signal_status_bucket(exec_result.get("status") if isinstance(exec_result, dict) else None),
+    ])
+
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: set[str], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in result.get("signal_items", [])[:8]:
         signal = item["signal"]
@@ -473,7 +508,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         is_execution = exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}
         if not settings.send_normal_signals and not is_execution:
             continue
-        fingerprint = f"{signal.symbol}|{signal.entry:.8f}|{signal.market_mode}|{exec_result.get('status')}"
+        fingerprint = _build_signal_fingerprint(signal, exec_result)
         if _is_duplicate_signal_fingerprint(fingerprint, sent_fingerprints, trade_store):
             continue
 
