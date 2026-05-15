@@ -433,6 +433,66 @@ def build_technical_dataset_export(settings: Any | None = None, redis_client: An
     ]).strip()
 
 
+def clear_snapshot_records(settings: Any | None = None, redis_client: Any | None = None, clear_local: bool = True) -> dict:
+    """Clear only Technical Snapshot AI data.
+
+    This is intentionally separate from Admin/Hard Reset. It does not touch
+    trades, execution checks, signal fingerprints, cooldowns, or bot state.
+    The ON/OFF capture flag is preserved.
+    """
+    result = {
+        "ok": False,
+        "redis_deleted": False,
+        "local_deleted": False,
+        "redis_key": SNAPSHOT_REDIS_RECORDS_KEY,
+        "local_path": str(snapshot_path(settings)),
+        "error": "",
+    }
+
+    redis_ok = False
+    if redis_client:
+        try:
+            redis_client.delete(SNAPSHOT_REDIS_RECORDS_KEY)
+            redis_ok = True
+            result["redis_deleted"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+
+    local_ok = False
+    if clear_local:
+        try:
+            path = snapshot_path(settings)
+            if path.exists():
+                path.unlink()
+            local_ok = True
+            result["local_deleted"] = True
+        except Exception as exc:
+            if not result["error"]:
+                result["error"] = str(exc)
+    else:
+        local_ok = True
+
+    result["ok"] = bool(redis_ok or local_ok)
+    if result["ok"] and not result["error"]:
+        result["error"] = ""
+    return result
+
+
+def build_clear_snapshot_result(settings: Any | None = None, redis_client: Any | None = None) -> str:
+    result = clear_snapshot_records(settings=settings, redis_client=redis_client, clear_local=True)
+    if not result.get("ok"):
+        return "⚠️ لم أستطع مسح Technical Snapshot data: " + str(result.get("error") or "unknown error")
+    return "\n".join([
+        "🧹 Technical Snapshot Data Cleared",
+        "┄┄┄┄┄┄┄┄",
+        "✅ تم مسح داتا الـ AI snapshots فقط.",
+        "✅ لم يتم لمس الصفقات أو tracking أو execution state.",
+        f"Redis key: {result.get('redis_key')}",
+        f"Local mirror: {result.get('local_path')}",
+        "Capture ON/OFF لم يتغير.",
+    ])
+
+
 def build_gate_suggestions_report(settings: Any | None = None, redis_client: Any | None = None) -> str:
     records = load_snapshot_records(settings, limit=20000, redis_client=redis_client)
     if not records:
