@@ -74,7 +74,7 @@ def build_command_outputs(trades, execution_results, signal_items):
             filter_trades_by_period(execution_trades, period),
             title="🚀 تقرير أداء التنفيذ",
             period=period,
-            table=period != "since_start",
+            table=False,
         )
         # Normal reports have no Wallet Impact.
         commands[f"/report_all{suffix}"] = build_general_report(
