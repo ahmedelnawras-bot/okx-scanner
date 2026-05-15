@@ -70,6 +70,7 @@ class GateRecipe:
     reject_extreme_score_without_confirmation: bool = True
     require_recovery_bounce: bool = False
     require_strong_confirmation: bool = False
+    require_rs_structure_hybrid: bool = False
 
     def rules(self) -> list[str]:
         rows = [
@@ -98,6 +99,8 @@ class GateRecipe:
             rows.append("Recovery يحتاج bounce/reclaim/support واضح؛ relative strength وحدها لا تكفي.")
         if self.require_strong_confirmation:
             rows.append("Strong/Block يحتاج relative strength أو volume/momentum confirmation.")
+        if self.require_rs_structure_hybrid:
+            rows.append("RS Hybrid: القوة النسبية لا تكفي وحدها؛ تحتاج structure/reclaim/breakout/MTF معها.")
         if self.mode_key == "block":
             rows.append("BLOCK_LONGS: هذه ليست صفقات عادية؛ هي استثناءات فقط أثناء منع اللونج.")
         return rows
@@ -231,6 +234,43 @@ RECIPES: dict[str, tuple[GateRecipe, ...]] = {
             allow_relative_strength=False,
             wave3_min_vol=1.30,
             min_vol_ratio=1.12,
+            reject_near_resistance_without_breakout=True,
+            reject_high_risk_without_edge=True,
+            reject_extreme_score_without_confirmation=True,
+            require_strong_confirmation=True,
+        ),
+        # Recipe #4: RS + structure hybrid. Adds a new test without changing existing recipes.
+        GateRecipe(
+            name="strong_rs_hybrid",
+            mode_key="strong",
+            title="RS + Structure Hybrid",
+            description="خلطة Strong جديدة: لا تقبل القوة النسبية وحدها؛ تحتاج معها structure/reclaim/breakout أو MTF لتقليل الارتدادات الضعيفة.",
+            min_quality_score=71,
+            allowed_setups=tuple(sorted({"relative_strength_vs_btc", "vwap_reclaim", "higher_low_continuation", "support_bounce_confirmed", "retest_breakout_confirmed", "wave_3"})),
+            clean_setups_only=False,
+            allow_relative_strength=True,
+            relative_strength_min_vol=1.25,
+            wave3_min_vol=1.28,
+            min_vol_ratio=1.10,
+            reject_near_resistance_without_breakout=True,
+            reject_high_risk_without_edge=True,
+            reject_extreme_score_without_confirmation=True,
+            require_strong_confirmation=True,
+            require_rs_structure_hybrid=True,
+        ),
+        # Recipe #5: volume edge. Volume can act as the strong confirmation, while risk filters remain unchanged.
+        GateRecipe(
+            name="strong_volume_edge",
+            mode_key="strong",
+            title="Volume Edge Confirmation",
+            description="خلطة Strong جديدة: فوليوم واضح جدًا يسمح بالقبول حتى لو التأكيدات الأخرى أقل، مع استمرار رفض المقاومة/high-risk/امتداد بلا تأكيد.",
+            min_quality_score=69,
+            allowed_setups=tuple(sorted({"wave_3", "vwap_reclaim", "retest_breakout_confirmed", "higher_low_continuation"})),
+            clean_setups_only=False,
+            allow_relative_strength=False,
+            relative_strength_min_vol=1.55,
+            wave3_min_vol=1.45,
+            min_vol_ratio=1.55,
             reject_near_resistance_without_breakout=True,
             reject_high_risk_without_edge=True,
             reject_extreme_score_without_confirmation=True,
@@ -659,6 +699,11 @@ def evaluate_recipe(record: dict[str, Any], recipe: GateRecipe, calibration: dic
             return False, "missing_recovery_bounce_or_reclaim", quality
     if recipe.require_strong_confirmation and not (rel or mtf or breakout or vol >= recipe.relative_strength_min_vol):
         return False, "missing_strong_confirmation", quality
+    if recipe.require_rs_structure_hybrid and rel:
+        structure_setups = {"higher_low_continuation", "support_bounce_confirmed", "vwap_reclaim", "retest_breakout_confirmed"}
+        has_structure = bool((tags | {setup}) & structure_setups) or breakout or mtf
+        if not has_structure:
+            return False, "relative_strength_without_structure", quality
 
     if allowed and setup not in allowed and not (rel and recipe.allow_relative_strength):
         return False, "setup_not_allowed_for_recipe", quality
@@ -1225,3 +1270,168 @@ def build_gate_sim_all_artifact(settings: Any | None = None, redis_client: Any |
         "caption": "Gate Simulation JSON — All Modes — Multi Recipes",
         "payload": payload,
     }
+
+
+def _mode_count_payload(records: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(records)
+    counts: Counter[str] = Counter(str(r.get("mode") or "unknown") for r in records)
+    return {
+        "total": total,
+        "by_mode": {mode: {"count": count, "pct": round((count / max(1, total)) * 100.0, 4)} for mode, count in counts.most_common()},
+    }
+
+
+def _mode_transition_payload(records: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[datetime, Counter[str]] = {}
+    for record in records:
+        t = _record_time(record)
+        mode = str(record.get("mode") or "unknown")
+        if t is None:
+            continue
+        buckets.setdefault(t, Counter())[mode] += 1
+    series: list[tuple[datetime, str]] = []
+    for t in sorted(buckets):
+        mode, _count = buckets[t].most_common(1)[0]
+        series.append((t, mode))
+    transitions: Counter[str] = Counter()
+    previous: str | None = None
+    changes = 0
+    for _t, mode in series:
+        if previous is not None and mode != previous:
+            transitions[f"{previous} -> {mode}"] += 1
+            changes += 1
+        previous = mode
+    return {
+        "scan_points": len(series),
+        "mode_changes": changes,
+        "transitions": dict(transitions.most_common()),
+    }
+
+
+def _mode_reason_payload(records: list[dict[str, Any]], limit: int = 10) -> dict[str, Any]:
+    by_mode: dict[str, Counter[str]] = {}
+    for record in records:
+        mode = str(record.get("mode") or "unknown")
+        features = _features(record)
+        reason = (
+            record.get("mode_reason")
+            or record.get("market_reason")
+            or record.get("trigger")
+            or features.get("mode_reason")
+            or features.get("market_reason")
+            or features.get("trigger")
+            or "unknown"
+        )
+        by_mode.setdefault(mode, Counter())[str(reason)] += 1
+    return {mode: dict(counter.most_common(limit)) for mode, counter in by_mode.items()}
+
+
+def build_mode_coverage_payload(settings: Any | None = None, redis_client: Any | None = None, live_limit: int = 50000) -> dict[str, Any]:
+    replay_records, live_records = _load_inputs(settings, redis_client, live_limit=live_limit)
+    payload = {
+        **_gate_payload_base("mode_coverage_diagnostic"),
+        "ok": True,
+        "important": "Diagnostic only. Does not change market-mode thresholds or execution.",
+        "replay": {
+            "distribution": _mode_count_payload(replay_records),
+            "transitions": _mode_transition_payload(replay_records),
+            "top_reasons_by_mode": _mode_reason_payload(replay_records),
+        },
+        "live_snapshot": {
+            "distribution": _mode_count_payload(live_records),
+            "transitions": _mode_transition_payload(live_records),
+            "top_reasons_by_mode": _mode_reason_payload(live_records),
+        },
+    }
+    replay_modes = (payload["replay"]["distribution"].get("by_mode") or {})
+    missing = [mode for mode in MODES.values() if mode not in replay_modes or int((replay_modes.get(mode) or {}).get("count") or 0) <= 0]
+    payload["replay"]["missing_modes"] = missing
+    return payload
+
+
+def build_mode_coverage_report(settings: Any | None = None, redis_client: Any | None = None, live_limit: int = 50000) -> str:
+    payload = build_mode_coverage_payload(settings=settings, redis_client=redis_client, live_limit=live_limit)
+
+    def render_source(title: str, data: dict[str, Any]) -> list[str]:
+        dist = data.get("distribution") or {}
+        rows = [title, f"- Total records: {dist.get('total', 0)}"]
+        for mode, info in (dist.get("by_mode") or {}).items():
+            rows.append(f"- {mode}: {info.get('count', 0)} ({info.get('pct', 0):.2f}%)")
+        transitions = data.get("transitions") or {}
+        rows.append(f"- Scan points: {transitions.get('scan_points', 0)} | Mode changes: {transitions.get('mode_changes', 0)}")
+        top_transitions = transitions.get("transitions") or {}
+        if top_transitions:
+            rows.append("- Top transitions: " + ", ".join([f"{k}: {v}" for k, v in list(top_transitions.items())[:5]]))
+        missing = data.get("missing_modes") or []
+        if missing:
+            rows.append("⚠️ Missing modes in replay: " + ", ".join(missing))
+        return rows
+
+    rows = [
+        "🧭 Mode Coverage Diagnostic",
+        "┄┄┄┄┄┄┄┄",
+        "تحليل فقط: لا يغير المودات أو التنفيذ أو thresholds.",
+        "",
+    ]
+    rows.extend(render_source("Replay", payload.get("replay") or {}))
+    rows.append("")
+    rows.extend(render_source("Live Snapshot", payload.get("live_snapshot") or {}))
+    rows.extend([
+        "",
+        "📌 الاستخدام العملي:",
+        "- لو BLOCK/RECOVERY = 0 في replay، لا نحكم على recipes الخاصة بهم.",
+        "- لو الانتقالات قليلة جدًا، نراجع تسجيل/توزيع المودات قبل أي optimization.",
+    ])
+    return "\n".join(rows)
+
+
+def build_score_calibration_payload(settings: Any | None = None, redis_client: Any | None = None, live_limit: int = 50000) -> dict[str, Any]:
+    replay_records, live_records = _load_inputs(settings, redis_client, live_limit=live_limit)
+    modes: dict[str, Any] = {}
+    for gate, mode in MODES.items():
+        replay_cal = _build_calibration(replay_records, mode)
+        live_cal = _build_calibration(live_records, mode)
+        modes[gate] = {
+            "mode": mode,
+            "replay": replay_cal,
+            "live_snapshot": live_cal,
+            "gap": {
+                "p50_live_minus_replay": round(float(live_cal.get("p50") or 0.0) - float(replay_cal.get("p50") or 0.0), 4),
+                "p85_live_minus_replay": round(float(live_cal.get("p85") or 0.0) - float(replay_cal.get("p85") or 0.0), 4),
+                "p95_live_minus_replay": round(float(live_cal.get("p95") or 0.0) - float(replay_cal.get("p95") or 0.0), 4),
+            },
+        }
+    return {
+        **_gate_payload_base("score_calibration_diagnostic"),
+        "ok": True,
+        "important": "Diagnostic only. Does not change scoring, recipes, or execution.",
+        "modes": modes,
+    }
+
+
+def build_score_calibration_report(settings: Any | None = None, redis_client: Any | None = None, live_limit: int = 50000) -> str:
+    payload = build_score_calibration_payload(settings=settings, redis_client=redis_client, live_limit=live_limit)
+    rows = [
+        "📏 Score Calibration Diagnostic",
+        "┄┄┄┄┄┄┄┄",
+        "تحليل فقط: يقارن توزيع score بين replay و live snapshots ولا يغير أي scoring.",
+        "",
+        "Mode | Replay count p50/p85/p95 | Live count p50/p85/p95 | Gap live-replay",
+    ]
+    for data in (payload.get("modes") or {}).values():
+        r = data.get("replay") or {}
+        l = data.get("live_snapshot") or {}
+        g = data.get("gap") or {}
+        rows.append(
+            f"- {data.get('mode')}: "
+            f"R {int(r.get('count') or 0)} {r.get('p50',0):.2f}/{r.get('p85',0):.2f}/{r.get('p95',0):.2f} | "
+            f"L {int(l.get('count') or 0)} {l.get('p50',0):.2f}/{l.get('p85',0):.2f}/{l.get('p95',0):.2f} | "
+            f"Δ {g.get('p50_live_minus_replay',0):+.2f}/{g.get('p85_live_minus_replay',0):+.2f}/{g.get('p95_live_minus_replay',0):+.2f}"
+        )
+    rows.extend([
+        "",
+        "📌 القراءة:",
+        "- لو Live أعلى كثيرًا من Replay، thresholds الجديدة قد تكون مضللة.",
+        "- لو أحد المودات count=0، لا تستخدم calibration الخاص به في قرار recipe.",
+    ])
+    return "\n".join(rows)
