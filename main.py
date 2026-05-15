@@ -51,6 +51,7 @@ from analytics.technical_dataset import (
     build_signal_snapshot,
     build_technical_dataset_export,
     build_technical_dataset_status,
+    build_clear_snapshot_result,
     build_gate_suggestions_report,
     is_snapshot_enabled,
     set_snapshot_enabled,
@@ -809,6 +810,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 continue
             if command == "/tech_snapshot_export":
                 _send_text(sender, build_technical_dataset_export(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/tech_snapshot_clear":
+                _send_text(sender, build_clear_snapshot_result(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/gate_suggestions":
                 _send_text(sender, build_gate_suggestions_report(settings, redis_client=_snapshot_redis_client(trade_store)))
