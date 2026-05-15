@@ -58,6 +58,12 @@ from analytics.technical_dataset import (
 from reporting.report_technical_dataset import build_historical_report, build_technical_dataset_help
 
 
+def _snapshot_redis_client(trade_store=None):
+    if trade_store and getattr(trade_store, "enabled", False):
+        return getattr(trade_store, "client", None)
+    return None
+
+
 def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool = False) -> list[dict]:
     url = f"{base_url}/api/v5/market/tickers?instType=SWAP"
     try:
@@ -359,7 +365,7 @@ def run_once(
 
         signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
         current_execution_results.append(exec_result)
-        if is_snapshot_enabled(settings):
+        if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)):
             technical_snapshot_records.append(
                 build_signal_snapshot(
                     scan_id,
@@ -394,7 +400,7 @@ def run_once(
         execution_results_for_reports = current_execution_results
 
     if technical_snapshot_records:
-        snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings)
+        snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings, redis_client=_snapshot_redis_client(trade_store))
         if not snapshot_write_result.get("ok"):
             print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
 
@@ -412,7 +418,7 @@ def run_once(
         "menu_keyboard": build_main_inline_keyboard(),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
-        "technical_snapshot_enabled": is_snapshot_enabled(settings),
+        "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
         "technical_snapshot_written": len(technical_snapshot_records),
         "help": build_master_help(
             mode=state.mode,
@@ -591,7 +597,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
-        f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings) else 'OFF'}",
+        f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
         "",
         "🧠 آخر حالة تنفيذ:",
         f"{rejection_reason}",
@@ -791,21 +797,21 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, clean_reply)
                 continue
             if command == "/tech_snapshot_on":
-                status = set_snapshot_enabled(True, settings)
+                status = set_snapshot_enabled(True, settings, redis_client=_snapshot_redis_client(trade_store))
                 _send_text(sender, "✅ Technical Snapshot: ON" if status.get("ok") else f"⚠️ لم أستطع تشغيل التسجيل: {status.get('error')}")
                 continue
             if command == "/tech_snapshot_off":
-                status = set_snapshot_enabled(False, settings)
+                status = set_snapshot_enabled(False, settings, redis_client=_snapshot_redis_client(trade_store))
                 _send_text(sender, "⏸ Technical Snapshot: OFF" if status.get("ok") else f"⚠️ لم أستطع إيقاف التسجيل: {status.get('error')}")
                 continue
             if command == "/tech_snapshot_status":
-                _send_text(sender, build_technical_dataset_status(settings))
+                _send_text(sender, build_technical_dataset_status(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/tech_snapshot_export":
-                _send_text(sender, build_technical_dataset_export(settings))
+                _send_text(sender, build_technical_dataset_export(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/gate_suggestions":
-                _send_text(sender, build_gate_suggestions_report(settings))
+                _send_text(sender, build_gate_suggestions_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command == "/historical_report":
                 _send_text(sender, build_historical_report(settings))
