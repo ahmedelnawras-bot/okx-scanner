@@ -43,6 +43,28 @@ def money_line(value: float) -> str:
     return f"{icon} {value:+.2f}$"
 
 
+def fmt_holding_duration(start: datetime | None, end: datetime | None = None) -> str:
+    start = _ensure_aware(start)
+    end = _ensure_aware(end) or datetime.now(timezone.utc)
+    if start is None:
+        return "unknown"
+    seconds = max(0, int((end - start).total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def trade_timer_label(t: TrackedTrade) -> str:
+    if getattr(t, "is_closed", False):
+        return f"Closed after {fmt_holding_duration(t.opened_at, t.closed_at or t.updated_at)}"
+    return f"Running {fmt_holding_duration(t.opened_at)}"
+
+
 def open_trades(trades: Iterable[TrackedTrade]) -> list[TrackedTrade]:
     return [t for t in trades if t.status in OPEN_STATUSES]
 
@@ -99,7 +121,11 @@ def tradingview_url(symbol: str) -> str:
 
 def trade_card_lines(t: TrackedTrade, *, exposure_label: bool = True) -> list[str]:
     pnl = trade_effective_pnl(t)
-    pnl_label = f"{pnl:+.2f}% Exposure" if exposure_label else f"{pnl:+.2f}%"
+    if exposure_label:
+        pnl_name = "Realized PnL" if getattr(t, "is_closed", False) else "Floating PnL"
+        pnl_label = f"{pnl:+.2f}% {pnl_name}"
+    else:
+        pnl_label = f"{pnl:+.2f}%"
     extra = []
     if getattr(t, "protected_runner", False):
         extra.append("🛡 Protected Runner")
@@ -110,7 +136,7 @@ def trade_card_lines(t: TrackedTrade, *, exposure_label: bool = True) -> list[st
     extra_text = f" | {' | '.join(extra)}" if extra else ""
     return [
         f"• <b>{t.symbol}</b> | {pnl_label}",
-        f"⏱️ {trade_stage(t)} | ⭐ {float(t.score or 0):.2f}{extra_text}",
+        f"⏱️ {trade_timer_label(t)} | {trade_stage(t)} | ⭐ {float(t.score or 0):.2f}{extra_text}",
         f"🎯 TP1: {float(t.tp1 or 0):.6f} | 🏁 TP2: {float(t.tp2 or 0):.6f}",
         f"📦 Close Plan: {float(getattr(t, 'tp1_close_pct', 40.0) or 40.0):.0f}/{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
         f"🛡 SL: {float(t.sl or 0):.6f}",
@@ -158,7 +184,7 @@ def behavior_summary_lines(trades: list[TrackedTrade], *, label: str = "Behavior
         f"🔄 Trailing Exit: {trailing / total * 100:.1f}%",
         f"🔒 Breakeven Exit: {breakeven / total * 100:.1f}%",
         f"🛑 Direct SL: {direct_sl / total * 100:.1f}%",
-        f"⚡ Avg Floating Profit: {floating:+.2f}% Exposure",
+        f"⚡ Avg Floating Profit: {floating:+.2f}% Total Floating PnL",
         f"💡 Risk / Reward Quality: {quality}",
     ]
 
@@ -179,19 +205,19 @@ def wallet_impact_lines(trades: list[TrackedTrade], *, starting_balance: float =
         "",
         "✅ <b>الصفقات المغلقة</b>",
         "📈 الأرباح",
-        f"{money_from_exposure_pct(closed_profit):+.2f}$ | {closed_profit:+.2f}% Exposure",
+        f"{money_from_exposure_pct(closed_profit):+.2f}$ | {closed_profit:+.2f}% Realized PnL",
         "📉 الخسائر",
-        f"{money_from_exposure_pct(closed_loss):+.2f}$ | {closed_loss:+.2f}% Exposure",
+        f"{money_from_exposure_pct(closed_loss):+.2f}$ | {closed_loss:+.2f}% Realized PnL",
         "⚖️ الصافي",
-        f"<b>{money_line(money_from_exposure_pct(closed_net))} | {closed_net:+.2f}% Exposure</b>",
+        f"<b>{money_line(money_from_exposure_pct(closed_net))} | {closed_net:+.2f}% Realized PnL</b>",
         "",
         "🔄 <b>الصفقات المفتوحة</b>",
         "📈 الأرباح العائمة",
-        f"{money_from_exposure_pct(floating_profit):+.2f}$ | {floating_profit:+.2f}% Exposure",
+        f"{money_from_exposure_pct(floating_profit):+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
         "📉 الخسائر العائمة",
-        f"{money_from_exposure_pct(floating_loss):+.2f}$ | {floating_loss:+.2f}% Exposure",
-        "⚖️ الصافي العائم",
-        f"<b>{money_line(money_from_exposure_pct(floating_net))} | {floating_net:+.2f}% Exposure</b>",
+        f"{money_from_exposure_pct(floating_loss):+.2f}$ | {floating_loss:+.2f}% Total Floating PnL",
+        "⚖️ Total Floating PnL",
+        f"<b>{money_line(money_from_exposure_pct(floating_net))} | {floating_net:+.2f}% Total Floating PnL</b>",
         "",
         "💼 <b>التأثير الحالي على المحفظة</b>",
         f"<b>{money_line(money_from_exposure_pct(total))}</b>",
