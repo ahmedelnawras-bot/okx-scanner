@@ -1,16 +1,19 @@
-"""Passive gate simulation reports for AI/replay research.
+"""Passive multi-recipe gate simulation reports for AI/replay research.
 
 This module is read-only:
 - it does not change live scoring, filters, TP/SL, market modes, or execution,
-- it compares proposed gates against Historical Replay and Live Snapshot data,
-- it is intended for diagnostics before any real execution changes.
+- it compares proposed mode gates against Historical Replay and Live Snapshot data,
+- it uses one shared Gate Quality Score formula, then compares multiple recipes
+  per mode by changing only acceptance thresholds and technical requirements.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable
 
 from analytics.technical_dataset import load_snapshot_records
@@ -24,9 +27,8 @@ MODES = {
 }
 
 GOOD_CONTINUATION_SETUPS = {"higher_low_continuation", "support_bounce_confirmed", "vwap_reclaim"}
-NORMAL_ALLOWED_SETUPS = GOOD_CONTINUATION_SETUPS | {"wave_3"}
-RECOVERY_ALLOWED_SETUPS = GOOD_CONTINUATION_SETUPS
-STRONG_ALLOWED_SETUPS = {"higher_low_continuation", "vwap_reclaim", "wave_3", "support_bounce_confirmed"}
+RECOVERY_CORE_SETUPS = {"support_bounce_confirmed", "vwap_reclaim", "higher_low_continuation"}
+STRONG_CORE_SETUPS = {"higher_low_continuation", "vwap_reclaim", "wave_3", "support_bounce_confirmed"}
 HIGH_RISK_SYMBOLS = {
     "RAVE-USDT-SWAP",
     "BSB-USDT-SWAP",
@@ -36,77 +38,174 @@ HIGH_RISK_SYMBOLS = {
     "SIGN-USDT-SWAP",
 }
 
-NORMAL_MIN_SCORE = 6.4
-NORMAL_OVEREXTENDED_SCORE = 8.8
-RECOVERY_MIN_SCORE = 6.2
-RECOVERY_LATE_PUMP_SCORE = 8.9
-STRONG_MIN_SCORE = 6.6
-STRONG_OVEREXTENDED_SCORE = 9.3
-GLOBAL_HIGH_SCORE = 9.2
-HIGH_RISK_MIN_SCORE = 8.7
-WAVE3_MIN_VOL_RATIO = 1.25
-RELATIVE_STRENGTH_MIN_VOL_RATIO = 1.20
-RECOVERY_BOUNCE_MIN_VOL_RATIO = 1.10
-STRONG_SETUP_MIN_VOL_RATIO = 1.25
 GATE_SIM_EXPORT_DIR = Path("data/gate_simulations")
 
+# One shared quality score formula for all modes/recipes.
+QUALITY_SCORE_WEIGHTS = {
+    "setup_quality": 35,
+    "market_context": 20,
+    "volume_momentum": 20,
+    "risk_location": 15,
+    "bot_score_zone": 10,
+}
 
-def _set_text(values: set[str]) -> str:
-    return ", ".join(sorted(values))
 
+@dataclass(frozen=True)
+class GateRecipe:
+    name: str
+    mode_key: str
+    title: str
+    description: str
+    min_quality_score: float
+    allowed_setups: tuple[str, ...]
+    clean_setups_only: bool = False
+    allow_relative_strength: bool = True
+    relative_strength_min_vol: float = 1.15
+    wave3_min_vol: float = 1.20
+    min_vol_ratio: float = 0.0
+    reject_near_resistance_without_breakout: bool = True
+    reject_high_risk_without_edge: bool = True
+    reject_extreme_score_without_confirmation: bool = True
+    require_recovery_bounce: bool = False
+    require_strong_confirmation: bool = False
 
-def _gate_rules(gate: str) -> list[str]:
-    gate = str(gate or "").lower().strip()
-    common = [
-        "رفض near_resistance إلا لو فيه breakout مؤكد.",
-        f"رفض رموز high-risk إلا لو score >= {HIGH_RISK_MIN_SCORE:.1f} أو فيه MTF confirmation.",
-        f"رفض score >= {GLOBAL_HIGH_SCORE:.1f} إلا لو breakout/MTF يؤكد الحركة.",
-    ]
-    if gate == "normal":
-        return [
-            "المود المطلوب: NORMAL_LONG فقط.",
-            *common,
-            f"الحد الأدنى للسكور: {NORMAL_MIN_SCORE:.1f}.",
-            f"رفض score > {NORMAL_OVEREXTENDED_SCORE:.1f} بدون MTF أو breakout.",
-            f"السيت أب المقبول مباشرة: {_set_text(GOOD_CONTINUATION_SETUPS)}.",
-            f"wave_3 تقبل فقط مع relative strength أو MTF أو vol_ratio >= {WAVE3_MIN_VOL_RATIO:.2f}.",
-            f"relative_strength_vs_btc تقبل فقط لو vol_ratio >= {RELATIVE_STRENGTH_MIN_VOL_RATIO:.2f}.",
+    def rules(self) -> list[str]:
+        rows = [
+            f"Recipe: {self.name} — {self.title}",
+            f"المود المطلوب: {MODES.get(self.mode_key, self.mode_key)}.",
+            f"Gate Quality Score المطلوب: >= {self.min_quality_score:.1f} / 100.",
+            f"السيت أب المسموح: {', '.join(self.allowed_setups) if self.allowed_setups else 'أي setup بشرط تحقيق الجودة' }.",
         ]
-    if gate == "recovery":
-        return [
-            "المود المطلوب: RECOVERY_LONG فقط.",
-            *common,
-            f"الحد الأدنى للسكور: {RECOVERY_MIN_SCORE:.1f}.",
-            f"رفض score > {RECOVERY_LATE_PUMP_SCORE:.1f} إلا لو support_bounce_confirmed أو MTF.",
-            f"سيت أب recovery المقبول: {_set_text(RECOVERY_ALLOWED_SETUPS)}.",
-            f"recovery_relative_bounce تقبل فقط لو vol_ratio >= {RECOVERY_BOUNCE_MIN_VOL_RATIO:.2f}.",
-        ]
-    if gate == "strong":
-        return [
-            "المود المطلوب: STRONG_LONG_ONLY فقط.",
-            *common,
-            f"الحد الأدنى للسكور: {STRONG_MIN_SCORE:.1f}.",
-            f"strong_execution_pass مقبول إلا لو score > {STRONG_OVEREXTENDED_SCORE:.1f} بدون breakout/MTF.",
-            f"السيت أب القوي يحتاج relative strength أو MTF أو breakout أو vol_ratio >= {STRONG_SETUP_MIN_VOL_RATIO:.2f}.",
-            f"السيت أب المسموح: {_set_text(STRONG_ALLOWED_SETUPS)}.",
-        ]
-    return []
+        if self.clean_setups_only:
+            rows.append("يسمح فقط بالسيت أب النظيف المحدد؛ relative strength وحدها لا تكفي.")
+        if self.allow_relative_strength:
+            rows.append(f"relative_strength_vs_btc مسموحة إذا vol_ratio >= {self.relative_strength_min_vol:.2f}.")
+        else:
+            rows.append("relative_strength_vs_btc وحدها لا تقبل في هذه الخلطة.")
+        if "wave_3" in self.allowed_setups:
+            rows.append(f"wave_3 تحتاج vol_ratio >= {self.wave3_min_vol:.2f} أو MTF/breakout/relative strength.")
+        if self.min_vol_ratio > 0:
+            rows.append(f"الحد الأدنى للفوليوم: vol_ratio >= {self.min_vol_ratio:.2f} عند توفره.")
+        if self.reject_near_resistance_without_breakout:
+            rows.append("رفض near_resistance إلا مع breakout مؤكد.")
+        if self.reject_high_risk_without_edge:
+            rows.append("رموز high-risk تحتاج MTF/breakout أو جودة عالية جدًا.")
+        if self.reject_extreme_score_without_confirmation:
+            rows.append("منطقة السكور extreme لا تُرفض وحدها، لكنها تحتاج confirmation إذا معها امتداد/مقاومة.")
+        if self.require_recovery_bounce:
+            rows.append("Recovery يحتاج bounce/reclaim/support واضح؛ relative strength وحدها لا تكفي.")
+        if self.require_strong_confirmation:
+            rows.append("Strong يحتاج relative strength أو volume/momentum confirmation.")
+        return rows
 
 
-def format_gate_rules(gate: str) -> list[str]:
-    rules = _gate_rules(gate)
-    if not rules:
-        return ["⚙️ Gate Test Rules", "- لا توجد شروط معرفة لهذا الاختبار."]
-    rows = ["⚙️ شروط البوابة المستخدمة في الاختبار", "هذه الشروط تُقرأ مباشرة من نفس قيم المحاكاة الحالية:"]
-    rows.extend([f"- {rule}" for rule in rules])
-    return rows
-
-
-def format_gate_rules_compact(gate: str) -> list[str]:
-    rules = _gate_rules(gate)
-    if not rules:
-        return ["- Rules: غير معرفة"]
-    return ["- Rules: " + " | ".join(rules[:5]), "- More rules: " + " | ".join(rules[5:])] if len(rules) > 5 else ["- Rules: " + " | ".join(rules)]
+RECIPES: dict[str, tuple[GateRecipe, ...]] = {
+    "normal": (
+        GateRecipe(
+            name="normal_conservative",
+            mode_key="normal",
+            title="فلترة صارمة لاستمرار نظيف",
+            description="يحافظ على أفضل setups فقط ويقلل ضغط المرشحين بقوة.",
+            min_quality_score=72,
+            allowed_setups=tuple(sorted(GOOD_CONTINUATION_SETUPS)),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.10,
+        ),
+        GateRecipe(
+            name="normal_balanced",
+            mode_key="normal",
+            title="توازن بين الجودة وعدد الفرص",
+            description="يسمح بالاستمرار النظيف و wave_3 و relative strength المؤكدة.",
+            min_quality_score=64,
+            allowed_setups=tuple(sorted(GOOD_CONTINUATION_SETUPS | {"wave_3", "relative_strength_vs_btc"})),
+            relative_strength_min_vol=1.15,
+            wave3_min_vol=1.20,
+        ),
+        GateRecipe(
+            name="normal_aggressive",
+            mode_key="normal",
+            title="هجومي لعدم قتل المومنتوم",
+            description="يقبل فرص أكثر مع رفض المخاطر الواضحة فقط.",
+            min_quality_score=56,
+            allowed_setups=tuple(sorted(GOOD_CONTINUATION_SETUPS | {"wave_3", "relative_strength_vs_btc", "retest_breakout_confirmed"})),
+            relative_strength_min_vol=1.05,
+            wave3_min_vol=1.10,
+            reject_high_risk_without_edge=False,
+        ),
+    ),
+    "recovery": (
+        GateRecipe(
+            name="recovery_safe",
+            mode_key="recovery",
+            title="ارتداد مؤكد فقط",
+            description="يمنع شراء السقوط ويطلب bounce/reclaim واضح.",
+            min_quality_score=74,
+            allowed_setups=tuple(sorted(RECOVERY_CORE_SETUPS)),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.10,
+            require_recovery_bounce=True,
+        ),
+        GateRecipe(
+            name="recovery_balanced",
+            mode_key="recovery",
+            title="Recovery متوازن",
+            description="يسمح بالارتداد المؤكد وبعض relative bounce مع volume.",
+            min_quality_score=66,
+            allowed_setups=tuple(sorted(RECOVERY_CORE_SETUPS | {"relative_strength_vs_btc"})),
+            relative_strength_min_vol=1.20,
+            min_vol_ratio=1.05,
+            require_recovery_bounce=True,
+        ),
+        GateRecipe(
+            name="recovery_aggressive",
+            mode_key="recovery",
+            title="Recovery هجومي مشروط",
+            description="أوسع قليلًا لكنه لا يسمح بالمقاومة أو الارتداد الضعيف.",
+            min_quality_score=58,
+            allowed_setups=tuple(sorted(RECOVERY_CORE_SETUPS | {"relative_strength_vs_btc", "wave_3"})),
+            relative_strength_min_vol=1.10,
+            wave3_min_vol=1.20,
+        ),
+    ),
+    "strong": (
+        GateRecipe(
+            name="strong_strict",
+            mode_key="strong",
+            title="أقوى العملات فقط",
+            description="يشدد على momentum/relative strength في سوق غير مضمون.",
+            min_quality_score=70,
+            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS)),
+            relative_strength_min_vol=1.20,
+            wave3_min_vol=1.25,
+            min_vol_ratio=1.15,
+            require_strong_confirmation=True,
+        ),
+        GateRecipe(
+            name="strong_balanced",
+            mode_key="strong",
+            title="Strong متوازن",
+            description="يحافظ على قوة المود بدون تضييق زائد.",
+            min_quality_score=62,
+            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS | {"relative_strength_vs_btc", "retest_breakout_confirmed"})),
+            relative_strength_min_vol=1.15,
+            wave3_min_vol=1.20,
+            require_strong_confirmation=True,
+        ),
+        GateRecipe(
+            name="strong_aggressive",
+            mode_key="strong",
+            title="Strong هجومي",
+            description="يسمح بزخم أكثر مع حماية near resistance.",
+            min_quality_score=55,
+            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS | {"relative_strength_vs_btc", "retest_breakout_confirmed"})),
+            relative_strength_min_vol=1.05,
+            wave3_min_vol=1.10,
+            reject_high_risk_without_edge=False,
+        ),
+    ),
+}
 
 
 def _pct(part: int | float, total: int | float) -> str:
@@ -118,6 +217,8 @@ def _pct(part: int | float, total: int | float) -> str:
 
 def _num(value: Any, default: float = 0.0) -> float:
     try:
+        if value is None or value == "":
+            return default
         return float(value)
     except Exception:
         return default
@@ -126,6 +227,13 @@ def _num(value: Any, default: float = 0.0) -> float:
 def _features(record: dict[str, Any]) -> dict[str, Any]:
     value = record.get("features")
     return value if isinstance(value, dict) else {}
+
+
+def _first_existing(features: dict[str, Any], names: tuple[str, ...], default: Any = None) -> Any:
+    for name in names:
+        if name in features and features.get(name) is not None:
+            return features.get(name)
+    return default
 
 
 def _setup_tags(record: dict[str, Any]) -> set[str]:
@@ -158,25 +266,28 @@ def _warnings_text(record: dict[str, Any]) -> str:
 def _near_resistance(record: dict[str, Any]) -> bool:
     text = _warnings_text(record).lower()
     tags = _setup_tags(record) | _pair_tags(record)
-    return bool(
-        "near_resistance" in tags
-        or "resistance" in text
-        or "مقاوم" in text
-    )
+    return bool("near_resistance" in tags or "resistance" in text or "مقاوم" in text)
 
 
 def _breakout_confirmed(record: dict[str, Any]) -> bool:
     features = _features(record)
-    return bool(features.get("breakout") and str(features.get("breakout_quality") or "").lower() in {"good", "strong"})
+    quality = str(features.get("breakout_quality") or "").lower()
+    return bool(features.get("breakout") or "breakout" in _setup_tags(record) or quality in {"good", "strong"})
+
+
+def _mtf_confirmed(record: dict[str, Any]) -> bool:
+    features = _features(record)
+    return bool(features.get("mtf_confirmed") or features.get("mtf") == "confirmed")
 
 
 def _score(record: dict[str, Any]) -> float:
     features = _features(record)
-    return _num(features.get("effective_score"), _num(features.get("score"), _num(features.get("raw_score"))))
+    return _num(features.get("effective_score"), _num(features.get("score"), _num(features.get("raw_score"), _num(record.get("score")))))
 
 
 def _vol_ratio(record: dict[str, Any]) -> float:
-    return _num(_features(record).get("vol_ratio"), 1.0)
+    features = _features(record)
+    return _num(_first_existing(features, ("vol_ratio", "volume_ratio", "volume_spike_ratio"), 1.0), 1.0)
 
 
 def _setup_type(record: dict[str, Any]) -> str:
@@ -185,79 +296,251 @@ def _setup_type(record: dict[str, Any]) -> str:
 
 def _is_relative_strength(record: dict[str, Any]) -> bool:
     tags = _setup_tags(record) | _pair_tags(record)
-    return bool("relative_strength_vs_btc" in tags or "rs_btc" in tags)
-
-
-def _fail(reason: str) -> tuple[bool, str]:
-    return False, reason
-
-
-def _pass(reason: str) -> tuple[bool, str]:
-    return True, reason
-
-
-def evaluate_gate(record: dict[str, Any], gate: str) -> tuple[bool, str]:
-    """Return pass/fail and reason for the passive proposed gate."""
-    score = _score(record)
     setup = _setup_type(record)
+    return bool("relative_strength_vs_btc" in tags or "rs_btc" in tags or setup == "relative_strength_vs_btc")
+
+
+def _is_high_risk_symbol(record: dict[str, Any]) -> bool:
+    return str(record.get("symbol") or "") in HIGH_RISK_SYMBOLS
+
+
+def _has_recovery_fail_risk(record: dict[str, Any]) -> bool:
+    features = _features(record)
+    text = " ".join(str(x).lower() for x in [
+        features.get("market_reason"),
+        features.get("legacy_gate_reason"),
+        record.get("legacy_gate_reason"),
+        record.get("block_reason"),
+    ])
+    return bool("recovery_hard_fail" in text or "recovery_soft_fail" in text or "fail" in text and "recovery" in text)
+
+
+def _calibration(scores: list[float]) -> dict[str, float]:
+    values = sorted(float(x) for x in scores if x is not None)
+    if not values:
+        return {"count": 0, "p20": 0.0, "p50": 0.0, "p85": 0.0, "p95": 0.0}
+
+    def pick(p: float) -> float:
+        if len(values) == 1:
+            return values[0]
+        idx = int(round((len(values) - 1) * p))
+        idx = max(0, min(len(values) - 1, idx))
+        return values[idx]
+
+    return {"count": len(values), "p20": pick(0.20), "p50": median(values), "p85": pick(0.85), "p95": pick(0.95)}
+
+
+def _score_zone(score: float, calibration: dict[str, float]) -> str:
+    if not calibration or int(calibration.get("count") or 0) <= 5:
+        return "unknown"
+    if score <= float(calibration.get("p20") or 0):
+        return "low"
+    if score <= float(calibration.get("p85") or 0):
+        return "healthy"
+    if score <= float(calibration.get("p95") or 0):
+        return "high"
+    return "extreme"
+
+
+def _component_setup(record: dict[str, Any]) -> float:
     tags = _setup_tags(record)
+    setup = _setup_type(record)
+    scores = [8.0]
+    if "support_bounce_confirmed" in tags or setup == "support_bounce_confirmed":
+        scores.append(35.0)
+    if "vwap_reclaim" in tags or setup == "vwap_reclaim":
+        scores.append(33.0)
+    if "higher_low_continuation" in tags or setup == "higher_low_continuation":
+        scores.append(31.0)
+    if "retest_breakout_confirmed" in tags or setup == "retest_breakout_confirmed":
+        scores.append(29.0)
+    if "wave_3" in tags or setup == "wave_3":
+        scores.append(25.0)
+    if _is_relative_strength(record):
+        scores.append(21.0)
+    return min(35.0, max(scores))
+
+
+def _component_market(record: dict[str, Any]) -> float:
+    features = _features(record)
+    points = 10.0  # neutral baseline when context is missing.
+    btc_15m = _num(_first_existing(features, ("btc_change_15m", "btc_15m_change", "btc_15m"), None), 0.0)
+    btc_1h = _num(_first_existing(features, ("btc_change_1h", "btc_1h_change", "btc_1h"), None), 0.0)
+    red_ratio = _num(_first_existing(features, ("red_ratio", "market_red_ratio"), None), -1.0)
+    strong_coins = _num(_first_existing(features, ("strong_coins", "strong_coins_count"), None), -1.0)
+
+    if btc_15m >= 0.15:
+        points += 2.0
+    elif btc_15m <= -0.45:
+        points -= 3.0
+    if btc_1h >= 0.25:
+        points += 2.0
+    elif btc_1h <= -0.80:
+        points -= 4.0
+    if red_ratio >= 0:
+        if red_ratio <= 50:
+            points += 2.0
+        elif red_ratio >= 65:
+            points -= 3.0
+    if strong_coins >= 0:
+        if strong_coins >= 6:
+            points += 2.0
+        elif strong_coins <= 3:
+            points -= 2.0
+    if _has_recovery_fail_risk(record):
+        points -= 5.0
+    return max(0.0, min(20.0, points))
+
+
+def _component_volume_momentum(record: dict[str, Any]) -> float:
+    features = _features(record)
+    vol = _vol_ratio(record)
+    points = 5.0
+    if vol >= 2.0:
+        points += 10.0
+    elif vol >= 1.5:
+        points += 8.0
+    elif vol >= 1.25:
+        points += 5.0
+    elif vol >= 1.10:
+        points += 3.0
+    if _is_relative_strength(record):
+        points += 3.0
+    if _setup_type(record) == "wave_3":
+        points += 2.0
+    change_15m = _num(_first_existing(features, ("change_15m", "pct_change_15m", "change_pct_15m"), None), 0.0)
+    if 0.10 <= change_15m <= 2.8:
+        points += 2.0
+    elif change_15m > 4.5:
+        points -= 2.0
+    if bool(features.get("close_near_high") or features.get("impulse_candle")):
+        points += 2.0
+    return max(0.0, min(20.0, points))
+
+
+def _component_risk(record: dict[str, Any]) -> float:
+    points = 10.0
     near_res = _near_resistance(record)
     breakout_ok = _breakout_confirmed(record)
-    symbol = str(record.get("symbol") or "")
-    vol = _vol_ratio(record)
-    mtf = bool(_features(record).get("mtf_confirmed"))
-
     if near_res and not breakout_ok:
-        return _fail("near_resistance")
+        points -= 9.0
+    elif near_res and breakout_ok:
+        points -= 2.0
+    else:
+        points += 3.0
+    setup = _setup_type(record)
+    if setup in {"support_bounce_confirmed", "vwap_reclaim", "higher_low_continuation"}:
+        points += 2.0
+    if _is_high_risk_symbol(record):
+        points -= 3.0
+    features = _features(record)
+    sl_pct = _num(_first_existing(features, ("sl_pct", "sl_distance_pct", "risk_pct"), None), 0.0)
+    if sl_pct:
+        if 1.2 <= sl_pct <= 2.8:
+            points += 1.0
+        elif sl_pct > 4.0:
+            points -= 2.0
+    return max(0.0, min(15.0, points))
 
-    if symbol in HIGH_RISK_SYMBOLS and score < HIGH_RISK_MIN_SCORE and not mtf:
-        return _fail("high_risk_symbol_without_edge")
 
-    if score >= GLOBAL_HIGH_SCORE and not (breakout_ok or mtf):
-        return _fail("overextended_high_score")
+def _component_bot_score(record: dict[str, Any], calibration: dict[str, float]) -> tuple[float, str]:
+    score = _score(record)
+    zone = _score_zone(score, calibration)
+    if zone == "healthy":
+        return 10.0, zone
+    if zone == "high":
+        return 7.0, zone
+    if zone == "low":
+        return 4.0, zone
+    if zone == "extreme":
+        return 4.0, zone
+    return 6.0, zone
 
-    if gate == "normal":
-        if str(record.get("mode") or "") != MODES["normal"]:
-            return _fail("wrong_mode")
-        if score < NORMAL_MIN_SCORE:
-            return _fail("score_too_low")
-        if score > NORMAL_OVEREXTENDED_SCORE and not (mtf or breakout_ok):
-            return _fail("normal_score_overextended")
-        if setup in GOOD_CONTINUATION_SETUPS:
-            return _pass("clean_continuation_setup")
-        if setup == "wave_3" and (_is_relative_strength(record) or mtf or vol >= WAVE3_MIN_VOL_RATIO):
-            return _pass("wave3_with_strength")
-        if _is_relative_strength(record) and vol >= RELATIVE_STRENGTH_MIN_VOL_RATIO:
-            return _pass("relative_strength_with_volume")
-        return _fail("weak_normal_setup")
 
-    if gate == "recovery":
-        if str(record.get("mode") or "") != MODES["recovery"]:
-            return _fail("wrong_mode")
-        if score < RECOVERY_MIN_SCORE:
-            return _fail("score_too_low")
-        if score > RECOVERY_LATE_PUMP_SCORE and not (setup == "support_bounce_confirmed" or mtf):
-            return _fail("late_recovery_pump")
-        if setup in RECOVERY_ALLOWED_SETUPS:
-            return _pass("confirmed_recovery_setup")
-        if bool(_features(record).get("recovery_relative_bounce")) and vol >= RECOVERY_BOUNCE_MIN_VOL_RATIO:
-            return _pass("relative_recovery_bounce")
-        return _fail("unconfirmed_recovery")
+def calculate_gate_quality(record: dict[str, Any], calibration: dict[str, float]) -> dict[str, Any]:
+    """Single shared 0-100 score used by all modes and all recipes.
 
-    if gate == "strong":
-        if str(record.get("mode") or "") != MODES["strong"]:
-            return _fail("wrong_mode")
-        if score < STRONG_MIN_SCORE:
-            return _fail("score_too_low")
-        if str(record.get("legacy_gate_reason") or "") == "strong_execution_pass":
-            if score > STRONG_OVEREXTENDED_SCORE and not (breakout_ok or mtf):
-                return _fail("strong_overextended")
-            return _pass("legacy_strong_execution_pass")
-        if setup in STRONG_ALLOWED_SETUPS and (_is_relative_strength(record) or mtf or breakout_ok or vol >= STRONG_SETUP_MIN_VOL_RATIO):
-            return _pass("strong_setup_confirmed")
-        return _fail("weak_strong_setup")
+    Recipes are only allowed to change acceptance thresholds and technical
+    conditions; they do not use a different score formula.
+    """
+    setup = _component_setup(record)
+    market = _component_market(record)
+    volume = _component_volume_momentum(record)
+    risk = _component_risk(record)
+    bot_score, zone = _component_bot_score(record, calibration)
+    total = setup + market + volume + risk + bot_score
+    features = _features(record)
+    return {
+        "gate_quality_score": round(max(0.0, min(100.0, total)), 4),
+        "components": {
+            "setup_quality": round(setup, 4),
+            "market_context": round(market, 4),
+            "volume_momentum": round(volume, 4),
+            "risk_location": round(risk, 4),
+            "bot_score_zone": round(bot_score, 4),
+        },
+        "weights": QUALITY_SCORE_WEIGHTS,
+        "score_raw": round(_score(record), 4),
+        "score_zone": zone,
+        "indicators": {
+            "setup_type": _setup_type(record),
+            "setup_tags": sorted(_setup_tags(record)),
+            "near_resistance": _near_resistance(record),
+            "breakout_confirmed": _breakout_confirmed(record),
+            "mtf_confirmed": _mtf_confirmed(record),
+            "relative_strength_vs_btc": _is_relative_strength(record),
+            "vol_ratio": _vol_ratio(record),
+            "high_risk_symbol": _is_high_risk_symbol(record),
+            "btc_change_15m": _first_existing(features, ("btc_change_15m", "btc_15m_change", "btc_15m"), None),
+            "btc_change_1h": _first_existing(features, ("btc_change_1h", "btc_1h_change", "btc_1h"), None),
+        },
+    }
 
-    return _fail("unknown_gate")
+
+def evaluate_recipe(record: dict[str, Any], recipe: GateRecipe, calibration: dict[str, float]) -> tuple[bool, str, dict[str, Any]]:
+    quality = calculate_gate_quality(record, calibration)
+    q = float(quality.get("gate_quality_score") or 0.0)
+    mode = MODES.get(recipe.mode_key, recipe.mode_key)
+    if str(record.get("mode") or "") != mode:
+        return False, "wrong_mode", quality
+
+    setup = _setup_type(record)
+    tags = _setup_tags(record)
+    allowed = set(recipe.allowed_setups or ())
+    near_res = _near_resistance(record)
+    breakout = _breakout_confirmed(record)
+    mtf = _mtf_confirmed(record)
+    vol = _vol_ratio(record)
+    rel = _is_relative_strength(record)
+
+    if q < recipe.min_quality_score:
+        return False, "quality_score_below_recipe_threshold", quality
+    if recipe.reject_near_resistance_without_breakout and near_res and not breakout:
+        return False, "near_resistance_without_breakout", quality
+    if recipe.reject_high_risk_without_edge and _is_high_risk_symbol(record) and not (mtf or breakout or q >= 78):
+        return False, "high_risk_symbol_without_edge", quality
+    if recipe.reject_extreme_score_without_confirmation and quality.get("score_zone") == "extreme" and (near_res or not (mtf or breakout)):
+        return False, "extreme_score_without_confirmation", quality
+    if recipe.min_vol_ratio > 0 and vol < recipe.min_vol_ratio:
+        return False, "volume_below_recipe_min", quality
+    if recipe.require_recovery_bounce and setup not in RECOVERY_CORE_SETUPS:
+        if not (bool(_features(record).get("recovery_relative_bounce")) and vol >= recipe.relative_strength_min_vol):
+            return False, "missing_recovery_bounce_or_reclaim", quality
+    if recipe.require_strong_confirmation and not (rel or mtf or breakout or vol >= recipe.relative_strength_min_vol):
+        return False, "missing_strong_confirmation", quality
+
+    if allowed and setup not in allowed and not (rel and recipe.allow_relative_strength):
+        return False, "setup_not_allowed_for_recipe", quality
+    if recipe.clean_setups_only and setup not in allowed:
+        return False, "clean_setup_required", quality
+    if setup == "wave_3" and not (rel or mtf or breakout or vol >= recipe.wave3_min_vol):
+        return False, "wave3_without_confirmation", quality
+    if rel and setup not in allowed and recipe.allow_relative_strength and vol < recipe.relative_strength_min_vol:
+        return False, "relative_strength_without_volume", quality
+    if rel and not recipe.allow_relative_strength and setup not in allowed:
+        return False, "relative_strength_not_allowed", quality
+
+    return True, "recipe_pass", quality
 
 
 def _new_stats() -> dict[str, Any]:
@@ -276,19 +559,28 @@ def _new_stats() -> dict[str, Any]:
         "drawdown_sum": 0.0,
         "weighted_sum": 0.0,
         "weighted_count": 0,
+        "quality_score_sum": 0.0,
+        "quality_score_count": 0,
     }
 
 
-def _update_stats(stats: dict[str, Any], record: dict[str, Any]) -> None:
+def _is_quality_candidate(record: dict[str, Any]) -> bool:
+    return bool(record.get("quality_candidate") or record.get("execution_candidate") or record.get("blocked_by_limit"))
+
+
+def _update_stats(stats: dict[str, Any], record: dict[str, Any], quality_score: float | None = None) -> None:
     stats["total"] += 1
-    if record.get("quality_candidate"):
+    if _is_quality_candidate(record):
         stats["quality"] += 1
     if record.get("execution_candidate"):
         stats["execution"] += 1
     if record.get("blocked_by_limit"):
         stats["blocked"] += 1
-    outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
-    if outcome:
+    if quality_score is not None:
+        stats["quality_score_sum"] += float(quality_score)
+        stats["quality_score_count"] += 1
+    outcome = record.get("outcome")
+    if isinstance(outcome, dict) and outcome:
         stats["outcomes"] += 1
         if outcome.get("hit_tp1"):
             stats["tp1"] += 1
@@ -302,87 +594,16 @@ def _update_stats(stats: dict[str, Any], record: dict[str, Any]) -> None:
             stats["first_sl"] += 1
         stats["max_gain_sum"] += _num(outcome.get("max_gain_24h"))
         stats["drawdown_sum"] += _num(outcome.get("max_drawdown_24h"))
-        weighted = outcome.get("weighted_result_pct")
+        weighted = outcome.get("weighted_trade_result_pct")
+        if weighted is None:
+            weighted = outcome.get("weighted_result_pct")
         if weighted is not None:
             stats["weighted_sum"] += _num(weighted)
             stats["weighted_count"] += 1
 
 
-def _format_stats(label: str, stats: dict[str, Any]) -> list[str]:
-    total = int(stats.get("total") or 0)
-    outcomes = int(stats.get("outcomes") or 0)
-    avg_gain = (float(stats.get("max_gain_sum") or 0.0) / outcomes) if outcomes else 0.0
-    avg_dd = (float(stats.get("drawdown_sum") or 0.0) / outcomes) if outcomes else 0.0
-    rows = [
-        f"{label}: {total}",
-        f"- quality/exe/blocked: {stats.get('quality', 0)} / {stats.get('execution', 0)} / {stats.get('blocked', 0)}",
-    ]
-    if outcomes:
-        rows.extend([
-            f"- first TP1/SL: {_pct(stats.get('first_tp1', 0), outcomes)} / {_pct(stats.get('first_sl', 0), outcomes)}",
-            f"- TP1/TP2/SL touch: {_pct(stats.get('tp1', 0), outcomes)} / {_pct(stats.get('tp2', 0), outcomes)} / {_pct(stats.get('sl', 0), outcomes)}",
-            f"- avg max/DD: {avg_gain:.2f}% / {avg_dd:.2f}%",
-        ])
-        if stats.get("weighted_count"):
-            avg_weighted = float(stats.get("weighted_sum") or 0.0) / max(1, int(stats.get("weighted_count") or 0))
-            rows.append(f"- avg weighted result: {avg_weighted:.2f}%")
-    return rows
-
-
-def _analyze_records(records: Iterable[dict[str, Any]], gate: str, mode: str) -> dict[str, Any]:
-    before = _new_stats()
-    after = _new_stats()
-    rejected = _new_stats()
-    reasons: Counter[str] = Counter()
-    setup_counter: Counter[str] = Counter()
-    pass_setup_counter: Counter[str] = Counter()
-
-    for record in records:
-        if str(record.get("mode") or "") != mode:
-            continue
-        # Only simulate candidate pressure. Normal rows are still counted in before total.
-        _update_stats(before, record)
-        setup_counter[_setup_type(record) or "unknown"] += 1
-        passed, reason = evaluate_gate(record, gate)
-        if passed:
-            _update_stats(after, record)
-            pass_setup_counter[_setup_type(record) or "unknown"] += 1
-        else:
-            _update_stats(rejected, record)
-            reasons[reason] += 1
-
-    return {
-        "before": before,
-        "after": after,
-        "rejected": rejected,
-        "reasons": reasons,
-        "setups": setup_counter,
-        "pass_setups": pass_setup_counter,
-    }
-
-
-def _format_analysis_block(title: str, analysis: dict[str, Any]) -> list[str]:
-    before = analysis["before"]
-    after = analysis["after"]
-    rejected = analysis["rejected"]
-    total = int(before.get("total") or 0)
-    passed = int(after.get("total") or 0)
-    rows = [title]
-    rows.extend(_format_stats("Before", before))
-    rows.extend(_format_stats("After gate", after))
-    rows.append(f"- rejected to normal: {rejected.get('total', 0)} | reduction: {_pct(max(total - passed, 0), total)}")
-    reasons = analysis.get("reasons") or Counter()
-    if reasons:
-        rows.append("- top reject reasons: " + ", ".join([f"{k}:{v}" for k, v in reasons.most_common(4)]))
-    pass_setups = analysis.get("pass_setups") or Counter()
-    if pass_setups:
-        rows.append("- top pass setups: " + ", ".join([f"{k}:{v}" for k, v in pass_setups.most_common(4)]))
-    return rows
-
-
-
 def _plain_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "total": int(stats.get("total") or 0),
         "quality": int(stats.get("quality") or 0),
         "execution": int(stats.get("execution") or 0),
@@ -397,6 +618,94 @@ def _plain_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "drawdown_sum": float(stats.get("drawdown_sum") or 0.0),
         "weighted_sum": float(stats.get("weighted_sum") or 0.0),
         "weighted_count": int(stats.get("weighted_count") or 0),
+        "quality_score_sum": float(stats.get("quality_score_sum") or 0.0),
+        "quality_score_count": int(stats.get("quality_score_count") or 0),
+    }
+    outcomes = max(1, int(out["outcomes"] or 0))
+    out["first_tp1_rate_pct"] = round((out["first_tp1"] / outcomes) * 100.0, 4) if out["outcomes"] else 0.0
+    out["first_sl_rate_pct"] = round((out["first_sl"] / outcomes) * 100.0, 4) if out["outcomes"] else 0.0
+    out["avg_weighted_result_pct"] = round(out["weighted_sum"] / max(1, out["weighted_count"]), 4) if out["weighted_count"] else 0.0
+    out["avg_gate_quality_score"] = round(out["quality_score_sum"] / max(1, out["quality_score_count"]), 4) if out["quality_score_count"] else 0.0
+    return out
+
+
+def _format_stats(label: str, stats: dict[str, Any]) -> list[str]:
+    total = int(stats.get("total") or 0)
+    outcomes = int(stats.get("outcomes") or 0)
+    avg_gain = (float(stats.get("max_gain_sum") or 0.0) / outcomes) if outcomes else 0.0
+    avg_dd = (float(stats.get("drawdown_sum") or 0.0) / outcomes) if outcomes else 0.0
+    avg_q = (float(stats.get("quality_score_sum") or 0.0) / max(1, int(stats.get("quality_score_count") or 0))) if stats.get("quality_score_count") else 0.0
+    rows = [
+        f"{label}: {total}",
+        f"- quality/exe/blocked: {stats.get('quality', 0)} / {stats.get('execution', 0)} / {stats.get('blocked', 0)}",
+    ]
+    if avg_q:
+        rows.append(f"- avg gate quality score: {avg_q:.1f}/100")
+    if outcomes:
+        rows.extend([
+            f"- first TP1/SL: {_pct(stats.get('first_tp1', 0), outcomes)} / {_pct(stats.get('first_sl', 0), outcomes)}",
+            f"- TP1/TP2/SL touch: {_pct(stats.get('tp1', 0), outcomes)} / {_pct(stats.get('tp2', 0), outcomes)} / {_pct(stats.get('sl', 0), outcomes)}",
+            f"- avg max/DD: {avg_gain:.2f}% / {avg_dd:.2f}%",
+        ])
+        if stats.get("weighted_count"):
+            avg_weighted = float(stats.get("weighted_sum") or 0.0) / max(1, int(stats.get("weighted_count") or 0))
+            rows.append(f"- avg weighted result: {avg_weighted:.2f}%")
+    return rows
+
+
+def _build_calibration(records: list[dict[str, Any]], mode: str) -> dict[str, float]:
+    scores = [_score(r) for r in records if str(r.get("mode") or "") == mode]
+    return _calibration(scores)
+
+
+def _setup_counters(records: list[dict[str, Any]], mode: str) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for record in records:
+        if str(record.get("mode") or "") == mode:
+            counter[_setup_type(record) or "unknown"] += 1
+    return counter
+
+
+def _analyze_recipe(records: list[dict[str, Any]], recipe: GateRecipe, calibration: dict[str, float]) -> dict[str, Any]:
+    mode = MODES[recipe.mode_key]
+    before = _new_stats()
+    after = _new_stats()
+    rejected = _new_stats()
+    reasons: Counter[str] = Counter()
+    pass_setup_counter: Counter[str] = Counter()
+    all_setup_counter: Counter[str] = Counter()
+    score_zones_before: Counter[str] = Counter()
+    score_zones_after: Counter[str] = Counter()
+
+    for record in records:
+        if str(record.get("mode") or "") != mode:
+            continue
+        quality = calculate_gate_quality(record, calibration)
+        q = float(quality.get("gate_quality_score") or 0.0)
+        zone = str(quality.get("score_zone") or "unknown")
+        _update_stats(before, record, q)
+        all_setup_counter[_setup_type(record) or "unknown"] += 1
+        score_zones_before[zone] += 1
+        passed, reason, quality = evaluate_recipe(record, recipe, calibration)
+        if passed:
+            _update_stats(after, record, float(quality.get("gate_quality_score") or 0.0))
+            pass_setup_counter[_setup_type(record) or "unknown"] += 1
+            score_zones_after[str(quality.get("score_zone") or "unknown")] += 1
+        else:
+            _update_stats(rejected, record, float(quality.get("gate_quality_score") or 0.0))
+            reasons[reason] += 1
+
+    return {
+        "recipe": asdict(recipe),
+        "rules": recipe.rules(),
+        "before": before,
+        "after": after,
+        "rejected": rejected,
+        "reasons": reasons,
+        "setups": all_setup_counter,
+        "pass_setups": pass_setup_counter,
+        "score_zones_before": score_zones_before,
+        "score_zones_after": score_zones_after,
     }
 
 
@@ -407,6 +716,8 @@ def _analysis_payload(analysis: dict[str, Any]) -> dict[str, Any]:
     total = before.get("total", 0)
     passed = after.get("total", 0)
     return {
+        "recipe": analysis.get("recipe") or {},
+        "rules": analysis.get("rules") or [],
         "before": before,
         "after_gate": after,
         "rejected_to_normal": rejected,
@@ -414,7 +725,27 @@ def _analysis_payload(analysis: dict[str, Any]) -> dict[str, Any]:
         "reject_reasons": dict((analysis.get("reasons") or Counter()).most_common()),
         "all_setups": dict((analysis.get("setups") or Counter()).most_common()),
         "pass_setups": dict((analysis.get("pass_setups") or Counter()).most_common()),
+        "score_zones_before": dict((analysis.get("score_zones_before") or Counter()).most_common()),
+        "score_zones_after": dict((analysis.get("score_zones_after") or Counter()).most_common()),
     }
+
+
+def _recipe_score_for_recommendation(replay_payload: dict[str, Any], live_payload: dict[str, Any]) -> float:
+    """Rank recipes by outcome quality + enough opportunity + live pressure reduction."""
+    after = replay_payload.get("after_gate") or {}
+    before = replay_payload.get("before") or {}
+    live_after = live_payload.get("after_gate") or {}
+    live_before = live_payload.get("before") or {}
+    outcomes = float(after.get("outcomes") or 0)
+    if outcomes <= 0:
+        return 0.0
+    first_tp1 = float(after.get("first_tp1_rate_pct") or 0.0)
+    avg_weighted = float(after.get("avg_weighted_result_pct") or 0.0)
+    kept_ratio = float(after.get("total") or 0) / max(1.0, float(before.get("total") or 0))
+    live_reduction = 100.0 - ((float(live_after.get("total") or 0) / max(1.0, float(live_before.get("total") or 0))) * 100.0)
+    # Avoid selecting a recipe that keeps almost nothing even if the rate is high.
+    opportunity_bonus = min(20.0, kept_ratio * 35.0)
+    return (first_tp1 * 0.55) + (avg_weighted * 4.0) + opportunity_bonus + (live_reduction * 0.10)
 
 
 def _write_gate_json(payload: dict[str, Any], name: str) -> dict[str, Any]:
@@ -430,65 +761,127 @@ def _gate_payload_base(kind: str) -> dict[str, Any]:
         "kind": kind,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "analytics.gate_simulation",
-        "note": "Passive gate simulation only. Does not change live scoring, execution, TP/SL, or market modes.",
+        "note": "Passive multi-recipe gate simulation only. Does not change live scoring, execution, TP/SL, or market modes.",
+        "shared_gate_quality_score": {
+            "scale": "0-100",
+            "formula": "single shared formula for all modes and recipes",
+            "weights": QUALITY_SCORE_WEIGHTS,
+            "important": "Recipes change acceptance thresholds and technical conditions only; they do not use different score formulas.",
+        },
     }
+
+
+def _load_inputs(settings: Any | None, redis_client: Any | None, live_limit: int = 50000) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    replay_records = list(iter_replay_records(redis_client=redis_client))
+    live_records = load_snapshot_records(settings=settings, limit=live_limit, redis_client=redis_client)
+    return replay_records, live_records
 
 
 def build_gate_sim_payload(gate: str, settings: Any | None = None, redis_client: Any | None = None, live_limit: int = 50000) -> dict[str, Any]:
     gate = str(gate or "").lower().strip()
     if gate not in MODES:
-        return {**_gate_payload_base("single_gate"), "ok": False, "error": "unknown_gate", "gate": gate}
+        return {**_gate_payload_base("single_gate_multi_recipe"), "ok": False, "error": "unknown_gate", "gate": gate}
+
+    replay_records, live_records = _load_inputs(settings, redis_client, live_limit=live_limit)
     mode = MODES[gate]
-    replay_analysis = _analyze_records(iter_replay_records(redis_client=redis_client), gate, mode)
-    live_records = load_snapshot_records(settings=settings, limit=live_limit, redis_client=redis_client)
-    live_analysis = _analyze_records(live_records, gate, mode)
+    replay_cal = _build_calibration(replay_records, mode)
+    live_cal = _build_calibration(live_records, mode)
+    recipes_payload: list[dict[str, Any]] = []
+
+    best_name = ""
+    best_score = -10**9
+    for recipe in RECIPES[gate]:
+        replay_analysis = _analysis_payload(_analyze_recipe(replay_records, recipe, replay_cal))
+        live_analysis = _analysis_payload(_analyze_recipe(live_records, recipe, live_cal))
+        rank_score = _recipe_score_for_recommendation(replay_analysis, live_analysis)
+        if rank_score > best_score:
+            best_score = rank_score
+            best_name = recipe.name
+        recipes_payload.append({
+            "name": recipe.name,
+            "title": recipe.title,
+            "description": recipe.description,
+            "recommendation_score": round(rank_score, 4),
+            "rules": recipe.rules(),
+            "recipe_config": asdict(recipe),
+            "replay": replay_analysis,
+            "live_snapshot": live_analysis,
+        })
+
     return {
-        **_gate_payload_base("single_gate"),
+        **_gate_payload_base("single_gate_multi_recipe"),
         "ok": True,
         "gate": gate,
         "mode": mode,
-        "rules": _gate_rules(gate),
-        "replay": _analysis_payload(replay_analysis),
-        "live_snapshot": _analysis_payload(live_analysis),
+        "score_calibration": {
+            "replay": replay_cal,
+            "live_snapshot": live_cal,
+        },
+        "recipes": recipes_payload,
+        "recommended_recipe": best_name,
     }
+
+
+def _format_recipe_short(recipe_payload: dict[str, Any]) -> list[str]:
+    replay = recipe_payload.get("replay") or {}
+    live = recipe_payload.get("live_snapshot") or {}
+    rb = replay.get("before") or {}
+    ra = replay.get("after_gate") or {}
+    lb = live.get("before") or {}
+    la = live.get("after_gate") or {}
+    rows = [
+        f"🧪 {recipe_payload.get('name')} — {recipe_payload.get('title')}",
+        f"- قبول: gate_quality_score >= {((recipe_payload.get('recipe_config') or {}).get('min_quality_score') or 0):.1f}",
+        f"- Replay pass: {ra.get('total', 0)}/{rb.get('total', 0)} | reduction {replay.get('reduction_pct', 0):.1f}%",
+        f"- Replay first TP1/SL: {_pct(ra.get('first_tp1', 0), ra.get('outcomes', 0))} / {_pct(ra.get('first_sl', 0), ra.get('outcomes', 0))}",
+    ]
+    if ra.get("weighted_count"):
+        rows.append(f"- Replay avg weighted: {ra.get('avg_weighted_result_pct', 0):.2f}%")
+    rows.extend([
+        f"- Live pass: {la.get('total', 0)}/{lb.get('total', 0)} | pressure reduction {live.get('reduction_pct', 0):.1f}%",
+    ])
+    reasons = (replay.get("reject_reasons") or {})
+    if reasons:
+        rows.append("- Top replay rejects: " + ", ".join([f"{k}:{v}" for k, v in list(reasons.items())[:3]]))
+    setups = (replay.get("pass_setups") or {})
+    if setups:
+        rows.append("- Top pass setups: " + ", ".join([f"{k}:{v}" for k, v in list(setups.items())[:3]]))
+    return rows
 
 
 def _format_report_from_payload(payload: dict[str, Any]) -> str:
     if not payload.get("ok"):
         return "⚠️ Gate simulation غير معروف. استخدم normal / recovery / strong."
-    gate = str(payload.get("gate") or "")
-    mode = str(payload.get("mode") or "")
-    # Reconstruct light analysis blocks from payload stats for consistent Telegram output.
-    replay_analysis = {
-        "before": payload["replay"]["before"],
-        "after": payload["replay"]["after_gate"],
-        "rejected": payload["replay"]["rejected_to_normal"],
-        "reasons": Counter(payload["replay"].get("reject_reasons") or {}),
-        "pass_setups": Counter(payload["replay"].get("pass_setups") or {}),
-    }
-    live_analysis = {
-        "before": payload["live_snapshot"]["before"],
-        "after": payload["live_snapshot"]["after_gate"],
-        "rejected": payload["live_snapshot"]["rejected_to_normal"],
-        "reasons": Counter(payload["live_snapshot"].get("reject_reasons") or {}),
-        "pass_setups": Counter(payload["live_snapshot"].get("pass_setups") or {}),
-    }
     rows = [
-        f"🧪 Gate Simulation — {mode}",
+        f"🧪 Gate Simulation — {payload.get('mode')} — Multi Recipes",
         "┄┄┄┄┄┄┄┄",
-        "تحليل فقط: لا يغير execution أو scoring.",
+        "تحليل فقط: لا يغير execution أو scoring أو TP/SL.",
+        "طريقة حساب Gate Quality Score واحدة لكل المودات والخلطات؛ الاختلاف فقط في رقم القبول وشروط المؤشرات.",
         "📎 تم تجهيز ملف JSON بنفس نتائج التقرير.",
         "",
+        "⚙️ Gate Quality Score",
+        "- Setup Quality: 35%",
+        "- Market Context: 20%",
+        "- Volume / Momentum: 20%",
+        "- Risk Location: 15%",
+        "- Bot Score Zone: 10%",
     ]
-    rows.extend(format_gate_rules(gate))
-    rows.append("")
-    rows.extend(_format_analysis_block("📚 Historical Replay", replay_analysis))
-    rows.append("")
-    rows.extend(_format_analysis_block("🟢 Live Snapshot", live_analysis))
+    cal = payload.get("score_calibration") or {}
+    replay_cal = cal.get("replay") or {}
+    live_cal = cal.get("live_snapshot") or {}
     rows.extend([
         "",
-        "📌 الحكم النهائي يحتاج مقارنة بعد إعادة Replay بمنطق TP/SL النهائي لو تم تغييره.",
+        "📏 Score Calibration",
+        f"- Replay p20/p50/p85/p95: {replay_cal.get('p20', 0):.2f} / {replay_cal.get('p50', 0):.2f} / {replay_cal.get('p85', 0):.2f} / {replay_cal.get('p95', 0):.2f}",
+        f"- Live p20/p50/p85/p95: {live_cal.get('p20', 0):.2f} / {live_cal.get('p50', 0):.2f} / {live_cal.get('p85', 0):.2f} / {live_cal.get('p95', 0):.2f}",
+        "",
     ])
+    for recipe_payload in payload.get("recipes") or []:
+        rows.extend(_format_recipe_short(recipe_payload))
+        rows.append("")
+    if payload.get("recommended_recipe"):
+        rows.append(f"✅ Recommended recipe مبدئيًا: {payload.get('recommended_recipe')}")
+    rows.append("📌 القرار النهائي بعد مقارنة JSON والتأكد من replay الجديد 45d.")
     return "\n".join(rows)
 
 
@@ -502,32 +895,51 @@ def build_gate_sim_artifact(gate: str, settings: Any | None = None, redis_client
     if not payload.get("ok"):
         return {"ok": False, "text": text, "message": payload.get("error") or "unknown_gate"}
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    file_result = _write_gate_json(payload, f"gate_sim_{payload.get('gate')}_{stamp}")
+    file_result = _write_gate_json(payload, f"gate_sim_{payload.get('gate')}_multi_recipe_{stamp}")
     return {
         "ok": True,
         "text": text,
         "path": file_result.get("path"),
         "size_bytes": file_result.get("size_bytes"),
-        "caption": f"Gate Simulation JSON — {payload.get('mode')}",
+        "caption": f"Gate Simulation JSON — {payload.get('mode')} — Multi Recipes",
         "payload": payload,
     }
 
 
 def build_gate_sim_all_payload(settings: Any | None = None, redis_client: Any | None = None) -> dict[str, Any]:
-    live_records = load_snapshot_records(settings=settings, limit=50000, redis_client=redis_client)
-    replay_records = list(iter_replay_records(redis_client=redis_client))
+    replay_records, live_records = _load_inputs(settings, redis_client, live_limit=50000)
     modes_payload: dict[str, Any] = {}
     for gate, mode in MODES.items():
-        replay = _analyze_records(replay_records, gate, mode)
-        live = _analyze_records(live_records, gate, mode)
+        replay_cal = _build_calibration(replay_records, mode)
+        live_cal = _build_calibration(live_records, mode)
+        recipes_payload: list[dict[str, Any]] = []
+        best_name = ""
+        best_score = -10**9
+        for recipe in RECIPES[gate]:
+            replay_analysis = _analysis_payload(_analyze_recipe(replay_records, recipe, replay_cal))
+            live_analysis = _analysis_payload(_analyze_recipe(live_records, recipe, live_cal))
+            rank_score = _recipe_score_for_recommendation(replay_analysis, live_analysis)
+            if rank_score > best_score:
+                best_score = rank_score
+                best_name = recipe.name
+            recipes_payload.append({
+                "name": recipe.name,
+                "title": recipe.title,
+                "description": recipe.description,
+                "recommendation_score": round(rank_score, 4),
+                "rules": recipe.rules(),
+                "recipe_config": asdict(recipe),
+                "replay": replay_analysis,
+                "live_snapshot": live_analysis,
+            })
         modes_payload[gate] = {
             "mode": mode,
-            "rules": _gate_rules(gate),
-            "replay": _analysis_payload(replay),
-            "live_snapshot": _analysis_payload(live),
+            "score_calibration": {"replay": replay_cal, "live_snapshot": live_cal},
+            "recipes": recipes_payload,
+            "recommended_recipe": best_name,
         }
     return {
-        **_gate_payload_base("all_gates"),
+        **_gate_payload_base("all_gates_multi_recipe"),
         "ok": True,
         "modes": modes_payload,
     }
@@ -535,25 +947,31 @@ def build_gate_sim_all_payload(settings: Any | None = None, redis_client: Any | 
 
 def _format_all_report_from_payload(payload: dict[str, Any]) -> str:
     rows = [
-        "🧪 Gate Simulation — All Modes",
+        "🧪 Gate Simulation — All Modes — Multi Recipes",
         "┄┄┄┄┄┄┄┄",
         "تحليل مختصر فقط؛ استخدم أوامر كل مود للتفاصيل.",
-        "⚙️ كل مود يستخدم شروطه الحالية من analytics/gate_simulation.py، والتفاصيل تظهر في ملف JSON أيضًا.",
-        "📎 تم تجهيز ملف JSON شامل لكل البوابات.",
+        "كل المودات تستخدم نفس Gate Quality Score، والاختلاف في recipe thresholds والمؤشرات.",
+        "📎 تم تجهيز ملف JSON شامل لكل البوابات والخلطات.",
         "",
     ]
     for gate, data in (payload.get("modes") or {}).items():
         mode = data.get("mode") or MODES.get(gate, gate)
-        rb, ra = data["replay"]["before"], data["replay"]["after_gate"]
-        lb, la = data["live_snapshot"]["before"], data["live_snapshot"]["after_gate"]
-        rows.extend([
-            f"{mode}",
-            *format_gate_rules_compact(gate),
-            f"- Replay pass: {ra.get('total', 0)}/{rb.get('total', 0)} | reduction {_pct(max(int(rb.get('total') or 0)-int(ra.get('total') or 0),0), rb.get('total',0))}",
-            f"- Replay first TP1/SL after: {_pct(ra.get('first_tp1', 0), ra.get('outcomes', 0))} / {_pct(ra.get('first_sl', 0), ra.get('outcomes', 0))}",
-            f"- Live pass: {la.get('total', 0)}/{lb.get('total', 0)} | reduction {_pct(max(int(lb.get('total') or 0)-int(la.get('total') or 0),0), lb.get('total',0))}",
-            "",
-        ])
+        rows.append(f"{mode}")
+        for recipe_payload in data.get("recipes") or []:
+            replay = recipe_payload.get("replay") or {}
+            live = recipe_payload.get("live_snapshot") or {}
+            ra = replay.get("after_gate") or {}
+            rb = replay.get("before") or {}
+            la = live.get("after_gate") or {}
+            lb = live.get("before") or {}
+            rows.append(
+                f"- {recipe_payload.get('name')}: Replay {ra.get('total',0)}/{rb.get('total',0)} "
+                f"TP1/SL {_pct(ra.get('first_tp1',0), ra.get('outcomes',0))}/{_pct(ra.get('first_sl',0), ra.get('outcomes',0))} | "
+                f"Live {la.get('total',0)}/{lb.get('total',0)}"
+            )
+        if data.get("recommended_recipe"):
+            rows.append(f"  ✅ recommended: {data.get('recommended_recipe')}")
+        rows.append("")
     rows.append("📌 لا يتم تطبيق أي Gate على البوت الحقيقي من هذه الأوامر.")
     return "\n".join(rows)
 
@@ -566,12 +984,12 @@ def build_gate_sim_all_artifact(settings: Any | None = None, redis_client: Any |
     payload = build_gate_sim_all_payload(settings=settings, redis_client=redis_client)
     text = _format_all_report_from_payload(payload)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    file_result = _write_gate_json(payload, f"gate_sim_all_{stamp}")
+    file_result = _write_gate_json(payload, f"gate_sim_all_multi_recipe_{stamp}")
     return {
         "ok": True,
         "text": text,
         "path": file_result.get("path"),
         "size_bytes": file_result.get("size_bytes"),
-        "caption": "Gate Simulation JSON — All Modes",
+        "caption": "Gate Simulation JSON — All Modes — Multi Recipes",
         "payload": payload,
     }
