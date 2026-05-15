@@ -6,6 +6,7 @@ mode and logs a clear warning instead of crashing.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,8 @@ DEEP_CLEAN_PATTERNS = [
 OPEN_SET = f"{PREFIX}:trades:open"
 HISTORY_SET = f"{PREFIX}:trades:history"
 EXEC_CHECKS_LIST = f"{PREFIX}:execution:checks"
+SIGNAL_FP_PREFIX = f"{PREFIX}:signals:fp"
+SIGNAL_FP_TTL_SECONDS = 6 * 60 * 60
 
 
 def _to_iso(value: Any) -> Any:
@@ -192,11 +195,12 @@ class RedisTradeStore:
         except Exception as exc:
             print(f"⚠️ Redis append_execution_checks failed: {exc}", flush=True)
 
-    def load_execution_checks(self) -> list[dict[str, Any]]:
+    def load_execution_checks(self, limit: int | None = None) -> list[dict[str, Any]]:
         if not self.enabled or not self.client:
             return []
         try:
-            rows = self.client.lrange(EXEC_CHECKS_LIST, 0, -1) or []
+            end = -1 if limit is None or limit <= 0 else max(0, int(limit) - 1)
+            rows = self.client.lrange(EXEC_CHECKS_LIST, 0, end) or []
             out = []
             for raw in reversed(rows):
                 try:
@@ -210,6 +214,50 @@ class RedisTradeStore:
 
     def _parse_execution_check_ts(self, item: dict[str, Any]) -> datetime | None:
         return _parse_dt(item.get("ts") or item.get("created_at") or item.get("time"))
+
+    def _signal_fingerprint_key(self, fingerprint: str) -> str:
+        digest = hashlib.sha1(str(fingerprint or "").encode("utf-8")).hexdigest()
+        return f"{SIGNAL_FP_PREFIX}:{digest}"
+
+    def mark_signal_fingerprint(self, fingerprint: str, ttl_seconds: int = SIGNAL_FP_TTL_SECONDS) -> bool:
+        """Return True when fingerprint was already sent recently; otherwise mark it.
+
+        This persists duplicate protection across restarts but expires automatically,
+        so a real fresh setup is not blocked forever.
+        """
+        if not fingerprint:
+            return False
+        if not self.enabled or not self.client:
+            return False
+        try:
+            key = self._signal_fingerprint_key(fingerprint)
+            created = self.client.set(key, "1", nx=True, ex=max(60, int(ttl_seconds)))
+            return not bool(created)
+        except Exception as exc:
+            print(f"⚠️ Redis mark_signal_fingerprint failed: {exc}", flush=True)
+            return False
+
+    def health_snapshot(self) -> dict[str, Any]:
+        stats: dict[str, Any] = {
+            "enabled": bool(self.enabled and self.client),
+            "prefix": PREFIX,
+            "open_set": 0,
+            "history_set": 0,
+            "trade_keys": 0,
+            "execution_checks": 0,
+            "signal_fingerprints": 0,
+        }
+        if not self.enabled or not self.client:
+            return stats
+        try:
+            stats["open_set"] = len(self.client.smembers(OPEN_SET) or [])
+            stats["history_set"] = len(self.client.smembers(HISTORY_SET) or [])
+            stats["trade_keys"] = sum(1 for _ in self.client.scan_iter(f"{PREFIX}:trade:*"))
+            stats["execution_checks"] = int(self.client.llen(EXEC_CHECKS_LIST) or 0)
+            stats["signal_fingerprints"] = sum(1 for _ in self.client.scan_iter(f"{SIGNAL_FP_PREFIX}:*"))
+        except Exception as exc:
+            stats["error"] = str(exc)
+        return stats
 
     def clean_preview(self, mode: str = "soft") -> dict[str, Any]:
         """Return a safe preview for Redis cleanup commands.
@@ -226,6 +274,7 @@ class RedisTradeStore:
             "history_set": 0,
             "trade_keys": 0,
             "execution_checks": 0,
+            "signal_fingerprints": 0,
             "stale_open_candidates": 0,
             "old_execution_checks": 0,
             "keys_to_delete": 0,
@@ -240,6 +289,7 @@ class RedisTradeStore:
             stats["trade_keys"] = sum(1 for _ in self.client.scan_iter(f"{PREFIX}:trade:*"))
             rows = self.client.lrange(EXEC_CHECKS_LIST, 0, -1) or []
             stats["execution_checks"] = len(rows)
+            stats["signal_fingerprints"] = sum(1 for _ in self.client.scan_iter(f"{SIGNAL_FP_PREFIX}:*"))
             now = datetime.now(timezone.utc)
             stale_cutoff = now.timestamp() - (24 * 60 * 60)
             old_check_cutoff = now.timestamp() - (7 * 24 * 60 * 60)
@@ -256,8 +306,8 @@ class RedisTradeStore:
                 if not trade:
                     stale += 1
                     continue
-                opened = _parse_dt(getattr(trade, "opened_at", None)) or _parse_dt(getattr(trade, "updated_at", None))
-                if opened and opened.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
+                last_seen = _parse_dt(getattr(trade, "updated_at", None)) or _parse_dt(getattr(trade, "opened_at", None))
+                if last_seen and last_seen.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
                     stale += 1
             old_checks = 0
             for raw in rows:
@@ -311,8 +361,8 @@ class RedisTradeStore:
                         remove = True
                         delete_key = True
                     else:
-                        opened = _parse_dt(getattr(trade, "opened_at", None)) or _parse_dt(getattr(trade, "updated_at", None))
-                        if opened and opened.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
+                        last_seen = _parse_dt(getattr(trade, "updated_at", None)) or _parse_dt(getattr(trade, "opened_at", None))
+                        if last_seen and last_seen.timestamp() < stale_cutoff and not getattr(trade, "protected_runner", False):
                             remove = True
                             delete_key = True
                 if remove:
