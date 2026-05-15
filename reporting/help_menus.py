@@ -209,6 +209,8 @@ def build_diagnostics_help() -> str:
         "↳ يحاكي بوابة RECOVERY على replay + live ويرسل تقرير + JSON.",
         "/gate_sim_strong",
         "↳ يحاكي بوابة STRONG على replay + live ويرسل تقرير + JSON.",
+        "/gate_sim_block",
+        "↳ يحاكي استثناءات BLOCK_LONGS فقط ويرسل تقرير + JSON.",
         "/gate_sim_all",
         "↳ ملخص سريع لمحاكاة كل البوابات ويرسل JSON شامل.",
         "",
