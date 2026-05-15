@@ -6,7 +6,8 @@ v129 focus:
 - BLOCK_LONGS exit has two paths:
   1) fast exit to RECOVERY_LONG when rebound edge is clear;
   2) safe exit to STRONG_LONG_ONLY when market is no longer crashing.
-- RECOVERY_LONG is not mandatory; it is a temporary alternative to STRONG.
+- RECOVERY_LONG is temporary and should only be reached from BLOCK/confirmed crash rebound paths.
+- NORMAL_LONG remains the healthy/green market mode; STRONG_LONG_ONLY is defensive pressure mode.
 """
 from __future__ import annotations
 
@@ -71,13 +72,14 @@ RECOVERY_HARD_FAIL_RED_RATIO = 0.70
 RECOVERY_HARD_FAIL_AVG = -0.75
 RECOVERY_HARD_FAIL_BTC = -0.75
 
-# Recovery should be temporary. When the rebound is no longer just a bounce
-# and breadth/BTC are healthy, upgrade back to STRONG so the bot does not stay
-# trapped in RECOVERY_LONG while the market is already tradable.
-RECOVERY_TO_STRONG_RED_RATIO = 0.45
-RECOVERY_TO_STRONG_AVG = -0.10
-RECOVERY_TO_STRONG_BTC = -0.20
-RECOVERY_TO_STRONG_MIN_STRONG_COINS = 6
+# Recovery is a temporary post-BLOCK fast-rebound mode.
+# NORMAL_LONG is the healthy/green market; STRONG_LONG_ONLY is the defensive
+# pressure mode. These thresholds only help Recovery leave quickly when the
+# rebound is no longer a fresh bounce but the market is still not green enough.
+RECOVERY_TO_STRONG_RED_RATIO = 0.58
+RECOVERY_TO_STRONG_AVG = -0.35
+RECOVERY_TO_STRONG_BTC = -0.30
+RECOVERY_TO_STRONG_MIN_STRONG_COINS = 4
 
 
 def _values(snapshot: MarketSnapshot) -> tuple[float, float, float, int]:
@@ -121,8 +123,17 @@ def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
         and btc > -0.40
         and strong >= 5
     )
-    return bool(old_core_recovery and (snapshot.fast_rebound or snapshot.btc_reclaim or strong >= 6) or fast_recovery_edge)
-
+    controlled_rebound_edge = bool(
+        snapshot.btc_reclaim
+        and snapshot.breadth_improving
+        and red_ratio <= 0.58
+        and avg > -0.55
+        and btc > -0.35
+        and strong >= 5
+    )
+    # Do not treat a plain healthy/strong snapshot as Recovery. Recovery is a
+    # fast post-crash rebound path, not a replacement for NORMAL/STRONG.
+    return bool(old_core_recovery and (snapshot.fast_rebound or controlled_rebound_edge) or fast_recovery_edge)
 
 def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
     red_ratio, avg, btc, strong = _values(snapshot)
@@ -136,11 +147,14 @@ def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
 
 def _is_recovery_to_strong_ready(snapshot: MarketSnapshot) -> bool:
     red_ratio, avg, btc, strong = _values(snapshot)
-    healthy_breadth = red_ratio <= RECOVERY_TO_STRONG_RED_RATIO and strong >= RECOVERY_TO_STRONG_MIN_STRONG_COINS
-    healthy_price = avg >= RECOVERY_TO_STRONG_AVG and btc >= RECOVERY_TO_STRONG_BTC
-    confirmation = bool(snapshot.breadth_improving or snapshot.btc_reclaim or snapshot.fast_rebound or strong >= RECOVERY_TO_STRONG_MIN_STRONG_COINS)
-    return bool(healthy_breadth and healthy_price and confirmation)
-
+    pressure_but_stable = (
+        red_ratio <= RECOVERY_TO_STRONG_RED_RATIO
+        and avg >= RECOVERY_TO_STRONG_AVG
+        and btc >= RECOVERY_TO_STRONG_BTC
+        and strong >= RECOVERY_TO_STRONG_MIN_STRONG_COINS
+    )
+    recovery_edge_fading = bool(not snapshot.fast_rebound or snapshot.breadth_improving or snapshot.btc_reclaim)
+    return bool(pressure_but_stable and recovery_edge_fading)
 
 def _risk_flags(snapshot: MarketSnapshot) -> dict:
     """Classify market risk using old-core entry/exit paths.
@@ -209,14 +223,9 @@ def _base_mode(snapshot: MarketSnapshot) -> str:
     flags = _risk_flags(snapshot)
     if flags["real_block"]:
         return MODE_BLOCK_LONGS
-    if flags["recovery_to_strong_ready"]:
-        return MODE_STRONG_LONG_ONLY
-    if flags["recovery_ready"]:
-        return MODE_RECOVERY_LONG
     if flags["weak_breadth"]:
         return MODE_STRONG_LONG_ONLY
     return MODE_NORMAL_LONG
-
 
 def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | None = None, now: datetime | None = None) -> MarketModeState:
     now = now or datetime.now(timezone.utc)
@@ -234,13 +243,10 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     candidate_mode = previous.mode
 
     if previous.mode == MODE_BLOCK_LONGS:
-        # If the rebound is already healthy, skip RECOVERY and return to STRONG.
-        if flags["recovery_to_strong_ready"]:
-            candidate_mode = MODE_STRONG_LONG_ONLY
-        # Fast exit path: recovery edge confirmed, but market is not strong enough yet.
-        elif flags["recovery_ready"]:
+        # Fast exit path: BLOCK -> RECOVERY only on a real rebound edge.
+        if flags["recovery_ready"]:
             candidate_mode = MODE_RECOVERY_LONG
-        # Slow/safe exit path: dump stopped; move to STRONG after confirmation.
+        # Slow/safe exit path: crash stopped but market is still pressured -> STRONG.
         elif flags["no_longer_crashing"] or flags["stabilizing"] or not flags["real_block"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
                 candidate_mode = MODE_STRONG_LONG_ONLY
@@ -253,50 +259,46 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         # Enter BLOCK from STRONG only after confirmed real breakdown.
         if flags["real_block"] and next_state.consecutive_weak_scans >= STRONG_TO_BLOCK_CONFIRM_SCANS:
             candidate_mode = MODE_BLOCK_LONGS
-        # Do not downgrade STRONG to RECOVERY when breadth/BTC are already healthy.
-        elif flags["recovery_to_strong_ready"]:
-            candidate_mode = MODE_STRONG_LONG_ONLY
-        elif flags["recovery_ready"]:
-            candidate_mode = MODE_RECOVERY_LONG
         elif flags["normal_ready"]:
             candidate_mode = MODE_NORMAL_LONG
         else:
+            # STRONG is the pressure mode. Do not jump to RECOVERY unless a
+            # BLOCK/crash path happened first.
             candidate_mode = MODE_STRONG_LONG_ONLY
 
     elif previous.mode == MODE_RECOVERY_LONG:
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["recovery_to_strong_ready"]:
-            candidate_mode = MODE_STRONG_LONG_ONLY
+        elif flags["normal_ready"]:
+            candidate_mode = MODE_NORMAL_LONG
         elif _recovery_soft_fail(snapshot) and not flags["recovery_ready"]:
             candidate_mode = MODE_STRONG_LONG_ONLY
         elif previous.recovery_cycle_started_at and now - previous.recovery_cycle_started_at >= timedelta(minutes=RECOVERY_WINDOW_MINUTES):
             candidate_mode = MODE_STRONG_LONG_ONLY
+        elif flags["recovery_to_strong_ready"] and not flags["recovery_ready"]:
+            candidate_mode = MODE_STRONG_LONG_ONLY
         elif flags["recovery_ready"]:
             candidate_mode = MODE_RECOVERY_LONG
-        elif flags["normal_ready"]:
-            candidate_mode = MODE_NORMAL_LONG
         else:
-            # Recovery is not a separate permanent path. If rebound edge fades,
-            # fall back to STRONG, not BLOCK unless a real breakdown returns.
+            # Recovery is temporary. If the bounce fades without a new crash,
+            # fall back to STRONG pressure mode.
             candidate_mode = MODE_STRONG_LONG_ONLY
 
     else:  # NORMAL_LONG
         if flags["real_block"]:
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["recovery_to_strong_ready"]:
-            candidate_mode = MODE_STRONG_LONG_ONLY
-        elif flags["recovery_ready"]:
-            candidate_mode = MODE_RECOVERY_LONG
         elif flags["weak_breadth"]:
+            # NORMAL is the healthy/green market. Weakness from NORMAL becomes
+            # STRONG pressure mode. Rebound-like noise alone does not create
+            # RECOVERY from NORMAL.
             candidate_mode = MODE_STRONG_LONG_ONLY
         else:
-            candidate_mode = raw
+            candidate_mode = MODE_NORMAL_LONG
 
     # Anti-flapping cooldown with faster defensive exits from NORMAL and slower return to NORMAL.
     if candidate_mode != previous.mode:
         required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
-        if previous.mode == MODE_NORMAL_LONG and candidate_mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
+        if previous.mode == MODE_NORMAL_LONG and candidate_mode == MODE_STRONG_LONG_ONLY:
             required_cooldown = NORMAL_EXIT_COOLDOWN_MINUTES
         elif previous.mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG) and candidate_mode == MODE_NORMAL_LONG:
             required_cooldown = RETURN_TO_NORMAL_COOLDOWN_MINUTES
