@@ -360,7 +360,7 @@ def run_once(
     if trade_store:
         trade_store.save_trades(trades)
         trade_store.append_execution_checks(current_execution_results)
-        execution_results_for_reports = trade_store.load_execution_checks() or current_execution_results
+        execution_results_for_reports = trade_store.load_execution_checks(limit=500) or current_execution_results
     else:
         execution_results_for_reports = current_execution_results
 
@@ -455,7 +455,18 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
     )
 
 
-def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: set[str], okx_client: OKXTradeClient | None = None) -> None:
+def _is_duplicate_signal_fingerprint(fingerprint: str, sent_fingerprints: set[str], trade_store: RedisTradeStore | None = None) -> bool:
+    """Duplicate signal guard with Redis TTL when available, memory fallback otherwise."""
+    if fingerprint in sent_fingerprints:
+        return True
+    if trade_store and trade_store.enabled and trade_store.mark_signal_fingerprint(fingerprint):
+        sent_fingerprints.add(fingerprint)
+        return True
+    sent_fingerprints.add(fingerprint)
+    return False
+
+
+def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: set[str], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in result.get("signal_items", [])[:8]:
         signal = item["signal"]
         exec_result = item["execution"]
@@ -463,9 +474,8 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         if not settings.send_normal_signals and not is_execution:
             continue
         fingerprint = f"{signal.symbol}|{signal.entry:.8f}|{signal.market_mode}|{exec_result.get('status')}"
-        if fingerprint in sent_fingerprints:
+        if _is_duplicate_signal_fingerprint(fingerprint, sent_fingerprints, trade_store):
             continue
-        sent_fingerprints.add(fingerprint)
 
         text = item["message"]
         if is_execution and settings.execution_enabled and settings.okx_place_orders and okx_client:
@@ -485,7 +495,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         sender.send_message(text, reply_markup=build_signal_buttons(signal))
 
 
-def _build_fast_status(result: dict, settings: Settings) -> str:
+def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
@@ -494,6 +504,8 @@ def _build_fast_status(result: dict, settings: Settings) -> str:
     rejection_reason = "none"
     if last_rejection:
         rejection_reason = f"{last_rejection.get('status')} | {last_rejection.get('reason', 'unknown')}"
+
+    redis_stats = trade_store.health_snapshot() if trade_store else {"enabled": False}
 
     return "\n".join([
         "🟢 Bot Status",
@@ -505,6 +517,7 @@ def _build_fast_status(result: dict, settings: Settings) -> str:
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
+        f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         "",
@@ -544,6 +557,7 @@ def _format_clean_preview(stats: dict, title: str, confirm_command: str) -> str:
         f"History set: {stats.get('history_set', 0)}",
         f"Trade keys: {stats.get('trade_keys', 0)}",
         f"Execution checks: {stats.get('execution_checks', 0)}",
+        f"Signal fingerprints: {stats.get('signal_fingerprints', 0)}",
     ]
     if stats.get("mode") == "deep":
         lines += [
@@ -708,7 +722,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
                 continue
             elif command == "/status":
-                reply = _build_fast_status(result, settings)
+                reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
                 reply = result.get("mode_message", "No mode yet")
             elif command == "/help_execution":
@@ -875,7 +889,7 @@ def live_worker() -> None:
                     sender.send_message(result.get("mode_message", ""))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
-                _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None)
+                _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
                 telegram_offset = _answer_commands(sender, result, telegram_offset, settings, trade_store)
         except Exception as exc:
             error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
