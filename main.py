@@ -867,6 +867,14 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                     if not result.get("ok"):
                         _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
                 continue
+            if command == "/gate_sim_block":
+                artifact = build_gate_sim_artifact("block", settings, redis_client=_snapshot_redis_client(trade_store))
+                _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
+                if artifact.get("ok") and artifact.get("path"):
+                    result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+                    if not result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                continue
             if command == "/gate_sim_all":
                 artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
                 _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
