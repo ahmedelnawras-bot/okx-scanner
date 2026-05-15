@@ -76,10 +76,21 @@ def build_command_outputs(trades, execution_results, signal_items):
             period=period,
             table=False,
         )
+        commands[f"/report_execution_open{suffix}"] = build_open_trades_report(
+            execution_trades,
+            title="🚀📂 صفقات التنفيذ المفتوحة",
+            execution_only=True,
+            period=period,
+        )
         # Normal reports have no Wallet Impact.
         commands[f"/report_all{suffix}"] = build_general_report(
             filter_trades_by_period(normal_trades, period),
             title="📊 تقرير الصفقات العادية",
+            period=period,
+        )
+        commands[f"/open_trades{suffix}"] = build_open_trades_report(
+            normal_trades,
+            title="📂 الصفقات العادية المفتوحة",
             period=period,
         )
 
