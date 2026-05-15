@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
 from statistics import median
@@ -24,11 +24,13 @@ MODES = {
     "normal": "NORMAL_LONG",
     "recovery": "RECOVERY_LONG",
     "strong": "STRONG_LONG_ONLY",
+    "block": "BLOCK_LONGS",
 }
 
 GOOD_CONTINUATION_SETUPS = {"higher_low_continuation", "support_bounce_confirmed", "vwap_reclaim"}
 RECOVERY_CORE_SETUPS = {"support_bounce_confirmed", "vwap_reclaim", "higher_low_continuation"}
 STRONG_CORE_SETUPS = {"higher_low_continuation", "vwap_reclaim", "wave_3", "support_bounce_confirmed"}
+BLOCK_EXCEPTION_SETUPS = {"relative_strength_vs_btc", "retest_breakout_confirmed", "vwap_reclaim", "wave_3"}
 HIGH_RISK_SYMBOLS = {
     "RAVE-USDT-SWAP",
     "BSB-USDT-SWAP",
@@ -95,7 +97,9 @@ class GateRecipe:
         if self.require_recovery_bounce:
             rows.append("Recovery يحتاج bounce/reclaim/support واضح؛ relative strength وحدها لا تكفي.")
         if self.require_strong_confirmation:
-            rows.append("Strong يحتاج relative strength أو volume/momentum confirmation.")
+            rows.append("Strong/Block يحتاج relative strength أو volume/momentum confirmation.")
+        if self.mode_key == "block":
+            rows.append("BLOCK_LONGS: هذه ليست صفقات عادية؛ هي استثناءات فقط أثناء منع اللونج.")
         return rows
 
 
@@ -170,11 +174,12 @@ RECIPES: dict[str, tuple[GateRecipe, ...]] = {
         ),
     ),
     "strong": (
+        # Recipe #1 is the protected baseline. Do not change it when testing new Strong ideas.
         GateRecipe(
             name="strong_strict",
             mode_key="strong",
-            title="أقوى العملات فقط",
-            description="يشدد على momentum/relative strength في سوق غير مضمون.",
+            title="أقوى العملات فقط — baseline ثابت",
+            description="الخلطة الناجحة الحالية؛ تُستخدم كخط أساس ولا نعدل شروطها عند إضافة مؤشرات جديدة.",
             min_quality_score=70,
             allowed_setups=tuple(sorted(STRONG_CORE_SETUPS)),
             relative_strength_min_vol=1.20,
@@ -183,26 +188,73 @@ RECIPES: dict[str, tuple[GateRecipe, ...]] = {
             require_strong_confirmation=True,
         ),
         GateRecipe(
-            name="strong_balanced",
+            name="strong_momentum_plus",
             mode_key="strong",
-            title="Strong متوازن",
-            description="يحافظ على قوة المود بدون تضييق زائد.",
-            min_quality_score=62,
-            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS | {"relative_strength_vs_btc", "retest_breakout_confirmed"})),
-            relative_strength_min_vol=1.15,
-            wave3_min_vol=1.20,
+            title="زخم قوي بفوليوم أعلى",
+            description="خلطة جديدة تختبر volume/momentum أقوى بدون تعديل strong_strict.",
+            min_quality_score=74,
+            allowed_setups=tuple(sorted({"wave_3", "vwap_reclaim", "relative_strength_vs_btc", "higher_low_continuation"})),
+            relative_strength_min_vol=1.30,
+            wave3_min_vol=1.35,
+            min_vol_ratio=1.20,
+            reject_high_risk_without_edge=True,
             require_strong_confirmation=True,
         ),
         GateRecipe(
-            name="strong_aggressive",
+            name="strong_breakout_clean",
             mode_key="strong",
-            title="Strong هجومي",
-            description="يسمح بزخم أكثر مع حماية near resistance.",
-            min_quality_score=55,
-            allowed_setups=tuple(sorted(STRONG_CORE_SETUPS | {"relative_strength_vs_btc", "retest_breakout_confirmed"})),
-            relative_strength_min_vol=1.05,
-            wave3_min_vol=1.10,
-            reject_high_risk_without_edge=False,
+            title="اختراق/استرداد نظيف",
+            description="خلطة جديدة لاختبار breakout/reclaim النظيف مع حماية near resistance.",
+            min_quality_score=68,
+            allowed_setups=tuple(sorted({"retest_breakout_confirmed", "vwap_reclaim", "wave_3", "higher_low_continuation"})),
+            relative_strength_min_vol=1.15,
+            wave3_min_vol=1.20,
+            min_vol_ratio=1.10,
+            reject_high_risk_without_edge=True,
+            require_strong_confirmation=True,
+        ),
+    ),
+    "block": (
+        GateRecipe(
+            name="block_exception_strict",
+            mode_key="block",
+            title="استثناء بلوك صارم",
+            description="يسمح فقط باستثناءات نادرة جدًا وقت BLOCK_LONGS.",
+            min_quality_score=78,
+            allowed_setups=tuple(sorted(BLOCK_EXCEPTION_SETUPS)),
+            clean_setups_only=True,
+            allow_relative_strength=True,
+            relative_strength_min_vol=1.35,
+            wave3_min_vol=1.35,
+            min_vol_ratio=1.25,
+            reject_high_risk_without_edge=True,
+            require_strong_confirmation=True,
+        ),
+        GateRecipe(
+            name="block_exception_breakout",
+            mode_key="block",
+            title="استثناء اختراق مؤكد",
+            description="يركز على retest_breakout_confirmed / vwap_reclaim وقت البلوك.",
+            min_quality_score=72,
+            allowed_setups=("retest_breakout_confirmed", "vwap_reclaim"),
+            clean_setups_only=True,
+            allow_relative_strength=False,
+            min_vol_ratio=1.20,
+            reject_high_risk_without_edge=True,
+            require_strong_confirmation=True,
+        ),
+        GateRecipe(
+            name="block_exception_rs",
+            mode_key="block",
+            title="استثناء قوة نسبية قوي",
+            description="اختبار ضيق للقوة النسبية ضد BTC أثناء البلوك.",
+            min_quality_score=74,
+            allowed_setups=("relative_strength_vs_btc",),
+            allow_relative_strength=True,
+            relative_strength_min_vol=1.45,
+            min_vol_ratio=1.25,
+            reject_high_risk_without_edge=True,
+            require_strong_confirmation=True,
         ),
     ),
 }
@@ -302,6 +354,55 @@ def _is_relative_strength(record: dict[str, Any]) -> bool:
 
 def _is_high_risk_symbol(record: dict[str, Any]) -> bool:
     return str(record.get("symbol") or "") in HIGH_RISK_SYMBOLS
+
+
+def _is_block_exception(record: dict[str, Any]) -> bool:
+    text = " ".join(str(x).lower() for x in [
+        record.get("execution_path"),
+        record.get("legacy_gate_reason"),
+        record.get("block_reason"),
+        _features(record).get("legacy_gate_reason"),
+        _features(record).get("market_reason"),
+    ])
+    tags = _setup_tags(record) | _pair_tags(record)
+    return bool("block_exception" in text or "block_exception" in tags)
+
+
+def _record_time(record: dict[str, Any]) -> datetime | None:
+    value = record.get("time") or record.get("timestamp") or record.get("created_at") or record.get("signal_time")
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _outcome(record: dict[str, Any]) -> dict[str, Any]:
+    value = record.get("outcome")
+    return value if isinstance(value, dict) else {}
+
+
+def _tp2_lock_minutes(record: dict[str, Any]) -> int:
+    """How long a same-symbol trade should block new entries in no-stacking simulation.
+
+    If TP2 was hit, the lock ends at time_to_tp2_min. If TP2 was not hit, we
+    conservatively lock until the replay horizon ends, because the user rule is:
+    do not open another trade on the same symbol before TP2.
+    """
+    outcome = _outcome(record)
+    if outcome.get("hit_tp2") and outcome.get("time_to_tp2_min") is not None:
+        return max(15, int(_num(outcome.get("time_to_tp2_min"), 15)))
+    bars = int(_num(outcome.get("horizon_bars"), 96) or 96)
+    return max(15, bars * 15)
 
 
 def _has_recovery_fail_risk(record: dict[str, Any]) -> bool:
@@ -561,6 +662,14 @@ def _new_stats() -> dict[str, Any]:
         "weighted_count": 0,
         "quality_score_sum": 0.0,
         "quality_score_count": 0,
+        "runner_active": 0,
+        "runner_closed": 0,
+        "runner_positive": 0,
+        "runner_max_gain_sum": 0.0,
+        "runner_exit_sum": 0.0,
+        "runner_contribution_sum": 0.0,
+        "weighted_without_runner_sum": 0.0,
+        "weighted_without_runner_count": 0,
     }
 
 
@@ -598,8 +707,25 @@ def _update_stats(stats: dict[str, Any], record: dict[str, Any], quality_score: 
         if weighted is None:
             weighted = outcome.get("weighted_result_pct")
         if weighted is not None:
-            stats["weighted_sum"] += _num(weighted)
+            weighted_value = _num(weighted)
+            stats["weighted_sum"] += weighted_value
             stats["weighted_count"] += 1
+            runner_pct = _num(outcome.get("runner_pct"), 0.0)
+            runner_exit_pct = _num(outcome.get("runner_exit_pct"), 0.0)
+            runner_contribution = runner_exit_pct * (runner_pct / 100.0) if outcome.get("runner_active") else 0.0
+            stats["runner_contribution_sum"] += runner_contribution
+            stats["weighted_without_runner_sum"] += weighted_value - runner_contribution
+            stats["weighted_without_runner_count"] += 1
+        if outcome.get("runner_active"):
+            stats["runner_active"] += 1
+        if outcome.get("runner_closed"):
+            stats["runner_closed"] += 1
+        runner_max_gain = _num(outcome.get("runner_max_gain_pct"), 0.0)
+        runner_exit_pct = _num(outcome.get("runner_exit_pct"), 0.0)
+        if outcome.get("runner_active") and (runner_max_gain > 0 or runner_exit_pct > 0):
+            stats["runner_positive"] += 1
+        stats["runner_max_gain_sum"] += runner_max_gain
+        stats["runner_exit_sum"] += runner_exit_pct
 
 
 def _plain_stats(stats: dict[str, Any]) -> dict[str, Any]:
@@ -620,11 +746,24 @@ def _plain_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "weighted_count": int(stats.get("weighted_count") or 0),
         "quality_score_sum": float(stats.get("quality_score_sum") or 0.0),
         "quality_score_count": int(stats.get("quality_score_count") or 0),
+        "runner_active": int(stats.get("runner_active") or 0),
+        "runner_closed": int(stats.get("runner_closed") or 0),
+        "runner_positive": int(stats.get("runner_positive") or 0),
+        "runner_max_gain_sum": float(stats.get("runner_max_gain_sum") or 0.0),
+        "runner_exit_sum": float(stats.get("runner_exit_sum") or 0.0),
+        "runner_contribution_sum": float(stats.get("runner_contribution_sum") or 0.0),
+        "weighted_without_runner_sum": float(stats.get("weighted_without_runner_sum") or 0.0),
+        "weighted_without_runner_count": int(stats.get("weighted_without_runner_count") or 0),
     }
     outcomes = max(1, int(out["outcomes"] or 0))
     out["first_tp1_rate_pct"] = round((out["first_tp1"] / outcomes) * 100.0, 4) if out["outcomes"] else 0.0
     out["first_sl_rate_pct"] = round((out["first_sl"] / outcomes) * 100.0, 4) if out["outcomes"] else 0.0
     out["avg_weighted_result_pct"] = round(out["weighted_sum"] / max(1, out["weighted_count"]), 4) if out["weighted_count"] else 0.0
+    out["avg_weighted_without_runner_pct"] = round(out["weighted_without_runner_sum"] / max(1, out["weighted_without_runner_count"]), 4) if out["weighted_without_runner_count"] else 0.0
+    out["avg_runner_contribution_pct"] = round(out["runner_contribution_sum"] / max(1, out["weighted_count"]), 4) if out["weighted_count"] else 0.0
+    out["avg_runner_max_gain_pct"] = round(out["runner_max_gain_sum"] / max(1, out["runner_active"]), 4) if out["runner_active"] else 0.0
+    out["avg_runner_exit_pct"] = round(out["runner_exit_sum"] / max(1, out["runner_active"]), 4) if out["runner_active"] else 0.0
+    out["runner_positive_rate_pct"] = round((out["runner_positive"] / max(1, out["runner_active"])) * 100.0, 4) if out["runner_active"] else 0.0
     out["avg_gate_quality_score"] = round(out["quality_score_sum"] / max(1, out["quality_score_count"]), 4) if out["quality_score_count"] else 0.0
     return out
 
@@ -650,6 +789,13 @@ def _format_stats(label: str, stats: dict[str, Any]) -> list[str]:
         if stats.get("weighted_count"):
             avg_weighted = float(stats.get("weighted_sum") or 0.0) / max(1, int(stats.get("weighted_count") or 0))
             rows.append(f"- avg weighted result: {avg_weighted:.2f}%")
+        if stats.get("runner_active"):
+            rows.append(
+                f"- runner active/closed/positive: {stats.get('runner_active',0)} / {stats.get('runner_closed',0)} / {_pct(stats.get('runner_positive',0), stats.get('runner_active',0))}"
+            )
+            rows.append(
+                f"- avg runner max/exit/contribution: {stats.get('avg_runner_max_gain_pct',0):.2f}% / {stats.get('avg_runner_exit_pct',0):.2f}% / {stats.get('avg_runner_contribution_pct',0):.3f}%"
+            )
     return rows
 
 
@@ -676,6 +822,7 @@ def _analyze_recipe(records: list[dict[str, Any]], recipe: GateRecipe, calibrati
     all_setup_counter: Counter[str] = Counter()
     score_zones_before: Counter[str] = Counter()
     score_zones_after: Counter[str] = Counter()
+    passed_records: list[tuple[dict[str, Any], float]] = []
 
     for record in records:
         if str(record.get("mode") or "") != mode:
@@ -688,7 +835,9 @@ def _analyze_recipe(records: list[dict[str, Any]], recipe: GateRecipe, calibrati
         score_zones_before[zone] += 1
         passed, reason, quality = evaluate_recipe(record, recipe, calibration)
         if passed:
-            _update_stats(after, record, float(quality.get("gate_quality_score") or 0.0))
+            q_pass = float(quality.get("gate_quality_score") or 0.0)
+            _update_stats(after, record, q_pass)
+            passed_records.append((record, q_pass))
             pass_setup_counter[_setup_type(record) or "unknown"] += 1
             score_zones_after[str(quality.get("score_zone") or "unknown")] += 1
         else:
@@ -706,6 +855,44 @@ def _analyze_recipe(records: list[dict[str, Any]], recipe: GateRecipe, calibrati
         "pass_setups": pass_setup_counter,
         "score_zones_before": score_zones_before,
         "score_zones_after": score_zones_after,
+        "no_stacking_before_tp2": _simulate_no_stacking_before_tp2(passed_records),
+    }
+
+
+def _simulate_no_stacking_before_tp2(passed_records: list[tuple[dict[str, Any], float]]) -> dict[str, Any]:
+    """Simulate the user rule: do not open another trade on same symbol before TP2.
+
+    This is analysis-only. It estimates realistic trade count after same-symbol
+    de-duplication. It does not emulate global max positions/exposure.
+    """
+    accepted = _new_stats()
+    blocked = _new_stats()
+    lock_until: dict[str, datetime] = {}
+    accepted_count = 0
+    blocked_count = 0
+    for record, quality_score in sorted(passed_records, key=lambda item: (_record_time(item[0]) or datetime.min.replace(tzinfo=timezone.utc), str(item[0].get("symbol") or ""))):
+        symbol = str(record.get("symbol") or "")
+        t = _record_time(record)
+        if not symbol or t is None or not isinstance(record.get("outcome"), dict):
+            # Live snapshots or records without outcomes cannot be lifecycle de-stacked safely.
+            continue
+        until = lock_until.get(symbol)
+        if until and t < until:
+            _update_stats(blocked, record, quality_score)
+            blocked_count += 1
+            continue
+        _update_stats(accepted, record, quality_score)
+        accepted_count += 1
+        lock_until[symbol] = t + timedelta(minutes=_tp2_lock_minutes(record))
+    raw = len([1 for r, _ in passed_records if isinstance(r.get("outcome"), dict) and _record_time(r) is not None])
+    return {
+        "rule": "no_new_trade_same_symbol_before_tp2",
+        "raw_passed_with_outcomes": raw,
+        "accepted_trades": _plain_stats(accepted),
+        "blocked_existing_trade_before_tp2": _plain_stats(blocked),
+        "accepted_count": accepted_count,
+        "blocked_count": blocked_count,
+        "reduction_pct": round((blocked_count / max(1, raw)) * 100.0, 4) if raw else 0.0,
     }
 
 
@@ -727,6 +914,7 @@ def _analysis_payload(analysis: dict[str, Any]) -> dict[str, Any]:
         "pass_setups": dict((analysis.get("pass_setups") or Counter()).most_common()),
         "score_zones_before": dict((analysis.get("score_zones_before") or Counter()).most_common()),
         "score_zones_after": dict((analysis.get("score_zones_after") or Counter()).most_common()),
+        "no_stacking_before_tp2": analysis.get("no_stacking_before_tp2") or {},
     }
 
 
@@ -739,8 +927,10 @@ def _recipe_score_for_recommendation(replay_payload: dict[str, Any], live_payloa
     outcomes = float(after.get("outcomes") or 0)
     if outcomes <= 0:
         return 0.0
-    first_tp1 = float(after.get("first_tp1_rate_pct") or 0.0)
-    avg_weighted = float(after.get("avg_weighted_result_pct") or 0.0)
+    no_stack = replay_payload.get("no_stacking_before_tp2") or {}
+    accepted = no_stack.get("accepted_trades") or {}
+    first_tp1 = float((accepted.get("first_tp1_rate_pct") if accepted.get("outcomes") else after.get("first_tp1_rate_pct")) or 0.0)
+    avg_weighted = float((accepted.get("avg_weighted_result_pct") if accepted.get("weighted_count") else after.get("avg_weighted_result_pct")) or 0.0)
     kept_ratio = float(after.get("total") or 0) / max(1.0, float(before.get("total") or 0))
     live_reduction = 100.0 - ((float(live_after.get("total") or 0) / max(1.0, float(live_before.get("total") or 0))) * 100.0)
     # Avoid selecting a recipe that keeps almost nothing even if the rate is high.
@@ -837,6 +1027,18 @@ def _format_recipe_short(recipe_payload: dict[str, Any]) -> list[str]:
     ]
     if ra.get("weighted_count"):
         rows.append(f"- Replay avg weighted: {ra.get('avg_weighted_result_pct', 0):.2f}%")
+        if ra.get("runner_active"):
+            rows.append(
+                f"- Runner active/positive/contrib: {ra.get('runner_active',0)} / {ra.get('runner_positive_rate_pct',0):.1f}% / {ra.get('avg_runner_contribution_pct',0):.3f}%"
+            )
+    no_stack = replay.get("no_stacking_before_tp2") or {}
+    if no_stack.get("raw_passed_with_outcomes"):
+        accepted = no_stack.get("accepted_trades") or {}
+        rows.append(
+            f"- No-stack before TP2: {no_stack.get('accepted_count',0)}/{no_stack.get('raw_passed_with_outcomes',0)} trades | "
+            f"TP1/SL {_pct(accepted.get('first_tp1',0), accepted.get('outcomes',0))}/{_pct(accepted.get('first_sl',0), accepted.get('outcomes',0))} | "
+            f"avg {accepted.get('avg_weighted_result_pct',0):.2f}%"
+        )
     rows.extend([
         f"- Live pass: {la.get('total', 0)}/{lb.get('total', 0)} | pressure reduction {live.get('reduction_pct', 0):.1f}%",
     ])
