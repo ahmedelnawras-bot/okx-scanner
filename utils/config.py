@@ -37,6 +37,9 @@ class Settings:
     paper_margin_usdt: float = float(os.getenv("PAPER_MARGIN_USDT", "35"))
     okx_td_mode: str = os.getenv("OKX_TD_MODE", "cross")
     verbose_logs: bool = os.getenv("VERBOSE_LOGS", "0").lower() in ("1", "true", "yes", "on")
+    technical_snapshot_enabled: bool = os.getenv("TECHNICAL_SNAPSHOT_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+    snapshot_output_path: str = os.getenv("SNAPSHOT_OUTPUT_PATH", "data/technical_snapshots.jsonl")
+    technical_snapshot_flag_path: str = os.getenv("TECHNICAL_SNAPSHOT_FLAG_PATH", "data/technical_snapshot.flag")
     reminder_first_minutes: int = 15
     reminder_second_minutes: int = 15
     reminder_third_minutes: int = 10
