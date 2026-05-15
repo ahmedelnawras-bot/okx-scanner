@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Any
 
 
+SNAPSHOT_REDIS_KEY = "okx_long_bot:technical_snapshot:enabled"
+SNAPSHOT_REDIS_RECORDS_KEY = "okx_long_bot:technical_snapshot:records"
+DEFAULT_REDIS_RECORD_LIMIT = 50000
+
+
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -36,8 +41,59 @@ def flag_path(settings: Any | None = None) -> Path:
     return _data_path(getattr(settings, "technical_snapshot_flag_path", None), os.getenv("TECHNICAL_SNAPSHOT_FLAG_PATH", "data/technical_snapshot.flag"))
 
 
-def is_snapshot_enabled(settings: Any | None = None) -> bool:
-    """Runtime flag overrides env when present; env remains the default."""
+def redis_record_limit() -> int:
+    try:
+        return max(1000, int(os.getenv("SNAPSHOT_REDIS_MAX_RECORDS", str(DEFAULT_REDIS_RECORD_LIMIT))))
+    except Exception:
+        return DEFAULT_REDIS_RECORD_LIMIT
+
+
+def _decode_redis_value(value: Any) -> str:
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _redis_get_snapshot_flag(redis_client: Any | None) -> bool | None:
+    if not redis_client:
+        return None
+    try:
+        value = redis_client.get(SNAPSHOT_REDIS_KEY)
+        if value is None:
+            return None
+        value = _decode_redis_value(value).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    except Exception:
+        return None
+    return None
+
+
+def _redis_set_snapshot_flag(redis_client: Any | None, enabled: bool) -> bool:
+    if not redis_client:
+        return False
+    try:
+        redis_client.set(SNAPSHOT_REDIS_KEY, "on" if enabled else "off")
+        return True
+    except Exception:
+        return False
+
+
+def is_snapshot_enabled(settings: Any | None = None, redis_client: Any | None = None) -> bool:
+    """Redis runtime flag overrides local flag/env when available.
+
+    Redis keeps ON/OFF persistent across Railway restarts/redeploys.
+    Local flag remains as a fallback for local runs or Redis outages.
+    """
+    redis_value = _redis_get_snapshot_flag(redis_client)
+    if redis_value is not None:
+        return redis_value
+
     flag = flag_path(settings)
     try:
         if flag.exists():
@@ -51,14 +107,35 @@ def is_snapshot_enabled(settings: Any | None = None) -> bool:
     return bool(getattr(settings, "technical_snapshot_enabled", _env_bool("TECHNICAL_SNAPSHOT_ENABLED", "0")))
 
 
-def set_snapshot_enabled(enabled: bool, settings: Any | None = None) -> dict:
+def set_snapshot_enabled(enabled: bool, settings: Any | None = None, redis_client: Any | None = None) -> dict:
+    redis_ok = _redis_set_snapshot_flag(redis_client, enabled)
+
     flag = flag_path(settings)
+    file_ok = False
+    file_error = ""
     try:
         flag.parent.mkdir(parents=True, exist_ok=True)
         flag.write_text("on" if enabled else "off", encoding="utf-8")
-        return {"ok": True, "enabled": enabled, "flag_path": str(flag)}
+        file_ok = True
     except Exception as exc:
-        return {"ok": False, "enabled": is_snapshot_enabled(settings), "error": str(exc), "flag_path": str(flag)}
+        file_error = str(exc)
+
+    if redis_ok or file_ok:
+        return {
+            "ok": True,
+            "enabled": enabled,
+            "source": "redis" if redis_ok else "file",
+            "redis_key": SNAPSHOT_REDIS_KEY if redis_ok else "",
+            "flag_path": str(flag),
+        }
+
+    return {
+        "ok": False,
+        "enabled": is_snapshot_enabled(settings, redis_client=redis_client),
+        "error": file_error or "Redis and local flag file are unavailable",
+        "redis_key": SNAPSHOT_REDIS_KEY,
+        "flag_path": str(flag),
+    }
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -102,7 +179,7 @@ def build_signal_snapshot(scan_id: str, signal: Any, execution: dict | None, mar
 
     record = {
         "event": "live_signal_snapshot",
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at": _utc_now(),
         "scan_id": scan_id,
         "signal_id": _signal_id(scan_id, signal),
@@ -160,18 +237,7 @@ def build_signal_snapshot(scan_id: str, signal: Any, execution: dict | None, mar
     return _clean(record)
 
 
-def append_signal_snapshot(record: dict, settings: Any | None = None) -> dict:
-    path = snapshot_path(settings)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        return {"ok": True, "path": str(path)}
-    except Exception as exc:
-        return {"ok": False, "path": str(path), "error": str(exc)}
-
-
-def append_many_signal_snapshots(records: list[dict], settings: Any | None = None) -> dict:
+def _append_records_to_local_jsonl(records: list[dict], settings: Any | None = None) -> dict:
     path = snapshot_path(settings)
     if not records:
         return {"ok": True, "path": str(path), "written": 0}
@@ -185,7 +251,82 @@ def append_many_signal_snapshots(records: list[dict], settings: Any | None = Non
         return {"ok": False, "path": str(path), "written": 0, "error": str(exc)}
 
 
-def load_snapshot_records(settings: Any | None = None, limit: int = 5000) -> list[dict]:
+def _append_records_to_redis(records: list[dict], redis_client: Any | None = None) -> dict:
+    if not redis_client:
+        return {"ok": False, "written": 0, "error": "Redis unavailable"}
+    if not records:
+        return {"ok": True, "written": 0, "redis_key": SNAPSHOT_REDIS_RECORDS_KEY}
+    try:
+        limit = redis_record_limit()
+        encoded = [json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) for record in records]
+        pipe = redis_client.pipeline()
+        # LPUSH keeps newest records first. load_snapshot_records reverses them back to chronological order.
+        pipe.lpush(SNAPSHOT_REDIS_RECORDS_KEY, *encoded)
+        pipe.ltrim(SNAPSHOT_REDIS_RECORDS_KEY, 0, max(0, limit - 1))
+        pipe.execute()
+        return {"ok": True, "written": len(records), "redis_key": SNAPSHOT_REDIS_RECORDS_KEY, "limit": limit}
+    except Exception as exc:
+        return {"ok": False, "written": 0, "redis_key": SNAPSHOT_REDIS_RECORDS_KEY, "error": str(exc)}
+
+
+def append_signal_snapshot(record: dict, settings: Any | None = None, redis_client: Any | None = None) -> dict:
+    return append_many_signal_snapshots([record], settings=settings, redis_client=redis_client)
+
+
+def append_many_signal_snapshots(records: list[dict], settings: Any | None = None, redis_client: Any | None = None) -> dict:
+    """Persist snapshots to Redis first, with local JSONL as a mirror/fallback.
+
+    Redis is the durable store for Railway restart/redeploy safety.
+    The local JSONL file remains useful for local development and quick inspection,
+    but it should not be treated as the source of truth on ephemeral hosts.
+    """
+    local_result = _append_records_to_local_jsonl(records, settings=settings)
+    redis_result = _append_records_to_redis(records, redis_client=redis_client)
+
+    if redis_result.get("ok"):
+        return {
+            "ok": True,
+            "store": "redis",
+            "written": redis_result.get("written", 0),
+            "redis_key": SNAPSHOT_REDIS_RECORDS_KEY,
+            "local_mirror": local_result,
+        }
+    if local_result.get("ok"):
+        return {
+            "ok": True,
+            "store": "local_file_fallback",
+            "written": local_result.get("written", 0),
+            "path": local_result.get("path"),
+            "redis_error": redis_result.get("error"),
+        }
+    return {
+        "ok": False,
+        "written": 0,
+        "redis_error": redis_result.get("error"),
+        "file_error": local_result.get("error"),
+        "path": local_result.get("path"),
+        "redis_key": SNAPSHOT_REDIS_RECORDS_KEY,
+    }
+
+
+def _load_records_from_redis(redis_client: Any | None = None, limit: int = 5000) -> list[dict]:
+    if not redis_client:
+        return []
+    try:
+        end = max(0, int(limit) - 1)
+        rows = redis_client.lrange(SNAPSHOT_REDIS_RECORDS_KEY, 0, end) or []
+        records: list[dict] = []
+        for raw in reversed(rows):
+            try:
+                records.append(json.loads(_decode_redis_value(raw)))
+            except Exception:
+                continue
+        return records
+    except Exception:
+        return []
+
+
+def _load_records_from_local_jsonl(settings: Any | None = None, limit: int = 5000) -> list[dict]:
     path = snapshot_path(settings)
     if not path.exists():
         return []
@@ -204,21 +345,55 @@ def load_snapshot_records(settings: Any | None = None, limit: int = 5000) -> lis
     return records
 
 
-def build_technical_dataset_status(settings: Any | None = None) -> str:
-    records = load_snapshot_records(settings, limit=20000)
+def load_snapshot_records(settings: Any | None = None, limit: int = 5000, redis_client: Any | None = None) -> list[dict]:
+    records = _load_records_from_redis(redis_client=redis_client, limit=limit)
+    if records:
+        return records
+    return _load_records_from_local_jsonl(settings=settings, limit=limit)
+
+
+def snapshot_storage_status(settings: Any | None = None, redis_client: Any | None = None) -> dict:
+    path = snapshot_path(settings)
+    local_size_kb = round(path.stat().st_size / 1024, 1) if path.exists() else 0.0
+    redis_available = bool(redis_client)
+    redis_count = 0
+    redis_error = ""
+    if redis_client:
+        try:
+            redis_count = int(redis_client.llen(SNAPSHOT_REDIS_RECORDS_KEY) or 0)
+        except Exception as exc:
+            redis_available = False
+            redis_error = str(exc)
+    return {
+        "redis_available": redis_available,
+        "redis_key": SNAPSHOT_REDIS_RECORDS_KEY,
+        "redis_count": redis_count,
+        "redis_limit": redis_record_limit(),
+        "redis_error": redis_error,
+        "local_path": str(path),
+        "local_size_kb": local_size_kb,
+        "state_store": "Redis" if _redis_get_snapshot_flag(redis_client) is not None else "file/env fallback",
+        "data_store": "Redis" if redis_available else "local file fallback",
+    }
+
+
+def build_technical_dataset_status(settings: Any | None = None, redis_client: Any | None = None) -> str:
+    records = load_snapshot_records(settings, limit=20000, redis_client=redis_client)
+    storage = snapshot_storage_status(settings, redis_client=redis_client)
     by_level = Counter(str(r.get("signal_level") or "unknown") for r in records)
     by_mode = Counter(str(r.get("mode") or "unknown") for r in records)
     candidates = sum(1 for r in records if r.get("quality_candidate"))
     executions = sum(1 for r in records if r.get("execution_candidate"))
     blocked = sum(1 for r in records if r.get("blocked_by_limit"))
-    path = snapshot_path(settings)
-    size_kb = round(path.stat().st_size / 1024, 1) if path.exists() else 0.0
     lines = [
         "🧠 Technical Dataset Status",
         "┄┄┄┄┄┄┄┄",
-        f"Capture: {'ON' if is_snapshot_enabled(settings) else 'OFF'}",
-        f"File: {path}",
-        f"Size: {size_kb} KB",
+        f"Capture: {'ON' if is_snapshot_enabled(settings, redis_client=redis_client) else 'OFF'}",
+        f"State Store: {storage.get('state_store')}",
+        f"Data Store: {storage.get('data_store')}",
+        f"Redis Records: {storage.get('redis_count')} / {storage.get('redis_limit')}",
+        f"Local Mirror: {storage.get('local_path')}",
+        f"Local Size: {storage.get('local_size_kb')} KB",
         f"Records loaded: {len(records)}",
         "",
         f"Normal: {by_level.get('normal', 0)}",
@@ -232,21 +407,34 @@ def build_technical_dataset_status(settings: Any | None = None) -> str:
         lines.extend([f"- {mode}: {count}" for mode, count in by_mode.most_common(8)])
     else:
         lines.append("- no data yet")
+    if storage.get("redis_error"):
+        lines += ["", f"⚠️ Redis error: {storage.get('redis_error')}"]
     return "\n".join(lines)
 
 
-def build_technical_dataset_export(settings: Any | None = None) -> str:
+def build_technical_dataset_export(settings: Any | None = None, redis_client: Any | None = None) -> str:
+    storage = snapshot_storage_status(settings, redis_client=redis_client)
+    records = load_snapshot_records(settings, limit=5, redis_client=redis_client)
+    last = records[-1] if records else {}
+    last_line = ""
+    if last:
+        last_line = f"Last: {last.get('symbol', '')} | {last.get('mode', '')} | {last.get('signal_level', '')}"
     return "\n".join([
         "📦 Technical Dataset Export",
         "┄┄┄┄┄┄┄┄",
-        f"AI raw file: {snapshot_path(settings)}",
-        "Format: JSONL — one signal snapshot per line.",
-        "Use this file for AI analysis / future mode-gate design.",
-    ])
+        f"Primary AI store: {storage.get('data_store')}",
+        f"Redis key: {storage.get('redis_key')}",
+        f"Redis records: {storage.get('redis_count')} / {storage.get('redis_limit')}",
+        f"Local mirror file: {snapshot_path(settings)}",
+        f"Capture state: {storage.get('state_store')}",
+        "Format: JSONL-compatible records — one signal snapshot per record.",
+        "Redis is the source of truth on Railway; the local file is only a mirror/fallback.",
+        last_line,
+    ]).strip()
 
 
-def build_gate_suggestions_report(settings: Any | None = None) -> str:
-    records = load_snapshot_records(settings, limit=20000)
+def build_gate_suggestions_report(settings: Any | None = None, redis_client: Any | None = None) -> str:
+    records = load_snapshot_records(settings, limit=20000, redis_client=redis_client)
     if not records:
         return "🧠 Gate Suggestions\n┄┄┄┄┄┄┄┄\nلا توجد بيانات كافية حتى الآن."
     grouped: dict[str, list[dict]] = defaultdict(list)
