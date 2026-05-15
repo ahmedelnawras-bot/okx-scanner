@@ -41,10 +41,21 @@ from reporting.help_menus import (
     build_master_help,
     build_okx_control_help,
     build_admin_help,
+    build_diagnostics_help,
 )
 from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 from services.telegram_sender import TelegramSender
+from analytics.technical_dataset import (
+    append_many_signal_snapshots,
+    build_signal_snapshot,
+    build_technical_dataset_export,
+    build_technical_dataset_status,
+    build_gate_suggestions_report,
+    is_snapshot_enabled,
+    set_snapshot_enabled,
+)
+from reporting.report_technical_dataset import build_historical_report, build_technical_dataset_help
 
 
 def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool = False) -> list[dict]:
@@ -294,9 +305,11 @@ def run_once(
     snapshot = _build_snapshot(ranked_pairs, settings)
     initial_mode = previous_state or MarketModeState(mode=MODE_NORMAL_LONG, changed_at=datetime.now(timezone.utc))
     state = decide_market_mode(snapshot, previous=initial_mode)
+    scan_id = datetime.now(timezone.utc).isoformat()
 
     signal_items = []
     current_execution_results = []
+    technical_snapshot_records = []
     new_trades = []
     slot_counts = _execution_slot_counts(persisted_trades)
     recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
@@ -346,6 +359,22 @@ def run_once(
 
         signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
         current_execution_results.append(exec_result)
+        if is_snapshot_enabled(settings):
+            technical_snapshot_records.append(
+                build_signal_snapshot(
+                    scan_id,
+                    signal,
+                    exec_result,
+                    market_context={
+                        "mode": state.mode,
+                        "btc_change_15m": float(snapshot.btc_change_15m or 0.0),
+                        "avg_change_15m": float(snapshot.avg_change_15m or 0.0),
+                        "red_ratio_15m": float(snapshot.red_ratio_15m or 0.0),
+                        "strong_coins_count": int(snapshot.strong_coins_count or 0),
+                        "market_guard_valid_count": int(getattr(snapshot, "market_guard_valid_count", 0) or 0),
+                    },
+                )
+            )
 
         candidate_trade = register_trade(signal, exec_result)
         # Persist accepted execution trades and normal tracked signals without duplicating the same active symbol.
@@ -364,6 +393,11 @@ def run_once(
     else:
         execution_results_for_reports = current_execution_results
 
+    if technical_snapshot_records:
+        snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings)
+        if not snapshot_write_result.get("ok"):
+            print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
+
     mode_message = _build_mode_message(state, snapshot, protection)
     mode_context = _build_mode_context(state, snapshot, protection)
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items)
@@ -378,6 +412,8 @@ def run_once(
         "menu_keyboard": build_main_inline_keyboard(),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
+        "technical_snapshot_enabled": is_snapshot_enabled(settings),
+        "technical_snapshot_written": len(technical_snapshot_records),
         "help": build_master_help(
             mode=state.mode,
             execution_enabled=settings.execution_enabled,
@@ -555,6 +591,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
+        f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings) else 'OFF'}",
         "",
         "🧠 آخر حالة تنفيذ:",
         f"{rejection_reason}",
@@ -683,6 +720,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             _send_text(sender, result.get("help_execution", ""))
         elif key == "normal":
             _send_text(sender, result.get("help_normal", ""))
+        elif key == "diagnostics":
+            _send_text(sender, build_diagnostics_help())
         elif key == "okx_control":
             _send_text(sender, build_okx_control_help())
         elif key == "admin":
@@ -750,6 +789,29 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             clean_reply = _handle_admin_clean_command(command, trade_store)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
+                continue
+            if command == "/tech_snapshot_on":
+                status = set_snapshot_enabled(True, settings)
+                _send_text(sender, "✅ Technical Snapshot: ON" if status.get("ok") else f"⚠️ لم أستطع تشغيل التسجيل: {status.get('error')}")
+                continue
+            if command == "/tech_snapshot_off":
+                status = set_snapshot_enabled(False, settings)
+                _send_text(sender, "⏸ Technical Snapshot: OFF" if status.get("ok") else f"⚠️ لم أستطع إيقاف التسجيل: {status.get('error')}")
+                continue
+            if command == "/tech_snapshot_status":
+                _send_text(sender, build_technical_dataset_status(settings))
+                continue
+            if command == "/tech_snapshot_export":
+                _send_text(sender, build_technical_dataset_export(settings))
+                continue
+            if command == "/gate_suggestions":
+                _send_text(sender, build_gate_suggestions_report(settings))
+                continue
+            if command == "/historical_report":
+                _send_text(sender, build_historical_report(settings))
+                continue
+            if command == "/help_technical_dataset":
+                _send_text(sender, build_technical_dataset_help())
                 continue
             if command in ("/start", "/help"):
                 reply = result.get("help") or "OKX Long Bot is running."
