@@ -7,7 +7,9 @@ from reporting.report_format import (
     THIN_SEP,
     OPEN_STATUSES,
     append_trade_cards,
-    open_trades,
+    period_cutoff,
+    period_label,
+    trade_activity_time,
     trade_effective_pnl,
     wallet_impact_lines,
 )
@@ -17,10 +19,29 @@ def _is_execution_trade(t: TrackedTrade) -> bool:
     return bool(getattr(t, "execution_trade", False) or getattr(t, "tracking_bucket", "") == "execution")
 
 
-def _filter_open(trades: list[TrackedTrade], execution_only: bool = False) -> list[TrackedTrade]:
+def _trade_open_time(t: TrackedTrade):
+    """Timestamp used for period-based open-trade reports.
+
+    Open reports should answer: "which currently open trades were opened in this
+    period?" Using updated_at would make old trades appear in /open_trades_1h
+    just because the scanner refreshed their price. We fall back to activity time
+    only for legacy records that do not have opened_at.
+    """
+    return getattr(t, "opened_at", None) or trade_activity_time(t)
+
+
+def _filter_open(
+    trades: list[TrackedTrade],
+    execution_only: bool = False,
+    period: str = "since_start",
+) -> list[TrackedTrade]:
     items = [t for t in trades if t.status in OPEN_STATUSES]
     if execution_only:
         items = [t for t in items if _is_execution_trade(t)]
+
+    cutoff = period_cutoff(period)
+    if cutoff is not None:
+        items = [t for t in items if (_trade_open_time(t) or cutoff) >= cutoff]
     return items
 
 
@@ -32,8 +53,9 @@ def build_open_trades_report(
     trades: list[TrackedTrade],
     title: str = "📂 الصفقات العادية المفتوحة",
     execution_only: bool = False,
+    period: str = "since_start",
 ) -> str:
-    opened = _filter_open(trades, execution_only=execution_only)
+    opened = _filter_open(trades, execution_only=execution_only, period=period)
 
     if execution_only and not opened:
         rejected_count = sum(
@@ -44,7 +66,7 @@ def build_open_trades_report(
         )
         lines = [
             title,
-            "📅 Since Start",
+            f"📅 {period_label(period)}",
             SEP,
             LEVERAGE_NOTE_AR,
             "",
@@ -72,7 +94,7 @@ def build_open_trades_report(
     floating = sum(trade_effective_pnl(t) for t in opened)
     wr = len(winners) / max(1, len(opened)) * 100.0 if opened else 0.0
 
-    lines = [title, "📅 Since Start", SEP, LEVERAGE_NOTE_AR, ""]
+    lines = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
         "📊 <b>Quick Stats</b>",
         f"• Open: {len(opened)}",
