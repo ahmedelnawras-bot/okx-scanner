@@ -163,15 +163,23 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
     avg15m = float(snapshot.avg_change_15m or 0.0)
     red_ratio_pct = float(snapshot.red_ratio_15m or 0.0) * 100.0
     strong_coins = int(snapshot.strong_coins_count or 0)
+    hourly_ma5_pressure = bool(getattr(snapshot, "hourly_ma5_pressure", False))
+    btc_1h_ma5_gap_pct = float(getattr(snapshot, "btc_1h_ma5_gap_pct", 0.0) or 0.0)
+    hourly_ma_guard = "pressure" if hourly_ma5_pressure else "clear"
     return {
         "mode": state.mode,
         "strong_coins": strong_coins,
         "red_ratio": red_ratio_pct,
         "avg15m": avg15m,
         "btc15m": float(snapshot.btc_change_15m or 0.0),
+        "hourly_ma5_pressure": hourly_ma5_pressure,
+        "btc_1h_close": float(getattr(snapshot, "btc_1h_close", 0.0) or 0.0),
+        "btc_1h_ma5": float(getattr(snapshot, "btc_1h_ma5", 0.0) or 0.0),
+        "btc_1h_ma5_gap_pct": btc_1h_ma5_gap_pct,
+        "hourly_ma_guard": hourly_ma_guard,
         "sample_size": int(getattr(snapshot, "market_guard_valid_count", 0) or getattr(snapshot, "market_guard_sample_size", 200) or 200),
         "market_mix": f"Strong Coins: {strong_coins} | Red Ratio: {red_ratio_pct:.0f}% | Avg 15m Move: {avg15m:.2f}%",
-        "market_state": f"strong_coins={strong_coins} | avg15m={avg15m:.2f}% | red_ratio={red_ratio_pct:.0f}%",
+        "market_state": f"strong_coins={strong_coins} | avg15m={avg15m:.2f}% | red_ratio={red_ratio_pct:.0f}% | 1h_ma5={hourly_ma_guard}",
         "trigger": "fast rebound" if state.mode == MODE_RECOVERY_LONG else ("risk-off breadth" if state.mode == MODE_BLOCK_LONGS else "balanced scan"),
         "mode_reason": "fast rebound path" if state.mode == MODE_RECOVERY_LONG else "core market breadth decision",
         "signal_rules": "normal signal first → execution later",
