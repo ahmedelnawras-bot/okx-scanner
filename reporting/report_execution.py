@@ -129,7 +129,7 @@ def build_execution_report(
     period: str = "since_start",
     table: bool = False,
 ) -> str:
-    if table or period in {"month", "last_7d", "today", "last_1h"}:
+    if table:
         return build_execution_period_table(execution_results, trades, title="🚀 تقرير الصفقات المرشحة — Execution", period=period)
 
     trades = filter_trades_by_period(trades or [], period)
@@ -145,6 +145,8 @@ def build_execution_report(
     win_count, loss_count, wr = _closed_wr_parts(trades)
     winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
     losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
+    closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
 
     lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
@@ -163,9 +165,11 @@ def build_execution_report(
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚡ Net Floating: {sum(trade_effective_pnl(t) for t in opened):+.2f}% Exposure")
-    append_trade_cards(lines, "🟢 <b>Latest 3 Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "🔴 <b>Latest 3 Losers</b>", losers[:3], limit=3)
+        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+    append_trade_cards(lines, "🟢 <b>Latest 3 Open Winners</b>", winners[:3], limit=3)
+    append_trade_cards(lines, "🔴 <b>Latest 3 Open Losers</b>", losers[:3], limit=3)
+    append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
+    append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
 
     if rejected:
         reason_counts = Counter(item.get("reason", "unknown") for item in rejected)
