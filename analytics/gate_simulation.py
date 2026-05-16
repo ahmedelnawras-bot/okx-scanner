@@ -533,7 +533,12 @@ def _ema_slope_pct(record: dict[str, Any]) -> float | None:
 
 
 def _close_ema_gap_pct(record: dict[str, Any]) -> float | None:
-    """Percent distance of close from EMA/MA. Positive means above EMA, negative below."""
+    """Percent distance of close from EMA/MA. Positive means above EMA, negative below.
+
+    Live snapshots currently expose this mainly as ``dist_ma``. Historical replay
+    may not have a direct MA distance, so this function still falls back to
+    close/EMA values when they are present.
+    """
     features = _features(record)
     direct = _first_existing(
         features,
@@ -548,6 +553,11 @@ def _close_ema_gap_pct(record: dict[str, Any]) -> float | None:
             "close_vs_ma_pct",
             "close_to_ma_pct",
             "ma_distance_pct",
+            "dist_ma",
+            "distance_ma",
+            "distance_from_ma",
+            "ma_gap_pct",
+            "price_ma_gap_pct",
         ),
         None,
     )
@@ -568,20 +578,60 @@ def _change_pct(record: dict[str, Any], names: tuple[str, ...]) -> float:
     return _num(_first_existing(features, names, 0.0), 0.0)
 
 
+def _recent_symbol_change_pct(record: dict[str, Any]) -> float:
+    """Best available recent move proxy for replay/live records."""
+    return _change_pct(
+        record,
+        (
+            "change_pct",
+            "symbol_change_pct",
+            "symbol_bounce_pct",
+            "change_15m",
+            "pct_change_15m",
+            "change_pct_15m",
+            "change_30m",
+            "pct_change_30m",
+            "change_pct_30m",
+            "change_1h",
+            "pct_change_1h",
+            "change_pct_1h",
+        ),
+    )
+
+
 def _ema_slope_close_bearish(record: dict[str, Any]) -> bool:
-    """Balanced Strong filter: only reject when close is below EMA and EMA slope is clearly negative."""
+    """Balanced Strong filter.
+
+    Preferred path: reject only when EMA/MA slope and close position are both bad.
+    Fallback path: when slope is missing, use close-vs-MA (``dist_ma``) and the
+    recent symbol move so the filter is not dead on the current replay/live data.
+    """
     slope = _ema_slope_pct(record)
     gap = _close_ema_gap_pct(record)
-    if slope is None or gap is None:
-        return False
-    # Conservative thresholds to avoid over-filtering momentum: require both bad slope and bad close position,
-    # or a clearly hard negative slope with price not reclaiming EMA.
-    return bool((slope <= -0.05 and gap <= -0.15) or (slope <= -0.12 and gap <= 0.05))
+    recent = _recent_symbol_change_pct(record)
+
+    if slope is not None and gap is not None:
+        return bool((slope <= -0.05 and gap <= -0.15) or (slope <= -0.12 and gap <= 0.05))
+
+    # Current live snapshots provide dist_ma but not EMA slope. Treat clearly weak
+    # close position as bearish, and treat borderline close position as bearish
+    # only if the recent move is also negative.
+    if gap is not None:
+        return bool(gap <= -0.35 or (gap <= 0.10 and recent <= -2.0) or (gap <= 0.35 and recent <= -4.0))
+
+    # Historical replay may only have change_pct. Keep this conservative to avoid
+    # over-filtering Strong momentum setups.
+    return bool(recent <= -5.0)
 
 
 def _normal_overextended_before_entry(record: dict[str, Any]) -> bool:
-    """Normal filter: reject late long entries after exaggerated move far above EMA."""
+    """Normal filter: reject late long entries after exaggerated move far above EMA/MA.
+
+    Uses ``dist_ma`` when available and ``change_pct`` as the replay-compatible
+    recent-move proxy.
+    """
     gap = _close_ema_gap_pct(record)
+    recent = _recent_symbol_change_pct(record)
     ch15 = _change_pct(record, ("change_15m", "pct_change_15m", "change_pct_15m"))
     ch30 = _change_pct(record, ("change_30m", "pct_change_30m", "change_pct_30m"))
     ch1h = _change_pct(record, ("change_1h", "pct_change_1h", "change_pct_1h"))
@@ -594,11 +644,15 @@ def _normal_overextended_before_entry(record: dict[str, Any]) -> bool:
         0.0,
     )
     effective_gap = max(gap if gap is not None else 0.0, extension)
+
+    # Far above MA: likely chase entry.
     if effective_gap >= 3.5:
         return True
-    if effective_gap >= 2.0 and (ch15 >= 3.5 or ch30 >= 5.0 or ch1h >= 7.0):
+    # Moderately above MA plus a strong recent move.
+    if effective_gap >= 2.0 and max(recent, ch15, ch30, ch1h) >= 3.5:
         return True
-    if ch15 >= 5.0 or ch30 >= 7.5 or ch1h >= 10.0:
+    # Replay-compatible protection when MA distance is missing.
+    if recent >= 5.0 or ch15 >= 5.0 or ch30 >= 7.5 or ch1h >= 10.0:
         return True
     return False
 
