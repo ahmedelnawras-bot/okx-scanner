@@ -1,6 +1,9 @@
 """
-Signal formation preserves old philosophy: momentum, continuation, reclaim, and rebound can all form normal signals.
-Execution-specific strictness stays downstream and never suppresses the normal signal itself.
+Signal formation preserves old philosophy: momentum, continuation,
+reclaim, and rebound can all form normal signals.
+
+Execution-specific strictness stays downstream and never suppresses
+the normal signal itself.
 
 v128c score architecture final fix:
 ──────────────────────────────────────────────────────────────────────────────
@@ -75,9 +78,6 @@ SMART_SL_MAX_PCT = 2.80
 SMART_TP1_RR = 1.20
 SMART_TP2_RR = 2.00
 
-# UI only cap
-_SCORE_DISPLAY_CAP = 10.0
-
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
@@ -86,9 +86,40 @@ def _clamp(value: float, low: float, high: float) -> float:
 def _soft_cap_score(boost_score: float) -> float:
     """
     UI soft-cap only.
+    Keeps score distribution visible.
     Execution MUST NEVER depend on this.
     """
-    return round(min(float(boost_score), _SCORE_DISPLAY_CAP), 2)
+
+    score = float(boost_score)
+
+    # ─────────────────────────────────────────
+    # Natural zone
+    # ─────────────────────────────────────────
+    if score <= 8.5:
+        ui_score = score
+
+    # ─────────────────────────────────────────
+    # Soft compression
+    # ─────────────────────────────────────────
+    elif score <= 10:
+        ui_score = 8.5 + ((score - 8.5) * 0.55)
+
+    # ─────────────────────────────────────────
+    # Strong compression
+    # ─────────────────────────────────────────
+    elif score <= 12:
+        ui_score = 9.33 + ((score - 10) * 0.22)
+
+    # ─────────────────────────────────────────
+    # Rare elite zone
+    # ─────────────────────────────────────────
+    else:
+        ui_score = 9.77 + min(
+            (score - 12) * 0.05,
+            0.22,
+        )
+
+    return round(min(ui_score, 9.99), 2)
 
 
 def _clamp_vol_ratio(vol_ratio: float) -> float:
