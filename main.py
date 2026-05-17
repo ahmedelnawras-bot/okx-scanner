@@ -5,6 +5,10 @@ Preserved design:
 - normal signal first, execution decision second
 - Telegram/OKX adapters are isolated from core analysis
 - OKX orders are blocked from live trading unless explicitly enabled
+
+Phase 1 fixes applied:
+- FIX 1: Variable shadowing (result → doc_result) في 4 أماكن
+- FIX 2: State mutation في run_once (scan_mode snapshot قبل اللوب)
 """
 from __future__ import annotations
 
@@ -47,8 +51,6 @@ from reporting.help_menus import (
 from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 
-# Mode reminder timing constants. Keep old approved cadence:
-# BLOCK levels after 15m, +15m, +10m => 15 / 30 / 40 minutes.
 BLOCK_REMINDER_THRESHOLDS = [(15, 1), (30, 2), (40, 3)]
 GENERAL_MODE_REMINDER_MINUTES = 30
 
@@ -89,10 +91,6 @@ _GATE_SIM_RUNNING = False
 
 
 def _send_gate_sim_artifact(sender: TelegramSender, gate: str, settings: Settings, trade_store: RedisTradeStore | None = None) -> None:
-    """Run a passive gate simulation with a visible progress notice.
-
-    This does not change execution or market behavior; it only prevents silent long waits.
-    """
     global _GATE_SIM_RUNNING
     if _GATE_SIM_RUNNING:
         _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
@@ -103,9 +101,10 @@ def _send_gate_sim_artifact(sender: TelegramSender, gate: str, settings: Setting
         artifact = build_gate_sim_artifact(gate, settings, redis_client=_snapshot_redis_client(trade_store))
         _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
         if artifact.get("ok") and artifact.get("path"):
-            result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-            if not result.get("ok"):
-                _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+            # ✅ FIX 1a: doc_result بدل result — يمنع shadowing على scan result
+            doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+            if not doc_result.get("ok"):
+                _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
     finally:
         _GATE_SIM_RUNNING = False
 
@@ -121,9 +120,6 @@ def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool 
         if not offline_test_mode:
             print(f"⚠️ OKX tickers fetch failed; live fake fallback disabled: {exc}", flush=True)
             return []
-
-        # Offline fallback is allowed only when OFFLINE_TEST_MODE=1.
-        # This keeps local tests possible without generating fake live signals.
         return [
             {"instId": "BTC-USDT-SWAP", "last": "103250", "volCcy24h": "250000000", "change_pct": 1.4},
             {"instId": "ETH-USDT-SWAP", "last": "4980", "volCcy24h": "180000000", "change_pct": 2.2},
@@ -144,18 +140,12 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[str, float]:
-    """Build current symbol prices from OKX ticker data for open-trade tracking.
-
-    Uses real OKX last prices when available. Fallback pairs are used only for
-    symbols already scanned in this same cycle, never for synthetic price moves.
-    """
     price_map: dict[str, float] = {}
     for raw in raw_tickers or []:
         symbol = str(raw.get("instId") or raw.get("symbol") or "")
         price = _safe_float(raw.get("last") or raw.get("lastPrice"))
         if symbol and price > 0:
             price_map[symbol] = price
-
     for pair in fallback_pairs or []:
         symbol = str(getattr(pair, "symbol", "") or "")
         price = _safe_float(getattr(pair, "last_price", 0.0))
@@ -165,13 +155,6 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
 
 
 def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
-    """Build market-mode snapshot from real 15m candles.
-
-    v130 restores the old core Market Guard calculation: Market Mode is based
-    on the last closed 15m candle for a liquid sample, not ticker/day change
-    values from ranked pairs. This prevents false BLOCK_LONGS caused by
-    24h/reference-price change fields being displayed as Avg 15m.
-    """
     return build_market_guard_snapshot(
         ranked_pairs,
         base_url=settings.okx_base_url,
@@ -185,12 +168,6 @@ def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
 
 
 def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protection: dict) -> dict:
-    """Build display context for /mood and reminders.
-
-    v129 keeps all details but passes numeric Market Mix fields separately so
-    the UI can format them safely. This also avoids text like avg=21.03% when
-    the raw source was an OKX reference price rather than a percent.
-    """
     avg15m = float(snapshot.avg_change_15m or 0.0)
     red_ratio_pct = float(snapshot.red_ratio_15m or 0.0) * 100.0
     strong_coins = int(snapshot.strong_coins_count or 0)
@@ -232,11 +209,6 @@ def _build_mode_message(state: MarketModeState, snapshot: MarketSnapshot, protec
 
 
 def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot) -> dict:
-    """Update only the mode-related fields after a lightweight Market Mode Guard run.
-
-    This avoids a full pair scan/signal rebuild while keeping /mood, /status,
-    reminders, and logs aligned with fast BTC/breadth risk changes.
-    """
     protection = block_protection_status(state)
     result["state"] = state
     result["mode"] = state.mode
@@ -261,13 +233,6 @@ def _run_market_mode_guard(
     state: MarketModeState | None,
     reminder_tracker: dict,
 ) -> MarketModeState | None:
-    """Fast mode-only guard.
-
-    Full Scan remains on SCAN_INTERVAL_SECONDS. This guard runs between full scans
-    and checks only lightweight ticker breadth/BTC risk so NORMAL can move to
-    STRONG/BLOCK faster during sudden market weakness without rescanning all
-    signal logic or touching scoring/filters.
-    """
     if state is None:
         return state
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout, settings.offline_test_mode)
@@ -277,20 +242,12 @@ def _run_market_mode_guard(
     guarded_state = decide_market_mode(snapshot, previous=state)
     _refresh_mode_outputs(result, guarded_state, snapshot)
     if guarded_state.mode != previous_mode:
-        # Reset reminder state on transition so the next reminder starts from #1.
         reminder_tracker.clear()
         sender.send_message(result.get("mode_message", ""))
     return guarded_state
 
 
-
-
 def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
-    """Lightweight scan-universe prefilter restored from the old core idea.
-
-    It should keep the ranked universe broad, only removing unusable/no-liquidity
-    names before signal formation. This is intentionally not an execution filter.
-    """
     try:
         if not pair or float(getattr(pair, "last_price", 0.0) or 0.0) <= 0:
             return False
@@ -299,13 +256,10 @@ def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
         if turnover < 500_000:
             return False
         if current_mode == MODE_BLOCK_LONGS:
-            # In BLOCK we still scan enough to detect exceptions/recovery leaders,
-            # but avoid ultra-thin names.
             return turnover >= 2_000_000 or bool(tags & {"rs_btc", "breakout", "rebound", "major"})
         return True
     except Exception:
         return False
-
 
 
 def _is_trade_closed(trade) -> bool:
@@ -337,7 +291,6 @@ def _execution_slot_counts(trades) -> dict[str, int]:
 
 
 def _has_active_same_symbol(trades, candidate_trade) -> bool:
-    """Avoid duplicate active tracking, but allow new entry after TP2 protected runner."""
     symbol = getattr(candidate_trade, "symbol", "")
     bucket = getattr(candidate_trade, "tracking_bucket", "normal")
     path = getattr(candidate_trade, "execution_path", "")
@@ -351,6 +304,7 @@ def _has_active_same_symbol(trades, candidate_trade) -> bool:
         if _is_counted_open_trade(trade):
             return True
     return False
+
 
 def run_once(
     previous_state: MarketModeState | None = None,
@@ -377,19 +331,24 @@ def run_once(
     scan_pairs = ranked_pairs
     filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
     btc_bounce_pct = float(snapshot.btc_change_15m or 0.0)
+
+    # ✅ FIX 2: snapshot الـ mode قبل اللوب — يمنع تأثير register_recovery_trade
+    # على باقي الـ pairs في نفس الـ scan
+    scan_mode = state.mode
+
     print(
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
         flush=True,
     )
 
     for pair in filtered_pairs:
-        # Dynamic metadata for recovery relative bounce. PairCandidate is a dataclass
-        # without slots, so attaching this is safe and avoids changing model schema.
         try:
             setattr(pair, "btc_bounce_pct", btc_bounce_pct)
         except Exception:
             pass
-        signal = build_signal_candidate(pair, state.mode, settings.min_normal_score, settings.min_strong_score)
+
+        # ✅ FIX 2: استخدام scan_mode بدل state.mode داخل اللوب
+        signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
             continue
 
@@ -437,7 +396,6 @@ def run_once(
             )
 
         candidate_trade = register_trade(signal, exec_result)
-        # Persist accepted execution trades and normal tracked signals without duplicating the same active symbol.
         if not _has_active_same_symbol([*persisted_trades, *new_trades], candidate_trade):
             new_trades.append(candidate_trade)
 
@@ -493,16 +451,10 @@ def run_once(
 
 
 def _plain_result(result: dict) -> dict:
-    """Remove dataclass-heavy fields before JSON logging."""
     return {k: v for k, v in result.items() if k not in {"state", "signal_items", "trades"}}
 
 
 def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None) -> None:
-    """Small Railway-safe scan summary.
-
-    Do not print command_outputs, full reports, full execution result objects,
-    or Telegram message bodies here. Those can exceed Railway's log rate limit.
-    """
     scan = result.get("scan_stats", {}) or {}
     ctx = result.get("mode_context", {}) or {}
     execution_results = result.get("current_execution_results") or result.get("execution_results") or []
@@ -552,7 +504,6 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
 
 
 def _is_duplicate_signal_fingerprint(fingerprint: str, sent_fingerprints: set[str], trade_store: RedisTradeStore | None = None) -> bool:
-    """Duplicate signal guard with Redis TTL when available, memory fallback otherwise."""
     if fingerprint in sent_fingerprints:
         return True
     if trade_store and trade_store.enabled and trade_store.mark_signal_fingerprint(fingerprint):
@@ -563,13 +514,6 @@ def _is_duplicate_signal_fingerprint(fingerprint: str, sent_fingerprints: set[st
 
 
 def _signal_status_bucket(exec_status: str | None) -> str:
-    """Stable signal channel bucket for duplicate protection.
-
-    Do not include raw entry price in the fingerprint. Entry changes slightly on every
-    scan, which can turn the same momentum setup into repeated Telegram messages.
-    Keep execution-level upgrades separate so a normal signal can still be sent later
-    as an execution candidate during the TTL window.
-    """
     status = str(exec_status or "").strip().lower()
     if status == "accepted_preview":
         return "execution_accepted"
@@ -581,12 +525,6 @@ def _signal_status_bucket(exec_status: str | None) -> str:
 
 
 def _build_signal_fingerprint(signal, exec_result: dict) -> str:
-    """Build a stable fingerprint for one actionable signal idea.
-
-    Stable fields prevent duplicate spam caused by tiny price movements, while setup
-    and execution-status buckets allow genuinely different opportunities/upgrades to
-    pass through. Redis TTL still controls when the same idea can be sent again.
-    """
     return "|".join([
         str(getattr(signal, "symbol", "")).upper(),
         "LONG",
@@ -673,9 +611,6 @@ def _extract_commands(text: str) -> list[str]:
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None) -> None:
     parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
     sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
-
-
-
 
 
 def _format_clean_preview(stats: dict, title: str, confirm_command: str) -> str:
@@ -798,6 +733,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         _send_text(sender, reply)
         return
 
+
 def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings, trade_store: RedisTradeStore | None = None) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
@@ -816,7 +752,6 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         commands = _extract_commands(text)
         plain_text = text.strip()
 
-        # Reply-keyboard buttons from the approved /help dashboard.
         if not commands and plain_text:
             button_map = {
                 "🚀 Execution": "/help_execution",
@@ -872,9 +807,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 if not export.get("ok"):
                     _send_text(sender, "⚠️ " + str(export.get("message") or "Technical snapshot export failed."))
                 else:
-                    result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Live Technical Snapshot Dataset"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(result.get("error") or result))
+                    # ✅ FIX 1b: doc_result بدل result — يمنع shadowing على scan result
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Live Technical Snapshot Dataset"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
                 continue
             if command == "/tech_snapshot_clear":
                 _send_text(sender, build_clear_snapshot_result(settings, redis_client=_snapshot_redis_client(trade_store)))
@@ -905,9 +841,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                     artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
                     _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
                     if artifact.get("ok") and artifact.get("path"):
-                        result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-                        if not result.get("ok"):
-                            _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(result.get("error") or result))
+                        # ✅ FIX 1c: doc_result بدل result — يمنع shadowing على scan result
+                        doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+                        if not doc_result.get("ok"):
+                            _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
                 finally:
                     _GATE_SIM_RUNNING = False
                 continue
@@ -951,9 +888,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 if not export.get("ok"):
                     _send_text(sender, "⚠️ " + str(export.get("message") or "Replay export failed."))
                 else:
-                    result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Historical Replay Dataset"))
-                    if not result.get("ok"):
-                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(result.get("error") or result))
+                    # ✅ FIX 1d: doc_result بدل result — يمنع shadowing على scan result
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Historical Replay Dataset"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
                 continue
             if command == "/replay_summary":
                 _send_text(sender, build_replay_summary_report(settings, redis_client=_snapshot_redis_client(trade_store)))
@@ -981,7 +919,6 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v123 بعد."
             _send_text(sender, reply)
     return offset
-
 
 
 def _block_protection_alert_for_level(level: int, affected: int = 0, protected: int = 0, tightened: int = 0) -> str:
@@ -1017,7 +954,6 @@ def _block_protection_alert_for_level(level: int, affected: int = 0, protected: 
         "⚙️ الإجراء: حماية دفاعية بدون إغلاق عشوائي",
         "✅ أقصى مستوى حماية مفعل",
     ])
-
 
 
 def _enrich_reminder_context(result: dict, base_context: dict) -> dict:
@@ -1080,7 +1016,6 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
                 break
         return
 
-    # Normal / Strong / Recovery: compact reminder every 30 minutes while same mode continues.
     expected_count = minutes_in_mode // GENERAL_MODE_REMINDER_MINUTES
     if expected_count > tracker.get("general_sent", 0):
         tracker["general_sent"] = expected_count
@@ -1144,8 +1079,6 @@ def live_worker() -> None:
             if sender.enabled and settings.telegram_enabled:
                 sender.send_message(error_text)
 
-        # Keep Telegram commands responsive during the scan wait window.
-        # Instead of sleeping 15 minutes in one block, poll commands every few seconds.
         wait_until = time.time() + max(30, int(settings.scan_interval_seconds))
         while time.time() < wait_until:
             if sender.enabled and settings.telegram_enabled:
