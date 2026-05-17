@@ -1,4 +1,5 @@
-"""Signal formation preserves old philosophy: momentum, continuation, reclaim, and rebound can all form normal signals.
+"""
+Signal formation preserves old philosophy: momentum, continuation, reclaim, and rebound can all form normal signals.
 Execution-specific strictness stays downstream and never suppresses the normal signal itself.
 
 v128c score architecture final fix:
@@ -28,6 +29,7 @@ effective_score
     execution never depends on display/UI score
 ──────────────────────────────────────────────────────────────────────────────
 """
+
 from __future__ import annotations
 
 from .models import PairCandidate, SignalCandidate
@@ -69,9 +71,11 @@ _SETUP_WEIGHTS = {
 
 SMART_SL_MIN_PCT = 1.20
 SMART_SL_MAX_PCT = 2.80
+
 SMART_TP1_RR = 1.20
 SMART_TP2_RR = 2.00
 
+# UI only cap
 _SCORE_DISPLAY_CAP = 10.0
 
 
@@ -104,8 +108,10 @@ def _smart_target_profile(
 
     if market_mode == MODE_RECOVERY_LONG:
         risk_pct = 1.45
+
     elif entry_timing == "pullback":
         risk_pct = 1.70
+
     else:
         risk_pct = 1.55
 
@@ -136,7 +142,14 @@ def _smart_target_profile(
     if "near_resistance" in tags:
         risk_pct -= 0.10
 
-    risk_pct = round(_clamp(risk_pct, SMART_SL_MIN_PCT, SMART_SL_MAX_PCT), 4)
+    risk_pct = round(
+        _clamp(
+            risk_pct,
+            SMART_SL_MIN_PCT,
+            SMART_SL_MAX_PCT,
+        ),
+        4,
+    )
 
     return {
         "model": "smart_sl_1p2_2p8_tp1_1p2r_tp2_2r",
@@ -157,55 +170,87 @@ def _infer_setup(
     pair_tags = set(pair.tags)
 
     if market_mode == MODE_RECOVERY_LONG:
-        tags = ["recovery_execution", "relative_strength_vs_btc", "whitelist"]
+
+        tags = [
+            "recovery_execution",
+            "relative_strength_vs_btc",
+            "whitelist",
+        ]
 
         if "breakout" in pair_tags:
             tags.append("elite")
 
-        return "relative_strength_vs_btc", "market", tags, warnings
+        return (
+            "relative_strength_vs_btc",
+            "market",
+            tags,
+            warnings,
+        )
 
     if {"breakout", "momentum", "rs_btc"}.issubset(pair_tags):
+
         return (
             "wave_3",
             "market",
-            ["wave_3", "relative_strength_vs_btc", "elite", "whitelist"],
+            [
+                "wave_3",
+                "relative_strength_vs_btc",
+                "elite",
+                "whitelist",
+            ],
             warnings,
         )
 
     if "breakout" in pair_tags and "momentum" in pair_tags:
+
         return (
             "retest_breakout_confirmed",
             "market",
-            ["retest_breakout_confirmed", "elite", "whitelist"],
+            [
+                "retest_breakout_confirmed",
+                "elite",
+                "whitelist",
+            ],
             warnings,
         )
 
     if "rs_btc" in pair_tags and "continuation" in pair_tags:
+
         return (
             "relative_strength_vs_btc",
             "market",
-            ["relative_strength_vs_btc", "whitelist"],
+            [
+                "relative_strength_vs_btc",
+                "whitelist",
+            ],
             warnings,
         )
 
     if "momentum" in pair_tags:
+
         if "near_resistance" in pair_tags:
             warnings.append("مقاومة قريبة قبل TP1")
 
         return (
             "vwap_reclaim",
             "market",
-            ["vwap_reclaim", "whitelist"],
+            [
+                "vwap_reclaim",
+                "whitelist",
+            ],
             warnings,
         )
 
     if "rebound" in pair_tags:
+
         warnings.append("ارتداد مبكر يحتاج تأكيد")
 
         return (
             "support_bounce_confirmed",
             "pullback",
-            ["support_bounce_confirmed"],
+            [
+                "support_bounce_confirmed",
+            ],
             warnings,
         )
 
@@ -214,7 +259,9 @@ def _infer_setup(
     return (
         "higher_low_continuation",
         "pullback",
-        ["higher_low_continuation"],
+        [
+            "higher_low_continuation",
+        ],
         warnings,
     )
 
@@ -234,6 +281,9 @@ def _infer_quality_context(
     turnover = float(pair.turnover_usdt or 0.0)
     change = float(pair.change_pct or 0.0)
 
+    # ─────────────────────────────────────────
+    # Volume ratio
+    # ─────────────────────────────────────────
     vol_ratio = 1.00
 
     if "liquid" in tags:
@@ -262,6 +312,9 @@ def _infer_quality_context(
 
     vol_ratio = _clamp_vol_ratio(vol_ratio)
 
+    # ─────────────────────────────────────────
+    # MTF confirmation
+    # ─────────────────────────────────────────
     mtf_confirmed = bool(
         "rs_btc" in tags
         or setup_type in {
@@ -273,7 +326,11 @@ def _infer_quality_context(
         or (change >= 2.2 and turnover >= 10_000_000)
     )
 
+    # ─────────────────────────────────────────
+    # Breakout quality
+    # ─────────────────────────────────────────
     if setup_type == "wave_3" and vol_ratio >= 1.12:
+
         breakout_quality = "strong"
 
     elif (
@@ -284,12 +341,14 @@ def _infer_quality_context(
         }
         and vol_ratio >= 1.08
     ):
+
         breakout_quality = "good"
 
     elif setup_type in {
         "support_bounce_confirmed",
         "higher_low_continuation",
     }:
+
         breakout_quality = "ok"
 
     else:
@@ -309,16 +368,23 @@ def _infer_quality_context(
     if "elite" in tags or setup_type in ELITE_SETUPS:
         setup_weight = max(setup_weight, 3)
 
-    # FIX:
-    # effective_score MUST stay on execution scale
+    # IMPORTANT FIX:
+    # effective_score must remain on execution scale
     # NOT display scale
     effective_score = round(
         boost_score - (0.15 if resistance_warning else 0.0),
         2,
     )
 
-    btc_bounce_pct = float(getattr(pair, "btc_bounce_pct", 0.0) or 0.0)
+    # ─────────────────────────────────────────
+    # Recovery bounce context
+    # ─────────────────────────────────────────
+    btc_bounce_pct = float(
+        getattr(pair, "btc_bounce_pct", 0.0) or 0.0
+    )
+
     symbol_bounce_pct = max(float(change or 0.0), 0.0)
+
     btc_bounce_positive = max(btc_bounce_pct, 0.0)
 
     bounce_ratio = (
@@ -337,12 +403,20 @@ def _infer_quality_context(
     )
 
     return {
+
+        # ─────────────────────────────────────
+        # Scores
+        # ─────────────────────────────────────
         "effective_score": round(effective_score, 2),
         "display_score": round(display_score, 2),
         "boost_score": round(boost_score, 2),
         "raw_score": round(raw_score, 2),
+
         "score_scale": "boost_score_execution_scale",
 
+        # ─────────────────────────────────────
+        # Context
+        # ─────────────────────────────────────
         "vol_ratio": vol_ratio,
         "mtf_confirmed": mtf_confirmed,
         "dist_ma": dist_ma,
@@ -373,16 +447,44 @@ def _infer_quality_context(
             else "watch_resistance"
         ),
 
-        "wave_estimate": 3 if setup_type == "wave_3" else 0,
-        "wave_context": "wave_3" if setup_type == "wave_3" else setup_type,
-        "volume_state": f"vol_ratio_{vol_ratio:.2f}",
-        "htf_confirmation": "yes" if mtf_confirmed else "no",
+        "wave_estimate": (
+            3 if setup_type == "wave_3" else 0
+        ),
 
+        "wave_context": (
+            "wave_3"
+            if setup_type == "wave_3"
+            else setup_type
+        ),
+
+        "volume_state": f"vol_ratio_{vol_ratio:.2f}",
+
+        "htf_confirmation": (
+            "yes"
+            if mtf_confirmed
+            else "no"
+        ),
+
+        # ─────────────────────────────────────
+        # Recovery analytics
+        # ─────────────────────────────────────
         "btc_bounce_pct": round(btc_bounce_pct, 3),
-        "symbol_bounce_pct": round(symbol_bounce_pct, 3),
-        "bounce_ratio_vs_btc": round(bounce_ratio, 2),
+
+        "symbol_bounce_pct": round(
+            symbol_bounce_pct,
+            3,
+        ),
+
+        "bounce_ratio_vs_btc": round(
+            bounce_ratio,
+            2,
+        ),
+
         "bounce_faster_than_btc": bounce_faster_than_btc,
-        "recovery_relative_bounce": bounce_faster_than_btc,
+
+        "recovery_relative_bounce": (
+            bounce_faster_than_btc
+        ),
     }
 
 
@@ -393,9 +495,19 @@ def build_signal_candidate(
     min_strong_score: float,
 ) -> SignalCandidate | None:
 
-    raw_score = pair.score_hint + pair.rebound_hint
+    # ─────────────────────────────────────────
+    # Raw score
+    # ─────────────────────────────────────────
+    raw_score = (
+        pair.score_hint
+        + pair.rebound_hint
+    )
 
+    # ─────────────────────────────────────────
+    # Boost score
+    # ─────────────────────────────────────────
     boost_score = raw_score
+
     pair_tags = set(pair.tags)
 
     if "near_resistance" in pair_tags:
@@ -423,6 +535,9 @@ def build_signal_candidate(
 
     rejection_reason = ""
 
+    # ─────────────────────────────────────────
+    # BLOCK mode restrictions
+    # ─────────────────────────────────────────
     if market_mode == MODE_BLOCK_LONGS:
 
         if (
@@ -433,11 +548,16 @@ def build_signal_candidate(
 
         tags.append("block_exception")
         warnings.append("Block exception only")
+
         boost_score += 0.20
 
+    # ─────────────────────────────────────────
+    # Threshold logic
+    # ─────────────────────────────────────────
     threshold = min_normal_score
 
     if market_mode == MODE_STRONG_LONG_ONLY:
+
         threshold = min_strong_score
 
         if (
@@ -447,13 +567,23 @@ def build_signal_candidate(
             return None
 
     elif market_mode == MODE_RECOVERY_LONG:
+
         threshold = min_normal_score + 0.10
 
-    if boost_score < threshold or pair.last_price <= 0:
+    if (
+        boost_score < threshold
+        or pair.last_price <= 0
+    ):
         return None
 
+    # ─────────────────────────────────────────
+    # UI score only
+    # ─────────────────────────────────────────
     display_score = _soft_cap_score(boost_score)
 
+    # ─────────────────────────────────────────
+    # Targets
+    # ─────────────────────────────────────────
     target_profile = _smart_target_profile(
         pair,
         setup_type,
@@ -463,13 +593,19 @@ def build_signal_candidate(
 
     rr1 = float(target_profile["rr1"])
     rr2 = float(target_profile["rr2"])
-    risk_pct = float(target_profile["risk_pct"])
+
+    risk_pct = float(
+        target_profile["risk_pct"]
+    )
 
     if "near_resistance" in pair_tags:
         rejection_reason = "near_resistance_warning"
 
     entry = pair.last_price
-    sl = entry * (1.0 - risk_pct / 100.0)
+
+    sl = entry * (
+        1.0 - risk_pct / 100.0
+    )
 
     risk_amount = entry - sl
 
@@ -479,6 +615,9 @@ def build_signal_candidate(
     if tp1 <= entry or tp2 <= tp1:
         return None
 
+    # ─────────────────────────────────────────
+    # Quality meta
+    # ─────────────────────────────────────────
     quality_meta = _infer_quality_context(
         pair=pair,
         setup_type=setup_type,
@@ -490,18 +629,23 @@ def build_signal_candidate(
         warnings=warnings,
     )
 
-    if rejection_reason and not quality_meta.get("resistance_warning"):
+    if (
+        rejection_reason
+        and not quality_meta.get("resistance_warning")
+    ):
         quality_meta["resistance_warning"] = rejection_reason
 
     return SignalCandidate(
+
         symbol=pair.symbol,
 
         entry=round(entry, 8),
         sl=round(sl, 8),
+
         tp1=round(tp1, 8),
         tp2=round(tp2, 8),
 
-        # UI score only
+        # UI ONLY
         score=display_score,
 
         setup_type=setup_type,
@@ -509,6 +653,7 @@ def build_signal_candidate(
         market_mode=market_mode,
 
         execution_setup_tags=tags,
+
         warnings=warnings,
 
         notes=[
@@ -516,15 +661,19 @@ def build_signal_candidate(
         ],
 
         meta={
+
             "turnover_usdt": pair.turnover_usdt,
             "change_pct": pair.change_pct,
+
             "pair_tags": list(pair.tags),
 
             "rr1": rr1,
             "rr2": rr2,
+
             "risk_pct": risk_pct,
 
             "target_model": target_profile.get("model"),
+
             "smart_sl_min_pct": target_profile.get("sl_min_pct"),
             "smart_sl_max_pct": target_profile.get("sl_max_pct"),
 
@@ -534,7 +683,11 @@ def build_signal_candidate(
             ),
 
             "rejection_context": rejection_reason,
-            "threshold_used": round(threshold, 2),
+
+            "threshold_used": round(
+                threshold,
+                2,
+            ),
 
             **quality_meta,
         },
