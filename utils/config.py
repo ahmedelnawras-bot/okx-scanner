@@ -1,10 +1,26 @@
-"""Environment-backed config. Keeps main.py orchestration-only."""
+"""Environment-backed config. Keeps main.py orchestration-only.
+
+Phase 2 fix:
+- MAX_OPEN_POSITIONS default: 30 → 7
+- إضافة safety cap: مش ممكن يعدي 7 حتى لو الـ env variable أكبر
+"""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 
 from .constants import MAX_EXECUTION_POSITIONS
+
+
+def _safe_max_positions() -> int:
+    """قراءة MAX_OPEN_POSITIONS مع safety cap عند 7.
+
+    حتى لو كان في Railway env variable بقيمة 30،
+    الـ cap بيضمن إننا مش بنعدي الحد الرسمي للمشروع.
+    """
+    env_val = int(os.getenv("MAX_OPEN_POSITIONS", str(MAX_EXECUTION_POSITIONS)))
+    # ✅ Safety cap: الحد الرسمي للمشروع = 7 صفقات مفتوحة
+    return min(env_val, MAX_EXECUTION_POSITIONS)
 
 
 @dataclass(frozen=True)
@@ -21,7 +37,8 @@ class Settings:
     request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
     scan_interval_seconds: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
     market_mode_guard_interval_seconds: int = int(os.getenv("MARKET_MODE_GUARD_INTERVAL_SECONDS", "300"))
-    max_execution_positions: int = int(os.getenv("MAX_OPEN_POSITIONS", str(MAX_EXECUTION_POSITIONS)))
+    # ✅ FIX: safety cap عند MAX_EXECUTION_POSITIONS (7)
+    max_execution_positions: int = _safe_max_positions()
     telegram_enabled: bool = os.getenv("TELEGRAM_ENABLED", "1").lower() in ("1", "true", "yes", "on")
     send_normal_signals: bool = os.getenv("SEND_NORMAL_SIGNALS", "1").lower() in ("1", "true", "yes", "on")
     send_mode_status_each_scan: bool = os.getenv("SEND_MODE_STATUS_EACH_SCAN", "0").lower() in ("1", "true", "yes", "on")
