@@ -1,3 +1,11 @@
+"""Historical Replay Engine — Phase 2 unified pipeline.
+
+التغييرات:
+- _pair_from_candle: نفس tags الـ Live (pair_selection.py) تماماً
+- score_hint: نفس formula الـ Live
+- rebound_hint: proportional زي الـ Live
+- max_open_positions: 7 بدل 10
+"""
 from __future__ import annotations
 
 import threading
@@ -9,7 +17,11 @@ from analysis.market_modes import MarketModeState, MarketSnapshot, decide_market
 from analysis.models import PairCandidate
 from analysis.scoring import build_signal_candidate
 from execution.execution_processor import process_trade_candidate
-from utils.constants import MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE, MAX_RECOVERY_TRADES_PER_CYCLE
+from config.risk_config import (
+    MAX_DAILY_OPEN_TRADES,
+    MAX_BLOCK_EXCEPTION_TRADES,
+    MAX_RECOVERY_TRADES_PER_CYCLE,
+)
 
 from .dataset_writer import append_records
 from .okx_loader import (
@@ -25,6 +37,10 @@ from .state import DATA_KEY, LOCAL_DATA_PATH, append_log, clear_stop, get_status
 _WORKER_LOCK = threading.Lock()
 _WORKER_THREAD: threading.Thread | None = None
 
+# ── Major symbols — نفس الـ Live ───────────────────────────────────────────────
+_MAJOR_SYMBOLS = ("BTC-", "ETH-", "SOL-", "XRP-", "DOGE-", "BNB-", "AVAX-", "LINK-")
+_RS_MAJOR_SYMBOLS = ("BTC-", "ETH-", "SOL-", "LINK-", "AVAX-")
+
 
 def _safe_pct(open_: float, close: float) -> float:
     try:
@@ -39,42 +55,81 @@ def _volume_avg(candles: list[HistoricalCandle], idx: int, lookback: int = 20) -
     return mean(vals) if vals else 0.0
 
 
+def _infer_rs_btc(symbol: str, change_pct: float, turnover: float) -> bool:
+    """نفس منطق _infer_relative_strength في pair_selection.py."""
+    return bool(
+        change_pct >= 1.8
+        or (change_pct >= 0.8 and any(symbol.startswith(p) for p in _RS_MAJOR_SYMBOLS))
+        or (change_pct >= 1.0 and turnover >= 20_000_000)
+    )
+
+
+def _infer_near_resistance(change_pct: float, turnover: float) -> bool:
+    """نفس منطق _infer_near_resistance في pair_selection.py."""
+    return change_pct >= 4.2 and turnover < 30_000_000
+
+
 def _pair_from_candle(symbol: str, candles: list[HistoricalCandle], idx: int, btc_change: float = 0.0) -> PairCandidate | None:
+    """بيبني PairCandidate من الـ candle data.
+
+    ✅ Phase 2: نفس tags وformula الـ Live (pair_selection.py) تماماً.
+    """
     candle = candles[idx]
     change_15m = _safe_pct(candle.open, candle.close)
     quote_volume = float(candle.quote_volume or candle.volume or 0.0)
-    avg_vol = _volume_avg(candles, idx, lookback=20)
-    vol_ratio = (quote_volume / avg_vol) if avg_vol > 0 else 1.0
-
-    tags: list[str] = []
-    if quote_volume >= 100_000 or vol_ratio >= 1.1:
-        tags.append("liquid")
-    if change_15m >= 0.28:
-        tags.append("momentum")
-    if change_15m >= 0.65 and vol_ratio >= 1.15:
-        tags.append("breakout")
-    if change_15m >= btc_change + 0.20 and change_15m > 0:
-        tags.append("rs_btc")
-    if change_15m < -0.35 and vol_ratio >= 0.9:
-        tags.append("rebound")
-    if change_15m >= 1.8 and vol_ratio < 1.05:
-        tags.append("near_resistance")
-    if symbol.startswith(("BTC-", "ETH-", "SOL-", "XRP-", "DOGE-", "BNB-", "AVAX-", "LINK-")):
-        tags.append("major")
-
-    score_hint = 5.85
-    score_hint += min(max(change_15m, -1.0), 2.2) * 0.85
-    score_hint += min(max(vol_ratio - 1.0, 0.0), 2.5) * 0.38
-    if "breakout" in tags:
-        score_hint += 0.45
-    if "rs_btc" in tags:
-        score_hint += 0.35
-    if "major" in tags:
-        score_hint += 0.10
-    rebound_hint = 0.45 if "rebound" in tags else 0.0
 
     if candle.close <= 0:
         return None
+
+    # ── score_hint: نفس formula الـ Live ──────────────────────────────────────
+    # Live: min(turnover/2_500_000, 10) + max(change, 0)*0.60
+    # هنا: نفس المعادلة مع الـ 15m quote_volume
+    score_hint = min(quote_volume / 2_500_000.0, 10.0)
+    score_hint += max(change_15m, 0.0) * 0.60
+
+    # ── rebound_hint: proportional زي الـ Live ────────────────────────────────
+    # Live: max(-change_pct, 0) * 0.55
+    rebound_hint = max(-change_15m, 0.0) * 0.55
+
+    # ── Tags: نفس منطق pair_selection.py تماماً ──────────────────────────────
+    tags: list[str] = []
+
+    # major
+    if any(symbol.startswith(p) for p in _MAJOR_SYMBOLS):
+        tags.append("major")
+
+    # liquid: نفس threshold الـ Live
+    if quote_volume >= 3_000_000:
+        tags.append("liquid")
+
+    # momentum: نفس threshold الـ Live
+    if change_15m >= 1.25:
+        tags.append("momentum")
+
+    # breakout: نفس threshold الـ Live
+    if change_15m >= 3.2:
+        tags.append("breakout")
+
+    # rebound: نفس range الـ Live
+    if -5.5 <= change_15m <= -0.9:
+        tags.append("rebound")
+
+    # compression: ✅ كان غايب في الـ Replay — متوافق مع الـ Live دلوقتي
+    if abs(change_15m) <= 0.7:
+        tags.append("compression")
+
+    # continuation: ✅ كان غايب في الـ Replay — متوافق مع الـ Live دلوقتي
+    if 0.75 <= change_15m <= 2.8:
+        tags.append("continuation")
+
+    # rs_btc: نفس منطق _infer_relative_strength في pair_selection.py
+    if _infer_rs_btc(symbol, change_15m, quote_volume):
+        tags.append("rs_btc")
+
+    # near_resistance: نفس منطق _infer_near_resistance في pair_selection.py
+    if _infer_near_resistance(change_15m, quote_volume):
+        tags.append("near_resistance")
+
     pair = PairCandidate(
         symbol=symbol,
         last_price=float(candle.close),
@@ -93,12 +148,7 @@ def _pair_from_candle(symbol: str, candles: list[HistoricalCandle], idx: int, bt
 
 def _btc_hourly_ma5_guard_from_15m(candles: list[HistoricalCandle], idx: int) -> dict:
     if not candles or idx < 16:
-        return {
-            "hourly_ma5_pressure": False,
-            "btc_1h_close": 0.0,
-            "btc_1h_ma5": 0.0,
-            "btc_1h_ma5_gap_pct": 0.0,
-        }
+        return {"hourly_ma5_pressure": False, "btc_1h_close": 0.0, "btc_1h_ma5": 0.0, "btc_1h_ma5_gap_pct": 0.0}
     closes: list[float] = []
     j = idx
     while j >= 0 and len(closes) < 10:
@@ -110,12 +160,7 @@ def _btc_hourly_ma5_guard_from_15m(candles: list[HistoricalCandle], idx: int) ->
             closes.append(close)
         j -= 4
     if len(closes) < 5:
-        return {
-            "hourly_ma5_pressure": False,
-            "btc_1h_close": 0.0,
-            "btc_1h_ma5": 0.0,
-            "btc_1h_ma5_gap_pct": 0.0,
-        }
+        return {"hourly_ma5_pressure": False, "btc_1h_close": 0.0, "btc_1h_ma5": 0.0, "btc_1h_ma5_gap_pct": 0.0}
     close = closes[0]
     ma5 = sum(closes[:5]) / 5.0
     gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
@@ -125,12 +170,7 @@ def _btc_hourly_ma5_guard_from_15m(candles: list[HistoricalCandle], idx: int) ->
         previous_below_ma5 = bool(prev_ma5 > 0 and closes[1] < prev_ma5)
     ma5_below_ma10 = bool(len(closes) >= 10 and ma5 < (sum(closes[:10]) / 10.0))
     pressure = bool(gap_pct <= -0.05 and (previous_below_ma5 or ma5_below_ma10))
-    return {
-        "hourly_ma5_pressure": pressure,
-        "btc_1h_close": close,
-        "btc_1h_ma5": ma5,
-        "btc_1h_ma5_gap_pct": gap_pct,
-    }
+    return {"hourly_ma5_pressure": pressure, "btc_1h_close": close, "btc_1h_ma5": ma5, "btc_1h_ma5_gap_pct": gap_pct}
 
 
 def _market_snapshot_at(symbol_candles: dict[str, list[HistoricalCandle]], idx: int) -> MarketSnapshot:
@@ -203,10 +243,7 @@ def _record_from_signal(run_id: str, ts: int, signal: Any, execution: dict, snap
         "legacy_gate_passed": bool(gate.get("allowed", False)),
         "legacy_gate_reason": gate.get("reason") or reason,
         "trade_plan": {
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
             "tp1_pct": ((tp1 / entry) - 1.0) * 100.0 if entry else 0.0,
             "tp2_pct": ((tp2 / entry) - 1.0) * 100.0 if entry else 0.0,
             "sl_pct": ((sl / entry) - 1.0) * 100.0 if entry else 0.0,
@@ -217,6 +254,7 @@ def _record_from_signal(run_id: str, ts: int, signal: Any, execution: dict, snap
             "score": float(getattr(signal, "score", 0.0) or 0.0),
             "effective_score": float(meta.get("effective_score") or getattr(signal, "score", 0.0) or 0.0),
             "raw_score": float(meta.get("raw_score") or getattr(signal, "score", 0.0) or 0.0),
+            "boost_score": float(meta.get("boost_score") or 0.0),
             "setup_type": getattr(signal, "setup_type", ""),
             "entry_timing": getattr(signal, "entry_timing", ""),
             "setup_tags": list(getattr(signal, "execution_setup_tags", []) or []),
@@ -265,7 +303,8 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
     min_normal_score = float(getattr(settings, "min_normal_score", 6.2) or 6.2)
     min_strong_score = float(getattr(settings, "min_strong_score", 7.5) or 7.5)
     min_execution_score = float(getattr(settings, "min_execution_score", 6.6) or 6.6)
-    max_open_positions = int(getattr(settings, "max_execution_positions", 10) or 10)
+    # ✅ Phase 2: max_open_positions = 7 بدل 10
+    max_open_positions = int(getattr(settings, "max_execution_positions", MAX_DAILY_OPEN_TRADES) or MAX_DAILY_OPEN_TRADES)
 
     days = max(1, int(days))
     tf_ms = timeframe_to_ms(timeframe)
@@ -277,26 +316,14 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
     clear_stop(redis_client)
     status = get_status(redis_client)
     status.update({
-        "running": True,
-        "state": "loading_symbols",
-        "run_id": run_id,
-        "days": days,
-        "symbols_limit": int(symbols_limit),
-        "timeframe": timeframe,
-        "expected_candles_per_symbol": expected_candles,
-        "min_required_candles": min_required_candles,
-        "current_symbol": "",
-        "current_symbol_candles": 0,
-        "started_at": utc_now_iso(),
-        "completed_at": "",
-        "progress_pct": 0.0,
-        "symbols_total": int(symbols_limit),
-        "symbols_done": 0,
-        "records": 0,
-        "normal": 0,
-        "quality_candidates": 0,
-        "execution_candidates": 0,
-        "blocked_by_limits": 0,
+        "running": True, "state": "loading_symbols", "run_id": run_id,
+        "days": days, "symbols_limit": int(symbols_limit), "timeframe": timeframe,
+        "expected_candles_per_symbol": expected_candles, "min_required_candles": min_required_candles,
+        "current_symbol": "", "current_symbol_candles": 0,
+        "started_at": utc_now_iso(), "completed_at": "", "progress_pct": 0.0,
+        "symbols_total": int(symbols_limit), "symbols_done": 0,
+        "records": 0, "normal": 0, "quality_candidates": 0,
+        "execution_candidates": 0, "blocked_by_limits": 0,
         "message": "Loading OKX symbols for historical replay.",
     })
     set_status(status, redis_client)
@@ -305,39 +332,41 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
     try:
         tickers = fetch_swap_tickers(base_url, timeout=timeout)
         symbols = select_top_usdt_swap_symbols(tickers, limit=symbols_limit)
-        status.update({"symbols_total": len(symbols), "state": "loading_candles", "message": f"Loading historical candles for {len(symbols)} symbols."})
+        status.update({"symbols_total": len(symbols), "state": "loading_candles",
+                        "message": f"Loading historical candles for {len(symbols)} symbols."})
         set_status(status, redis_client)
 
         symbol_candles: dict[str, list[HistoricalCandle]] = {}
         for i, symbol in enumerate(symbols, start=1):
             candles: list[HistoricalCandle] = []
             if stop_requested(redis_client):
-                status.update({"running": False, "state": "stopped", "completed_at": utc_now_iso(), "message": "Stopped while loading candles."})
+                status.update({"running": False, "state": "stopped", "completed_at": utc_now_iso(),
+                                "message": "Stopped while loading candles."})
                 set_status(status, redis_client)
                 return
             try:
-                status.update({"current_symbol": symbol, "current_symbol_candles": 0, "message": f"Loading candles: {i}/{len(symbols)} {symbol}"})
+                status.update({"current_symbol": symbol, "current_symbol_candles": 0,
+                                "message": f"Loading candles: {i}/{len(symbols)} {symbol}"})
                 set_status(status, redis_client)
                 candles = fetch_historical_candles(base_url, symbol, bar=timeframe, days=days, timeout=timeout)
                 if len(candles) >= min_required_candles:
                     symbol_candles[symbol] = candles
                     append_log(f"Loaded {len(candles)}/{expected_candles} candles for {symbol}", redis_client)
                 else:
-                    append_log(f"Skipped {symbol}: only {len(candles)}/{expected_candles} candles (< {min_required_candles})", redis_client)
-                status.update({"current_symbol": symbol, "current_symbol_candles": len(candles)})
+                    append_log(f"Skipped {symbol}: only {len(candles)}/{expected_candles} candles", redis_client)
             except Exception as exc:
                 append_log(f"Failed loading {symbol}: {exc}", redis_client)
             status.update({
                 "symbols_done": i,
                 "progress_pct": round((i / max(1, len(symbols))) * 35.0, 2),
-                "current_symbol": symbol,
-                "current_symbol_candles": len(candles),
+                "current_symbol": symbol, "current_symbol_candles": len(candles),
                 "message": f"Loading candles: {i}/{len(symbols)} | {symbol} | {len(candles)}/{expected_candles}",
             })
             set_status(status, redis_client)
 
         if not symbol_candles:
-            status.update({"running": False, "state": "error", "completed_at": utc_now_iso(), "message": "No historical candles loaded from OKX."})
+            status.update({"running": False, "state": "error", "completed_at": utc_now_iso(),
+                            "message": "No historical candles loaded from OKX."})
             set_status(status, redis_client)
             return
 
@@ -346,21 +375,20 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
         end_idx = max(start_idx, min_len - 97)
         total_steps = max(1, end_idx - start_idx)
         state = MarketModeState()
-        counts = {"records": 0, "normal": 0, "quality_candidates": 0, "execution_candidates": 0, "blocked_by_limits": 0}
+        counts = {"records": 0, "normal": 0, "quality_candidates": 0,
+                  "execution_candidates": 0, "blocked_by_limits": 0}
         status.update({
-            "current_symbol": "",
-            "current_symbol_candles": 0,
-            "state": "running",
-            "running": True,
-            "symbols_done": len(symbol_candles),
-            "symbols_total": len(symbol_candles),
+            "current_symbol": "", "current_symbol_candles": 0,
+            "state": "running", "running": True,
+            "symbols_done": len(symbol_candles), "symbols_total": len(symbol_candles),
             "message": f"Replaying {len(symbol_candles)} symbols over {total_steps} candles.",
         })
         set_status(status, redis_client)
 
         for step_no, idx in enumerate(range(start_idx, end_idx), start=1):
             if stop_requested(redis_client):
-                status.update({"running": False, "state": "stopped", "completed_at": utc_now_iso(), "message": "Replay stopped by user."})
+                status.update({"running": False, "state": "stopped", "completed_at": utc_now_iso(),
+                                "message": "Replay stopped by user."})
                 set_status({**status, **counts}, redis_client)
                 append_log("Replay stopped by user.", redis_client)
                 return
@@ -381,11 +409,11 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
                     pairs.append(pair)
             pairs.sort(key=lambda p: (p.score_hint + p.rebound_hint, p.turnover_usdt), reverse=True)
 
-            # ✅ FIX: snapshot الـ mode قبل اللوب لمنع تأثير register_recovery_trade على باقي الـ pairs
+            # ✅ Phase 1 fix: snapshot mode قبل اللوب
             scan_mode = state.mode
 
             for pair in pairs:
-                # ✅ FIX: استخدام scan_mode بدل state.mode
+                # ✅ Phase 1 fix: scan_mode بدل state.mode
                 signal = build_signal_candidate(pair, scan_mode, min_normal_score, min_strong_score)
                 if not signal:
                     continue
@@ -396,7 +424,7 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
                     min_execution_score=min_execution_score,
                     recovery_slots_remaining=recovery_remaining if state.mode == "RECOVERY_LONG" else None,
                     block_open_positions=slot_counts.get("block_exception", 0),
-                    max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
+                    max_block_positions=MAX_BLOCK_EXCEPTION_TRADES,
                     recovery_open_positions=slot_counts.get("recovery", 0),
                     max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
                 )
@@ -414,15 +442,11 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
 
                 future = symbol_candles.get(pair.symbol, [])[idx + 1: idx + 97]
                 outcome = evaluate_trade_outcome(
-                    future,
-                    signal.entry,
-                    signal.tp1,
-                    signal.tp2,
-                    signal.sl,
-                    horizon_bars=96,
-                    market_mode=getattr(signal, "market_mode", ""),
+                    future, signal.entry, signal.tp1, signal.tp2, signal.sl,
+                    horizon_bars=96, market_mode=getattr(signal, "market_mode", ""),
                 )
-                rec = _record_from_signal(run_id, symbol_candles[pair.symbol][idx].ts, signal, exec_result, snapshot, outcome)
+                rec = _record_from_signal(run_id, symbol_candles[pair.symbol][idx].ts,
+                                          signal, exec_result, snapshot, outcome)
                 batch.append(rec)
                 counts["records"] += 1
                 if rec.get("quality_candidate"):
@@ -441,8 +465,7 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
                 progress = 35.0 + (step_no / total_steps) * 65.0
                 status.update(counts)
                 status.update({
-                    "state": "running",
-                    "running": True,
+                    "state": "running", "running": True,
                     "progress_pct": round(min(progress, 99.8), 2),
                     "message": f"Replay running: candle {step_no}/{total_steps}, records={counts['records']}",
                 })
@@ -450,22 +473,23 @@ def _run_replay_worker(days: int, symbols_limit: int, timeframe: str, redis_clie
 
         status.update(counts)
         status.update({
-            "running": False,
-            "state": "completed",
-            "progress_pct": 100.0,
+            "running": False, "state": "completed", "progress_pct": 100.0,
             "completed_at": utc_now_iso(),
             "message": f"Historical replay completed. Records: {counts['records']}",
         })
         set_status(status, redis_client)
         append_log(f"Replay completed: {run_id} records={counts['records']}", redis_client)
+
     except Exception as exc:
         status = get_status(redis_client)
-        status.update({"running": False, "state": "error", "completed_at": utc_now_iso(), "message": f"Replay error: {exc}"})
+        status.update({"running": False, "state": "error", "completed_at": utc_now_iso(),
+                        "message": f"Replay error: {exc}"})
         set_status(status, redis_client)
         append_log(f"Replay error: {exc}", redis_client)
 
 
-def start_replay(days: int = 30, symbols_limit: int = 200, timeframe: str = "15m", redis_client: Any | None = None, settings: Any | None = None) -> dict[str, Any]:
+def start_replay(days: int = 30, symbols_limit: int = 200, timeframe: str = "15m",
+                 redis_client: Any | None = None, settings: Any | None = None) -> dict[str, Any]:
     global _WORKER_THREAD
     with _WORKER_LOCK:
         status = get_status(redis_client)
@@ -474,18 +498,15 @@ def start_replay(days: int = 30, symbols_limit: int = 200, timeframe: str = "15m
         clear_stop(redis_client)
         _WORKER_THREAD = threading.Thread(
             target=_run_replay_worker,
-            kwargs={"days": days, "symbols_limit": symbols_limit, "timeframe": timeframe, "redis_client": redis_client, "settings": settings},
-            daemon=True,
-            name="historical-replay-runner",
+            kwargs={"days": days, "symbols_limit": symbols_limit, "timeframe": timeframe,
+                    "redis_client": redis_client, "settings": settings},
+            daemon=True, name="historical-replay-runner",
         )
         _WORKER_THREAD.start()
         status.update({
-            "running": True,
-            "state": "starting",
-            "days": int(days),
-            "symbols_limit": int(symbols_limit),
-            "timeframe": timeframe,
-            "started_at": utc_now_iso(),
+            "running": True, "state": "starting",
+            "days": int(days), "symbols_limit": int(symbols_limit),
+            "timeframe": timeframe, "started_at": utc_now_iso(),
             "message": "Historical replay runner started in background.",
         })
         status = set_status(status, redis_client)
