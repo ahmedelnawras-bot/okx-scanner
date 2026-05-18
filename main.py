@@ -1005,9 +1005,10 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
                     "protection_next": "Soft Protection" if level == 1 else "Defensive Protection" if level == 2 else "Max protection active",
                     "remaining_minutes": 15 if level == 1 else 10 if level == 2 else 0,
                 })
-                sender.send_message(build_market_mode_sections(mode, context, variant="reminder"))
+                # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
+                _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
                 trades = result.get("trades", [])
-                sender.send_message(_block_protection_alert_for_level(
+                _send_text(sender, _block_protection_alert_for_level(
                     level,
                     affected=len(trades),
                     protected=sum(1 for t in trades if getattr(t, "pnl_pct", 0) > 0),
@@ -1021,7 +1022,8 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
         tracker["general_sent"] = expected_count
         context = _enrich_reminder_context(result, result.get("mode_context", {}))
         context.update({"reminder_count": expected_count, "minutes_in_mode": minutes_in_mode})
-        sender.send_message(build_market_mode_sections(mode, context, variant="reminder"))
+        # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
+        _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
 
 
 def live_worker() -> None:
@@ -1068,7 +1070,8 @@ def live_worker() -> None:
                 _print_scan_summary(result, trade_store)
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
-                    sender.send_message(result.get("mode_message", ""))
+                    # ✅ FIX: _send_text بدل send_message لدعم HTML tags
+                    _send_text(sender, result.get("mode_message", ""))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
