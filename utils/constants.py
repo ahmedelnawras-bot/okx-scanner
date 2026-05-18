@@ -1,4 +1,8 @@
-"""Shared constants for the OKX Long Bot clean rebuild v116."""
+"""Shared constants for the OKX Long Bot clean rebuild v116.
+
+Phase 2 fix:
+- MAX_EXECUTION_POSITIONS: 30 → 7 (الحد الرسمي للمشروع)
+"""
 
 MODE_NORMAL_LONG = "NORMAL_LONG"
 MODE_STRONG_LONG_ONLY = "STRONG_LONG_ONLY"
@@ -33,7 +37,10 @@ DEFAULT_LEVERAGE = 15
 RECOVERY_WINDOW_MINUTES = 90
 MAX_RECOVERY_TRADES_PER_CYCLE = 3
 MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE = 3
-MAX_EXECUTION_POSITIONS = 30
+
+# ✅ FIX: 30 → 7 (الحد الرسمي = 7 صفقات مفتوحة يومياً كحد أقصى)
+MAX_EXECUTION_POSITIONS = 7
+
 LEVERAGE_NOTE_AR = "⚡ جميع نسب الأداء محسوبة على رافعة 15x"
 
 
@@ -57,7 +64,6 @@ MODE_EXECUTION_HEADER_MAP = {
     MODE_BLOCK_LONGS: "🚀🔴 BLOCK EXCEPTION EXECUTION",
     MODE_RECOVERY_LONG: "🚀🔵 RECOVERY EXECUTION",
 }
-
 
 MODE_NORMAL_SIGNAL_HEADER_MAP = {
     MODE_NORMAL_LONG: "📈🟢 LONG SIGNAL",
