@@ -514,9 +514,11 @@ def decide_execution_candidate(
     path = "candidate_only"
     reason = "not_whitelisted"
 
+    # ✅ FIX: استخدام _execution_score بدل signal.score (display)
+    # pending_pullback لازم يتحكم فيه الـ boost_score الحقيقي
     pending_pullback = (
         signal.entry_timing == "pullback"
-        and signal.score < 7.3
+        and _execution_score(signal) < 7.3
     )
 
     if late_risky:
@@ -548,7 +550,8 @@ def decide_execution_candidate(
         if normal_extra_allowed and not strict_allowed:
             reason = "normal_extra_whitelist_pass"
 
-        if near_resistance_warning and signal.score < 7.2:
+        # ✅ FIX: استخدام _execution_score بدل signal.score في near_resistance check
+        if near_resistance_warning and _execution_score(signal) < 7.2:
             pending_pullback = True
             reason = "pullback_first_instead_of_reject"
 
@@ -561,7 +564,8 @@ def decide_execution_candidate(
     ):
         allowed, path, reason = True, "elite_or_whitelist", "strong_execution_pass"
 
-        if near_resistance_warning and signal.score < 7.8:
+        # ✅ FIX: استخدام _execution_score بدل signal.score في strong near_resistance
+        if near_resistance_warning and _execution_score(signal) < 7.8:
             pending_pullback = True
             reason = "strong_pullback_first"
 
