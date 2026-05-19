@@ -158,19 +158,33 @@ def build_trade_track_message(trade) -> str:
     runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
     symbol = getattr(trade, "symbol", "-")
 
+    # ✅ FIX: إضافة entry price وcurrent price change بشكل واضح
+    entry_price = float(getattr(trade, "entry", 0.0) or 0.0)
+    current_price = float(getattr(trade, "current_price", 0.0) or entry_price)
+    closed_at = getattr(trade, "closed_at", None)
+    is_closed = getattr(trade, "is_closed", False)
+
+    # حساب التغيير من الـ entry للـ current
+    price_change_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+    price_change_icon = "🟢" if price_change_pct >= 0 else "🔴"
+    price_change_str = f"{price_change_pct:+.2f}%"
+
     lines = [
         f"📊 Track — {symbol}",
         "━━━━━━━━━━━━",
-        f"🟢 Status: {title_status}",
+        f"{'🔴 CLOSED' if is_closed else '🟢'} Status: {title_status}",
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {mode}",
         f"⏱ TF: 15m | ⭐ Score: {float(getattr(trade, 'score', 0.0) or 0.0):.2f}",
         "",
         "📍 Position",
-        f"• Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
-        f"• Effective Entry: {_fmt_price(getattr(trade, 'entry', 0.0))}",
-        f"• Current: {_fmt_price(getattr(trade, 'current_price', 0.0) or getattr(trade, 'entry', 0.0))}",
+        f"• Entry Price: {_fmt_price(entry_price)}",
+        f"• Current Price: {_fmt_price(current_price)} {price_change_icon} {price_change_str}",
         f"• Entry Type: {getattr(trade, 'entry_type', 'Market') if hasattr(trade, 'entry_type') else 'Market'}",
+        *(
+            [f"• Closed At: {closed_at.strftime('%H:%M %d/%m') if hasattr(closed_at, 'strftime') else str(closed_at)}"]
+            if is_closed and closed_at else []
+        ),
         "",
         f"💰 Current Result — {_profit_state(total_usd, protected)}",
         f"• Locked Profit: {locked_usd:+.2f}$",
@@ -249,6 +263,10 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
     entry_label = "Market" if signal.entry_timing == "market" else "Pullback"
     path = _execution_path(signal, execution_result)
     tp1_pct, tp2_pct, runner_pct = (50, 25, 25) if path == "recovery" else (40, 40, 20)
+
+    # ✅ FIX: إضافة entry price بشكل واضح
+    entry_price = float(signal.entry or 0.0)
+
     return "\n".join([
         f"📊 Track — {signal.symbol}",
         "━━━━━━━━━━━━",
@@ -258,9 +276,8 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
         f"⏱ TF: 15m | ⭐ Score: {signal.score:.2f}",
         "",
         "📍 Position",
-        f"• Entry: {_fmt_price(signal.entry)}",
-        f"• Effective Entry: {_fmt_price(signal.entry)}",
-        f"• Current: {_fmt_price(signal.entry)}",
+        f"• Entry Price: {_fmt_price(entry_price)}",
+        f"• Current Price: {_fmt_price(entry_price)} (just opened)",
         f"• Entry Type: {entry_label}",
         "",
         f"💰 Current Result — ⚪ تعادل",
@@ -321,7 +338,9 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"💎 {signal.symbol}",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
-            f"📍 {entry_label}: {_fmt_price(signal.entry)}",
+            # ✅ FIX: entry price واضح في الـ execution signal
+            f"📍 {entry_label}",
+            f"• Price: {_fmt_price(signal.entry)}",
             f"🎯 TP1: {_fmt_price(signal.tp1)}",
             f"🏁 TP2: {_fmt_price(signal.tp2)}",
             "🏃 Runner: 20% after TP2",
@@ -368,7 +387,9 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"💎 {signal.symbol}",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
-        f"📍 {entry_label}: {_fmt_price(signal.entry)}",
+        # ✅ FIX: entry price واضح في الـ normal signal
+        f"📍 {entry_label}",
+        f"• Price: {_fmt_price(signal.entry)}",
         f"🎯 TP1: {_fmt_price(signal.tp1)}",
         f"🏁 TP2: {_fmt_price(signal.tp2)}",
         "🏃 Runner: 20% after TP2",
