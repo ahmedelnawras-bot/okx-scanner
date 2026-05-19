@@ -6,10 +6,16 @@ v128c execution score architecture alignment:
 - Weak Drift and Recovery quality now evaluate true execution strength
 - Telegram/UI behavior unchanged
 """
+
 from __future__ import annotations
 
 from analysis.models import SignalCandidate
-from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG, MODE_BLOCK_LONGS
+from utils.constants import (
+    MODE_NORMAL_LONG,
+    MODE_STRONG_LONG_ONLY,
+    MODE_RECOVERY_LONG,
+    MODE_BLOCK_LONGS,
+)
 
 STRICT_WHITELIST = {
     "vwap_reclaim",
@@ -44,34 +50,72 @@ SETUP_WEIGHTS = {
 }
 
 
+# =========================================================
+# Safe normalization
+# =========================================================
+
 def _normalize_execution_tag(value) -> str:
     try:
-        tag = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+        tag = (
+            str(value or "")
+            .strip()
+            .lower()
+            .replace(" ", "_")
+            .replace("-", "_")
+        )
+
         while "__" in tag:
             tag = tag.replace("__", "_")
+
         return tag.strip("_|")
+
     except Exception:
         return ""
 
 
+# =========================================================
+# Stable deduplicated tags
+# =========================================================
+
 def _signal_tags(signal: SignalCandidate) -> set[str]:
-    tags = {_normalize_execution_tag(t) for t in (signal.execution_setup_tags or [])}
-    tags.add(_normalize_execution_tag(signal.setup_type))
+    """
+    Stable deduplicated execution tags.
+    """
 
-    for t in (signal.meta or {}).get("pair_tags", []) or []:
-        tags.add(_normalize_execution_tag(t))
+    collected: list[str] = []
 
-    return {t for t in tags if t}
+    for tag in (signal.execution_setup_tags or []):
+        norm = _normalize_execution_tag(tag)
+
+        if norm:
+            collected.append(norm)
+
+    setup_type = _normalize_execution_tag(signal.setup_type)
+
+    if setup_type:
+        collected.append(setup_type)
+
+    for tag in (signal.meta or {}).get("pair_tags", []) or []:
+        norm = _normalize_execution_tag(tag)
+
+        if norm:
+            collected.append(norm)
+
+    unique_tags = list(dict.fromkeys(collected))
+
+    return set(unique_tags)
 
 
 def _execution_score(signal: SignalCandidate) -> float:
-    """REAL execution score.
+    """
+    REAL execution score.
 
     Priority:
-    1) boost_score       -> execution scale
-    2) effective_score   -> analytics fallback
-    3) signal.score      -> UI/display fallback
+    1) boost_score
+    2) effective_score
+    3) signal.score
     """
+
     meta = signal.meta or {}
 
     return float(
@@ -83,7 +127,15 @@ def _execution_score(signal: SignalCandidate) -> float:
 
 
 def has_complete_execution_plan(signal: SignalCandidate) -> bool:
-    return all(v and v > 0 for v in (signal.entry, signal.sl, signal.tp1, signal.tp2))
+    return all(
+        v and v > 0
+        for v in (
+            signal.entry,
+            signal.sl,
+            signal.tp1,
+            signal.tp2,
+        )
+    )
 
 
 def _is_late_risky_execution_context(signal: SignalCandidate) -> bool:
@@ -110,6 +162,7 @@ def _is_late_risky_execution_context(signal: SignalCandidate) -> bool:
 
 def _has_normal_long_execution_setup(signal: SignalCandidate) -> bool:
     """NORMAL_LONG-only extension copied conceptually from the old code."""
+
     tags = _signal_tags(signal)
 
     if tags & NORMAL_LONG_EXTRA_WHITELIST:
@@ -118,6 +171,7 @@ def _has_normal_long_execution_setup(signal: SignalCandidate) -> bool:
     try:
         if int((signal.meta or {}).get("wave_estimate") or 0) == 3:
             return True
+
     except Exception:
         pass
 
@@ -127,10 +181,17 @@ def _has_normal_long_execution_setup(signal: SignalCandidate) -> bool:
 def _setup_weight(signal: SignalCandidate) -> int:
     tags = _signal_tags(signal)
 
-    weight = max((SETUP_WEIGHTS.get(t, 0) for t in tags), default=0)
+    weight = max(
+        (SETUP_WEIGHTS.get(t, 0) for t in tags),
+        default=0,
+    )
 
     try:
-        weight = max(weight, int((signal.meta or {}).get("setup_weight") or 0))
+        weight = max(
+            weight,
+            int((signal.meta or {}).get("setup_weight") or 0),
+        )
+
     except Exception:
         pass
 
@@ -140,31 +201,40 @@ def _setup_weight(signal: SignalCandidate) -> int:
 def get_weak_trend_drift_status(signal: SignalCandidate) -> dict:
     """Execution-only weak drift detector."""
 
-    result = {"active": False, "reason": "", "details": {}}
+    result = {
+        "active": False,
+        "reason": "",
+        "details": {},
+    }
 
     try:
         meta = signal.meta or {}
+
         mode = signal.market_mode or MODE_NORMAL_LONG
 
         if mode == MODE_BLOCK_LONGS:
             return result
 
-        # ✅ FIXED: real execution scale
         score = _execution_score(signal)
 
         vol_ratio = float(meta.get("vol_ratio") or 1.0)
+
         mtf_confirmed = bool(meta.get("mtf_confirmed"))
+
         dist_ma = float(meta.get("dist_ma") or 0.0)
 
         breakout = bool(meta.get("breakout"))
+
         pre_breakout = bool(meta.get("pre_breakout"))
 
         resistance_warning = bool(
             meta.get("resistance_warning")
-            or meta.get("rejection_context") == "near_resistance_warning"
+            or meta.get("rejection_context")
+            == "near_resistance_warning"
         )
 
         tags = _signal_tags(signal)
+
         setup_weight = _setup_weight(signal)
 
         entry_text = "|".join([
@@ -186,11 +256,20 @@ def get_weak_trend_drift_status(signal: SignalCandidate) -> dict:
             )
         )
 
-        market_state = str(meta.get("market_state") or "").lower()
-        market_state_label = str(meta.get("market_state_label") or "").lower()
-        market_bias_label = str(meta.get("market_bias_label") or "").lower()
+        market_state = str(
+            meta.get("market_state") or ""
+        ).lower()
+
+        market_state_label = str(
+            meta.get("market_state_label") or ""
+        ).lower()
+
+        market_bias_label = str(
+            meta.get("market_bias_label") or ""
+        ).lower()
 
         btc_mode = str(meta.get("btc_mode") or "")
+
         alt_mode = str(meta.get("alt_mode") or "")
 
         weak_market_context = (
@@ -204,7 +283,10 @@ def get_weak_trend_drift_status(signal: SignalCandidate) -> dict:
             or alt_mode in ("🔴 ضعيف",)
         )
 
-        low_momentum = (not mtf_confirmed and vol_ratio < 1.05)
+        low_momentum = (
+            not mtf_confirmed
+            and vol_ratio < 1.05
+        )
 
         drifting_range = (
             weak_market_context
@@ -268,12 +350,19 @@ def get_weak_trend_drift_status(signal: SignalCandidate) -> dict:
 
         return result
 
-    except Exception:
-        return result
+    except Exception as exc:
+        return {
+            "active": False,
+            "reason": "weak_drift_exception",
+            "details": {
+                "error": str(exc),
+            },
+        }
 
 
-def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> bool:
-    """Smart Weak Drift gate for execution only."""
+def _candidate_passes_weak_drift_execution_quality(
+    signal: SignalCandidate,
+) -> bool:
 
     drift = get_weak_trend_drift_status(signal)
 
@@ -281,19 +370,23 @@ def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> b
         return True
 
     meta = signal.meta or {}
+
     mode = signal.market_mode or MODE_NORMAL_LONG
 
-    # ✅ FIXED: real execution scale
     score = _execution_score(signal)
 
     vol_ratio = float(meta.get("vol_ratio") or 1.0)
+
     mtf_confirmed = bool(meta.get("mtf_confirmed"))
 
-    breakout_quality = str(meta.get("breakout_quality") or "").strip().lower()
+    breakout_quality = str(
+        meta.get("breakout_quality") or ""
+    ).strip().lower()
 
     resistance_warning = bool(
         meta.get("resistance_warning")
-        or meta.get("rejection_context") == "near_resistance_warning"
+        or meta.get("rejection_context")
+        == "near_resistance_warning"
     )
 
     setup_weight = _setup_weight(signal)
@@ -340,28 +433,68 @@ def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> b
         return False
 
     if mode == MODE_NORMAL_LONG:
-        if setup_weight >= 3 and score >= 6.5 and mtf_confirmed and vol_ratio >= 1.05:
+
+        if (
+            setup_weight >= 3
+            and score >= 6.5
+            and mtf_confirmed
+            and vol_ratio >= 1.05
+        ):
             return True
 
-        if setup_weight >= 2 and score >= 7.2 and mtf_confirmed and vol_ratio >= 1.10:
+        if (
+            setup_weight >= 2
+            and score >= 7.2
+            and mtf_confirmed
+            and vol_ratio >= 1.10
+        ):
             return True
 
-        if setup_weight >= 2 and score >= 7.8 and vol_ratio >= 1.25:
+        if (
+            setup_weight >= 2
+            and score >= 7.8
+            and vol_ratio >= 1.25
+        ):
             return True
 
-        if soft_late_warning and setup_weight >= 3 and score >= 6.8 and mtf_confirmed and vol_ratio >= 1.08:
+        if (
+            soft_late_warning
+            and setup_weight >= 3
+            and score >= 6.8
+            and mtf_confirmed
+            and vol_ratio >= 1.08
+        ):
             return True
 
-    if breakout_quality == "strong" and mtf_confirmed and vol_ratio >= 1.10 and score >= 7.2:
+    if (
+        breakout_quality == "strong"
+        and mtf_confirmed
+        and vol_ratio >= 1.10
+        and score >= 7.2
+    ):
         return True
 
-    if setup_weight >= 3 and score >= 7.3 and mtf_confirmed and vol_ratio >= 1.10:
+    if (
+        setup_weight >= 3
+        and score >= 7.3
+        and mtf_confirmed
+        and vol_ratio >= 1.10
+    ):
         return True
 
-    if setup_weight >= 3 and score >= 7.7 and vol_ratio >= 1.25:
+    if (
+        setup_weight >= 3
+        and score >= 7.7
+        and vol_ratio >= 1.25
+    ):
         return True
 
-    if setup_weight >= 2 and score >= 7.5 and mtf_confirmed and vol_ratio >= 1.15:
+    if (
+        setup_weight >= 2
+        and score >= 7.5
+        and mtf_confirmed
+        and vol_ratio >= 1.15
+    ):
         return True
 
     dynamic_score = 0
@@ -371,13 +504,16 @@ def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> b
 
     if vol_ratio >= 1.50:
         dynamic_score += 3
+
     elif vol_ratio >= 1.25:
         dynamic_score += 2
+
     elif vol_ratio >= 1.15:
         dynamic_score += 1
 
     if breakout_quality == "strong":
         dynamic_score += 2
+
     elif breakout_quality in ("ok", "good"):
         dynamic_score += 1
 
@@ -389,16 +525,20 @@ def _candidate_passes_weak_drift_execution_quality(signal: SignalCandidate) -> b
     if resistance_warning:
         dynamic_score -= 1
 
-    return dynamic_score >= 5 and score >= 7.6 and vol_ratio >= 1.15
+    return (
+        dynamic_score >= 5
+        and score >= 7.6
+        and vol_ratio >= 1.15
+    )
 
 
 def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
     """RECOVERY_LONG-only quality gate."""
 
     meta = signal.meta or {}
+
     tags = _signal_tags(signal)
 
-    # ✅ FIXED: real execution scale
     score = _execution_score(signal)
 
     vol_ratio = float(meta.get("vol_ratio") or 1.0)
@@ -407,11 +547,14 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
 
     setup_weight = _setup_weight(signal)
 
-    breakout_quality = str(meta.get("breakout_quality") or "").lower()
+    breakout_quality = str(
+        meta.get("breakout_quality") or ""
+    ).lower()
 
     resistance_warning = bool(
         meta.get("resistance_warning")
-        or meta.get("rejection_context") == "near_resistance_warning"
+        or meta.get("rejection_context")
+        == "near_resistance_warning"
     )
 
     bounce_fast = bool(
@@ -420,9 +563,22 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
     )
 
     checks = {
-        "rs_vs_btc": "relative_strength_vs_btc" in tags or "rs_btc" in tags,
+        "rs_vs_btc": (
+            "relative_strength_vs_btc" in tags
+            or "rs_btc" in tags
+        ),
+
         "bounce_faster_than_btc": bounce_fast,
-        "reclaim_or_mtf": mtf_confirmed or breakout_quality in {"ok", "good", "strong"},
+
+        "reclaim_or_mtf": (
+            mtf_confirmed
+            or breakout_quality in {
+                "ok",
+                "good",
+                "strong",
+            }
+        ),
+
         "micro_break_or_setup": (
             setup_weight >= 2
             or bool(tags & {
@@ -433,15 +589,23 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
                 "higher_low_continuation",
             })
         ),
+
         "volume_confirmation": vol_ratio >= 1.12,
+
         "score_quality": score >= 6.55,
+
         "rr_not_blocked_by_resistance": (
             not resistance_warning
-            or (score >= 7.2 and vol_ratio >= 1.20)
+            or (
+                score >= 7.2
+                and vol_ratio >= 1.20
+            )
         ),
     }
 
-    points = sum(1 for v in checks.values() if v)
+    points = sum(
+        1 for v in checks.values() if v
+    )
 
     strong_combo = (
         checks["bounce_faster_than_btc"]
@@ -450,8 +614,14 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
     )
 
     passed = bool(
-        (points >= 4 and checks["rr_not_blocked_by_resistance"])
-        or (strong_combo and points >= 3)
+        (
+            points >= 4
+            and checks["rr_not_blocked_by_resistance"]
+        )
+        or (
+            strong_combo
+            and points >= 3
+        )
     )
 
     return passed, {
@@ -473,11 +643,19 @@ def decide_execution_candidate(
 
     tags = _signal_tags(signal)
 
-    strict_allowed = bool(tags & STRICT_WHITELIST)
+    strict_allowed = bool(
+        tags & STRICT_WHITELIST
+    )
 
-    normal_extra_allowed = _has_normal_long_execution_setup(signal)
+    normal_extra_allowed = (
+        _has_normal_long_execution_setup(signal)
+    )
 
-    elite_allowed = bool(tags & ELITE_TAGS) or bool(signal.meta.get("is_elite_setup"))
+    elite_allowed = bool(
+        tags & ELITE_TAGS
+    ) or bool(
+        signal.meta.get("is_elite_setup")
+    )
 
     recovery_allowed = (
         signal.market_mode == MODE_RECOVERY_LONG
@@ -489,14 +667,21 @@ def decide_execution_candidate(
         and "block_exception" in tags
     )
 
-    complete_plan = has_complete_execution_plan(signal)
+    complete_plan = has_complete_execution_plan(
+        signal
+    )
 
     near_resistance_warning = bool(
-        signal.meta.get("rejection_context") == "near_resistance_warning"
+        signal.meta.get("rejection_context")
+        == "near_resistance_warning"
         or signal.meta.get("resistance_warning")
     )
 
-    weak_drift_passed = _candidate_passes_weak_drift_execution_quality(signal)
+    weak_drift_passed = (
+        _candidate_passes_weak_drift_execution_quality(
+            signal
+        )
+    )
 
     recovery_quality_passed, recovery_quality = (
         _recovery_quality_gate(signal)
@@ -505,17 +690,20 @@ def decide_execution_candidate(
     )
 
     recovery_soft_passed = bool(
-        recovery_allowed and recovery_quality_passed
+        recovery_allowed
+        and recovery_quality_passed
     )
 
-    late_risky = _is_late_risky_execution_context(signal)
+    late_risky = (
+        _is_late_risky_execution_context(signal)
+    )
 
     allowed = False
+
     path = "candidate_only"
+
     reason = "not_whitelisted"
 
-    # ✅ FIX: استخدام _execution_score بدل signal.score (display)
-    # pending_pullback لازم يتحكم فيه الـ boost_score الحقيقي
     pending_pullback = (
         signal.entry_timing == "pullback"
         and _execution_score(signal) < 7.3
@@ -543,38 +731,76 @@ def decide_execution_candidate(
         signal.market_mode == MODE_NORMAL_LONG
         and complete_plan
         and weak_drift_passed
-        and (strict_allowed or normal_extra_allowed)
+        and (
+            strict_allowed
+            or normal_extra_allowed
+        )
     ):
-        allowed, path, reason = True, "whitelist", "normal_whitelist_pass"
 
-        if normal_extra_allowed and not strict_allowed:
+        allowed = True
+
+        path = "whitelist"
+
+        reason = "normal_whitelist_pass"
+
+        if (
+            normal_extra_allowed
+            and not strict_allowed
+        ):
             reason = "normal_extra_whitelist_pass"
 
-        # ✅ FIX: استخدام _execution_score بدل signal.score في near_resistance check
-        if near_resistance_warning and _execution_score(signal) < 7.2:
+        if (
+            near_resistance_warning
+            and _execution_score(signal) < 7.2
+        ):
             pending_pullback = True
-            reason = "pullback_first_instead_of_reject"
+
+            reason = (
+                "pullback_first_instead_of_reject"
+            )
 
     elif (
-        signal.market_mode == MODE_STRONG_LONG_ONLY
+        signal.market_mode
+        == MODE_STRONG_LONG_ONLY
         and complete_plan
         and weak_drift_passed
-        and (elite_allowed or strict_allowed)
+        and (
+            elite_allowed
+            or strict_allowed
+        )
         and _execution_score(signal) >= 7.5
     ):
-        allowed, path, reason = True, "elite_or_whitelist", "strong_execution_pass"
 
-        # ✅ FIX: استخدام _execution_score بدل signal.score في strong near_resistance
-        if near_resistance_warning and _execution_score(signal) < 7.8:
+        allowed = True
+
+        path = "elite_or_whitelist"
+
+        reason = "strong_execution_pass"
+
+        if (
+            near_resistance_warning
+            and _execution_score(signal) < 7.8
+        ):
             pending_pullback = True
+
             reason = "strong_pullback_first"
 
     elif recovery_allowed and complete_plan:
 
         if not recovery_quality_passed:
-            path, reason = "recovery", "recovery_quality_not_confirmed"
 
-        elif recovery_slots_remaining is not None and recovery_slots_remaining <= 0:
+            path = "recovery"
+
+            reason = (
+                "recovery_quality_not_confirmed"
+            )
+
+        elif (
+            recovery_slots_remaining
+            is not None
+            and recovery_slots_remaining <= 0
+        ):
+
             return {
                 "allowed": False,
                 "path": "recovery",
@@ -592,13 +818,26 @@ def decide_execution_candidate(
             }
 
         else:
-            allowed, path, reason = True, "recovery", "recovery_execution_pass"
+
+            allowed = True
+
+            path = "recovery"
+
+            reason = "recovery_execution_pass"
 
     elif block_exception and complete_plan:
-        allowed, path, reason = True, "block_exception", "block_exception_pass"
+
+        allowed = True
+
+        path = "block_exception"
+
+        reason = "block_exception_pass"
 
     elif not weak_drift_passed:
-        path, reason = "blocked", "weak_drift_execution_block"
+
+        path = "blocked"
+
+        reason = "weak_drift_execution_block"
 
     return {
         "allowed": allowed,
