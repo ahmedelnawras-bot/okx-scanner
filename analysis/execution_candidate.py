@@ -17,6 +17,15 @@ from utils.constants import (
     MODE_BLOCK_LONGS,
 )
 
+
+# =========================================================
+# Nour Precision Filters Flags
+# =========================================================
+
+ENABLE_NOUR_FILTER_NORMAL_V1 = True
+ENABLE_NOUR_FILTER_STRONG_V1 = True
+ENABLE_NOUR_FILTER_BLOCK_V1 = True
+
 STRICT_WHITELIST = {
     "vwap_reclaim",
     "retest_breakout_confirmed",
@@ -196,6 +205,213 @@ def _setup_weight(signal: SignalCandidate) -> int:
         pass
 
     return weight
+
+
+
+# =========================================================
+# Nour Precision Filters
+# =========================================================
+
+def nour_execution_filter_normal_v1(
+    signal: SignalCandidate,
+) -> dict:
+
+    try:
+
+        meta = signal.meta or {}
+
+        score = _execution_score(signal)
+
+        vol_ratio = float(
+            meta.get("vol_ratio") or 1.0
+        )
+
+        mtf_confirmed = bool(
+            meta.get("mtf_confirmed")
+        )
+
+        dist_ma = float(
+            meta.get("dist_ma") or 0.0
+        )
+
+        resistance_warning = bool(
+            meta.get("resistance_warning")
+        )
+
+        if score < 7.0:
+            return {
+                "passed": False,
+                "reason": "nour_normal_low_score",
+            }
+
+        if vol_ratio < 1.08:
+            return {
+                "passed": False,
+                "reason": "nour_normal_weak_volume",
+            }
+
+        if not mtf_confirmed:
+            return {
+                "passed": False,
+                "reason": "nour_normal_no_mtf_confirmation",
+            }
+
+        if dist_ma > 4.5:
+            return {
+                "passed": False,
+                "reason": "nour_normal_overextended",
+            }
+
+        if (
+            resistance_warning
+            and score < 7.4
+        ):
+            return {
+                "passed": False,
+                "reason": "nour_normal_resistance_risk",
+            }
+
+        return {
+            "passed": True,
+            "reason": "ok",
+        }
+
+    except Exception as exc:
+
+        return {
+            "passed": False,
+            "reason": (
+                "nour_execution_filter_normal_v1_exception"
+            ),
+            "details": {
+                "error": str(exc),
+            },
+        }
+
+
+def nour_execution_filter_strong_v1(
+    signal: SignalCandidate,
+) -> dict:
+
+    try:
+
+        meta = signal.meta or {}
+
+        score = _execution_score(signal)
+
+        vol_ratio = float(
+            meta.get("vol_ratio") or 1.0
+        )
+
+        mtf_confirmed = bool(
+            meta.get("mtf_confirmed")
+        )
+
+        breakout_quality = str(
+            meta.get("breakout_quality") or ""
+        ).lower()
+
+        if score < 7.7:
+            return {
+                "passed": False,
+                "reason": "nour_strong_low_score",
+            }
+
+        if vol_ratio < 1.15:
+            return {
+                "passed": False,
+                "reason": "nour_strong_weak_volume",
+            }
+
+        if not mtf_confirmed:
+            return {
+                "passed": False,
+                "reason": (
+                    "nour_strong_no_mtf_confirmation"
+                ),
+            }
+
+        if breakout_quality not in {
+            "good",
+            "strong",
+        }:
+            return {
+                "passed": False,
+                "reason": (
+                    "nour_strong_breakout_quality_weak"
+                ),
+            }
+
+        return {
+            "passed": True,
+            "reason": "ok",
+        }
+
+    except Exception as exc:
+
+        return {
+            "passed": False,
+            "reason": (
+                "nour_execution_filter_strong_v1_exception"
+            ),
+            "details": {
+                "error": str(exc),
+            },
+        }
+
+
+def nour_execution_filter_block_v1(
+    signal: SignalCandidate,
+) -> dict:
+
+    try:
+
+        meta = signal.meta or {}
+
+        score = _execution_score(signal)
+
+        vol_ratio = float(
+            meta.get("vol_ratio") or 1.0
+        )
+
+        bounce_strength = float(
+            meta.get("bounce_ratio_vs_btc") or 0.0
+        )
+
+        if score < 8.0:
+            return {
+                "passed": False,
+                "reason": "nour_block_low_score",
+            }
+
+        if vol_ratio < 1.25:
+            return {
+                "passed": False,
+                "reason": "nour_block_weak_volume",
+            }
+
+        if bounce_strength < 1.15:
+            return {
+                "passed": False,
+                "reason": "nour_block_weak_bounce",
+            }
+
+        return {
+            "passed": True,
+            "reason": "ok",
+        }
+
+    except Exception as exc:
+
+        return {
+            "passed": False,
+            "reason": (
+                "nour_execution_filter_block_v1_exception"
+            ),
+            "details": {
+                "error": str(exc),
+            },
+        }
 
 
 def get_weak_trend_drift_status(signal: SignalCandidate) -> dict:
@@ -704,6 +920,10 @@ def decide_execution_candidate(
 
     reason = "not_whitelisted"
 
+    nour_filter_name = None
+    nour_filter_passed = None
+    nour_filter_reason = None
+
     pending_pullback = (
         signal.entry_timing == "pullback"
         and _execution_score(signal) < 7.3
@@ -759,6 +979,35 @@ def decide_execution_candidate(
                 "pullback_first_instead_of_reject"
             )
 
+
+        if ENABLE_NOUR_FILTER_NORMAL_V1:
+
+            nour_result = (
+                nour_execution_filter_normal_v1(
+                    signal
+                )
+            )
+
+            nour_filter_name = (
+                "nour_execution_filter_normal_v1"
+            )
+
+            nour_filter_passed = bool(
+                nour_result.get("passed")
+            )
+
+            nour_filter_reason = (
+                nour_result.get("reason")
+            )
+
+            if not nour_filter_passed:
+
+                allowed = False
+
+                path = "precision_filter"
+
+                reason = nour_filter_reason
+
     elif (
         signal.market_mode
         == MODE_STRONG_LONG_ONLY
@@ -784,6 +1033,35 @@ def decide_execution_candidate(
             pending_pullback = True
 
             reason = "strong_pullback_first"
+
+
+        if ENABLE_NOUR_FILTER_STRONG_V1:
+
+            nour_result = (
+                nour_execution_filter_strong_v1(
+                    signal
+                )
+            )
+
+            nour_filter_name = (
+                "nour_execution_filter_strong_v1"
+            )
+
+            nour_filter_passed = bool(
+                nour_result.get("passed")
+            )
+
+            nour_filter_reason = (
+                nour_result.get("reason")
+            )
+
+            if not nour_filter_passed:
+
+                allowed = False
+
+                path = "precision_filter"
+
+                reason = nour_filter_reason
 
     elif recovery_allowed and complete_plan:
 
@@ -833,6 +1111,35 @@ def decide_execution_candidate(
 
         reason = "block_exception_pass"
 
+
+        if ENABLE_NOUR_FILTER_BLOCK_V1:
+
+            nour_result = (
+                nour_execution_filter_block_v1(
+                    signal
+                )
+            )
+
+            nour_filter_name = (
+                "nour_execution_filter_block_v1"
+            )
+
+            nour_filter_passed = bool(
+                nour_result.get("passed")
+            )
+
+            nour_filter_reason = (
+                nour_result.get("reason")
+            )
+
+            if not nour_filter_passed:
+
+                allowed = False
+
+                path = "precision_filter"
+
+                reason = nour_filter_reason
+
     elif not weak_drift_passed:
 
         path = "blocked"
@@ -854,4 +1161,7 @@ def decide_execution_candidate(
         "weak_drift": get_weak_trend_drift_status(signal),
         "recovery_quality_passed": recovery_quality_passed,
         "recovery_quality": recovery_quality,
+        "nour_filter_name": nour_filter_name,
+        "nour_filter_passed": nour_filter_passed,
+        "nour_filter_reason": nour_filter_reason,
     }
