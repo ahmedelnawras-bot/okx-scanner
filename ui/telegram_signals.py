@@ -78,7 +78,10 @@ def _execution_path(signal: SignalCandidate, execution_result: dict | None) -> s
 
 
 def _tradingview_symbol(symbol: str) -> str:
-    """Convert OKX instrument id to a TradingView-friendly symbol."""
+    """Convert OKX instrument id to a TradingView-friendly symbol.
+
+    OKX Perpetual Futures format: OKX:BTCUSDT.P
+    """
     raw = str(symbol or "").upper()
     if raw.endswith("-USDT-SWAP"):
         base = raw.replace("-USDT-SWAP", "USDT")
@@ -88,11 +91,28 @@ def _tradingview_symbol(symbol: str) -> str:
 
 
 def build_tradingview_url(symbol: str) -> str:
+    """بيبني الـ URL الكامل — نفس الـ URL المستخدم في الـ button."""
     return f"https://www.tradingview.com/chart/?symbol={_tradingview_symbol(symbol)}"
 
 
 def build_tradingview_html_link(symbol: str) -> str:
-    return f'<a href="{build_tradingview_url(symbol)}">Open TradingView</a>'
+    """HTML clickable link — يُستخدم في الـ track messages مع parse_mode=HTML.
+
+    ✅ نفس format الـ button بالظبط — clickable وبيفتح TradingView.
+    """
+    tv_symbol = _tradingview_symbol(symbol)
+    url = f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+    return f'<a href="{url}">🔗 TradingView — {tv_symbol}</a>'
+
+
+def build_tradingview_plain_link(symbol: str) -> str:
+    """Plain text link للـ reports اللي مش HTML — يظهر كـ URL قابل للنقر في Telegram.
+
+    ✅ Telegram بيعمل auto-link للـ URLs تلقائياً.
+    """
+    tv_symbol = _tradingview_symbol(symbol)
+    url = f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+    return f"🔗 TradingView ({tv_symbol})\n{url}"
 
 
 def build_signal_buttons(signal: SignalCandidate) -> dict:
