@@ -106,7 +106,9 @@ def evaluate_trade_outcome(
         # Stage 1: after TP1, remaining position is protected at entry.
         if hit_tp1 and not hit_tp2:
             breakeven_stop = entry
-            # Check BE before TP2 conservatively inside the same candle.
+            # ✅ FIX Replay Realism: conservative ordering —
+            # لو نفس الكانيلة عندها low تحت BE وhigh فوق TP2،
+            # بنفترض الـ BE stop اتضرب الأول (worst case)
             if low > 0 and low <= breakeven_stop:
                 time_to_sl_min = time_to_sl_min or idx * 15
                 final_label = "breakeven_after_tp1"
