@@ -8,6 +8,7 @@ v130 restores the old core idea for Market Mode:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from analysis.market_modes import MarketSnapshot
@@ -218,13 +219,30 @@ def build_market_guard_snapshot(
     sample = select_market_guard_sample(ranked_pairs, limit=sample_size)
     changes: list[GuardChange] = []
 
-    for pair in sample:
+    def _fetch_pair_change(pair):
         symbol = _symbol_of(pair)
         candles = fetch_okx_candles(base_url, symbol, bar=timeframe, limit=3, timeout=timeout)
         change = get_last_closed_candle_change_pct(candles)
         if change is None:
-            continue
-        changes.append(GuardChange(symbol=symbol, change_pct=change, turnover_usdt=_turnover_of(pair)))
+            return None
+        return GuardChange(
+            symbol=symbol,
+            change_pct=change,
+            turnover_usdt=_turnover_of(pair),
+        )
+
+    max_workers = min(12, max(4, len(sample)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_pair_change, pair) for pair in sample]
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    changes.append(result)
+            except Exception:
+                continue
 
     if len(changes) < max(1, int(min_valid)):
         snap = _fallback_from_pair_change(ranked_pairs)
