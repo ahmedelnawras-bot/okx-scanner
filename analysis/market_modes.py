@@ -61,6 +61,11 @@ BLOCK_BTC_CHANGE = -0.70
 BLOCK_BTC_RED_RATIO = 0.55
 ALT_WEAK_RED_RATIO = 0.60
 
+# Fast emergency BLOCK path.
+FAST_BLOCK_BTC_15M = -1.10
+FAST_BLOCK_RED_RATIO = 0.80
+FAST_BLOCK_AVG = -1.80
+
 NO_LONGER_CRASHING_RED_RATIO = 0.62
 NO_LONGER_CRASHING_AVG = -0.75
 NO_LONGER_CRASHING_BTC = -0.45
@@ -183,6 +188,19 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     btc_breakdown = btc <= BLOCK_BTC_CHANGE and red_ratio >= BLOCK_BTC_RED_RATIO
     alt_weak_pressure = red_ratio >= ALT_WEAK_RED_RATIO and avg <= -0.85 and btc <= -0.45
 
+    # Fast emergency panic path.
+    fast_block_trigger = bool(
+        (
+            btc <= FAST_BLOCK_BTC_15M
+            and red_ratio >= FAST_BLOCK_RED_RATIO
+        )
+        or
+        (
+            avg <= FAST_BLOCK_AVG
+            and red_ratio >= 0.85
+        )
+    )
+
     no_longer_crashing = _is_no_longer_crashing(snapshot)
     recovery_ready = _is_recovery_ready(snapshot)
     normal_ready = _is_normal_ready(snapshot)
@@ -205,6 +223,7 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         "broad_market_crash": broad_market_crash,
         "btc_breakdown": btc_breakdown,
         "alt_weak_pressure": alt_weak_pressure,
+        "fast_block_trigger": fast_block_trigger,
         "weak_breadth": weak_breadth,
         "stabilizing": stabilizing,
         "no_longer_crashing": no_longer_crashing,
@@ -237,10 +256,17 @@ def _recovery_soft_fail(snapshot: MarketSnapshot) -> bool:
 
 def _base_mode(snapshot: MarketSnapshot) -> str:
     flags = _risk_flags(snapshot)
+
+    # Fast emergency BLOCK path.
+    if flags["fast_block_trigger"]:
+        return MODE_BLOCK_LONGS
+
     if flags["real_block"]:
         return MODE_BLOCK_LONGS
+
     if flags["weak_breadth"]:
         return MODE_STRONG_LONG_ONLY
+
     return MODE_NORMAL_LONG
 
 def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | None = None, now: datetime | None = None) -> MarketModeState:
