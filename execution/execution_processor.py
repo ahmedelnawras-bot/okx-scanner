@@ -83,6 +83,10 @@ def process_trade_candidate(
             "reason": gate["reason"],
             "path": gate["path"],
             "gate": gate,
+
+            "nour_filter_name": gate.get("nour_filter_name"),
+            "nour_filter_passed": gate.get("nour_filter_passed"),
+            "nour_filter_reason": gate.get("nour_filter_reason"),
         }
 
     # ─────────────────────────────────────────────────────────────
@@ -141,6 +145,10 @@ def process_trade_candidate(
             "slots": risk["slots"],
             "gate": gate,
 
+            "nour_filter_name": gate.get("nour_filter_name"),
+            "nour_filter_passed": gate.get("nour_filter_passed"),
+            "nour_filter_reason": gate.get("nour_filter_reason"),
+
             # debug visibility
             "execution_score": round(execution_score, 2),
             "display_score": round(float(signal.score), 2),
@@ -160,6 +168,10 @@ def process_trade_candidate(
         "order": build_preview_order(signal),
         "slots": risk["slots"],
         "gate": gate,
+
+        "nour_filter_name": gate.get("nour_filter_name"),
+        "nour_filter_passed": gate.get("nour_filter_passed"),
+        "nour_filter_reason": gate.get("nour_filter_reason"),
 
         # debug visibility
         "execution_score": round(execution_score, 2),
