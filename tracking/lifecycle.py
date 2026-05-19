@@ -89,8 +89,7 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
 
     if not trade.tp1_hit and current_price >= trade.tp1:
         trade.tp1_hit = True
-        # Keep the old protection behavior after TP1; slot exemption still waits for TP2.
-        trade.sl_moved_to_entry = True
+        # Slot exemption and protection escalation still wait for TP2.
         trade.closed_portion_pct = tp1_close_pct
         trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
         trade.status = "tp1_partial"
