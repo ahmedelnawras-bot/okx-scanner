@@ -13,6 +13,7 @@ Phase 1 fixes applied:
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 import requests
@@ -87,26 +88,25 @@ def _snapshot_redis_client(trade_store=None):
     return None
 
 
-_GATE_SIM_RUNNING = False
+# ✅ FIX Phase 3: threading.Lock بدل bool flag — thread-safe
+_GATE_SIM_LOCK = threading.Lock()
 
 
 def _send_gate_sim_artifact(sender: TelegramSender, gate: str, settings: Settings, trade_store: RedisTradeStore | None = None) -> None:
-    global _GATE_SIM_RUNNING
-    if _GATE_SIM_RUNNING:
+    # ✅ FIX: acquire مش بيبلوك — لو مش free بيرجع False فوراً
+    if not _GATE_SIM_LOCK.acquire(blocking=False):
         _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
         return
-    _GATE_SIM_RUNNING = True
     try:
         _send_text(sender, f"⏳ جاري تحليل /gate_sim_{gate} على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
         artifact = build_gate_sim_artifact(gate, settings, redis_client=_snapshot_redis_client(trade_store))
         _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
         if artifact.get("ok") and artifact.get("path"):
-            # ✅ FIX 1a: doc_result بدل result — يمنع shadowing على scan result
             doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
             if not doc_result.get("ok"):
                 _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
     finally:
-        _GATE_SIM_RUNNING = False
+        _GATE_SIM_LOCK.release()
 
 
 def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool = False) -> list[dict]:
@@ -831,22 +831,20 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_gate_sim_artifact(sender, "block", settings, trade_store=trade_store)
                 continue
             if command == "/gate_sim_all":
-                global _GATE_SIM_RUNNING
-                if _GATE_SIM_RUNNING:
+                # ✅ FIX Phase 3: Lock بدل global bool — thread-safe
+                if not _GATE_SIM_LOCK.acquire(blocking=False):
                     _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
                     continue
-                _GATE_SIM_RUNNING = True
                 try:
                     _send_text(sender, "⏳ جاري تحليل /gate_sim_all على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
                     artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
                     _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
                     if artifact.get("ok") and artifact.get("path"):
-                        # ✅ FIX 1c: doc_result بدل result — يمنع shadowing على scan result
                         doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
                         if not doc_result.get("ok"):
                             _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
                 finally:
-                    _GATE_SIM_RUNNING = False
+                    _GATE_SIM_LOCK.release()
                 continue
             if command == "/score_calibration":
                 _send_text(sender, "⏳ جاري حساب Score Calibration بين replay و live snapshots...")
