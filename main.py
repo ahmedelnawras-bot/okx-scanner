@@ -34,6 +34,8 @@ from analysis.market_guard import build_market_guard_snapshot
 from analysis.scoring import build_signal_candidate
 from execution.execution_processor import process_trade_candidate
 from execution.okx_trade_client import OKXTradeClient
+from risk.portfolio_state import build_portfolio_state_from_trades
+from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
 from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
 from tracking.persistence import RedisTradeStore
@@ -263,7 +265,12 @@ def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
 
 
 def _is_trade_closed(trade) -> bool:
-    return bool(getattr(trade, "is_closed", False))
+    status = str(getattr(trade, "status", "") or "").lower()
+    return bool(
+        getattr(trade, "is_closed", False)
+        or getattr(trade, "tp2_hit", False)
+        or status in {"tp2", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}
+    )
 
 
 def _is_counted_open_trade(trade) -> bool:
@@ -321,6 +328,18 @@ def run_once(
     state = decide_market_mode(snapshot, previous=initial_mode)
     scan_id = datetime.now(timezone.utc).isoformat()
 
+    initial_protection = block_protection_status(state)
+    initial_price_map = _build_live_price_map(tickers, fallback_pairs=ranked_pairs)
+    if persisted_trades:
+        persisted_trades = update_open_trades(
+            persisted_trades,
+            initial_price_map,
+            protection_level=initial_protection.get("level", 0),
+        )
+
+    portfolio_state = build_portfolio_state_from_trades(persisted_trades)
+    drawdown_status = evaluate_drawdown(portfolio_state)
+
     signal_items = []
     current_execution_results = []
     technical_snapshot_records = []
@@ -352,17 +371,29 @@ def run_once(
         if not signal:
             continue
 
-        exec_result = process_trade_candidate(
-            signal,
-            current_open_positions=slot_counts.get("general", 0),
-            max_open_positions=settings.max_execution_positions,
-            min_execution_score=settings.min_execution_score,
-            recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
-            block_open_positions=slot_counts.get("block_exception", 0),
-            max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
-            recovery_open_positions=slot_counts.get("recovery", 0),
-            max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
-        )
+        if not drawdown_status.allowed:
+            exec_result = {
+                "status": "rejected_risk",
+                "reason": drawdown_status.reason,
+                "path": "",
+                "slot_scope": "drawdown",
+                "drawdown_level": drawdown_status.level,
+                "drawdown_pct": drawdown_status.drawdown_pct,
+                "drawdown_message": drawdown_status.message_ar,
+            }
+        else:
+            exec_result = process_trade_candidate(
+                signal,
+                open_trades=[*persisted_trades, *new_trades],
+                current_open_positions=slot_counts.get("general", 0),
+                max_open_positions=settings.max_execution_positions,
+                min_execution_score=settings.min_execution_score,
+                recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
+                block_open_positions=slot_counts.get("block_exception", 0),
+                max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
+                recovery_open_positions=slot_counts.get("recovery", 0),
+                max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
+            )
 
         if exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}:
             path = str(exec_result.get("path") or "general")
@@ -418,6 +449,10 @@ def run_once(
 
     mode_message = _build_mode_message(state, snapshot, protection)
     mode_context = _build_mode_context(state, snapshot, protection)
+    portfolio_state = build_portfolio_state_from_trades(trades)
+    drawdown_status = evaluate_drawdown(portfolio_state)
+    drawdown_report = build_drawdown_report(portfolio_state)
+
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items)
     command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items)
 
@@ -432,6 +467,9 @@ def run_once(
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
         "technical_snapshot_written": len(technical_snapshot_records),
+        "portfolio_state": portfolio_state,
+        "drawdown_status": drawdown_status,
+        "drawdown_report": drawdown_report,
         "help": build_master_help(
             mode=state.mode,
             execution_enabled=settings.execution_enabled,
@@ -539,7 +577,9 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
     for item in result.get("signal_items", [])[:8]:
         signal = item["signal"]
         exec_result = item["execution"]
-        is_execution = exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}
+        exec_status = str(exec_result.get("status") or "")
+        is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
+        can_place_order = exec_status == "accepted_preview"
         if not settings.send_normal_signals and not is_execution:
             continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
@@ -547,7 +587,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             continue
 
         text = item["message"]
-        if is_execution and settings.execution_enabled and settings.okx_place_orders and okx_client:
+        if can_place_order and settings.execution_enabled and settings.okx_place_orders and okx_client:
             order_result = okx_client.place_market_long(
                 signal.symbol,
                 signal.entry,
@@ -575,6 +615,10 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         rejection_reason = f"{last_rejection.get('status')} | {last_rejection.get('reason', 'unknown')}"
 
     redis_stats = trade_store.health_snapshot() if trade_store else {"enabled": False}
+    drawdown = result.get("drawdown_status")
+    drawdown_line = "n/a"
+    if drawdown is not None:
+        drawdown_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}% | level={int(getattr(drawdown, 'level', 0) or 0)} | {'ALLOWED' if getattr(drawdown, 'allowed', True) else 'HALTED'}"
 
     return "\n".join([
         "🟢 Bot Status",
@@ -587,6 +631,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
+        f"💼 Drawdown: {drawdown_line}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
