@@ -712,18 +712,11 @@ def build_signal_candidate(
         market_mode,
     )
 
-    # Recovery execution path alignment:
-    # execution_candidate.py expects the downstream tag
-    # "recovery_execution" for RECOVERY_LONG routing.
-    # Keep scoring architecture unchanged and only restore the
-    # routing tag so recovery candidates can reach the dedicated
-    # recovery quality gate/slots path.
-    if market_mode == MODE_RECOVERY_LONG:
-        tags = list(
-            dict.fromkeys(
-                [*tags, "recovery_execution"]
-            )
-        )
+    if (
+        market_mode == MODE_RECOVERY_LONG
+        and "recovery_execution" not in tags
+    ):
+        tags.append("recovery_execution")
 
     rejection_reason = ""
 
@@ -744,11 +737,17 @@ def build_signal_candidate(
             "Block exception only"
         )
 
-    threshold = min_normal_score
+    threshold = max(
+        float(min_normal_score),
+        6.95,
+    )
 
     if market_mode == MODE_STRONG_LONG_ONLY:
 
-        threshold = min_strong_score
+        threshold = max(
+            float(min_strong_score),
+            7.45,
+        )
 
         if (
             setup_type
@@ -762,8 +761,9 @@ def build_signal_candidate(
 
     elif market_mode == MODE_RECOVERY_LONG:
 
-        threshold = (
-            min_normal_score + 0.10
+        threshold = max(
+            float(min_normal_score) + 0.10,
+            7.05,
         )
 
     if (
