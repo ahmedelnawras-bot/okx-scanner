@@ -744,10 +744,23 @@ def _format_clean_result(stats: dict, title: str) -> str:
         return "⚠️ Redis غير متاح حاليًا — لم يتم تنفيذ التنظيف."
     lines = [title, "┄┄┄┄┄┄┄┄"]
     if stats.get("mode") == "deep":
-        lines += [
-            f"Deleted keys: {stats.get('deleted_keys', 0)}",
-            "✅ تم بدء baseline جديد للتجربة.",
-        ]
+        deleted = int(stats.get("deleted_keys", 0) or 0)
+        remaining = int(stats.get("remaining_keys", 0) or 0)
+        attempted = int(stats.get("delete_attempted", deleted) or 0)
+        lines.append(f"Delete Attempted: {attempted}")
+        lines.append(f"Deleted keys: {deleted}")
+        if "current_namespace_keys" in stats:
+            lines.append(f"Current namespace keys: {int(stats.get('current_namespace_keys', 0) or 0)}")
+        lines.append(f"Remaining keys: {remaining}")
+        if stats.get("error"):
+            lines.append(f"⚠️ Error: {stats.get('error')}")
+        elif deleted > 0 and remaining == 0:
+            lines.append("✅ تم مسح بيانات Redis الخاصة بالبوت بالكامل.")
+        elif deleted > 0 and remaining > 0:
+            lines.append("⚠️ تم حذف جزء من البيانات لكن ما زالت هناك مفاتيح متبقية.")
+            lines.append("🔁 أعد تشغيل /deep_clean_confirm مرة أخرى أو راجع Redis namespace.")
+        else:
+            lines.append("⚠️ لم يتم العثور على مفاتيح للحذف، لذلك لم يتم تصفير Redis فعليًا.")
     else:
         lines += [
             f"Removed open members: {stats.get('removed_open_members', 0)}",
@@ -756,23 +769,82 @@ def _format_clean_result(stats: dict, title: str) -> str:
             f"Kept checks: {stats.get('kept_execution_checks', 0)}",
             "✅ تم تنظيف البيانات القديمة/المعطوبة فقط.",
         ]
-    if stats.get("error"):
-        lines.append(f"⚠️ Error: {stats.get('error')}")
+        if stats.get("error"):
+            lines.append(f"⚠️ Error: {stats.get('error')}")
     return "\n".join(lines)
 
 
-def _handle_admin_clean_command(command: str, trade_store: RedisTradeStore | None) -> str | None:
+def _reset_runtime_state_after_clean(result: dict, *, keep_mode_state: bool = True) -> None:
+    if not isinstance(result, dict):
+        return
+
+    empty_trades: list = []
+    empty_execution_results: list[dict] = []
+    empty_signal_items: list[dict] = []
+
+    reports = build_report_bundle(
+        empty_trades,
+        empty_execution_results,
+        empty_signal_items,
+    )
+    command_outputs = build_command_outputs(
+        empty_trades,
+        empty_execution_results,
+        empty_signal_items,
+    )
+
+    result["trades"] = empty_trades
+    result["signal_items"] = empty_signal_items
+    result["signals"] = []
+    result["execution_results"] = empty_execution_results
+    result["current_execution_results"] = []
+    result["technical_snapshot_written"] = 0
+    result["command_outputs"] = command_outputs
+    result.update(reports)
+
+    portfolio_state = build_portfolio_state_from_trades(empty_trades)
+    drawdown_status = evaluate_drawdown(portfolio_state)
+    result["portfolio_state"] = portfolio_state
+    result["drawdown_status"] = drawdown_status
+    result["drawdown_report"] = build_drawdown_report(portfolio_state)
+
+    if not keep_mode_state:
+        result["mode"] = MODE_NORMAL_LONG
+
+
+def _handle_admin_clean_command(
+    command: str,
+    trade_store: RedisTradeStore | None,
+    result: dict | None = None,
+) -> str | None:
     if command in {"/soft_clean", "/soft_clean_preview"}:
         stats = trade_store.clean_preview("soft") if trade_store else {"enabled": False}
         return _format_clean_preview(stats, "🧹 Soft Clean Preview", "/soft_clean_confirm")
     if command == "/soft_clean_confirm":
         stats = trade_store.soft_clean() if trade_store else {"enabled": False, "mode": "soft"}
+        if result is not None and stats.get("enabled"):
+            refreshed_trades = trade_store.load_trades() if trade_store else []
+            refreshed_checks = trade_store.load_execution_checks(limit=500) if trade_store else []
+            reports = build_report_bundle(refreshed_trades, refreshed_checks, [])
+            result["trades"] = refreshed_trades
+            result["signal_items"] = []
+            result["signals"] = []
+            result["execution_results"] = refreshed_checks
+            result["current_execution_results"] = []
+            result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [])
+            result.update(reports)
+            portfolio_state = build_portfolio_state_from_trades(refreshed_trades)
+            result["portfolio_state"] = portfolio_state
+            result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+            result["drawdown_report"] = build_drawdown_report(portfolio_state)
         return _format_clean_result(stats, "🧹 Soft Clean Done")
     if command in {"/deep_clean", "/deep_clean_preview"}:
         stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
         return _format_clean_preview(stats, "🧨 Deep Clean Preview", "/deep_clean_confirm")
     if command == "/deep_clean_confirm":
         stats = trade_store.deep_clean() if trade_store else {"enabled": False, "mode": "deep"}
+        if result is not None and stats.get("enabled"):
+            _reset_runtime_state_after_clean(result, keep_mode_state=True)
         return _format_clean_result(stats, "🧨 Deep Clean Done")
     return None
 
@@ -874,7 +946,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
-            clean_reply = _handle_admin_clean_command(command, trade_store)
+            clean_reply = _handle_admin_clean_command(command, trade_store, result)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
                 continue
