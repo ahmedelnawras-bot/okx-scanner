@@ -3,7 +3,7 @@
 Phase 2 — 3 مستويات حماية:
   LEVEL 0: Normal — drawdown < 20%
   LEVEL 1: Warning — drawdown >= 20%
-  LEVEL 2: Soft Stop — drawdown >= 28% (تقليل التنفيذ)
+  LEVEL 2: Soft Stop — drawdown >= 28% (ضغط/تقليل تنفيذ وليس وقف كامل)
   LEVEL 3: Hard Stop — drawdown >= 35% (وقف كامل)
 
 الحساب من START OF DAY PORTFOLIO BALANCE دايماً.
@@ -17,7 +17,6 @@ from config.risk_config import (
     DRAWDOWN_WARNING_PCT,
     DRAWDOWN_SOFT_STOP_PCT,
     DRAWDOWN_HARD_STOP_PCT,
-    MAX_DAILY_DRAWDOWN_PCT,
 )
 from risk.portfolio_state import PortfolioState
 
@@ -35,7 +34,13 @@ class DrawdownStatus:
 
 
 def evaluate_drawdown(portfolio: PortfolioState) -> DrawdownStatus:
-    """بيحدد مستوى الـ drawdown protection."""
+    """بيحدد مستوى الـ drawdown protection.
+
+    مهم:
+    - الإيقاف الكامل للتنفيذ يحصل فقط عند HARD STOP.
+    - WARNING و SOFT STOP يفضلوا مسموحين من ناحية allowed،
+      ويستفاد من level/reason في التشديد داخل execution layer.
+    """
     dd = portfolio.drawdown_pct
     equity = portfolio.current_equity
     sod = portfolio.start_of_day_balance
@@ -59,16 +64,16 @@ def evaluate_drawdown(portfolio: PortfolioState) -> DrawdownStatus:
     if dd >= DRAWDOWN_SOFT_STOP_PCT:
         return DrawdownStatus(
             level=2,
-            allowed=False,
-            reason="soft_stop_drawdown_approaching_limit",
+            allowed=True,
+            reason="soft_stop_drawdown_pressure",
             drawdown_pct=round(dd, 2),
             drawdown_usdt=round(portfolio.drawdown_usdt, 2),
             current_equity=round(equity, 2),
             start_of_day_balance=round(sod, 2),
             message_ar=(
                 f"🟠 Soft Stop — الخسارة اليومية {dd:.1f}% "
-                f"(تحذير عند {DRAWDOWN_SOFT_STOP_PCT}%). "
-                "تم تقليل التنفيذ حماية للمحفظة."
+                f"(التحذير المشدد عند {DRAWDOWN_SOFT_STOP_PCT}%). "
+                "التنفيذ غير موقوف بالكامل، لكن يجب تشديد الفلترة وتقليل المخاطرة."
             ),
         )
 
@@ -83,7 +88,7 @@ def evaluate_drawdown(portfolio: PortfolioState) -> DrawdownStatus:
             start_of_day_balance=round(sod, 2),
             message_ar=(
                 f"🟡 تحذير — الخسارة اليومية {dd:.1f}% "
-                f"(الحد {DRAWDOWN_HARD_STOP_PCT}%). "
+                f"(الحد النهائي {DRAWDOWN_HARD_STOP_PCT}%). "
                 "التنفيذ مستمر مع مراقبة مكثفة."
             ),
         )
