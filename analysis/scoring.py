@@ -72,11 +72,11 @@ _SETUP_WEIGHTS = {
     "higher_low_continuation": 2,
 }
 
-SMART_SL_MIN_PCT = 1.20
-SMART_SL_MAX_PCT = 2.80
+SMART_SL_MIN_PCT = 1.80
+SMART_SL_MAX_PCT = 3.80
 
-SMART_TP1_RR = 1.20
-SMART_TP2_RR = 2.00
+SMART_TP1_RR = 1.80
+SMART_TP2_RR = 3.10
 
 
 def _clamp(value: float, low: float, high: float) -> float:
