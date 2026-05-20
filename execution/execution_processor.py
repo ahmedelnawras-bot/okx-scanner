@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from analysis.models import SignalCandidate
 from analysis.execution_candidate import decide_execution_candidate
+
 from utils.constants import (
     MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
     MAX_RECOVERY_TRADES_PER_CYCLE,
 )
+
 from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
-from .models import TrackedTrade
 
 
 # ─────────────────────────────────────────
@@ -55,7 +56,7 @@ def _get_execution_score(signal: SignalCandidate) -> float:
 
 def process_trade_candidate(
     signal: SignalCandidate,
-    open_trades: list[TrackedTrade] | None = None,
+    open_trades: list | None = None,
     current_open_positions: int = 0,
     max_open_positions: int = 10,
     min_execution_score: float = 6.6,
@@ -121,12 +122,18 @@ def process_trade_candidate(
 
     for trade in open_trades:
 
+        trade_symbol = getattr(
+            trade,
+            "symbol",
+            None,
+        )
+
         trade_status = str(
             getattr(trade, "status", "")
         ).lower()
 
         if (
-            trade.symbol == signal.symbol
+            trade_symbol == signal.symbol
             and trade_status in ACTIVE_BLOCKING_STATUSES
         ):
 
@@ -139,7 +146,7 @@ def process_trade_candidate(
                 ),
 
                 "existing_trade_status": (
-                    trade.status
+                    trade_status
                 ),
             }
 
