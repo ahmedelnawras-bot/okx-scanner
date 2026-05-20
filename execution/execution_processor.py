@@ -165,7 +165,7 @@ def process_trade_candidate(
     if path == "block_exception":
 
         risk = evaluate_execution_risk(
-            execution_score=execution_score,
+            score=execution_score,
             max_open_positions=max_block_positions,
             current_open_positions=block_open_positions,
             min_execution_score=min_execution_score,
@@ -179,7 +179,7 @@ def process_trade_candidate(
     elif path == "recovery":
 
         risk = evaluate_execution_risk(
-            execution_score=execution_score,
+            score=execution_score,
             max_open_positions=max_recovery_positions,
             current_open_positions=recovery_open_positions,
             min_execution_score=min_execution_score,
@@ -193,7 +193,7 @@ def process_trade_candidate(
     else:
 
         risk = evaluate_execution_risk(
-            execution_score=execution_score,
+            score=execution_score,
             max_open_positions=max_open_positions,
             current_open_positions=current_open_positions,
             min_execution_score=min_execution_score,
