@@ -5,6 +5,11 @@ Key preserved ideas from the reference files:
 - merged ranked pairs, not top-volume only
 - balanced mix of volume, positive momentum, and negative reversal names
 - avoid over-choking the universe before candle analysis
+
+Phase update:
+- reduce over-concentration on the most traded OKX names
+- keep diversity across turnover tiers without touching scoring architecture
+- cap hyper-liquid dominance in the selection/final ranking layer only
 """
 from __future__ import annotations
 
@@ -15,6 +20,11 @@ from utils.safe_helpers import safe_float
 EXCLUDED_SYMBOL_HINTS = ("USDC", "USDE", "FDUSD", "TUSD", "BUSD", "DAI")
 MAJOR_SYMBOLS = ("BTC-", "ETH-", "SOL-", "XRP-", "DOGE-", "BNB-", "AVAX-", "LINK-")
 
+MEGA_LIQUID_TURNOVER = 60_000_000
+HIGH_LIQUID_TURNOVER = 20_000_000
+MID_LIQUID_TURNOVER = 5_000_000
+FINAL_TURNOVER_TIE_CAP = 20_000_000
+
 
 def _infer_relative_strength(symbol: str, change_pct: float, turnover: float) -> bool:
     return bool(
@@ -24,10 +34,48 @@ def _infer_relative_strength(symbol: str, change_pct: float, turnover: float) ->
     )
 
 
-
 def _infer_near_resistance(change_pct: float, turnover: float) -> bool:
     return change_pct >= 4.2 and turnover < 30_000_000
 
+
+def _turnover_tier(turnover: float) -> str:
+    if turnover >= MEGA_LIQUID_TURNOVER:
+        return "mega"
+    if turnover >= HIGH_LIQUID_TURNOVER:
+        return "high"
+    if turnover >= MID_LIQUID_TURNOVER:
+        return "mid"
+    return "base"
+
+
+def _tier_caps(scan_limit: int) -> dict[str, int]:
+    """Dynamic diversity caps.
+
+    These caps are selection-only safeguards so the scan universe does not get
+    over-dominated by the hyper-liquid OKX names every cycle.
+    """
+    return {
+        "mega": max(4, scan_limit // 12),
+        "high": max(8, scan_limit // 8),
+        "mid": max(16, scan_limit // 5),
+        "base": scan_limit,
+    }
+
+
+def _selection_key(item: PairCandidate) -> tuple[float, float, float]:
+    diversity_bonus = 0.15 if MID_LIQUID_TURNOVER <= item.turnover_usdt <= FINAL_TURNOVER_TIE_CAP and "major" not in item.tags else 0.0
+    turnover_tie = min(float(item.turnover_usdt or 0.0), float(FINAL_TURNOVER_TIE_CAP))
+    return (
+        item.score_hint
+        + item.rebound_hint
+        + (0.45 if "liquid" in item.tags else 0.0)
+        + (0.35 if "rs_btc" in item.tags else 0.0)
+        + (0.20 if "major" in item.tags else 0.0)
+        - (0.15 if "near_resistance" in item.tags else 0.0)
+        + diversity_bonus,
+        abs(float(item.change_pct or 0.0)),
+        turnover_tie,
+    )
 
 
 def _base_candidate(raw: dict) -> PairCandidate | None:
@@ -90,16 +138,20 @@ def _base_candidate(raw: dict) -> PairCandidate | None:
     )
 
 
-
 def select_ranked_pairs(raw_tickers: list[dict], scan_limit: int = 80) -> list[PairCandidate]:
-    """Use merged ranked pairs like the old bot.
+    """Use merged ranked pairs like the old bot, with better diversity.
 
-    Reference behavior copied conceptually from the older files:
+    Preserved behavior:
     - 35% volume leaders
     - 25% positive momentum
     - 25% negative reversal names
     - then fill from liquid names
-    We keep a few RS/continuation names alive so strong mode does not choke formation too early.
+
+    Diversity protection added:
+    - hyper-liquid symbols cannot dominate the whole scan universe
+    - major names are softly capped in the selection stage
+    - final tie-breaking caps turnover influence instead of letting the most
+      traded pairs always sit at the top
     """
     base_candidates = [_base_candidate(t) for t in raw_tickers]
     candidates = [c for c in base_candidates if c and c.last_price > 0 and c.turnover_usdt >= 500_000]
@@ -107,8 +159,13 @@ def select_ranked_pairs(raw_tickers: list[dict], scan_limit: int = 80) -> list[P
     by_volume = sorted(candidates, key=lambda c: c.turnover_usdt, reverse=True)
     by_momentum = sorted(candidates, key=lambda c: c.change_pct, reverse=True)
     by_reversal = sorted(candidates, key=lambda c: c.change_pct)
-    by_rs = sorted([c for c in candidates if "rs_btc" in c.tags], key=lambda c: (c.score_hint, c.turnover_usdt), reverse=True)
-    by_continuation = sorted([c for c in candidates if "continuation" in c.tags], key=lambda c: (c.score_hint, c.turnover_usdt), reverse=True)
+    by_rs = sorted([c for c in candidates if "rs_btc" in c.tags], key=_selection_key, reverse=True)
+    by_continuation = sorted([c for c in candidates if "continuation" in c.tags], key=_selection_key, reverse=True)
+    by_mid_liquidity = sorted(
+        [c for c in candidates if MID_LIQUID_TURNOVER <= c.turnover_usdt < MEGA_LIQUID_TURNOVER],
+        key=_selection_key,
+        reverse=True,
+    )
 
     n_vol = max(10, int(scan_limit * 0.35))
     n_momentum = max(8, int(scan_limit * 0.25))
@@ -116,54 +173,69 @@ def select_ranked_pairs(raw_tickers: list[dict], scan_limit: int = 80) -> list[P
 
     merged: list[PairCandidate] = []
     seen: set[str] = set()
+    tier_counts = {"mega": 0, "high": 0, "mid": 0, "base": 0}
+    caps = _tier_caps(scan_limit)
+    major_count = 0
+    max_major = max(8, scan_limit // 10)
 
-    def add(item: PairCandidate) -> bool:
+    def add(item: PairCandidate, *, force: bool = False) -> bool:
+        nonlocal major_count
+
         if item.symbol in seen:
             return False
+
+        tier = _turnover_tier(item.turnover_usdt)
+        is_major = "major" in item.tags
+
+        if not force:
+            if tier_counts[tier] >= caps[tier]:
+                return False
+            if is_major and major_count >= max_major:
+                return False
+
         seen.add(item.symbol)
         merged.append(item)
+        tier_counts[tier] += 1
+        if is_major:
+            major_count += 1
         return True
 
-    for item in by_volume[:n_vol]:
-        add(item)
-
-    positive_momentum_count = 0
-    for item in by_momentum[: n_momentum * 2]:
-        if positive_momentum_count >= n_momentum:
-            break
-        if item.change_pct > 0 and add(item):
-            positive_momentum_count += 1
-
-    negative_reversal_count = 0
-    for item in by_reversal[: n_reversal * 2]:
-        if negative_reversal_count >= n_reversal:
-            break
-        if item.change_pct < 0 and add(item):
-            negative_reversal_count += 1
-
-    # Keep some strong relative-strength/continuation names alive even if volume buckets filled first.
-    for bucket in (by_rs[: max(6, scan_limit // 8)], by_continuation[: max(6, scan_limit // 8)]):
+    def add_bucket(bucket: list[PairCandidate], target_count: int, *, predicate=None, force: bool = False) -> int:
+        added = 0
         for item in bucket:
-            if len(merged) >= scan_limit:
+            if len(merged) >= scan_limit or added >= target_count:
                 break
-            add(item)
+            if predicate is not None and not predicate(item):
+                continue
+            if add(item, force=force):
+                added += 1
+        return added
+
+    add_bucket(by_volume, n_vol)
+    add_bucket(by_momentum[: n_momentum * 2], n_momentum, predicate=lambda item: item.change_pct > 0)
+    add_bucket(by_reversal[: n_reversal * 2], n_reversal, predicate=lambda item: item.change_pct < 0)
+
+    support_target = max(6, scan_limit // 8)
+    add_bucket(by_rs[: support_target * 2], support_target)
+    add_bucket(by_continuation[: support_target * 2], support_target)
+
+    # Prefer some mid/high liquidity diversity before falling back to the full
+    # volume list again. This reduces repetitive concentration on the most
+    # traded OKX names without choking the universe.
+    add_bucket(by_mid_liquidity, max(0, scan_limit - len(merged)))
 
     for item in by_volume:
         if len(merged) >= scan_limit:
             break
         add(item)
 
+    # Final fallback: never return a half-empty list just because diversity caps
+    # were too strict for this market state.
+    if len(merged) < scan_limit:
+        for item in by_volume:
+            if len(merged) >= scan_limit:
+                break
+            add(item, force=True)
+
     merged = merged[:scan_limit]
-    return sorted(
-        merged,
-        key=lambda c: (
-            c.score_hint
-            + c.rebound_hint
-            + (0.45 if "liquid" in c.tags else 0.0)
-            + (0.35 if "rs_btc" in c.tags else 0.0)
-            + (0.20 if "major" in c.tags else 0.0)
-            - (0.15 if "near_resistance" in c.tags else 0.0),
-            c.turnover_usdt,
-        ),
-        reverse=True,
-    )
+    return sorted(merged, key=_selection_key, reverse=True)
