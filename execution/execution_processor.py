@@ -16,6 +16,11 @@ from .order_builder import build_preview_order
 # Same-symbol active protection
 # يمنع إعادة الدخول لنفس العملة
 # طالما الصفقة القديمة لم تنتهِ بالكامل
+#
+# يسمح بإعادة الدخول فقط بعد:
+# - TP2
+# - closed
+# - stopped
 # ─────────────────────────────────────────
 ACTIVE_BLOCKING_STATUSES = {
     "open",
@@ -29,7 +34,7 @@ ACTIVE_BLOCKING_STATUSES = {
 
 def _get_execution_score(signal: SignalCandidate) -> float:
     """
-    v128c execution architecture
+    v129 execution architecture
     ───────────────────────────
     IMPORTANT:
     execution/risk MUST use boost_score
@@ -69,6 +74,10 @@ def process_trade_candidate(
 
     # ─────────────────────────────────────────
     # Execution intelligence gate
+    # IMPORTANT:
+    # Nour filter + execution quality
+    # must stay inside execution layer
+    # NOT scoring architecture
     # ─────────────────────────────────────────
     gate = decide_execution_candidate(
         signal,
@@ -86,6 +95,8 @@ def process_trade_candidate(
             "late_risky_execution_context",
             "weak_drift_execution_block",
             "recovery_quality_not_confirmed",
+            "velocity_instability",
+            "expansion_exhaustion",
         }:
             status = "rejected_quality"
 
@@ -95,9 +106,13 @@ def process_trade_candidate(
             status = "rejected_limit"
 
         return {
+
             "status": status,
+
             "reason": gate["reason"],
+
             "path": gate["path"],
+
             "gate": gate,
 
             "nour_filter_name": gate.get(
@@ -116,7 +131,7 @@ def process_trade_candidate(
     # ─────────────────────────────────────────
     # Same symbol protection
     # يمنع إعادة الدخول لنفس العملة
-    # قبل انتهاء الصفقة بالكامل (TP2 / closed)
+    # قبل انتهاء الصفقة بالكامل
     # ─────────────────────────────────────────
     open_trades = open_trades or []
 
