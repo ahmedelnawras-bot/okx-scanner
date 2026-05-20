@@ -8,6 +8,7 @@ from utils.constants import (
 )
 from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
+from .models import TrackedTrade
 
 
 def _get_execution_score(signal: SignalCandidate) -> float:
@@ -50,6 +51,7 @@ def _get_execution_score(signal: SignalCandidate) -> float:
 
 def process_trade_candidate(
     signal: SignalCandidate,
+    open_trades: list[TrackedTrade] | None = None,
     current_open_positions: int = 0,
     max_open_positions: int = 10,
     min_execution_score: float = 6.6,
@@ -88,6 +90,26 @@ def process_trade_candidate(
             "nour_filter_passed": gate.get("nour_filter_passed"),
             "nour_filter_reason": gate.get("nour_filter_reason"),
         }
+
+    # ─────────────────────────────────────────────────────────────
+    # Same-symbol protection
+    # ممنوع إعادة الدخول لنفس الزوج
+    # قبل TP2 protected runner
+    # ─────────────────────────────────────────────────────────────
+    open_trades = open_trades or []
+
+    for trade in open_trades:
+
+        if (
+            trade.symbol == signal.symbol
+            and not trade.same_symbol_block_exempt
+        ):
+
+            return {
+                "status": "rejected_same_symbol",
+                "reason": "same_symbol_active_trade",
+                "existing_trade_status": trade.status,
+            }
 
     # ─────────────────────────────────────────────────────────────
     # v128b FIX:
