@@ -238,13 +238,13 @@ def nour_execution_filter_normal_v1(
             meta.get("resistance_warning")
         )
 
-        if score < 7.0:
+        if score < 7.25:
             return {
                 "passed": False,
                 "reason": "nour_normal_low_score",
             }
 
-        if vol_ratio < 1.08:
+        if vol_ratio < 1.12:
             return {
                 "passed": False,
                 "reason": "nour_normal_weak_volume",
@@ -256,7 +256,7 @@ def nour_execution_filter_normal_v1(
                 "reason": "nour_normal_no_mtf_confirmation",
             }
 
-        if dist_ma > 4.5:
+        if dist_ma > 3.8:
             return {
                 "passed": False,
                 "reason": "nour_normal_overextended",
@@ -264,7 +264,7 @@ def nour_execution_filter_normal_v1(
 
         if (
             resistance_warning
-            and score < 7.4
+            and score < 7.6
         ):
             return {
                 "passed": False,
