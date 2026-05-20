@@ -8,19 +8,38 @@ from utils.constants import MODE_RECOVERY_LONG
 from .models import TrackedTrade
 
 
+# Execution trade here means "count as an actually opened execution path"
+# and not just a preview/candidate shown in Telegram.
+#
+# Important:
+# - pending_pullback_preview is NOT an opened trade
+# - candidate_only / rejected_* are NOT execution trades
+# - accepted_preview keeps the current project behavior as the execution-tracking path
 _EXECUTION_OPEN_STATUSES = {
     "accepted_preview",
-    "pending_pullback_preview",
     "executed",
     "open",
     "tp1",
     "tp2",
     "trailing",
+    "runner",
+    "tp1_partial",
+    "tp2_partial",
+}
+
+_NON_FILLED_PREVIEW_STATUSES = {
+    "pending_pullback_preview",
+    "candidate_only",
+    "normal_signal_only",
+    "rejected_quality",
+    "rejected_limit",
+    "rejected_risk",
+    "rejected_same_symbol",
 }
 
 
 def is_execution_trade_status(status: str | None) -> bool:
-    return str(status or "") in _EXECUTION_OPEN_STATUSES
+    return str(status or "").strip().lower() in _EXECUTION_OPEN_STATUSES
 
 
 def _target_plan_for(signal: SignalCandidate, execution_path: str) -> tuple[str, float, float, float]:
@@ -58,6 +77,19 @@ def _resolve_entry_price(
         return float(signal.entry)
 
 
+def _resolve_execution_trade_flag(execution_status: str) -> bool:
+    normalized = str(execution_status or "").strip().lower()
+
+    if normalized in _NON_FILLED_PREVIEW_STATUSES:
+        return False
+
+    return normalized in _EXECUTION_OPEN_STATUSES
+
+
+def _resolve_tracking_bucket(execution_trade: bool) -> str:
+    return "execution" if execution_trade else "normal"
+
+
 def register_trade(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -69,6 +101,8 @@ def register_trade(
     - Every normal signal can be tracked normally.
     - Execution check result is stored as metadata.
     - Rejected execution checks never turn the trade into an execution trade.
+    - pending_pullback_preview stays preview-only and does not become
+      an actually opened execution trade.
     - Execution reports/wallet/open-execution only see execution_trade=True.
     """
 
@@ -86,7 +120,9 @@ def register_trade(
         execution_result.get("path") or ""
     )
 
-    execution_trade = is_execution_trade_status(execution_status)
+    execution_trade = _resolve_execution_trade_flag(
+        execution_status
+    )
 
     target_model, tp1_pct, tp2_pct, runner_pct = _target_plan_for(
         signal,
@@ -98,6 +134,10 @@ def register_trade(
     resolved_entry = _resolve_entry_price(
         signal,
         execution_result,
+    )
+
+    tracking_bucket = _resolve_tracking_bucket(
+        execution_trade
     )
 
     return TrackedTrade(
@@ -127,7 +167,7 @@ def register_trade(
 
         trade_source="execution" if execution_trade else "normal",
 
-        tracking_bucket="execution" if execution_trade else "normal",
+        tracking_bucket=tracking_bucket,
 
         execution_checked=bool(execution_result),
 
