@@ -129,6 +129,20 @@ def build_signal_buttons(signal: SignalCandidate) -> dict:
     }
 
 
+def _slot_status_snapshot(trade) -> tuple[bool, bool, bool]:
+    counted_open = bool(getattr(trade, "counts_as_active_slot", False))
+    daily_open = bool(getattr(trade, "counts_as_daily_open_risk", False))
+    same_symbol_blocks = bool(getattr(trade, "blocks_same_symbol_reentry", counted_open))
+    return counted_open, daily_open, same_symbol_blocks
+
+
+def _preview_status_label(status: str) -> str:
+    status = str(status or "").lower()
+    if status == "pending_pullback_preview":
+        return "🟡 Status: PULLBACK WAITING"
+    return "🟢 Status: OPEN / ACTIVE"
+
+
 def _profit_state(total_usd: float, protected: bool = False) -> str:
     if total_usd > 0.01:
         return "🟢 رابحة"
@@ -178,13 +192,12 @@ def build_trade_track_message(trade) -> str:
     runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
     symbol = getattr(trade, "symbol", "-")
 
-    # ✅ FIX: إضافة entry price وcurrent price change بشكل واضح
     entry_price = float(getattr(trade, "entry", 0.0) or 0.0)
     current_price = float(getattr(trade, "current_price", 0.0) or entry_price)
     closed_at = getattr(trade, "closed_at", None)
-    is_closed = getattr(trade, "is_closed", False)
+    is_closed = bool(getattr(trade, "is_closed", False))
+    counted_open, daily_open, same_symbol_blocks = _slot_status_snapshot(trade)
 
-    # حساب التغيير من الـ entry للـ current
     price_change_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
     price_change_icon = "🟢" if price_change_pct >= 0 else "🔴"
     price_change_str = f"{price_change_pct:+.2f}%"
@@ -224,16 +237,13 @@ def build_trade_track_message(trade) -> str:
         f"• Runner: {'🏃 Active' if getattr(trade, 'runner_active', False) else 'Not Active'}",
         f"• SL Moved: {'✅ Entry / Better' if getattr(trade, 'sl_moved_to_entry', False) else 'No'}",
         f"• Protected: {'✅ Yes' if protected else 'No'}",
+        "",
+        "🛡 Slot Status",
+        f"• Counted Open Slot: {'Yes' if counted_open else 'No'}",
+        f"• Daily Open Risk: {'Counted' if daily_open else 'Exempt'}",
+        f"• Same Symbol Block: {'Yes' if same_symbol_blocks else 'No'}",
+        f"• Protected Runner: {'Yes' if protected else 'No'}",
     ]
-    if protected:
-        lines.extend([
-            "",
-            "🛡 Slot Status",
-            "• General Slots: Exempt",
-            "• Daily Open Risk: Exempt",
-            "• Same Symbol Block: Exempt after TP2",
-            "• Still counted in reports: Yes",
-        ])
     lines.extend([
         "",
         "🧠 Setup",
@@ -283,21 +293,27 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
     entry_label = "Market" if signal.entry_timing == "market" else "Pullback"
     path = _execution_path(signal, execution_result)
     tp1_pct, tp2_pct, runner_pct = (50, 25, 25) if path == "recovery" else (40, 40, 20)
-
-    # ✅ FIX: إضافة entry price بشكل واضح
     entry_price = float(signal.entry or 0.0)
+
+    current_price_line = (
+        f"• Current Price: {_fmt_price(entry_price)} (waiting pullback trigger)"
+        if status == "pending_pullback_preview"
+        else f"• Current Price: {_fmt_price(entry_price)} (just opened)"
+    )
+
+    quality_label = "PREVIEW / WAITING PULLBACK" if status == "pending_pullback_preview" else "PASS"
 
     return "\n".join([
         f"📊 Track — {signal.symbol}",
         "━━━━━━━━━━━━",
-        "🟢 Status: OPEN / ACTIVE",
+        _preview_status_label(status),
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {signal.market_mode}",
         f"⏱ TF: 15m | ⭐ Score: {signal.score:.2f}",
         "",
         "📍 Position",
         f"• Entry Price: {_fmt_price(entry_price)}",
-        f"• Current Price: {_fmt_price(entry_price)} (just opened)",
+        current_price_line,
         f"• Entry Type: {entry_label}",
         "",
         f"💰 Current Result — ⚪ تعادل",
@@ -321,7 +337,7 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
         "",
         "🧠 Setup",
         f"• {setup_clean}",
-        f"• Quality: PASS",
+        f"• Quality: {quality_label}",
         f"• Execution: {status}",
         f"• Reason: {reason}",
         "",
@@ -346,6 +362,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
     setup_clean = _clean_name(signal.setup_type)
     tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
+    is_pullback_preview = status == "pending_pullback_preview"
 
     if is_execution:
         lines = [
@@ -353,12 +370,11 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             EXEC_LINE,
             "🔥 مرشحة للتنفيذ التجريبي",
             "🧠 Quality Filters: PASS",
-            "⚡ Preview Ready",
+            "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
             f"💎 {signal.symbol}",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
-            # ✅ FIX: entry price واضح في الـ execution signal
             f"📍 {entry_label}",
             f"• Price: {_fmt_price(signal.entry)}",
             f"🎯 TP1: {_fmt_price(signal.tp1)}",
@@ -385,9 +401,11 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "",
             "⚙️ Execution",
             f"Status: {status}",
-            "🧪 OKX Paper Orders: OFF/controlled by Railway",
-            "📌 Tracking / preview only unless OKX_PLACE_ORDERS=1",
+            "🟡 Pending pullback does NOT place a market order yet" if is_pullback_preview else "🧪 OKX Paper Orders: OFF/controlled by Railway",
+            "📌 Tracking / preview only unless OKX_PLACE_ORDERS=1" if not is_pullback_preview else "📌 Preview only — waiting pullback trigger before any execution",
         ]
+        if reason:
+            lines.append(f"• Reason: {reason}")
         if signal.warnings:
             lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
         slots = (execution_result or {}).get("slots")
@@ -398,7 +416,6 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             ])
         return "\n".join(lines)
 
-    # Normal signal: calm style. Execution rejection is only a small check at the end.
     lines = [
         _normal_header(signal.market_mode),
         LIGHT_LINE,
@@ -407,7 +424,6 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"💎 {signal.symbol}",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
-        # ✅ FIX: entry price واضح في الـ normal signal
         f"📍 {entry_label}",
         f"• Price: {_fmt_price(signal.entry)}",
         f"🎯 TP1: {_fmt_price(signal.tp1)}",
