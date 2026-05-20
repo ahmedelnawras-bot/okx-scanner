@@ -90,6 +90,46 @@ def _resolve_tracking_bucket(execution_trade: bool) -> str:
     return "execution" if execution_trade else "normal"
 
 
+def _preview_only_lifecycle_fields(
+    execution_status: str,
+    now: datetime,
+) -> dict:
+    """
+    Non-filled previews / rejected execution checks should not come back as
+    currently-open trades after deep_clean or after the next scan.
+
+    We still keep them in history through execution_status / execution_reason,
+    but archive them immediately as expired observations.
+    """
+    preview_reason = str(execution_status or "normal_signal_only").strip().lower() or "normal_signal_only"
+
+    return {
+        "status": "expired",
+        "closed_at": now,
+        "slot_exempt": True,
+        "slot_exempt_reason": f"preview_only:{preview_reason}",
+        "daily_open_risk_exempt": True,
+        "same_symbol_block_exempt": True,
+        "runner_active": False,
+        "trailing_active": False,
+        "protected_runner": False,
+    }
+
+
+def _execution_lifecycle_fields() -> dict:
+    """
+    Actually opened execution-path trades start as live/open positions.
+    """
+    return {
+        "status": "open",
+        "closed_at": None,
+        "slot_exempt": False,
+        "slot_exempt_reason": "",
+        "daily_open_risk_exempt": False,
+        "same_symbol_block_exempt": False,
+    }
+
+
 def register_trade(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -98,12 +138,12 @@ def register_trade(
     Register a signal into the correct tracking path.
 
     Important separation:
-    - Every normal signal can be tracked normally.
-    - Execution check result is stored as metadata.
-    - Rejected execution checks never turn the trade into an execution trade.
+    - Every signal keeps its execution-check metadata.
+    - Only actually opened execution-path trades remain open.
     - pending_pullback_preview stays preview-only and does not become
       an actually opened execution trade.
-    - Execution reports/wallet/open-execution only see execution_trade=True.
+    - Rejected / candidate-only / normal-signal-only items are archived
+      immediately so they do not refill open reports after deep_clean.
     """
 
     execution_result = execution_result or {}
@@ -138,6 +178,15 @@ def register_trade(
 
     tracking_bucket = _resolve_tracking_bucket(
         execution_trade
+    )
+
+    lifecycle_fields = (
+        _execution_lifecycle_fields()
+        if execution_trade
+        else _preview_only_lifecycle_fields(
+            execution_status,
+            now,
+        )
     )
 
     return TrackedTrade(
@@ -194,4 +243,6 @@ def register_trade(
         current_price=resolved_entry,
 
         highest_price=resolved_entry,
+
+        **lifecycle_fields,
     )
