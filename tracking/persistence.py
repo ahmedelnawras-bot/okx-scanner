@@ -120,6 +120,29 @@ class RedisTradeStore:
                 continue
         return sorted(keys)
 
+    def _current_namespace_keys(self) -> list[str]:
+        """Collect all keys that belong to the active namespace.
+
+        Includes exact well-known keys so deep_clean still works even when scan
+        results are partial or delayed.
+        """
+        if not self.enabled or not self.client:
+            return []
+        keys = set(self._scan_keys_for_patterns([
+            f"{PREFIX}:*",
+            f"{SIGNAL_FP_PREFIX}:*",
+        ]))
+        keys.update({OPEN_SET, HISTORY_SET, EXEC_CHECKS_LIST})
+        return sorted(k for k in keys if k)
+
+    def _deep_clean_keys(self) -> list[str]:
+        """Collect every long-bot key we know how to wipe."""
+        if not self.enabled or not self.client:
+            return []
+        keys = set(self._scan_keys_for_patterns(DEEP_CLEAN_PATTERNS))
+        keys.update(self._current_namespace_keys())
+        return sorted(k for k in keys if k)
+
     def load_trades(self) -> list[TrackedTrade]:
         if not self.enabled or not self.client:
             return []
@@ -278,6 +301,7 @@ class RedisTradeStore:
             "stale_open_candidates": 0,
             "old_execution_checks": 0,
             "keys_to_delete": 0,
+            "current_namespace_keys": 0,
         }
         if not self.enabled or not self.client:
             return stats
@@ -322,7 +346,10 @@ class RedisTradeStore:
             stats["stale_open_candidates"] = stale
             stats["old_execution_checks"] = old_checks
             if mode == "deep":
-                stats["keys_to_delete"] = len(self._scan_keys_for_patterns(DEEP_CLEAN_PATTERNS))
+                current_keys = self._current_namespace_keys()
+                deep_keys = self._deep_clean_keys()
+                stats["current_namespace_keys"] = len(current_keys)
+                stats["keys_to_delete"] = len(deep_keys)
         except Exception as exc:
             stats["error"] = str(exc)
         return stats
@@ -408,15 +435,28 @@ class RedisTradeStore:
         """
         preview = self.clean_preview("deep")
         stats = dict(preview)
-        stats.update({"deleted_keys": 0})
+        stats.update({
+            "deleted_keys": 0,
+            "delete_attempted": False,
+            "remaining_keys": 0,
+        })
         if not self.enabled or not self.client:
             return stats
         try:
-            keys = self._scan_keys_for_patterns(DEEP_CLEAN_PATTERNS)
+            keys = self._deep_clean_keys()
+            stats["delete_attempted"] = True
+
+            deleted = 0
             if keys:
                 for i in range(0, len(keys), 500):
-                    self.client.delete(*keys[i:i + 500])
-            stats["deleted_keys"] = len(keys)
+                    deleted += int(self.client.delete(*keys[i:i + 500]) or 0)
+
+            # Hard fallback for exact live namespace keys. This keeps the current
+            # baseline empty even if scan results were partial.
+            deleted += int(self.client.delete(OPEN_SET, HISTORY_SET, EXEC_CHECKS_LIST) or 0)
+
+            stats["deleted_keys"] = deleted
+            stats["remaining_keys"] = len(self._deep_clean_keys())
         except Exception as exc:
             stats["error"] = str(exc)
         return stats
