@@ -1,4 +1,10 @@
-"""Trade lifecycle with partial exits, protected runners, and path-specific target splits."""
+"""Trade lifecycle with partial exits, protected runners, and path-specific target splits.
+
+Phase 1 alignment:
+- TP2 does NOT fully close the trade if the 20% runner is still active.
+- After TP2, the remaining runner keeps being tracked.
+- After TP2, the trade becomes slot-exempt / daily-risk-exempt / same-symbol-block-exempt.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -21,13 +27,21 @@ def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
     trade.slot_exempt = True
     trade.daily_open_risk_exempt = True
     trade.same_symbol_block_exempt = True
+    trade.runner_active = False
+    trade.protected_runner = False
     if not trade.slot_exempt_reason:
         trade.slot_exempt_reason = status
     return trade
 
 
 def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
-    """After TP2 + SL at entry/better, the remaining runner is risk-exempt."""
+    """After TP2, the remaining 20% runner stays open for tracking only.
+
+    Important:
+    - TP2 is NOT a full close.
+    - The remaining runner should no longer consume slots.
+    - The remaining runner should no longer block same-symbol re-entry.
+    """
     if trade.tp2_hit and trade.sl_moved_to_entry:
         trade.protected_runner = True
         trade.slot_exempt = True
@@ -89,7 +103,7 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
 
     if not trade.tp1_hit and current_price >= trade.tp1:
         trade.tp1_hit = True
-        # Slot exemption and protection escalation still wait for TP2.
+        # Slot exemption and same-symbol exemption still wait until TP2.
         trade.closed_portion_pct = tp1_close_pct
         trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
         trade.status = "tp1_partial"
@@ -109,6 +123,7 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         trade.sl_moved_to_entry = True
         trade.closed_portion_pct = tp1_close_pct + tp2_close_pct
         trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp2) * (tp2_close_pct / 100.0)
+        # TP2 is partial, not a full close. Keep the final 20% runner alive.
         trade.status = "tp2_partial"
         trade = _mark_protected_runner(trade)
 
