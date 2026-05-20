@@ -31,6 +31,13 @@ ACTIVE_BLOCKING_STATUSES = {
     "partial_runner",
 }
 
+NON_BLOCKING_FINAL_STATUSES = {
+    "closed",
+    "stopped",
+    "tp2_hit",
+    "take_profit_2_hit",
+}
+
 
 def _get_execution_score(signal: SignalCandidate) -> float:
     """
@@ -59,6 +66,58 @@ def _get_execution_score(signal: SignalCandidate) -> float:
     return float(signal.score)
 
 
+def _trade_reached_tp2(trade) -> bool:
+    return bool(
+        getattr(trade, "tp2_hit", False)
+        or getattr(trade, "take_profit_2_hit", False)
+        or getattr(trade, "fully_closed_at_tp2", False)
+    )
+
+
+def _trade_is_terminal(trade) -> bool:
+    trade_status = str(
+        getattr(trade, "status", "")
+    ).lower()
+
+    if bool(getattr(trade, "is_closed", False)):
+        return True
+
+    if _trade_reached_tp2(trade):
+        return True
+
+    if trade_status in NON_BLOCKING_FINAL_STATUSES:
+        return True
+
+    return False
+
+
+def _same_symbol_trade_is_active(trade, signal: SignalCandidate) -> tuple[bool, str]:
+    trade_symbol = getattr(
+        trade,
+        "symbol",
+        None,
+    )
+
+    if trade_symbol != signal.symbol:
+        return False, ""
+
+    if _trade_is_terminal(trade):
+        return False, ""
+
+    trade_status = str(
+        getattr(trade, "status", "")
+    ).lower()
+
+    if trade_status in ACTIVE_BLOCKING_STATUSES:
+        return True, trade_status
+
+    # fallback protection:
+    # أي صفقة لنفس العملة ليست terminal
+    # تعتبر ما زالت نشطة حتى لو status غير متوقع
+    fallback_status = trade_status or "active_unfinished_trade"
+    return True, fallback_status
+
+
 def process_trade_candidate(
     signal: SignalCandidate,
     open_trades: list | None = None,
@@ -70,6 +129,7 @@ def process_trade_candidate(
     max_block_positions: int = MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
     recovery_open_positions: int = 0,
     max_recovery_positions: int = MAX_RECOVERY_TRADES_PER_CYCLE,
+    drawdown_status=None,
 ) -> dict:
 
     # ─────────────────────────────────────────
@@ -132,26 +192,18 @@ def process_trade_candidate(
     # Same symbol protection
     # يمنع إعادة الدخول لنفس العملة
     # قبل انتهاء الصفقة بالكامل
+    #
+    # TP2 = trade closed
     # ─────────────────────────────────────────
     open_trades = open_trades or []
 
     for trade in open_trades:
-
-        trade_symbol = getattr(
+        is_active, trade_status = _same_symbol_trade_is_active(
             trade,
-            "symbol",
-            None,
+            signal,
         )
 
-        trade_status = str(
-            getattr(trade, "status", "")
-        ).lower()
-
-        if (
-            trade_symbol == signal.symbol
-            and trade_status in ACTIVE_BLOCKING_STATUSES
-        ):
-
+        if is_active:
             return {
 
                 "status": "rejected_same_symbol",
@@ -184,6 +236,7 @@ def process_trade_candidate(
             max_open_positions=max_block_positions,
             current_open_positions=block_open_positions,
             min_execution_score=min_execution_score,
+            drawdown_status=drawdown_status,
         )
 
         slot_scope = "block_exception"
@@ -198,6 +251,7 @@ def process_trade_candidate(
             max_open_positions=max_recovery_positions,
             current_open_positions=recovery_open_positions,
             min_execution_score=min_execution_score,
+            drawdown_status=drawdown_status,
         )
 
         slot_scope = "recovery"
@@ -212,6 +266,7 @@ def process_trade_candidate(
             max_open_positions=max_open_positions,
             current_open_positions=current_open_positions,
             min_execution_score=min_execution_score,
+            drawdown_status=drawdown_status,
         )
 
         slot_scope = "general"
@@ -249,6 +304,14 @@ def process_trade_candidate(
 
             "nour_filter_reason": gate.get(
                 "nour_filter_reason"
+            ),
+
+            "drawdown_level": risk.get(
+                "drawdown_level"
+            ),
+
+            "drawdown_pct": risk.get(
+                "drawdown_pct"
             ),
 
             # debug visibility
@@ -298,6 +361,14 @@ def process_trade_candidate(
 
         "nour_filter_reason": gate.get(
             "nour_filter_reason"
+        ),
+
+        "drawdown_level": risk.get(
+            "drawdown_level"
+        ),
+
+        "drawdown_pct": risk.get(
+            "drawdown_pct"
         ),
 
         # debug visibility
