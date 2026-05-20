@@ -11,6 +11,21 @@ from .order_builder import build_preview_order
 from .models import TrackedTrade
 
 
+# ─────────────────────────────────────────
+# Same-symbol active protection
+# يمنع إعادة الدخول لنفس العملة
+# طالما الصفقة القديمة لم تنتهِ بالكامل
+# ─────────────────────────────────────────
+ACTIVE_BLOCKING_STATUSES = {
+    "open",
+    "tp1_hit",
+    "runner_active",
+    "breakeven_runner",
+    "protected_runner",
+    "partial_runner",
+}
+
+
 def _get_execution_score(signal: SignalCandidate) -> float:
     """
     v128c execution architecture
@@ -99,20 +114,33 @@ def process_trade_candidate(
 
     # ─────────────────────────────────────────
     # Same symbol protection
+    # يمنع إعادة الدخول لنفس العملة
+    # قبل انتهاء الصفقة بالكامل (TP2 / closed)
     # ─────────────────────────────────────────
     open_trades = open_trades or []
 
     for trade in open_trades:
 
+        trade_status = str(
+            getattr(trade, "status", "")
+        ).lower()
+
         if (
             trade.symbol == signal.symbol
-            and not trade.same_symbol_block_exempt
+            and trade_status in ACTIVE_BLOCKING_STATUSES
         ):
 
             return {
+
                 "status": "rejected_same_symbol",
-                "reason": "same_symbol_active_trade",
-                "existing_trade_status": trade.status,
+
+                "reason": (
+                    "same_symbol_active_trade"
+                ),
+
+                "existing_trade_status": (
+                    trade.status
+                ),
             }
 
     # ─────────────────────────────────────────
