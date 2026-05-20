@@ -84,7 +84,14 @@ class TrackedTrade:
 
     @property
     def is_closed(self) -> bool:
-        return self.status in {"closed_loss", "breakeven_after_tp1", "trailing_hit", "closed_win", "expired"}
+        return self.tp2_hit or self.status in {
+            "closed_loss",
+            "breakeven_after_tp1",
+            "trailing_hit",
+            "closed_win",
+            "expired",
+            "tp2_hit",
+        }
 
     @property
     def counts_as_active_slot(self) -> bool:
