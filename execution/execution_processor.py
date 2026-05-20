@@ -13,26 +13,13 @@ from .models import TrackedTrade
 
 def _get_execution_score(signal: SignalCandidate) -> float:
     """
-    v128b execution architecture fix
-    ───────────────────────────────
-    المشكلة:
-      execution/risk layer كان بيستخدم signal.score
-      و signal.score = display_score (soft-capped at 10)
+    v128c execution architecture
+    ───────────────────────────
+    IMPORTANT:
+    execution/risk MUST use boost_score
+    NOT display_score.
 
-      بالتالي:
-      - elite setups كلها تقريباً بقت 10
-      - execution gate فقد التدرج الحقيقي
-      - slots بقت تتملي بسرعة
-      - NORMAL mode بقى يستقبل كميات ضخمة
-
-    الحل:
-      execution/risk يستخدم boost_score الحقيقي
-      من meta بدل display_score.
-
-    مهم:
-      - UI يفضل يشوف display_score
-      - execution logic يستخدم boost_score
-      - ممنوع استخدام display_score في risk decisions
+    signal.score = UI display only.
     """
 
     meta = signal.meta or {}
@@ -40,12 +27,14 @@ def _get_execution_score(signal: SignalCandidate) -> float:
     boost_score = meta.get("boost_score")
 
     if boost_score is not None:
+
         try:
             return float(boost_score)
+
         except Exception:
             pass
 
-    # fallback احتياطي فقط
+    # emergency fallback only
     return float(signal.score)
 
 
@@ -62,12 +51,19 @@ def process_trade_candidate(
     max_recovery_positions: int = MAX_RECOVERY_TRADES_PER_CYCLE,
 ) -> dict:
 
+    # ─────────────────────────────────────────
+    # Execution intelligence gate
+    # ─────────────────────────────────────────
     gate = decide_execution_candidate(
         signal,
         recovery_slots_remaining=recovery_slots_remaining,
     )
 
+    # ─────────────────────────────────────────
+    # Candidate rejected by execution gate
+    # ─────────────────────────────────────────
     if not gate["allowed"]:
+
         status = "candidate_only"
 
         if gate["reason"] in {
@@ -77,7 +73,9 @@ def process_trade_candidate(
         }:
             status = "rejected_quality"
 
-        if gate["reason"] in {"recovery_cycle_full"}:
+        if gate["reason"] in {
+            "recovery_cycle_full",
+        }:
             status = "rejected_limit"
 
         return {
@@ -86,16 +84,22 @@ def process_trade_candidate(
             "path": gate["path"],
             "gate": gate,
 
-            "nour_filter_name": gate.get("nour_filter_name"),
-            "nour_filter_passed": gate.get("nour_filter_passed"),
-            "nour_filter_reason": gate.get("nour_filter_reason"),
+            "nour_filter_name": gate.get(
+                "nour_filter_name"
+            ),
+
+            "nour_filter_passed": gate.get(
+                "nour_filter_passed"
+            ),
+
+            "nour_filter_reason": gate.get(
+                "nour_filter_reason"
+            ),
         }
 
-    # ─────────────────────────────────────────────────────────────
-    # Same-symbol protection
-    # ممنوع إعادة الدخول لنفس الزوج
-    # قبل TP2 protected runner
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # Same symbol protection
+    # ─────────────────────────────────────────
     open_trades = open_trades or []
 
     for trade in open_trades:
@@ -111,19 +115,22 @@ def process_trade_candidate(
                 "existing_trade_status": trade.status,
             }
 
-    # ─────────────────────────────────────────────────────────────
-    # v128b FIX:
-    # execution/risk MUST use boost_score
+    # ─────────────────────────────────────────
+    # IMPORTANT:
+    # execution layer uses boost_score
     # NOT display_score
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
     execution_score = _get_execution_score(signal)
 
     path = str(gate.get("path") or "")
 
+    # ─────────────────────────────────────────
+    # BLOCK exception routing
+    # ─────────────────────────────────────────
     if path == "block_exception":
 
         risk = evaluate_execution_risk(
-            execution_score,
+            execution_score=execution_score,
             max_open_positions=max_block_positions,
             current_open_positions=block_open_positions,
             min_execution_score=min_execution_score,
@@ -131,10 +138,13 @@ def process_trade_candidate(
 
         slot_scope = "block_exception"
 
+    # ─────────────────────────────────────────
+    # RECOVERY routing
+    # ─────────────────────────────────────────
     elif path == "recovery":
 
         risk = evaluate_execution_risk(
-            execution_score,
+            execution_score=execution_score,
             max_open_positions=max_recovery_positions,
             current_open_positions=recovery_open_positions,
             min_execution_score=min_execution_score,
@@ -142,10 +152,13 @@ def process_trade_candidate(
 
         slot_scope = "recovery"
 
+    # ─────────────────────────────────────────
+    # NORMAL / STRONG routing
+    # ─────────────────────────────────────────
     else:
 
         risk = evaluate_execution_risk(
-            execution_score,
+            execution_score=execution_score,
             max_open_positions=max_open_positions,
             current_open_positions=current_open_positions,
             min_execution_score=min_execution_score,
@@ -153,29 +166,56 @@ def process_trade_candidate(
 
         slot_scope = "general"
 
+    # ─────────────────────────────────────────
+    # Risk rejected
+    # ─────────────────────────────────────────
     if not risk["allowed"]:
 
         return {
+
             "status": (
                 "rejected_limit"
                 if risk["reason"] == "max_positions_reached"
                 else "rejected_risk"
             ),
+
             "reason": risk["reason"],
+
             "path": gate["path"],
+
             "slot_scope": slot_scope,
+
             "slots": risk["slots"],
+
             "gate": gate,
 
-            "nour_filter_name": gate.get("nour_filter_name"),
-            "nour_filter_passed": gate.get("nour_filter_passed"),
-            "nour_filter_reason": gate.get("nour_filter_reason"),
+            "nour_filter_name": gate.get(
+                "nour_filter_name"
+            ),
+
+            "nour_filter_passed": gate.get(
+                "nour_filter_passed"
+            ),
+
+            "nour_filter_reason": gate.get(
+                "nour_filter_reason"
+            ),
 
             # debug visibility
-            "execution_score": round(execution_score, 2),
-            "display_score": round(float(signal.score), 2),
+            "execution_score": round(
+                execution_score,
+                2,
+            ),
+
+            "display_score": round(
+                float(signal.score),
+                2,
+            ),
         }
 
+    # ─────────────────────────────────────────
+    # Final acceptance state
+    # ─────────────────────────────────────────
     status = (
         "pending_pullback_preview"
         if gate["pending_pullback"]
@@ -183,19 +223,41 @@ def process_trade_candidate(
     )
 
     return {
+
         "status": status,
+
         "reason": gate["reason"],
+
         "path": gate["path"],
+
         "slot_scope": slot_scope,
+
         "order": build_preview_order(signal),
+
         "slots": risk["slots"],
+
         "gate": gate,
 
-        "nour_filter_name": gate.get("nour_filter_name"),
-        "nour_filter_passed": gate.get("nour_filter_passed"),
-        "nour_filter_reason": gate.get("nour_filter_reason"),
+        "nour_filter_name": gate.get(
+            "nour_filter_name"
+        ),
+
+        "nour_filter_passed": gate.get(
+            "nour_filter_passed"
+        ),
+
+        "nour_filter_reason": gate.get(
+            "nour_filter_reason"
+        ),
 
         # debug visibility
-        "execution_score": round(execution_score, 2),
-        "display_score": round(float(signal.score), 2),
+        "execution_score": round(
+            execution_score,
+            2,
+        ),
+
+        "display_score": round(
+            float(signal.score),
+            2,
+        ),
     }
