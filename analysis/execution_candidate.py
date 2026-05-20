@@ -311,13 +311,13 @@ def nour_execution_filter_strong_v1(
             meta.get("breakout_quality") or ""
         ).lower()
 
-        if score < 7.7:
+        if score < 7.85:
             return {
                 "passed": False,
                 "reason": "nour_strong_low_score",
             }
 
-        if vol_ratio < 1.15:
+        if vol_ratio < 1.18:
             return {
                 "passed": False,
                 "reason": "nour_strong_weak_volume",
@@ -378,19 +378,19 @@ def nour_execution_filter_block_v1(
             meta.get("bounce_ratio_vs_btc") or 0.0
         )
 
-        if score < 8.0:
+        if score < 8.10:
             return {
                 "passed": False,
                 "reason": "nour_block_low_score",
             }
 
-        if vol_ratio < 1.25:
+        if vol_ratio < 1.30:
             return {
                 "passed": False,
                 "reason": "nour_block_weak_volume",
             }
 
-        if bounce_strength < 1.15:
+        if bounce_strength < 1.20:
             return {
                 "passed": False,
                 "reason": "nour_block_weak_bounce",
@@ -806,9 +806,9 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
             })
         ),
 
-        "volume_confirmation": vol_ratio >= 1.12,
+        "volume_confirmation": vol_ratio >= 1.15,
 
-        "score_quality": score >= 6.55,
+        "score_quality": score >= 6.80,
 
         "rr_not_blocked_by_resistance": (
             not resistance_warning
@@ -1017,7 +1017,7 @@ def decide_execution_candidate(
             elite_allowed
             or strict_allowed
         )
-        and _execution_score(signal) >= 7.5
+        and _execution_score(signal) >= 7.75
     ):
 
         allowed = True
