@@ -71,6 +71,45 @@ def money_line(value: float) -> str:
     return f"{icon} {value:+.2f}$"
 
 
+def fmt_price(value: float | int | None) -> str:
+    """Adaptive price formatter for very small-priced symbols like SATS.
+
+    Prevents meaningful prices from being displayed as 0.000000 in reports.
+    """
+    if value is None:
+        return "-"
+
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+
+    if v == 0:
+        return "0"
+
+    abs_v = abs(v)
+
+    if abs_v >= 100:
+        decimals = 2
+    elif abs_v >= 1:
+        decimals = 4
+    elif abs_v >= 0.01:
+        decimals = 6
+    elif abs_v >= 0.0001:
+        decimals = 8
+    elif abs_v >= 0.000001:
+        decimals = 10
+    else:
+        decimals = 12
+
+    formatted = f"{v:.{decimals}f}"
+
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+
+    return formatted
+
+
 def fmt_holding_duration(
     start: datetime | None,
     end: datetime | None = None,
@@ -275,17 +314,17 @@ def trade_card_lines(
         # =================================================
         # Actual Entry Price
         # =================================================
-        f"🎯 Entry: {float(t.entry or 0):.6f}",
+        f"🎯 Entry: {fmt_price(getattr(t, 'entry', 0.0))}",
 
-        f"🎯 TP1: {float(t.tp1 or 0):.6f} | "
-        f"🏁 TP2: {float(t.tp2 or 0):.6f}",
+        f"🎯 TP1: {fmt_price(getattr(t, 'tp1', 0.0))} | "
+        f"🏁 TP2: {fmt_price(getattr(t, 'tp2', 0.0))}",
 
         f"📦 Close Plan: "
         f"{float(getattr(t, 'tp1_close_pct', 40.0) or 40.0):.0f}/"
         f"{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/"
         f"{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
 
-        f"🛡 SL: {float(t.sl or 0):.6f}",
+        f"🛡 SL: {fmt_price(getattr(t, 'sl', 0.0))}",
 
         f"🧠 {clean_setup(t)}",
 
