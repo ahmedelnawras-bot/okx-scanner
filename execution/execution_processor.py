@@ -15,12 +15,11 @@ from .order_builder import build_preview_order
 # ─────────────────────────────────────────
 # Same-symbol active protection
 # يمنع إعادة الدخول لنفس العملة
-# طالما الصفقة القديمة لم تنتهِ بالكامل
+# طالما الصفقة القديمة ما زالت تمنع re-entry
 #
-# يسمح بإعادة الدخول فقط بعد:
-# - TP2
-# - closed
-# - stopped
+# بعد TP2:
+# - الصفقة قد تظل موجودة للـ runner tracking
+# - لكنها لا تمنع same-symbol re-entry
 # ─────────────────────────────────────────
 ACTIVE_BLOCKING_STATUSES = {
     "open",
@@ -34,8 +33,13 @@ ACTIVE_BLOCKING_STATUSES = {
 NON_BLOCKING_FINAL_STATUSES = {
     "closed",
     "stopped",
+    "closed_loss",
+    "closed_win",
+    "expired",
     "tp2_hit",
     "take_profit_2_hit",
+    "trailing_hit",
+    "breakeven_after_tp1",
 }
 
 
@@ -70,25 +74,43 @@ def _trade_reached_tp2(trade) -> bool:
     return bool(
         getattr(trade, "tp2_hit", False)
         or getattr(trade, "take_profit_2_hit", False)
-        or getattr(trade, "fully_closed_at_tp2", False)
+        or str(getattr(trade, "status", "")).lower() in {"tp2_hit", "take_profit_2_hit"}
     )
 
 
-def _trade_is_terminal(trade) -> bool:
-    trade_status = str(
-        getattr(trade, "status", "")
-    ).lower()
+def _trade_is_closed(trade) -> bool:
+    return bool(getattr(trade, "is_closed", False))
 
-    if bool(getattr(trade, "is_closed", False)):
-        return True
+
+def _trade_blocks_same_symbol_reentry(trade) -> bool:
+    if bool(getattr(trade, "same_symbol_block_exempt", False)):
+        return False
+
+    explicit_flag = getattr(trade, "blocks_same_symbol_reentry", None)
+    if explicit_flag is not None:
+        try:
+            return bool(explicit_flag)
+        except Exception:
+            pass
+
+    if _trade_is_closed(trade):
+        return False
 
     if _trade_reached_tp2(trade):
-        return True
+        return False
+
+    trade_status = str(getattr(trade, "status", "")).lower()
 
     if trade_status in NON_BLOCKING_FINAL_STATUSES:
+        return False
+
+    if trade_status in ACTIVE_BLOCKING_STATUSES:
         return True
 
-    return False
+    # fallback protection:
+    # أي صفقة غير مغلقة ولم تصل TP2
+    # تعتبر ما زالت مانعة لإعادة الدخول
+    return True
 
 
 def _same_symbol_trade_is_active(trade, signal: SignalCandidate) -> tuple[bool, str]:
@@ -101,21 +123,14 @@ def _same_symbol_trade_is_active(trade, signal: SignalCandidate) -> tuple[bool, 
     if trade_symbol != signal.symbol:
         return False, ""
 
-    if _trade_is_terminal(trade):
+    if not _trade_blocks_same_symbol_reentry(trade):
         return False, ""
 
     trade_status = str(
         getattr(trade, "status", "")
     ).lower()
 
-    if trade_status in ACTIVE_BLOCKING_STATUSES:
-        return True, trade_status
-
-    # fallback protection:
-    # أي صفقة لنفس العملة ليست terminal
-    # تعتبر ما زالت نشطة حتى لو status غير متوقع
-    fallback_status = trade_status or "active_unfinished_trade"
-    return True, fallback_status
+    return True, trade_status or "active_unfinished_trade"
 
 
 def process_trade_candidate(
@@ -191,9 +206,10 @@ def process_trade_candidate(
     # ─────────────────────────────────────────
     # Same symbol protection
     # يمنع إعادة الدخول لنفس العملة
-    # قبل انتهاء الصفقة بالكامل
+    # قبل انتهاء مرحلة المنع الفعلية
     #
-    # TP2 = trade closed
+    # بعد TP2 لا يوجد block على نفس العملة
+    # حتى لو ظل runner tracking قائمًا
     # ─────────────────────────────────────────
     open_trades = open_trades or []
 
