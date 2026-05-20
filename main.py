@@ -540,8 +540,18 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
     accepted = sum(1 for r in execution_results if r.get("status") in {"accepted_preview", "pending_pullback_preview"})
     rejected = sum(1 for r in execution_results if str(r.get("status", "")).startswith("rejected"))
     candidate_only = sum(1 for r in execution_results if r.get("status") == "candidate_only")
-    open_trades = sum(1 for t in trades if not getattr(t, "is_closed", False))
-    protected = sum(1 for t in trades if getattr(t, "protected_runner", False))
+    open_trades = sum(1 for t in trades if _is_counted_open_trade(t))
+    protected = sum(
+        1 for t in trades
+        if bool(getattr(t, "protected_runner", False))
+        or (
+            bool(getattr(t, "tp2_hit", False))
+            and bool(
+                getattr(t, "runner_active", False)
+                or getattr(t, "has_open_runner", False)
+            )
+        )
+    )
 
     print(
         " | ".join([
@@ -1044,15 +1054,29 @@ def _enrich_reminder_context(result: dict, base_context: dict) -> dict:
     signal_items = result.get("signal_items", []) or []
     execution_results = result.get("current_execution_results") or result.get("execution_results") or []
     scan = result.get("scan_stats", {}) or {}
-    open_items = [t for t in trades if not getattr(t, "is_closed", False)]
+
+    counted_open_items = [t for t in trades if _is_counted_open_trade(t)]
+    protected_runner_items = [
+        t for t in trades
+        if bool(getattr(t, "protected_runner", False))
+        or (
+            bool(getattr(t, "tp2_hit", False))
+            and bool(
+                getattr(t, "runner_active", False)
+                or getattr(t, "has_open_runner", False)
+            )
+        )
+    ]
+
     ctx.update({
         "scanned_pairs": scan.get("scanned_pairs", ctx.get("sample_size", 200)),
         "signals_count": len(signal_items),
         "exec_accepted": sum(1 for r in execution_results if r.get("status") in {"accepted_preview", "pending_pullback_preview"}),
         "rejects_count": sum(1 for r in execution_results if str(r.get("status", "")).startswith("rejected") or r.get("status") == "candidate_only"),
-        "open_winners": sum(1 for t in open_items if getattr(t, "pnl_pct", 0.0) >= 0),
-        "danger_trades": sum(1 for t in open_items if getattr(t, "pnl_pct", 0.0) < 0),
-        "protected_runners": sum(1 for t in open_items if getattr(t, "protected_runner", False)),
+        "counted_open_positions": len(counted_open_items),
+        "open_winners": sum(1 for t in counted_open_items if getattr(t, "pnl_pct", 0.0) >= 0),
+        "danger_trades": sum(1 for t in counted_open_items if getattr(t, "pnl_pct", 0.0) < 0),
+        "protected_runners": len(protected_runner_items),
     })
     reasons = Counter(str(r.get("reason") or r.get("status") or "unknown") for r in execution_results if str(r.get("status", "")).startswith("rejected") or r.get("status") == "candidate_only")
     ctx["top_reject"] = reasons.most_common(1)[0][0] if reasons else "n/a"
