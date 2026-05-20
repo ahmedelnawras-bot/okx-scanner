@@ -84,19 +84,26 @@ class TrackedTrade:
 
     @property
     def is_closed(self) -> bool:
-        return self.tp2_hit or self.status in {
+        return self.status in {
             "closed_loss",
             "breakeven_after_tp1",
             "trailing_hit",
             "closed_win",
             "expired",
-            "tp2_hit",
         }
 
     @property
+    def has_open_runner(self) -> bool:
+        return bool(self.tp2_hit and not self.is_closed)
+
+    @property
     def counts_as_active_slot(self) -> bool:
-        return (not self.is_closed) and (not self.slot_exempt)
+        return (not self.is_closed) and (not self.tp2_hit) and (not self.slot_exempt)
 
     @property
     def counts_as_daily_open_risk(self) -> bool:
-        return (not self.is_closed) and (not self.daily_open_risk_exempt)
+        return (not self.is_closed) and (not self.tp2_hit) and (not self.daily_open_risk_exempt)
+
+    @property
+    def blocks_same_symbol_reentry(self) -> bool:
+        return (not self.is_closed) and (not self.tp2_hit) and (not self.same_symbol_block_exempt)
