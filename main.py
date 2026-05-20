@@ -266,15 +266,52 @@ def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
 
 def _is_trade_closed(trade) -> bool:
     status = str(getattr(trade, "status", "") or "").lower()
+
+    # TP2 can still leave a live runner (20%).
+    # So TP2 by itself is NOT a fully closed trade.
+    if bool(getattr(trade, "has_open_runner", False)):
+        return False
+
+    if bool(getattr(trade, "tp2_hit", False)) and bool(
+        getattr(trade, "runner_active", False) or getattr(trade, "protected_runner", False)
+    ):
+        return False
+
     return bool(
-        getattr(trade, "is_closed", False)
-        or getattr(trade, "tp2_hit", False)
-        or status in {"tp2", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}
+        (
+            getattr(trade, "is_closed", False)
+            and not bool(getattr(trade, "tp2_hit", False))
+        )
+        or status in {
+            "closed",
+            "stopped",
+            "closed_win",
+            "closed_loss",
+            "breakeven_after_tp1",
+            "trailing_hit",
+            "expired",
+        }
     )
 
 
 def _is_counted_open_trade(trade) -> bool:
+    counted = getattr(trade, "counts_as_active_slot", None)
+    if counted is not None:
+        return bool(counted)
+    if bool(getattr(trade, "tp2_hit", False)):
+        return False
     return bool(not _is_trade_closed(trade) and not getattr(trade, "slot_exempt", False))
+
+
+def _blocks_same_symbol_reentry(trade) -> bool:
+    if bool(getattr(trade, "same_symbol_block_exempt", False)):
+        return False
+    blocks = getattr(trade, "blocks_same_symbol_reentry", None)
+    if blocks is not None:
+        return bool(blocks)
+    if bool(getattr(trade, "tp2_hit", False)):
+        return False
+    return _is_counted_open_trade(trade)
 
 
 def _trade_slot_path(trade) -> str:
@@ -308,7 +345,7 @@ def _has_active_same_symbol(trades, candidate_trade) -> bool:
             continue
         if path and getattr(trade, "execution_path", "") != path:
             continue
-        if _is_counted_open_trade(trade):
+        if _blocks_same_symbol_reentry(trade):
             return True
     return False
 
@@ -393,6 +430,7 @@ def run_once(
                 max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
                 recovery_open_positions=slot_counts.get("recovery", 0),
                 max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
+                drawdown_status=drawdown_status,
             )
 
         if exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}:
