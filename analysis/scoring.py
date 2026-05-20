@@ -398,24 +398,6 @@ def _infer_setup(
 
     pair_tags = set(pair.tags)
 
-    if market_mode == MODE_RECOVERY_LONG:
-
-        tags = [
-            "recovery_execution",
-            "relative_strength_vs_btc",
-            "whitelist",
-        ]
-
-        if "breakout" in pair_tags:
-            tags.append("elite")
-
-        return (
-            "relative_strength_vs_btc",
-            "market",
-            tags,
-            warnings,
-        )
-
     if {
         "breakout",
         "momentum",
@@ -748,8 +730,6 @@ def build_signal_candidate(
         warnings.append(
             "Block exception only"
         )
-
-        boost_score += 0.20
 
     threshold = min_normal_score
 
