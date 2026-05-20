@@ -1,13 +1,12 @@
-"""Execution risk manager — Phase 2 update.
+"""Execution risk manager — Phase 1/2 compatible.
 
 التغييرات:
-- max_positions الافتراضي بقى 7 بدل 10
-- إضافة drawdown_status check
-- unified مع config/risk_config.py
+- يعتمد على عدد الصفقات المفتوحة الفعلي فقط عبر max_open_positions / current_open_positions
+- إضافة drawdown_status check بأولوية أعلى من باقي فلاتر التنفيذ
+- توحيد إخراج drawdown metadata في كل النتائج
 """
 from __future__ import annotations
 
-from config.risk_config import MAX_DAILY_OPEN_TRADES
 from risk.drawdown_monitor import DrawdownStatus
 
 
@@ -18,22 +17,24 @@ def evaluate_execution_risk(
     min_execution_score: float,
     drawdown_status: DrawdownStatus | None = None,
 ) -> dict:
-    """بيحدد هل الصفقة مسموح بيها أم لا.
+    """يحدد هل الصفقة مسموح بها أم لا.
 
     الترتيب:
     1. Drawdown protection (الأعلى أولوية)
-    2. Max positions check
+    2. Max open positions check
     3. Score check
     """
-    remaining = max(0, max_open_positions - current_open_positions)
+    remaining = max(0, int(max_open_positions) - int(current_open_positions))
+    drawdown_level = getattr(drawdown_status, "level", 0)
+    drawdown_pct = getattr(drawdown_status, "drawdown_pct", 0.0)
 
-    # ── 1. Drawdown Protection ─────────────────────────────────────────────────
+    # ── 1. Drawdown Protection ────────────────────────────────────────────────
     if drawdown_status is not None and not drawdown_status.allowed:
         return {
             "allowed": False,
             "reason": drawdown_status.reason,
-            "drawdown_level": drawdown_status.level,
-            "drawdown_pct": drawdown_status.drawdown_pct,
+            "drawdown_level": drawdown_level,
+            "drawdown_pct": drawdown_pct,
             "slots": {
                 "allowed": max_open_positions,
                 "counted": current_open_positions,
@@ -41,11 +42,13 @@ def evaluate_execution_risk(
             },
         }
 
-    # ── 2. Max Positions ───────────────────────────────────────────────────────
+    # ── 2. Max Open Positions ─────────────────────────────────────────────────
     if current_open_positions >= max_open_positions:
         return {
             "allowed": False,
             "reason": "max_positions_reached",
+            "drawdown_level": drawdown_level,
+            "drawdown_pct": drawdown_pct,
             "slots": {
                 "allowed": max_open_positions,
                 "counted": current_open_positions,
@@ -53,11 +56,13 @@ def evaluate_execution_risk(
             },
         }
 
-    # ── 3. Score Check ─────────────────────────────────────────────────────────
+    # ── 3. Score Check ────────────────────────────────────────────────────────
     if score < min_execution_score:
         return {
             "allowed": False,
             "reason": "score_too_low",
+            "drawdown_level": drawdown_level,
+            "drawdown_pct": drawdown_pct,
             "slots": {
                 "allowed": max_open_positions,
                 "counted": current_open_positions,
@@ -65,11 +70,12 @@ def evaluate_execution_risk(
             },
         }
 
-    # ── All checks passed ──────────────────────────────────────────────────────
+    # ── All checks passed ─────────────────────────────────────────────────────
     return {
         "allowed": True,
         "reason": "risk_pass",
-        "drawdown_level": getattr(drawdown_status, "level", 0),
+        "drawdown_level": drawdown_level,
+        "drawdown_pct": drawdown_pct,
         "slots": {
             "allowed": max_open_positions,
             "counted": current_open_positions,
