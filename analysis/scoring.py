@@ -5,21 +5,23 @@ reclaim, and rebound can all form normal signals.
 Execution-specific strictness stays downstream and never suppresses
 the normal signal itself.
 
-v129 execution intelligence update
+v129 FIXED execution intelligence update
 ──────────────────────────────────────────────────────────────────────────────
-NEW ADDITIONS:
+FIXES:
 
-1) Nour Filter V2
-   - velocity instability intelligence
-   - exhaustion detection
-   - tp reachability validation
-   - execution stability scoring
+1) Nour Filter V2 moved to execution layer philosophy
+   - scoring preserved
+   - signal formation preserved
+   - no upstream suppression
 
-2) Adaptive target engine
-   - smarter SL
-   - dynamic TP1
-   - dynamic TP2
-   - bounded risk geometry
+2) Adaptive target engine improved
+   - more realistic TP2
+   - safer SL behavior
+   - bounded execution geometry
+
+3) quality_meta restored
+   - dist_ma restored
+   - compatibility preserved
 
 IMPORTANT:
 - scoring architecture NOT changed
@@ -33,6 +35,7 @@ IMPORTANT:
 from __future__ import annotations
 
 from .models import PairCandidate, SignalCandidate
+
 from utils.constants import (
     MODE_NORMAL_LONG,
     MODE_STRONG_LONG_ONLY,
@@ -58,32 +61,31 @@ BLOCK_EXCEPTION_SETUPS = {
     "retest_breakout_confirmed",
 }
 
-_SETUP_WEIGHTS = {
-    "vwap_reclaim": 3,
-    "retest_breakout_confirmed": 3,
-    "liquidity_sweep_reclaim": 2,
-    "relative_strength_vs_btc": 2,
-    "wave_3": 2,
-    "support_bounce_confirmed": 2,
-    "failed_breakdown_trap": 2,
-    "higher_low_continuation": 2,
-}
+SMART_SL_MIN_PCT = 1.15
+SMART_SL_MAX_PCT = 3.40
 
-SMART_SL_MIN_PCT = 1.20
-SMART_SL_MAX_PCT = 3.80
+SMART_TP1_MIN_RR = 1.15
+SMART_TP1_MAX_RR = 2.10
 
-SMART_TP1_MIN_RR = 1.20
-SMART_TP1_MAX_RR = 2.20
-
-SMART_TP2_MIN_RR = 2.00
-SMART_TP2_MAX_RR = 4.20
+SMART_TP2_MIN_RR = 1.90
+SMART_TP2_MAX_RR = 3.20
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(float(low), min(float(high), float(value)))
+def _clamp(
+    value: float,
+    low: float,
+    high: float,
+) -> float:
+
+    return max(
+        float(low),
+        min(float(high), float(value)),
+    )
 
 
-def _soft_cap_score(boost_score: float) -> float:
+def _soft_cap_score(
+    boost_score: float,
+) -> float:
 
     score = float(boost_score)
 
@@ -91,10 +93,14 @@ def _soft_cap_score(boost_score: float) -> float:
         ui_score = score
 
     elif score <= 10:
-        ui_score = 8.5 + ((score - 8.5) * 0.55)
+        ui_score = 8.5 + (
+            (score - 8.5) * 0.55
+        )
 
     elif score <= 12:
-        ui_score = 9.33 + ((score - 10) * 0.22)
+        ui_score = 9.33 + (
+            (score - 10) * 0.22
+        )
 
     else:
         ui_score = 9.77 + min(
@@ -102,16 +108,32 @@ def _soft_cap_score(boost_score: float) -> float:
             0.22,
         )
 
-    return round(min(ui_score, 9.99), 2)
+    return round(
+        min(ui_score, 9.99),
+        2,
+    )
 
 
-def _clamp_vol_ratio(vol_ratio: float) -> float:
-    return round(_clamp(vol_ratio, 1.00, 2.40), 2)
+def _clamp_vol_ratio(
+    vol_ratio: float,
+) -> float:
+
+    return round(
+        _clamp(
+            vol_ratio,
+            1.00,
+            2.20,
+        ),
+        2,
+    )
 
 
-# ─────────────────────────────────────────────────────────────
-# NEW — Velocity / Stability Intelligence
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# Execution Stability Intelligence
+# IMPORTANT:
+# informational only
+# NOT hard rejection
+# ─────────────────────────────────────────
 def _calculate_execution_stability(
     pair: PairCandidate,
     setup_type: str,
@@ -120,15 +142,18 @@ def _calculate_execution_stability(
 
     tags = set(pair.tags or [])
 
-    turnover = float(pair.turnover_usdt or 0.0)
-    change_pct = abs(float(pair.change_pct or 0.0))
+    turnover = float(
+        pair.turnover_usdt or 0.0
+    )
+
+    change_pct = abs(
+        float(pair.change_pct or 0.0)
+    )
 
     stability_score = 1.00
     instability_score = 0.0
 
-    # ─────────────────────────────────────────
-    # Positive stability
-    # ─────────────────────────────────────────
+    # positive stability
     if "liquid" in tags:
         stability_score += 0.20
 
@@ -144,52 +169,44 @@ def _calculate_execution_stability(
     if turnover >= 20_000_000:
         stability_score += 0.15
 
-    if turnover >= 60_000_000:
-        stability_score += 0.10
-
     if setup_type in ELITE_SETUPS:
         stability_score += 0.18
 
-    # ─────────────────────────────────────────
-    # Velocity instability
-    # ─────────────────────────────────────────
+    # instability
     if change_pct >= 2.5:
-        instability_score += 0.30
+        instability_score += 0.25
 
     if change_pct >= 4.0:
-        instability_score += 0.40
+        instability_score += 0.35
 
     if "rebound" in tags:
-        instability_score += 0.12
+        instability_score += 0.10
 
     if "compression" in tags:
-        instability_score += 0.10
+        instability_score += 0.08
 
     if (
         "momentum" in tags
         and "breakout" not in tags
     ):
-        instability_score += 0.12
+        instability_score += 0.10
 
     if turnover < 800_000:
-        instability_score += 0.20
+        instability_score += 0.18
 
     if turnover < 250_000:
-        instability_score += 0.25
+        instability_score += 0.20
 
     if "near_resistance" in tags:
-        instability_score += 0.15
+        instability_score += 0.12
 
-    # ─────────────────────────────────────────
-    # Expansion exhaustion
-    # ─────────────────────────────────────────
     exhausted_move = bool(
         change_pct >= 4.5
         and "breakout" not in tags
     )
 
     if exhausted_move:
-        instability_score += 0.35
+        instability_score += 0.25
 
     execution_stability = round(
         max(
@@ -199,35 +216,46 @@ def _calculate_execution_stability(
         2,
     )
 
-    # ─────────────────────────────────────────
-    # Nour Filter V2
-    # ─────────────────────────────────────────
-    nour_passed = True
-    nour_reason = "stable_execution_context"
+    # IMPORTANT:
+    # no hard rejection here anymore
+    nour_passed = (
+        execution_stability >= 0.90
+        and not exhausted_move
+    )
 
-    if execution_stability < 0.95:
-
-        nour_passed = False
-        nour_reason = "velocity_instability"
-
-    if exhausted_move:
-
-        nour_passed = False
-        nour_reason = "expansion_exhaustion"
+    nour_reason = (
+        "stable_execution_context"
+        if nour_passed
+        else "unstable_execution_context"
+    )
 
     return {
-        "execution_stability": execution_stability,
-        "stability_score": round(stability_score, 2),
-        "instability_score": round(instability_score, 2),
-        "nour_filter_passed": nour_passed,
-        "nour_filter_reason": nour_reason,
-        "exhausted_move": exhausted_move,
+
+        "execution_stability":
+            execution_stability,
+
+        "stability_score":
+            round(stability_score, 2),
+
+        "instability_score":
+            round(instability_score, 2),
+
+        "nour_filter_passed":
+            nour_passed,
+
+        "nour_filter_reason":
+            nour_reason,
+
+        "exhausted_move":
+            exhausted_move,
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# NEW — Adaptive Target Geometry
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# Adaptive Target Geometry
+# FIXED:
+# more realistic TP2
+# ─────────────────────────────────────────
 def _calculate_adaptive_targets(
     pair: PairCandidate,
     setup_type: str,
@@ -238,37 +266,40 @@ def _calculate_adaptive_targets(
 
     tags = set(pair.tags or [])
 
-    turnover = float(pair.turnover_usdt or 0.0)
-    change_abs = abs(float(pair.change_pct or 0.0))
+    turnover = float(
+        pair.turnover_usdt or 0.0
+    )
 
-    # ─────────────────────────────────────────
-    # Base SL
-    # ─────────────────────────────────────────
+    change_abs = abs(
+        float(pair.change_pct or 0.0)
+    )
+
+    # base SL
     if entry_timing == "pullback":
-        risk_pct = 1.85
+        risk_pct = 1.75
     else:
-        risk_pct = 1.55
+        risk_pct = 1.45
 
     if market_mode == MODE_RECOVERY_LONG:
-        risk_pct += 0.10
+        risk_pct += 0.08
 
     if "rebound" in tags:
-        risk_pct += 0.18
+        risk_pct += 0.15
 
     if change_abs >= 2.5:
-        risk_pct += 0.25
+        risk_pct += 0.20
 
     if execution_stability >= 1.45:
-        risk_pct -= 0.15
+        risk_pct -= 0.12
 
     if execution_stability <= 0.95:
-        risk_pct += 0.25
+        risk_pct += 0.20
 
     if "major" in tags:
         risk_pct -= 0.08
 
     if turnover < 500_000:
-        risk_pct += 0.20
+        risk_pct += 0.15
 
     risk_pct = round(
         _clamp(
@@ -279,27 +310,22 @@ def _calculate_adaptive_targets(
         4,
     )
 
-    # ─────────────────────────────────────────
-    # TP1 Geometry
-    # ─────────────────────────────────────────
-    tp1_rr = 1.45
+    # TP1
+    tp1_rr = 1.40
 
     if execution_stability >= 1.30:
-        tp1_rr += 0.25
-
-    if execution_stability >= 1.55:
         tp1_rr += 0.20
 
+    if execution_stability >= 1.55:
+        tp1_rr += 0.15
+
     if "breakout" in tags:
-        tp1_rr += 0.12
+        tp1_rr += 0.10
 
     if "rs_btc" in tags:
-        tp1_rr += 0.12
+        tp1_rr += 0.10
 
     if "rebound" in tags:
-        tp1_rr -= 0.15
-
-    if turnover < 500_000:
         tp1_rr -= 0.12
 
     tp1_rr = round(
@@ -311,28 +337,26 @@ def _calculate_adaptive_targets(
         2,
     )
 
-    # ─────────────────────────────────────────
-    # TP2 Geometry
-    # ─────────────────────────────────────────
-    tp2_rr = 2.55
+    # TP2
+    tp2_rr = 2.25
 
     if execution_stability >= 1.40:
-        tp2_rr += 0.35
-
-    if execution_stability >= 1.65:
-        tp2_rr += 0.45
-
-    if "wave_3" == setup_type:
         tp2_rr += 0.25
 
-    if "rebound" in tags:
-        tp2_rr -= 0.25
+    if execution_stability >= 1.65:
+        tp2_rr += 0.20
 
-    if turnover < 500_000:
+    if setup_type == "wave_3":
+        tp2_rr += 0.15
+
+    if "rebound" in tags:
         tp2_rr -= 0.20
 
+    if turnover < 500_000:
+        tp2_rr -= 0.15
+
     if change_abs >= 4.0:
-        tp2_rr -= 0.25
+        tp2_rr -= 0.20
 
     tp2_rr = round(
         _clamp(
@@ -344,12 +368,24 @@ def _calculate_adaptive_targets(
     )
 
     return {
-        "model": "adaptive_execution_geometry_v2",
-        "risk_pct": risk_pct,
-        "rr1": tp1_rr,
-        "rr2": tp2_rr,
-        "sl_min_pct": SMART_SL_MIN_PCT,
-        "sl_max_pct": SMART_SL_MAX_PCT,
+
+        "model":
+            "adaptive_execution_geometry_v2_fixed",
+
+        "risk_pct":
+            risk_pct,
+
+        "rr1":
+            tp1_rr,
+
+        "rr2":
+            tp2_rr,
+
+        "sl_min_pct":
+            SMART_SL_MIN_PCT,
+
+        "sl_max_pct":
+            SMART_SL_MAX_PCT,
     }
 
 
@@ -359,6 +395,7 @@ def _infer_setup(
 ) -> tuple[str, str, list[str], list[str]]:
 
     warnings: list[str] = []
+
     pair_tags = set(pair.tags)
 
     if market_mode == MODE_RECOVERY_LONG:
@@ -379,7 +416,11 @@ def _infer_setup(
             warnings,
         )
 
-    if {"breakout", "momentum", "rs_btc"}.issubset(pair_tags):
+    if {
+        "breakout",
+        "momentum",
+        "rs_btc",
+    }.issubset(pair_tags):
 
         return (
             "wave_3",
@@ -393,7 +434,10 @@ def _infer_setup(
             warnings,
         )
 
-    if "breakout" in pair_tags and "momentum" in pair_tags:
+    if (
+        "breakout" in pair_tags
+        and "momentum" in pair_tags
+    ):
 
         return (
             "retest_breakout_confirmed",
@@ -406,7 +450,10 @@ def _infer_setup(
             warnings,
         )
 
-    if "rs_btc" in pair_tags and "continuation" in pair_tags:
+    if (
+        "rs_btc" in pair_tags
+        and "continuation" in pair_tags
+    ):
 
         return (
             "relative_strength_vs_btc",
@@ -421,7 +468,9 @@ def _infer_setup(
     if "momentum" in pair_tags:
 
         if "near_resistance" in pair_tags:
-            warnings.append("مقاومة قريبة قبل TP1")
+            warnings.append(
+                "مقاومة قريبة قبل TP1"
+            )
 
         return (
             "vwap_reclaim",
@@ -435,7 +484,9 @@ def _infer_setup(
 
     if "rebound" in pair_tags:
 
-        warnings.append("ارتداد مبكر يحتاج تأكيد")
+        warnings.append(
+            "ارتداد مبكر يحتاج تأكيد"
+        )
 
         return (
             "support_bounce_confirmed",
@@ -446,7 +497,9 @@ def _infer_setup(
             warnings,
         )
 
-    warnings.append("حركة متابعة — ليست أفضل إعداد تنفيذ")
+    warnings.append(
+        "حركة متابعة — ليست أفضل إعداد تنفيذ"
+    )
 
     return (
         "higher_low_continuation",
@@ -471,8 +524,14 @@ def _infer_quality_context(
 ) -> dict:
 
     tags = set(pair.tags or [])
-    turnover = float(pair.turnover_usdt or 0.0)
-    change = float(pair.change_pct or 0.0)
+
+    turnover = float(
+        pair.turnover_usdt or 0.0
+    )
+
+    change = float(
+        pair.change_pct or 0.0
+    )
 
     vol_ratio = 1.00
 
@@ -500,7 +559,9 @@ def _infer_quality_context(
     if "rebound" in tags:
         vol_ratio += 0.05
 
-    vol_ratio = _clamp_vol_ratio(vol_ratio)
+    vol_ratio = _clamp_vol_ratio(
+        vol_ratio
+    )
 
     mtf_confirmed = bool(
         "rs_btc" in tags
@@ -509,12 +570,18 @@ def _infer_quality_context(
             "retest_breakout_confirmed",
             "relative_strength_vs_btc",
         }
-        or ("major" in tags and change >= 0.75)
+        or (
+            "major" in tags
+            and change >= 0.75
+        )
     )
 
     breakout_quality = ""
 
-    if setup_type == "wave_3" and vol_ratio >= 1.12:
+    if (
+        setup_type == "wave_3"
+        and vol_ratio >= 1.12
+    ):
         breakout_quality = "strong"
 
     elif (
@@ -535,49 +602,93 @@ def _infer_quality_context(
 
     resistance_warning = (
         "near_resistance_before_tp1"
-        if any("مقاومة" in str(w) for w in warnings)
+        if any(
+            "مقاومة" in str(w)
+            for w in warnings
+        )
         or "near_resistance" in tags
         else ""
     )
 
     effective_score = round(
-        boost_score - (0.15 if resistance_warning else 0.0),
+        boost_score - (
+            0.15
+            if resistance_warning
+            else 0.0
+        ),
+        2,
+    )
+
+    # restored compatibility
+    dist_ma = round(
+        min(
+            abs(change) * 0.35,
+            4.5,
+        ),
         2,
     )
 
     return {
 
-        "effective_score": round(effective_score, 2),
-        "display_score": round(display_score, 2),
-        "boost_score": round(boost_score, 2),
-        "raw_score": round(raw_score, 2),
+        "effective_score":
+            round(effective_score, 2),
 
-        "score_scale": "boost_score_execution_scale",
+        "display_score":
+            round(display_score, 2),
 
-        "vol_ratio": vol_ratio,
-        "mtf_confirmed": mtf_confirmed,
+        "boost_score":
+            round(boost_score, 2),
 
-        "breakout_quality": breakout_quality,
+        "raw_score":
+            round(raw_score, 2),
 
-        "resistance_warning": resistance_warning,
+        "score_scale":
+            "boost_score_execution_scale",
+
+        "vol_ratio":
+            vol_ratio,
+
+        "dist_ma":
+            dist_ma,
+
+        "mtf_confirmed":
+            mtf_confirmed,
+
+        "breakout_quality":
+            breakout_quality,
+
+        "resistance_warning":
+            resistance_warning,
 
         "execution_stability":
-            execution_stability["execution_stability"],
+            execution_stability[
+                "execution_stability"
+            ],
 
         "stability_score":
-            execution_stability["stability_score"],
+            execution_stability[
+                "stability_score"
+            ],
 
         "instability_score":
-            execution_stability["instability_score"],
+            execution_stability[
+                "instability_score"
+            ],
 
         "nour_filter_passed":
-            execution_stability["nour_filter_passed"],
+            execution_stability[
+                "nour_filter_passed"
+            ],
 
         "nour_filter_reason":
-            execution_stability["nour_filter_reason"],
+            execution_stability[
+                "nour_filter_reason"
+            ],
 
         "exhausted_move":
-            execution_stability["exhausted_move"],
+            execution_stability[
+                "exhausted_move"
+            ],
     }
 
 
@@ -609,7 +720,12 @@ def build_signal_candidate(
     if "major" in pair_tags:
         boost_score += 0.08
 
-    setup_type, entry_timing, tags, warnings = _infer_setup(
+    (
+        setup_type,
+        entry_timing,
+        tags,
+        warnings,
+    ) = _infer_setup(
         pair,
         market_mode,
     )
@@ -619,13 +735,19 @@ def build_signal_candidate(
     if market_mode == MODE_BLOCK_LONGS:
 
         if (
-            setup_type not in BLOCK_EXCEPTION_SETUPS
+            setup_type
+            not in BLOCK_EXCEPTION_SETUPS
             or pair.turnover_usdt < 5_000_000
         ):
             return None
 
-        tags.append("block_exception")
-        warnings.append("Block exception only")
+        tags.append(
+            "block_exception"
+        )
+
+        warnings.append(
+            "Block exception only"
+        )
 
         boost_score += 0.20
 
@@ -636,14 +758,20 @@ def build_signal_candidate(
         threshold = min_strong_score
 
         if (
-            setup_type not in WHITELIST_SETUPS
-            and boost_score < (min_strong_score + 0.30)
+            setup_type
+            not in WHITELIST_SETUPS
+            and boost_score
+            < (
+                min_strong_score + 0.30
+            )
         ):
             return None
 
     elif market_mode == MODE_RECOVERY_LONG:
 
-        threshold = min_normal_score + 0.10
+        threshold = (
+            min_normal_score + 0.10
+        )
 
     if (
         boost_score < threshold
@@ -651,35 +779,41 @@ def build_signal_candidate(
     ):
         return None
 
-    # ─────────────────────────────────────────
-    # NEW — Nour Filter V2
-    # ─────────────────────────────────────────
-    stability_context = _calculate_execution_stability(
-        pair=pair,
-        setup_type=setup_type,
-        market_mode=market_mode,
+    # IMPORTANT:
+    # informational only now
+    stability_context = (
+        _calculate_execution_stability(
+            pair=pair,
+            setup_type=setup_type,
+            market_mode=market_mode,
+        )
     )
 
-    if not stability_context["nour_filter_passed"]:
-        return None
-
-    display_score = _soft_cap_score(boost_score)
-
-    # ─────────────────────────────────────────
-    # NEW — Adaptive targets
-    # ─────────────────────────────────────────
-    target_profile = _calculate_adaptive_targets(
-        pair=pair,
-        setup_type=setup_type,
-        entry_timing=entry_timing,
-        market_mode=market_mode,
-        execution_stability=(
-            stability_context["execution_stability"]
-        ),
+    display_score = _soft_cap_score(
+        boost_score
     )
 
-    rr1 = float(target_profile["rr1"])
-    rr2 = float(target_profile["rr2"])
+    target_profile = (
+        _calculate_adaptive_targets(
+            pair=pair,
+            setup_type=setup_type,
+            entry_timing=entry_timing,
+            market_mode=market_mode,
+            execution_stability=(
+                stability_context[
+                    "execution_stability"
+                ]
+            ),
+        )
+    )
+
+    rr1 = float(
+        target_profile["rr1"]
+    )
+
+    rr2 = float(
+        target_profile["rr2"]
+    )
 
     risk_pct = float(
         target_profile["risk_pct"]
@@ -693,8 +827,13 @@ def build_signal_candidate(
 
     risk_amount = entry - sl
 
-    tp1 = entry + (risk_amount * rr1)
-    tp2 = entry + (risk_amount * rr2)
+    tp1 = entry + (
+        risk_amount * rr1
+    )
+
+    tp2 = entry + (
+        risk_amount * rr2
+    )
 
     if (
         tp1 <= entry
@@ -703,16 +842,20 @@ def build_signal_candidate(
     ):
         return None
 
-    quality_meta = _infer_quality_context(
-        pair=pair,
-        setup_type=setup_type,
-        entry_timing=entry_timing,
-        boost_score=boost_score,
-        display_score=display_score,
-        raw_score=raw_score,
-        market_mode=market_mode,
-        warnings=warnings,
-        execution_stability=stability_context,
+    quality_meta = (
+        _infer_quality_context(
+            pair=pair,
+            setup_type=setup_type,
+            entry_timing=entry_timing,
+            boost_score=boost_score,
+            display_score=display_score,
+            raw_score=raw_score,
+            market_mode=market_mode,
+            warnings=warnings,
+            execution_stability=(
+                stability_context
+            ),
+        )
     )
 
     return SignalCandidate(
@@ -720,16 +863,20 @@ def build_signal_candidate(
         symbol=pair.symbol,
 
         entry=round(entry, 8),
+
         sl=round(sl, 8),
 
         tp1=round(tp1, 8),
+
         tp2=round(tp2, 8),
 
         # UI ONLY
         score=display_score,
 
         setup_type=setup_type,
+
         entry_timing=entry_timing,
+
         market_mode=market_mode,
 
         execution_setup_tags=tags,
@@ -737,41 +884,57 @@ def build_signal_candidate(
         warnings=warnings,
 
         notes=[
-            "v129: nour filter v2 enabled",
-            "v129: adaptive target engine enabled",
+            "v129 fixed",
+            "adaptive targets improved",
+            "nour filter moved downstream",
         ],
 
         meta={
 
-            "turnover_usdt": pair.turnover_usdt,
-            "change_pct": pair.change_pct,
+            "turnover_usdt":
+                pair.turnover_usdt,
 
-            "pair_tags": list(pair.tags),
+            "change_pct":
+                pair.change_pct,
 
-            "rr1": rr1,
-            "rr2": rr2,
+            "pair_tags":
+                list(pair.tags),
 
-            "risk_pct": risk_pct,
+            "rr1":
+                rr1,
 
-            "target_model": target_profile.get("model"),
+            "rr2":
+                rr2,
+
+            "risk_pct":
+                risk_pct,
+
+            "target_model":
+                target_profile.get(
+                    "model"
+                ),
 
             "smart_sl_min_pct":
-                target_profile.get("sl_min_pct"),
+                target_profile.get(
+                    "sl_min_pct"
+                ),
 
             "smart_sl_max_pct":
-                target_profile.get("sl_max_pct"),
+                target_profile.get(
+                    "sl_max_pct"
+                ),
 
             "is_elite_setup": (
-                setup_type in ELITE_SETUPS
+                setup_type
+                in ELITE_SETUPS
                 or "elite" in tags
             ),
 
-            "rejection_context": rejection_reason,
+            "rejection_context":
+                rejection_reason,
 
-            "threshold_used": round(
-                threshold,
-                2,
-            ),
+            "threshold_used":
+                round(threshold, 2),
 
             **quality_meta,
         },
