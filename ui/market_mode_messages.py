@@ -182,6 +182,19 @@ def _build_compact_market_reminder(mode: str, context: dict) -> str:
     remaining = context.get("remaining_minutes", 0)
     protection_tail = f"\n⏭ {context.get('protection_next', 'Next')} in ~{remaining}m" if remaining else ""
 
+    open_winners = int(context.get("open_winners", 0) or 0)
+    protected_runners = int(context.get("protected_runners", 0) or 0)
+    danger_trades = int(context.get("danger_trades", 0) or 0)
+    counted_open_positions = int(
+        context.get(
+            "counted_open_positions",
+            context.get(
+                "open_positions_count",
+                open_winners + danger_trades + protected_runners,
+            ),
+        ) or 0
+    )
+
     lines = [
         f"{mode_emoji} <b>Market Reminder #{context.get('reminder_count', 1)}</b>",
         f"⏱ {duration} in {mode}",
@@ -197,8 +210,9 @@ def _build_compact_market_reminder(mode: str, context: dict) -> str:
         "⚡ <b>Focus</b>",
         *_focus_lines(mode),
         "",
-        "📂 <b>Open Candidates</b>",
-        f"🟢 Winners: {context.get('open_winners', 0)} | 🟡 Protected: {context.get('protected_runners', 0)} | 🔴 Danger: {context.get('danger_trades', 0)}",
+        "📂 <b>Open Positions</b>",
+        f"• Counted Open: {counted_open_positions}",
+        f"🟢 Winners: {open_winners} | 🟡 Protected Runners: {protected_runners} | 🔴 Danger: {danger_trades}",
         "",
         "📈 <b>Scan Summary</b>",
         f"• Signals: {context.get('signals_count', 0)}",
