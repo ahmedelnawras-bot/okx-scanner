@@ -57,6 +57,13 @@ from ui.market_mode_messages import build_market_mode_sections, build_block_esca
 BLOCK_REMINDER_THRESHOLDS = [(15, 1), (30, 2), (40, 3)]
 GENERAL_MODE_REMINDER_MINUTES = 30
 
+# Symbol-level duplicate suppression before live.
+# Keep actual execution alerts visible, but stop repeating the same coin
+# every scan when nothing materially changed.
+SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS = 45 * 60
+SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
+SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
+
 from services.telegram_sender import TelegramSender
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
@@ -336,14 +343,11 @@ def _execution_slot_counts(trades) -> dict[str, int]:
 
 def _has_active_same_symbol(trades, candidate_trade) -> bool:
     symbol = getattr(candidate_trade, "symbol", "")
-    bucket = getattr(candidate_trade, "tracking_bucket", "normal")
-    path = getattr(candidate_trade, "execution_path", "")
+
+    # Same-symbol blocking should be symbol-wide.
+    # Do not allow duplicates just because tracking bucket or execution path changed.
     for trade in trades or []:
         if getattr(trade, "symbol", "") != symbol:
-            continue
-        if getattr(trade, "tracking_bucket", "normal") != bucket:
-            continue
-        if path and getattr(trade, "execution_path", "") != path:
             continue
         if _blocks_same_symbol_reentry(trade):
             return True
@@ -589,13 +593,33 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
     )
 
 
-def _is_duplicate_signal_fingerprint(fingerprint: str, sent_fingerprints: set[str], trade_store: RedisTradeStore | None = None) -> bool:
-    if fingerprint in sent_fingerprints:
+def _purge_expired_fingerprints(sent_fingerprints: dict[str, float], now_ts: float | None = None) -> None:
+    now_ts = now_ts or time.time()
+    expired = [fp for fp, expires_at in sent_fingerprints.items() if float(expires_at or 0) <= now_ts]
+    for fp in expired:
+        sent_fingerprints.pop(fp, None)
+
+
+def _is_duplicate_signal_fingerprint(
+    fingerprint: str,
+    sent_fingerprints: dict[str, float],
+    trade_store: RedisTradeStore | None = None,
+    ttl_seconds: int = SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS,
+) -> bool:
+    now_ts = time.time()
+    _purge_expired_fingerprints(sent_fingerprints, now_ts)
+
+    expires_at = float(sent_fingerprints.get(fingerprint, 0) or 0)
+    if expires_at > now_ts:
         return True
-    if trade_store and trade_store.enabled and trade_store.mark_signal_fingerprint(fingerprint):
-        sent_fingerprints.add(fingerprint)
+
+    if trade_store and trade_store.enabled and trade_store.mark_signal_fingerprint(
+        fingerprint, ttl_seconds=ttl_seconds
+    ):
+        sent_fingerprints[fingerprint] = now_ts + max(60, int(ttl_seconds))
         return True
-    sent_fingerprints.add(fingerprint)
+
+    sent_fingerprints[fingerprint] = now_ts + max(60, int(ttl_seconds))
     return False
 
 
@@ -605,23 +629,30 @@ def _signal_status_bucket(exec_status: str | None) -> str:
         return "execution_accepted"
     if status == "pending_pullback_preview":
         return "execution_pullback"
-    if status == "candidate_only":
-        return "execution_candidate_only"
-    return "normal_signal"
+
+    # Everything else is an observation-level alert for this symbol.
+    # This stops normal/candidate/rejected spam from repeating every scan.
+    return "symbol_observation"
+
+
+def _signal_fingerprint_ttl(exec_result: dict | None) -> int:
+    status = str((exec_result or {}).get("status") or "").strip().lower()
+    if status == "accepted_preview":
+        return SYMBOL_EXECUTION_DEDUP_TTL_SECONDS
+    if status == "pending_pullback_preview":
+        return SYMBOL_PULLBACK_DEDUP_TTL_SECONDS
+    return SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS
 
 
 def _build_signal_fingerprint(signal, exec_result: dict) -> str:
     return "|".join([
         str(getattr(signal, "symbol", "")).upper(),
         "LONG",
-        str(getattr(signal, "setup_type", "unknown") or "unknown"),
-        str(getattr(signal, "entry_timing", "unknown") or "unknown"),
-        str(getattr(signal, "market_mode", "unknown") or "unknown"),
         _signal_status_bucket(exec_result.get("status") if isinstance(exec_result, dict) else None),
     ])
 
 
-def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: set[str], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
+def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in result.get("signal_items", [])[:8]:
         signal = item["signal"]
         exec_result = item["execution"]
@@ -631,7 +662,12 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         if not settings.send_normal_signals and not is_execution:
             continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
-        if _is_duplicate_signal_fingerprint(fingerprint, sent_fingerprints, trade_store):
+        if _is_duplicate_signal_fingerprint(
+            fingerprint,
+            sent_fingerprints,
+            trade_store,
+            ttl_seconds=_signal_fingerprint_ttl(exec_result),
+        ):
             continue
 
         text = item["message"]
@@ -1217,7 +1253,7 @@ def live_worker() -> None:
     )
     trade_store = RedisTradeStore(settings.redis_url)
     state: MarketModeState | None = None
-    sent_fingerprints: set[str] = set()
+    sent_fingerprints: dict[str, float] = {}
     telegram_offset: int | None = None
     reminder_tracker: dict = {}
     next_mode_guard_ts: float = 0.0
