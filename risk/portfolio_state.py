@@ -20,7 +20,6 @@ from config.risk_config import (
     DRAWDOWN_WARNING_PCT,
     DRAWDOWN_SOFT_STOP_PCT,
     DRAWDOWN_HARD_STOP_PCT,
-    MAX_DAILY_DRAWDOWN_PCT,
 )
 
 
@@ -87,31 +86,82 @@ class PortfolioState:
         }
 
 
+def _trade_is_closed(trade) -> bool:
+    """اعتبر TP2 = closed حتى لو status لم يتحدث بعد."""
+    try:
+        if bool(getattr(trade, "tp2_hit", False)):
+            return True
+        if getattr(trade, "closed_at", None) is not None:
+            return True
+        if bool(getattr(trade, "is_closed", False)):
+            return True
+        status = str(getattr(trade, "status", "") or "").lower()
+        return status in {
+            "closed_loss",
+            "breakeven_after_tp1",
+            "trailing_hit",
+            "closed_win",
+            "expired",
+        }
+    except Exception:
+        return False
+
+
+def _same_utc_day(value: datetime | None, day_ref: datetime) -> bool:
+    if value is None:
+        return False
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.date() == day_ref.date()
+    except Exception:
+        return False
+
+
 def build_portfolio_state_from_trades(
     trades: list,
     reference_portfolio: float = REFERENCE_PORTFOLIO_USDT,
     margin_per_trade: float = PAPER_MARGIN_PER_TRADE_USDT,
     leverage: int = DEFAULT_LEVERAGE,
+    start_of_day_balance: float | None = None,
+    day_started_at: datetime | None = None,
 ) -> PortfolioState:
     """بيبني PortfolioState من الـ trades الحالية.
 
     بيحسب:
     - realized_pnl من الصفقات المغلقة
     - unrealized_pnl من الصفقات المفتوحة
+    - TP2 تعتبر صفقة مغلقة
     """
     now = datetime.now(timezone.utc)
     realized = 0.0
     unrealized = 0.0
     opened_today = 0
 
+    actual_start_of_day_balance = float(
+        start_of_day_balance
+        if start_of_day_balance is not None
+        else reference_portfolio
+    )
+
+    actual_day_started_at = (
+        day_started_at.astimezone(timezone.utc)
+        if isinstance(day_started_at, datetime) and day_started_at.tzinfo is not None
+        else day_started_at.replace(tzinfo=timezone.utc)
+        if isinstance(day_started_at, datetime)
+        else now.replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+
+    trade_value = float(margin_per_trade) * float(leverage)
+
     for trade in trades or []:
-        is_closed = getattr(trade, "is_closed", False)
+        is_closed = _trade_is_closed(trade)
         opened_at = getattr(trade, "opened_at", None)
         pnl_pct = float(getattr(trade, "pnl_pct", 0.0) or 0.0)
         realized_pnl_pct = float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0)
 
-        # حساب الـ PnL بالدولار
-        trade_value = margin_per_trade * leverage
         pnl_usdt = (pnl_pct / 100.0) * trade_value
 
         if is_closed:
@@ -120,21 +170,15 @@ def build_portfolio_state_from_trades(
         else:
             unrealized += pnl_usdt
 
-        # عدد الصفقات اللي اتفتحت النهارده
-        if opened_at:
-            try:
-                if hasattr(opened_at, "date"):
-                    if opened_at.date() == now.date():
-                        opened_today += 1
-            except Exception:
-                pass
+        if _same_utc_day(opened_at, actual_day_started_at):
+            opened_today += 1
 
     return PortfolioState(
-        reference_portfolio=reference_portfolio,
-        start_of_day_balance=reference_portfolio,
+        reference_portfolio=float(reference_portfolio),
+        start_of_day_balance=round(actual_start_of_day_balance, 4),
         realized_pnl_usdt=round(realized, 4),
         unrealized_pnl_usdt=round(unrealized, 4),
-        day_started_at=now.replace(hour=0, minute=0, second=0, microsecond=0),
+        day_started_at=actual_day_started_at,
         last_updated=now,
         trades_opened_today=opened_today,
     )
