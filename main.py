@@ -51,7 +51,35 @@ from reporting.help_menus import (
     build_diagnostics_help,
     build_diagnostics_commands_help,
 )
-from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
+try:
+    from ui.telegram_signals import (
+        build_signal_message,
+        build_signal_buttons,
+        build_track_message,
+        build_execution_confirmation_message,
+        build_execution_failure_message,
+    )
+except ImportError:
+    from ui.telegram_signals import build_signal_message, build_signal_buttons, build_track_message
+
+    def build_execution_confirmation_message(signal, execution_result=None, order_result=None, trade=None) -> str:
+        order_result = order_result or {}
+        entry = (order_result or {}).get("entry") or {}
+        return "\n".join([
+            "✅ OKX EXECUTION CONFIRMED",
+            f"💎 {getattr(signal, 'symbol', '-')}",
+            f"• Entry Order ID: {entry.get('order_id') or '-'}",
+            f"• SL Attached: {'YES' if (order_result or {}).get('sl_attached') else 'NO'}",
+        ])
+
+    def build_execution_failure_message(signal, execution_result=None, order_result=None) -> str:
+        order_result = order_result or {}
+        entry = (order_result or {}).get("entry") or {}
+        return "\n".join([
+            "⚠️ OKX EXECUTION FAILED",
+            f"💎 {getattr(signal, 'symbol', '-')}",
+            f"• Reason: {entry.get('reason') or order_result.get('reason') or 'okx_execution_failed'}",
+        ])
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 
 BLOCK_REMINDER_THRESHOLDS = [(15, 1), (30, 2), (40, 3)]
@@ -949,8 +977,35 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         item["exchange_order_result"] = managed_order_result
         item["exchange_order_ok"] = exchange_order_ok
 
+        if exchange_required:
+            _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
+
         send_result = sender.send_message(text, reply_markup=build_signal_buttons(signal))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
+
+        if exchange_required:
+            try:
+                if exchange_order_ok:
+                    sender.send_message(
+                        build_execution_confirmation_message(
+                            signal,
+                            exec_result,
+                            managed_order_result,
+                            trade=item.get("candidate_trade"),
+                        ),
+                        reply_markup=build_signal_buttons(signal),
+                    )
+                else:
+                    sender.send_message(
+                        build_execution_failure_message(
+                            signal,
+                            exec_result,
+                            managed_order_result,
+                        ),
+                        reply_markup=build_signal_buttons(signal),
+                    )
+            except Exception:
+                pass
 
         if send_ok and is_execution:
             if exchange_required and not exchange_order_ok:
