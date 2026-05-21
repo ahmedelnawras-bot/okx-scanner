@@ -385,7 +385,6 @@ def run_once(
     current_execution_results = []
     technical_snapshot_records = []
     local_gate_trades = []
-    new_trades = []
     slot_counts = _execution_slot_counts(persisted_trades)
     recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
 
@@ -444,12 +443,12 @@ def run_once(
         setattr(candidate_trade, "telegram_announced", False)
         setattr(candidate_trade, "announced_to_telegram", False)
 
-        should_activate_trade = consumes_live_slot and not _has_active_same_symbol(
+        eligible_for_activation = consumes_live_slot and not _has_active_same_symbol(
             [*persisted_trades, *local_gate_trades],
             candidate_trade,
         )
 
-        if should_activate_trade:
+        if eligible_for_activation:
             path = str(exec_result.get("path") or "general")
             if path == "block_exception":
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
@@ -461,14 +460,16 @@ def run_once(
             else:
                 slot_counts["general"] = slot_counts.get("general", 0) + 1
 
+            # Reserve this trade only for same-scan gating.
+            # It must NOT become an open tracked trade before Telegram alert succeeds.
             local_gate_trades.append(candidate_trade)
-            new_trades.append(candidate_trade)
 
         signal_items.append({
             "signal": signal,
             "execution": exec_result,
             "message": build_signal_message(signal, exec_result),
             "candidate_trade": candidate_trade,
+            "eligible_for_activation": eligible_for_activation,
             "telegram_announced": False,
             "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
         })
@@ -494,7 +495,7 @@ def run_once(
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     protection = block_protection_status(state)
     trades = update_open_trades(
-        [*persisted_trades, *new_trades],
+        list(persisted_trades),
         price_map,
         protection_level=protection.get("level", 0),
     )
@@ -615,6 +616,11 @@ def _activate_announced_trade(
     if exec_status != "accepted_preview":
         if updated_existing:
             _refresh_runtime_result_outputs(result, trade_store=trade_store)
+        return True
+
+    if not bool(item.get("eligible_for_activation")):
+        # This execution check passed a gate label, but it was not eligible to
+        # become a live tracked trade in this scan (same-symbol / slot context).
         return True
 
     if not updated_existing:
@@ -747,8 +753,26 @@ def _build_signal_fingerprint(signal, exec_result: dict) -> str:
     ])
 
 
+def _iter_signal_items_for_dispatch(result: dict) -> list[dict]:
+    items = list(result.get("signal_items", []) or [])
+    execution_items = [
+        item for item in items
+        if str((item.get("execution") or {}).get("status") or "").strip().lower()
+        in {"accepted_preview", "pending_pullback_preview"}
+    ]
+    normal_items = [
+        item for item in items
+        if str((item.get("execution") or {}).get("status") or "").strip().lower()
+        not in {"accepted_preview", "pending_pullback_preview"}
+    ]
+
+    # Always send all execution-related alerts.
+    # Limit normal observations to the first 8 to avoid Telegram spam.
+    return [*execution_items, *normal_items[:8]]
+
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
-    for item in result.get("signal_items", [])[:8]:
+    for item in _iter_signal_items_for_dispatch(result):
         signal = item["signal"]
         exec_result = item["execution"]
         exec_status = str(exec_result.get("status") or "")
@@ -783,9 +807,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             ])
 
         send_result = sender.send_message(text, reply_markup=build_signal_buttons(signal))
-        send_ok = True
-        if isinstance(send_result, dict):
-            send_ok = bool(send_result.get("ok", True))
+        send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
 
         item["announcement_status"] = "sent" if send_ok else "send_failed"
         if send_ok and is_execution:
@@ -1379,12 +1401,7 @@ def live_worker() -> None:
     while True:
         try:
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store)
-            last_result = result
             state = result["state"]
-            if settings.verbose_logs:
-                print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
-            else:
-                _print_scan_summary(result, trade_store)
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     # ✅ FIX: _send_text بدل send_message لدعم HTML tags
@@ -1393,6 +1410,12 @@ def live_worker() -> None:
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
                 telegram_offset = _answer_commands(sender, result, telegram_offset, settings, trade_store)
+
+            last_result = result
+            if settings.verbose_logs:
+                print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
+            else:
+                _print_scan_summary(result, trade_store)
         except Exception as exc:
             error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
             print(error_text, flush=True)
