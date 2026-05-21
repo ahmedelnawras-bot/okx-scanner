@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass
@@ -40,6 +41,38 @@ class TrackedTrade:
     slot_exempt_reason: str = ""
     daily_open_risk_exempt: bool = False
     same_symbol_block_exempt: bool = False
+
+    # Exchange-managed execution metadata.
+    # These fields let the bot know exactly what reached OKX and what still
+    # needs sync/amend/cancel later.
+    exchange_order_ok: bool = False
+    exchange_order_reason: str = ""
+    exchange_sync_state: str = "not_submitted"   # not_submitted | submitted | partial_live | live | sync_failed
+    last_exchange_error: str = ""
+    last_exchange_sync_at: datetime | None = None
+
+    entry_order_id: str = ""
+    entry_client_order_id: str = ""
+    entry_order_payload: dict[str, Any] = field(default_factory=dict)
+
+    sl_attached_on_entry: bool = False
+    sl_attached_payload: list[dict[str, Any]] = field(default_factory=list)
+    live_stop_loss_px: float = 0.0
+    last_sl_amend_reason: str = ""
+    last_sl_amend_at: datetime | None = None
+
+    tp_split_ok: bool = False
+    tp_split_reason: str = ""
+    tp1_order_id: str = ""
+    tp2_order_id: str = ""
+    tp1_client_order_id: str = ""
+    tp2_client_order_id: str = ""
+
+    runner_expected_size: str = ""
+    runner_requires_trailing_after_tp2: bool = False
+    runner_algo_id: str = ""
+    runner_algo_client_order_id: str = ""
+    managed_trade_plan: dict[str, Any] = field(default_factory=dict)
 
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
