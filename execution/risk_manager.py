@@ -1,12 +1,6 @@
-risk_manager-6.py
+risk_manager_6.py (تم تصحيح اسم الملف واستبدال الشرطات)
 
 تم تصحيح مشكلة SyntaxError: invalid decimal literal
-
-ملاحظات:
-
-- إزالة أي أرقام مكتوبة بالعربي
-
-- التأكد من استخدام النقطة للفواصل العشرية
 
 position_size = 35.0 max_daily_trades = 7 reference_portfolio = 1000.0 max_drawdown = 35.0 leverage = 15
 
