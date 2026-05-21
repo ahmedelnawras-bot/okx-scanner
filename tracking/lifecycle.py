@@ -1,13 +1,7 @@
-"""Trade lifecycle with partial exits, protected runners, and path-specific target splits.
-
-Phase 1 alignment:
-- TP2 does NOT fully close the trade if the 20% runner is still active.
-- After TP2, the remaining runner keeps being tracked.
-- After TP2, the trade becomes slot-exempt / daily-risk-exempt / same-symbol-block-exempt.
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from utils.constants import TRAILING_STOP_AFTER_TP2_PCT, BREAKEVEN_BUFFER_PCT
 from .models import TrackedTrade
@@ -15,9 +9,84 @@ from .models import TrackedTrade
 
 _CLOSED_STATUSES = {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}
 
+_FILLED_STATES = {
+    "filled",
+    "full_fill",
+    "fully_filled",
+    "completed",
+    "complete",
+}
+_PARTIAL_STATES = {
+    "partially_filled",
+    "partial_fill",
+    "partiallyfilled",
+    "partialfilled",
+}
+
+
+def _safe_setattr(obj: Any, name: str, value: Any) -> None:
+    try:
+        setattr(obj, name, value)
+    except Exception:
+        pass
+
 
 def _pnl_pct(entry: float, price: float) -> float:
     return ((price - entry) / entry) * 100.0 if entry else 0.0
+
+
+def _normalize_state(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_filled_state(value: Any) -> bool:
+    return _normalize_state(value) in _FILLED_STATES
+
+
+def _is_partial_state(value: Any) -> bool:
+    return _normalize_state(value) in _PARTIAL_STATES
+
+
+def _has_exchange_tp_metadata(trade: TrackedTrade) -> bool:
+    return bool(
+        getattr(trade, "tp1_order_id", None)
+        or getattr(trade, "tp2_order_id", None)
+        or getattr(trade, "tp1_exchange_state", None)
+        or getattr(trade, "tp2_exchange_state", None)
+    )
+
+
+def _entry_is_live_or_filled(trade: TrackedTrade) -> bool:
+    fill_ratio = float(getattr(trade, "entry_fill_ratio", 0.0) or 0.0)
+    fill_state = _normalize_state(getattr(trade, "entry_fill_state", "") or getattr(trade, "exchange_sync_state", ""))
+    if fill_ratio > 0:
+        return True
+    if any(token in fill_state for token in ("filled", "partial", "live", "executed", "open")):
+        return True
+    # Backward-compatible fallback for old tracked trades that do not store exchange fill metadata.
+    return True
+
+
+def _tp1_confirmed(trade: TrackedTrade, current_price: float) -> tuple[bool, str]:
+    state = _normalize_state(getattr(trade, "tp1_exchange_state", ""))
+    if _has_exchange_tp_metadata(trade):
+        if _is_filled_state(state):
+            return True, "exchange"
+        if _is_partial_state(state):
+            return False, "exchange_partial"
+        return False, "exchange_wait"
+    return current_price >= trade.tp1, "price"
+
+
+def _tp2_confirmed(trade: TrackedTrade, current_price: float) -> tuple[bool, str]:
+    state = _normalize_state(getattr(trade, "tp2_exchange_state", ""))
+    if _has_exchange_tp_metadata(trade):
+        if _is_filled_state(state):
+            return True, "exchange"
+        if _is_partial_state(state):
+            return False, "exchange_partial"
+        return False, "exchange_wait"
+    return current_price >= trade.tp2, "price"
 
 
 def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
@@ -35,13 +104,7 @@ def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
 
 
 def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
-    """After TP2, the remaining 20% runner stays open for tracking only.
-
-    Important:
-    - TP2 is NOT a full close.
-    - The remaining runner should no longer consume slots.
-    - The remaining runner should no longer block same-symbol re-entry.
-    """
+    """After TP2, the remaining runner stays open for tracking only."""
     if trade.tp2_hit and trade.sl_moved_to_entry:
         trade.protected_runner = True
         trade.slot_exempt = True
@@ -74,8 +137,41 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
     return trade
 
 
+def _apply_tp1_partial(trade: TrackedTrade, tp1_close_pct: float, source: str) -> TrackedTrade:
+    if trade.tp1_hit:
+        return trade
+    trade.tp1_hit = True
+    trade.closed_portion_pct = tp1_close_pct
+    trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
+    trade.status = "tp1_partial"
+    _safe_setattr(trade, "exchange_sync_state", "tp1_filled_exchange" if source == "exchange" else "tp1_touched")
+    return trade
+
+
+def _apply_tp2_partial(trade: TrackedTrade, tp1_close_pct: float, tp2_close_pct: float, source: str) -> TrackedTrade:
+    if not trade.tp1_hit:
+        trade = _apply_tp1_partial(trade, tp1_close_pct, source)
+    if trade.tp2_hit:
+        return trade
+    trade.tp2_hit = True
+    trade.trailing_active = True
+    trade.runner_active = True
+    trade.sl_moved_to_entry = True
+    trade.closed_portion_pct = tp1_close_pct + tp2_close_pct
+    trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp2) * (tp2_close_pct / 100.0)
+    trade.status = "tp2_partial"
+    _safe_setattr(trade, "exchange_sync_state", "tp2_filled_exchange" if source == "exchange" else "tp2_touched")
+    return _mark_protected_runner(trade)
+
+
 def update_trade_with_price(trade: TrackedTrade, current_price: float, protection_level: int = 0) -> TrackedTrade:
     if trade.status in _CLOSED_STATUSES:
+        return trade
+
+    if not _entry_is_live_or_filled(trade):
+        trade.updated_at = datetime.now(timezone.utc)
+        trade.current_price = current_price
+        _safe_setattr(trade, "exchange_sync_state", _normalize_state(getattr(trade, "exchange_sync_state", "")) or "entry_wait")
         return trade
 
     now = datetime.now(timezone.utc)
@@ -95,18 +191,16 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         trade.closed_portion_pct = 100.0
         trade.realized_pnl_pct = _pnl_pct(trade.entry, active_sl)
         trade.runner_pnl_pct = 0.0
+        _safe_setattr(trade, "exchange_sync_state", "stopped_before_tp1")
         return _mark_closed(trade, status)
 
     tp1_close_pct = float(trade.tp1_close_pct or 40.0)
     tp2_close_pct = float(trade.tp2_close_pct or 40.0)
     runner_close_pct = float(trade.runner_close_pct or 20.0)
 
-    if not trade.tp1_hit and current_price >= trade.tp1:
-        trade.tp1_hit = True
-        # Slot exemption and same-symbol exemption still wait until TP2.
-        trade.closed_portion_pct = tp1_close_pct
-        trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
-        trade.status = "tp1_partial"
+    tp1_ready, tp1_source = _tp1_confirmed(trade, current_price)
+    if not trade.tp1_hit and tp1_ready:
+        trade = _apply_tp1_partial(trade, tp1_close_pct, tp1_source)
 
     post_tp1_sl = max(active_sl, trade.entry if trade.sl_moved_to_entry else active_sl)
     if trade.tp1_hit and not trade.tp2_hit and current_price <= post_tp1_sl:
@@ -114,18 +208,12 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
         trade.realized_pnl_pct += max(0.0, _pnl_pct(trade.entry, post_tp1_sl)) * (remaining_pct / 100.0)
         trade.runner_pnl_pct = 0.0
+        _safe_setattr(trade, "exchange_sync_state", "post_tp1_breakeven")
         return _mark_closed(trade, "breakeven_after_tp1")
 
-    if trade.tp1_hit and not trade.tp2_hit and current_price >= trade.tp2:
-        trade.tp2_hit = True
-        trade.trailing_active = True
-        trade.runner_active = True
-        trade.sl_moved_to_entry = True
-        trade.closed_portion_pct = tp1_close_pct + tp2_close_pct
-        trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp2) * (tp2_close_pct / 100.0)
-        # TP2 is partial, not a full close. Keep the final 20% runner alive.
-        trade.status = "tp2_partial"
-        trade = _mark_protected_runner(trade)
+    tp2_ready, tp2_source = _tp2_confirmed(trade, current_price)
+    if trade.tp1_hit and not trade.tp2_hit and tp2_ready:
+        trade = _apply_tp2_partial(trade, tp1_close_pct, tp2_close_pct, tp2_source)
 
     if trade.tp2_hit:
         trade = _mark_protected_runner(trade)
@@ -139,7 +227,9 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
             trade.runner_pnl_pct = 0.0
             trade.runner_active = False
             trade.protected_runner = False
+            _safe_setattr(trade, "exchange_sync_state", "runner_trailing_hit")
             return _mark_closed(trade, "trailing_hit")
         trade.status = "runner"
+        _safe_setattr(trade, "exchange_sync_state", _normalize_state(getattr(trade, "exchange_sync_state", "")) or "runner_active")
 
     return trade
