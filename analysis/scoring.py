@@ -127,6 +127,111 @@ def _clamp_vol_ratio(
         2,
     )
 
+def _confirmation_bonus(
+    pair: PairCandidate,
+    setup_type: str,
+) -> float:
+
+    tags = set(pair.tags or [])
+    bonus = 0.0
+
+    if "rs_btc" in tags:
+        bonus += 0.18
+
+    if "breakout" in tags:
+        bonus += 0.10
+
+    if "liquid" in tags:
+        bonus += 0.08
+
+    if "continuation" in tags:
+        bonus += 0.08
+
+    if setup_type in {
+        "retest_breakout_confirmed",
+        "vwap_reclaim",
+        "relative_strength_vs_btc",
+    }:
+        bonus += 0.10
+
+    if "major" in tags:
+        bonus += 0.06
+
+    return round(bonus, 3)
+
+
+def _freshness_bonus(
+    pair: PairCandidate,
+    setup_type: str,
+    entry_timing: str,
+) -> float:
+
+    tags = set(pair.tags or [])
+    change_abs = abs(float(pair.change_pct or 0.0))
+    bonus = 0.0
+
+    if change_abs <= 1.20:
+        bonus += 0.18
+    elif change_abs <= 2.20:
+        bonus += 0.10
+    elif change_abs <= 3.20:
+        bonus += 0.03
+
+    if setup_type in {
+        "retest_breakout_confirmed",
+        "vwap_reclaim",
+        "higher_low_continuation",
+        "liquidity_sweep_reclaim",
+        "support_bounce_confirmed",
+    }:
+        bonus += 0.10
+
+    if entry_timing == "pullback":
+        bonus += 0.12
+
+    if "compression" in tags:
+        bonus += 0.08
+
+    if "rebound" in tags and change_abs <= 2.20:
+        bonus += 0.05
+
+    return round(bonus, 3)
+
+
+def _heat_penalty(
+    pair: PairCandidate,
+    setup_type: str,
+) -> float:
+
+    tags = set(pair.tags or [])
+    turnover = float(pair.turnover_usdt or 0.0)
+    change_abs = abs(float(pair.change_pct or 0.0))
+    penalty = 0.0
+
+    if change_abs >= 2.80:
+        penalty += 0.18
+
+    if change_abs >= 4.00:
+        penalty += 0.32
+
+    if "near_resistance" in tags:
+        penalty += 0.18
+
+    if turnover >= 20_000_000 and change_abs >= 2.50:
+        penalty += 0.12
+
+    if turnover >= 60_000_000 and change_abs >= 4.00:
+        penalty += 0.12
+
+    if {"breakout", "momentum", "rs_btc"}.issubset(tags) and change_abs >= 3.00:
+        penalty += 0.15
+
+    if setup_type == "wave_3" and change_abs >= 4.00:
+        penalty += 0.10
+
+    return round(penalty, 3)
+
+
 
 # ─────────────────────────────────────────
 # Execution Stability Intelligence
@@ -681,26 +786,9 @@ def build_signal_candidate(
     min_strong_score: float,
 ) -> SignalCandidate | None:
 
-    raw_score = (
-        pair.score_hint
-        + pair.rebound_hint
-    )
-
-    boost_score = raw_score
+    base_score = float(pair.score_hint or 0.0) + float(pair.rebound_hint or 0.0)
 
     pair_tags = set(pair.tags)
-
-    if "near_resistance" in pair_tags:
-        boost_score -= 0.25
-
-    if "rs_btc" in pair_tags:
-        boost_score += 0.30
-
-    if "rebound" in pair_tags:
-        boost_score += 0.12
-
-    if "major" in pair_tags:
-        boost_score += 0.08
 
     (
         setup_type,
@@ -711,6 +799,50 @@ def build_signal_candidate(
         pair,
         market_mode,
     )
+
+    confirmation_bonus = _confirmation_bonus(
+        pair,
+        setup_type,
+    )
+
+    freshness_bonus = _freshness_bonus(
+        pair,
+        setup_type,
+        entry_timing,
+    )
+
+    heat_penalty = _heat_penalty(
+        pair,
+        setup_type,
+    )
+
+    raw_score = round(
+        base_score
+        + confirmation_bonus
+        + freshness_bonus
+        - heat_penalty,
+        3,
+    )
+
+    boost_score = raw_score
+
+    if "near_resistance" in pair_tags:
+        boost_score -= 0.18
+
+    if "rs_btc" in pair_tags:
+        boost_score += 0.18
+
+    if "rebound" in pair_tags:
+        boost_score += 0.08
+
+    if "major" in pair_tags:
+        boost_score += 0.05
+
+    if {"breakout", "momentum", "rs_btc"}.issubset(pair_tags) and abs(float(pair.change_pct or 0.0)) >= 3.0:
+        boost_score -= 0.12
+
+    if entry_timing == "pullback":
+        boost_score += 0.06
 
     if (
         market_mode == MODE_RECOVERY_LONG
@@ -880,6 +1012,7 @@ def build_signal_candidate(
             "v129 fixed",
             "adaptive targets improved",
             "nour filter moved downstream",
+            "global anti-chase score refinement",
         ],
 
         meta={
@@ -928,6 +1061,15 @@ def build_signal_candidate(
 
             "threshold_used":
                 round(threshold, 2),
+
+            "freshness_bonus":
+                freshness_bonus,
+
+            "heat_penalty":
+                heat_penalty,
+
+            "confirmation_bonus":
+                confirmation_bonus,
 
             **quality_meta,
         },
