@@ -385,6 +385,7 @@ def run_once(
     current_execution_results = []
     technical_snapshot_records = []
     local_gate_trades = []
+    new_trades = []
     slot_counts = _execution_slot_counts(persisted_trades)
     recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
 
@@ -439,7 +440,16 @@ def run_once(
         exec_status = str(exec_result.get("status") or "").strip().lower()
         consumes_live_slot = exec_status == "accepted_preview"
 
-        if consumes_live_slot:
+        candidate_trade = register_trade(signal, exec_result)
+        setattr(candidate_trade, "telegram_announced", False)
+        setattr(candidate_trade, "announced_to_telegram", False)
+
+        should_activate_trade = consumes_live_slot and not _has_active_same_symbol(
+            [*persisted_trades, *local_gate_trades],
+            candidate_trade,
+        )
+
+        if should_activate_trade:
             path = str(exec_result.get("path") or "general")
             if path == "block_exception":
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
@@ -451,16 +461,8 @@ def run_once(
             else:
                 slot_counts["general"] = slot_counts.get("general", 0) + 1
 
-        candidate_trade = register_trade(signal, exec_result)
-        setattr(candidate_trade, "telegram_announced", False)
-        setattr(candidate_trade, "announced_to_telegram", False)
-
-        should_block_same_scan = consumes_live_slot and not _has_active_same_symbol(
-            [*persisted_trades, *local_gate_trades],
-            candidate_trade,
-        )
-        if should_block_same_scan:
             local_gate_trades.append(candidate_trade)
+            new_trades.append(candidate_trade)
 
         signal_items.append({
             "signal": signal,
@@ -492,7 +494,7 @@ def run_once(
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     protection = block_protection_status(state)
     trades = update_open_trades(
-        list(persisted_trades),
+        [*persisted_trades, *new_trades],
         price_map,
         protection_level=protection.get("level", 0),
     )
@@ -598,16 +600,27 @@ def _activate_announced_trade(
     item["telegram_announced"] = True
     item["announcement_status"] = "sent"
 
-    if exec_status != "accepted_preview":
-        return True
-
     trades = list(result.get("trades", []) or [])
     trade_id = getattr(candidate_trade, "trade_id", None)
-    if trade_id and any(getattr(t, "trade_id", None) == trade_id for t in trades):
+    updated_existing = False
+
+    for trade in trades:
+        if trade_id and getattr(trade, "trade_id", None) == trade_id:
+            setattr(trade, "telegram_announced", True)
+            setattr(trade, "announced_to_telegram", True)
+            setattr(trade, "telegram_announced_at", announced_at)
+            updated_existing = True
+            break
+
+    if exec_status != "accepted_preview":
+        if updated_existing:
+            _refresh_runtime_result_outputs(result, trade_store=trade_store)
         return True
 
-    trades.append(candidate_trade)
-    result["trades"] = trades
+    if not updated_existing:
+        trades.append(candidate_trade)
+        result["trades"] = trades
+
     _refresh_runtime_result_outputs(result, trade_store=trade_store)
     return True
 
