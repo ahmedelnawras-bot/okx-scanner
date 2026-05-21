@@ -471,6 +471,9 @@ def run_once(
             "candidate_trade": candidate_trade,
             "eligible_for_activation": eligible_for_activation,
             "telegram_announced": False,
+            "exchange_required": False,
+            "exchange_order_ok": False,
+            "exchange_order_result": None,
             "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
         })
         current_execution_results.append(exec_result)
@@ -594,12 +597,21 @@ def _activate_announced_trade(
     if candidate_trade is None:
         return False
 
+    exchange_required = bool(item.get("exchange_required"))
+    exchange_order_ok = bool(item.get("exchange_order_ok", not exchange_required))
+    if exec_status == "accepted_preview" and exchange_required and not exchange_order_ok:
+        item["announcement_status"] = "exchange_failed"
+        _attach_exchange_state_to_trade(candidate_trade, item.get("exchange_order_result"))
+        return False
+
     announced_at = datetime.now(timezone.utc)
     setattr(candidate_trade, "telegram_announced", True)
     setattr(candidate_trade, "announced_to_telegram", True)
     setattr(candidate_trade, "telegram_announced_at", announced_at)
     item["telegram_announced"] = True
     item["announcement_status"] = "sent"
+
+    _attach_exchange_state_to_trade(candidate_trade, item.get("exchange_order_result"))
 
     trades = list(result.get("trades", []) or [])
     trade_id = getattr(candidate_trade, "trade_id", None)
@@ -610,6 +622,7 @@ def _activate_announced_trade(
             setattr(trade, "telegram_announced", True)
             setattr(trade, "announced_to_telegram", True)
             setattr(trade, "telegram_announced_at", announced_at)
+            _attach_exchange_state_to_trade(trade, item.get("exchange_order_result"))
             updated_existing = True
             break
 
@@ -771,6 +784,138 @@ def _iter_signal_items_for_dispatch(result: dict) -> list[dict]:
     return [*execution_items, *normal_items[:8]]
 
 
+
+def _safe_set_trade_attr(trade, name: str, value) -> None:
+    try:
+        setattr(trade, name, value)
+    except Exception:
+        pass
+
+
+def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) -> None:
+    if trade is None or not isinstance(managed_order_result, dict):
+        return
+
+    entry = managed_order_result.get("entry") or {}
+    tp_split = managed_order_result.get("tp_split") or {}
+    tp1 = tp_split.get("tp1") or {}
+    tp2 = tp_split.get("tp2") or {}
+    plan = managed_order_result.get("plan") or {}
+
+    _safe_set_trade_attr(trade, "exchange_order_ok", bool(entry.get("ok")))
+    _safe_set_trade_attr(trade, "exchange_order_reason", entry.get("reason"))
+    _safe_set_trade_attr(trade, "entry_order_id", entry.get("order_id"))
+    _safe_set_trade_attr(trade, "entry_client_order_id", entry.get("client_order_id"))
+    _safe_set_trade_attr(trade, "entry_order_payload", entry.get("payload"))
+    _safe_set_trade_attr(trade, "sl_attached_on_entry", bool(managed_order_result.get("sl_attached")))
+    _safe_set_trade_attr(trade, "sl_attached_payload", (entry.get("payload") or {}).get("attachAlgoOrds"))
+    _safe_set_trade_attr(trade, "tp_split_ok", tp_split.get("ok"))
+    _safe_set_trade_attr(trade, "tp_split_reason", tp_split.get("reason"))
+    _safe_set_trade_attr(trade, "tp1_order_id", tp1.get("order_id"))
+    _safe_set_trade_attr(trade, "tp2_order_id", tp2.get("order_id"))
+    _safe_set_trade_attr(trade, "tp1_client_order_id", tp1.get("client_order_id"))
+    _safe_set_trade_attr(trade, "tp2_client_order_id", tp2.get("client_order_id"))
+    _safe_set_trade_attr(trade, "runner_expected_size", (plan.get("runner") or {}).get("size"))
+    _safe_set_trade_attr(trade, "runner_requires_trailing_after_tp2", bool(managed_order_result.get("requires_runner_trailing")))
+    _safe_set_trade_attr(trade, "managed_trade_plan", plan)
+
+
+def _execute_managed_okx_order(
+    okx_client: OKXTradeClient,
+    signal,
+    settings: Settings,
+) -> dict:
+    sl_value = float(getattr(signal, "sl", 0.0) or 0.0)
+    tp1_value = float(getattr(signal, "tp1", 0.0) or 0.0)
+    tp2_value = float(getattr(signal, "tp2", 0.0) or 0.0)
+    entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
+
+    entry_result = okx_client.place_market_long(
+        signal.symbol,
+        entry_value,
+        margin_usdt=settings.paper_margin_usdt,
+        leverage=settings.default_leverage,
+        td_mode=settings.okx_td_mode,
+        sl_trigger_px=sl_value if sl_value > 0 else None,
+        tag="entry",
+    )
+
+    plan = {}
+    if entry_value > 0 and sl_value > 0 and tp1_value > 0 and tp2_value > 0:
+        plan = okx_client.build_managed_trade_plan(
+            signal.symbol,
+            entry_value,
+            settings.paper_margin_usdt,
+            settings.default_leverage,
+            sl_value,
+            tp1_value,
+            tp2_value,
+        )
+
+    tp_split_result = None
+    if entry_result.get("ok") and tp1_value > 0 and tp2_value > 0:
+        tp_split_result = okx_client.place_reduce_only_tp_split(
+            signal.symbol,
+            entry_value,
+            settings.paper_margin_usdt,
+            settings.default_leverage,
+            tp1_price=tp1_value,
+            tp2_price=tp2_value,
+            td_mode=settings.okx_td_mode,
+            tag="tp",
+        )
+
+    return {
+        "ok": bool(entry_result.get("ok")),
+        "entry": entry_result,
+        "tp_split": tp_split_result,
+        "plan": plan,
+        "sl_attached": bool(sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))),
+        "tp_orders_ok": None if tp_split_result is None else bool(tp_split_result.get("ok")),
+        "requires_runner_trailing": bool((plan.get("runner") or {}).get("requires_trailing_after_tp2")) if isinstance(plan, dict) else False,
+    }
+
+
+def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
+    if not isinstance(managed_order_result, dict):
+        return []
+
+    entry = managed_order_result.get("entry") or {}
+    tp_split = managed_order_result.get("tp_split") or {}
+    plan = managed_order_result.get("plan") or {}
+
+    lines = [
+        f"{'✅' if entry.get('ok') else '⚠️'} OKX Managed Entry",
+        f"Simulated: {entry.get('simulated')}",
+        f"Entry Result: {entry.get('reason') or entry.get('response', {}).get('msg') or entry.get('response', {}).get('code')}",
+        f"SL Attached On Entry: {'YES' if managed_order_result.get('sl_attached') else 'NO'}",
+    ]
+
+    if isinstance(plan, dict) and plan.get("ok"):
+        lines.append(
+            "Plan: "
+            + f"SL={plan.get('attached_stop_loss', {}).get('slTriggerPx')} | "
+            + f"TP1 {plan.get('tp1', {}).get('close_pct')}% @ {plan.get('tp1', {}).get('price')} | "
+            + f"TP2 {plan.get('tp2', {}).get('close_pct')}% @ {plan.get('tp2', {}).get('price')} | "
+            + f"Runner {plan.get('runner', {}).get('close_pct')}%"
+        )
+
+    if isinstance(tp_split, dict):
+        lines.append(
+            "TP Orders: "
+            + f"{'OK' if tp_split.get('ok') else 'WARN'} | "
+            + f"TP1={((tp_split.get('tp1') or {}).get('reason') or 'n/a')} | "
+            + f"TP2={((tp_split.get('tp2') or {}).get('reason') or 'n/a')}"
+        )
+        runner_size = tp_split.get("runner_size")
+        if runner_size is not None:
+            lines.append(f"Runner Reserved Size: {runner_size}")
+
+    if managed_order_result.get("requires_runner_trailing"):
+        lines.append("Runner: trailing to be armed after TP2 / block SL sync.")
+
+    return lines
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in _iter_signal_items_for_dispatch(result):
         signal = item["signal"]
@@ -791,28 +936,30 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             continue
 
         text = item["message"]
-        if can_place_order and settings.execution_enabled and settings.okx_place_orders and okx_client:
-            order_result = okx_client.place_market_long(
-                signal.symbol,
-                signal.entry,
-                margin_usdt=settings.paper_margin_usdt,
-                leverage=settings.default_leverage,
-                td_mode=settings.okx_td_mode,
-            )
-            status_icon = "✅" if order_result.get("ok") else "⚠️"
-            text += "\n\n" + "\n".join([
-                f"{status_icon} OKX Paper Execution",
-                f"Simulated: {order_result.get('simulated')}",
-                f"Result: {order_result.get('reason') or order_result.get('response', {}).get('msg') or order_result.get('response', {}).get('code')}",
-            ])
+        managed_order_result = None
+        exchange_required = bool(can_place_order and settings.execution_enabled and settings.okx_place_orders and okx_client)
+        exchange_order_ok = True
+
+        if exchange_required:
+            managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
+            exchange_order_ok = bool(managed_order_result.get("ok"))
+            text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
+
+        item["exchange_required"] = exchange_required
+        item["exchange_order_result"] = managed_order_result
+        item["exchange_order_ok"] = exchange_order_ok
 
         send_result = sender.send_message(text, reply_markup=build_signal_buttons(signal))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
 
-        item["announcement_status"] = "sent" if send_ok else "send_failed"
         if send_ok and is_execution:
+            if exchange_required and not exchange_order_ok:
+                item["announcement_status"] = "exchange_failed"
+                _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
+                continue
             _activate_announced_trade(result, item, trade_store=trade_store)
-
+        else:
+            item["announcement_status"] = "sent" if send_ok else "send_failed"
 
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     execution_results = result.get("execution_results", []) or []
@@ -849,9 +996,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         "🧠 آخر حالة تنفيذ:",
         f"{rejection_reason}",
         "",
-        "✅ الأوامر تعمل بسرعة — ربط OKX مؤجل حاليًا" if not settings.okx_place_orders else "✅ OKX paper order placement enabled",
+        "🕹 Runtime Toggle: /okx_orders_on | /okx_orders_off",
+        "✅ Managed OKX entry + SL + TP split enabled" if settings.okx_place_orders else "✅ Preview mode only — managed exchange placement paused",
     ])
-
 
 def _extract_commands(text: str) -> list[str]:
     commands: list[str] = []
@@ -866,6 +1013,48 @@ def _extract_commands(text: str) -> list[str]:
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None) -> None:
     parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
     sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
+    try:
+        setattr(settings, "okx_place_orders", bool(enabled))
+        return bool(getattr(settings, "okx_place_orders")) == bool(enabled)
+    except Exception:
+        try:
+            object.__setattr__(settings, "okx_place_orders", bool(enabled))
+            return bool(getattr(settings, "okx_place_orders")) == bool(enabled)
+        except Exception:
+            return False
+
+
+def _build_okx_control_keyboard(settings: Settings) -> dict:
+    orders_on = bool(getattr(settings, "okx_place_orders", False))
+    toggle_text = "⏸ إيقاف تنفيذ OKX" if orders_on else "▶️ تشغيل تنفيذ OKX"
+    toggle_data = "okx_orders:off" if orders_on else "okx_orders:on"
+    return {
+        "inline_keyboard": [
+            [{"text": toggle_text, "callback_data": toggle_data}],
+            [
+                {"text": "📘 حالة OKX", "callback_data": "cmd:/status"},
+                {"text": "🔄 تحديث", "callback_data": "menu:okx_control"},
+            ],
+        ]
+    }
+
+
+def _build_okx_control_panel(settings: Settings) -> str:
+    runtime_status = "ON" if bool(getattr(settings, "okx_place_orders", False)) else "OFF"
+    live_guard = "ALLOWED" if bool(getattr(settings, "allow_live_trading", False)) else "BLOCKED"
+    simulated = "ON" if bool(getattr(settings, "okx_simulated", True)) else "OFF"
+    return "\n".join([
+        build_okx_control_help(),
+        "",
+        "⚙️ <b>Runtime OKX Control</b>",
+        f"• OKX Orders: <b>{runtime_status}</b>",
+        f"• Simulated Mode: <b>{simulated}</b>",
+        f"• Live Trading Guard: <b>{live_guard}</b>",
+        "• الزر يوقف/يرجع إرسال أوامر OKX فورًا بدون إعادة تشغيل البوت.",
+    ])
 
 
 def _format_clean_preview(stats: dict, title: str, confirm_command: str) -> str:
@@ -1017,6 +1206,25 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
     if callback_id:
         sender.answer_callback_query(callback_id, "Opened")
 
+    if data.startswith("okx_orders:"):
+        desired = data.split(":", 1)[1].strip().lower()
+        desired_enabled = desired == "on"
+        runtime_settings = settings or get_settings()
+        applied = _set_runtime_okx_orders(runtime_settings, desired_enabled)
+        state_text = "ON" if desired_enabled else "OFF"
+        prefix = "✅" if applied else "⚠️"
+        _send_text(
+            sender,
+            "\n".join([
+                f"{prefix} OKX Orders Runtime Toggle",
+                "┄┄┄┄┄┄┄┄",
+                f"Requested State: {state_text}",
+                f"Applied: {'YES' if applied else 'NO'}",
+            ]),
+            reply_markup=_build_okx_control_keyboard(runtime_settings),
+        )
+        return
+
     if data.startswith("track:"):
         symbol = data.split(":", 1)[1]
         matching_trade = None
@@ -1045,7 +1253,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         elif key == "diagnostics":
             _send_text(sender, build_diagnostics_help())
         elif key == "okx_control":
-            _send_text(sender, build_okx_control_help())
+            runtime_settings = settings or get_settings()
+            _send_text(sender, _build_okx_control_panel(runtime_settings), reply_markup=_build_okx_control_keyboard(runtime_settings))
         elif key == "admin":
             _send_text(sender, build_admin_help())
         elif key == "system_info":
@@ -1093,8 +1302,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 "Wallet Impact": "/report_execution_wallet",
                 "🧠 Diagnostics": "/report_diagnostics",
                 "Diagnostics": "/report_diagnostics",
-                "🤖 OKX Control": "/status",
-                "OKX Control": "/status",
+                "🤖 OKX Control": "/okx_control",
+                "OKX Control": "/okx_control",
                 "⚙️ Admin": "/status",
                 "Admin": "/status",
                 "📘 System Info": "/help",
@@ -1240,6 +1449,16 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = result.get("help_execution", "")
             elif command == "/help_normal":
                 reply = result.get("help_normal", "")
+            elif command == "/okx_orders_on":
+                applied = _set_runtime_okx_orders(settings, True)
+                reply = "✅ تم تشغيل تنفيذ OKX." if applied else "⚠️ تعذر تشغيل تنفيذ OKX."
+            elif command == "/okx_orders_off":
+                applied = _set_runtime_okx_orders(settings, False)
+                reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
+            elif command == "/okx_control":
+                reply = _build_okx_control_panel(settings)
+                _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
+                continue
             else:
                 reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v123 بعد."
             _send_text(sender, reply)
