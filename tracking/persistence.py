@@ -3,6 +3,11 @@
 Keeps reports stable across Railway restarts/redeploys. Redis is optional at
 runtime: if the library/server is unavailable, the bot continues in memory-only
 mode and logs a clear warning instead of crashing.
+
+Managed-execution compatibility:
+- Preserves exchange/order metadata stored on TrackedTrade
+- Preserves attached SL / TP order ids and managed trade plan payloads
+- Safe with older saved trades because unknown fields are ignored on load
 """
 from __future__ import annotations
 
@@ -38,9 +43,18 @@ SIGNAL_FP_PREFIX = f"{PREFIX}:signals:fp"
 SIGNAL_FP_TTL_SECONDS = 6 * 60 * 60
 
 
-def _to_iso(value: Any) -> Any:
+def _to_json_safe(value: Any) -> Any:
+    """Recursively convert values into JSON-safe structures.
+
+    Important for managed execution payloads because they may contain nested
+    dict/list structures that include datetimes.
+    """
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(v) for v in value]
     return value
 
 
@@ -63,15 +77,14 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def trade_to_dict(trade: TrackedTrade) -> dict[str, Any]:
     data = asdict(trade) if is_dataclass(trade) else dict(trade)
-    for key, value in list(data.items()):
-        data[key] = _to_iso(value)
-    return data
+    return {key: _to_json_safe(value) for key, value in data.items()}
 
 
 def trade_from_dict(data: dict[str, Any]) -> TrackedTrade | None:
     try:
         allowed = set(TrackedTrade.__dataclass_fields__.keys())
         clean = {k: v for k, v in dict(data).items() if k in allowed}
+
         for dt_key in ("opened_at", "updated_at", "closed_at"):
             if dt_key in clean:
                 parsed = _parse_dt(clean.get(dt_key))
@@ -79,10 +92,24 @@ def trade_from_dict(data: dict[str, Any]) -> TrackedTrade | None:
                     clean[dt_key] = parsed
                 elif dt_key == "closed_at":
                     clean[dt_key] = None
-        list_fields = ("execution_setup_tags", "warnings")
+
+        list_fields = (
+            "execution_setup_tags",
+            "warnings",
+        )
         for key in list_fields:
             if key in clean and not isinstance(clean[key], list):
                 clean[key] = []
+
+        dict_fields = (
+            "entry_order_payload",
+            "sl_attached_payload",
+            "managed_trade_plan",
+        )
+        for key in dict_fields:
+            if key in clean and clean[key] is not None and not isinstance(clean[key], dict):
+                clean[key] = {}
+
         return TrackedTrade(**clean)
     except Exception:
         return None
@@ -206,11 +233,18 @@ class RedisTradeStore:
             for item in execution_results:
                 payload = dict(item or {})
                 payload["ts"] = now
-                # Remove nested dataclass-like values if any.
                 try:
-                    encoded = json.dumps(payload, ensure_ascii=False, default=str)
+                    encoded = json.dumps(_to_json_safe(payload), ensure_ascii=False, default=str)
                 except Exception:
-                    encoded = json.dumps({"status": payload.get("status"), "reason": payload.get("reason"), "path": payload.get("path"), "ts": now}, ensure_ascii=False)
+                    encoded = json.dumps(
+                        {
+                            "status": payload.get("status"),
+                            "reason": payload.get("reason"),
+                            "path": payload.get("path"),
+                            "ts": now,
+                        },
+                        ensure_ascii=False,
+                    )
                 pipe.lpush(EXEC_CHECKS_LIST, encoded)
             pipe.ltrim(EXEC_CHECKS_LIST, 0, max(0, limit - 1))
             pipe.expire(EXEC_CHECKS_LIST, RETENTION_SECONDS)
@@ -414,7 +448,6 @@ class RedisTradeStore:
                     kept.append(raw)
             pipe.delete(EXEC_CHECKS_LIST)
             if kept:
-                # lrange returns newest -> oldest. Preserve the same order.
                 for raw in reversed(kept):
                     pipe.lpush(EXEC_CHECKS_LIST, raw)
                 pipe.ltrim(EXEC_CHECKS_LIST, 0, 9999)
@@ -451,8 +484,6 @@ class RedisTradeStore:
                 for i in range(0, len(keys), 500):
                     deleted += int(self.client.delete(*keys[i:i + 500]) or 0)
 
-            # Hard fallback for exact live namespace keys. This keeps the current
-            # baseline empty even if scan results were partial.
             deleted += int(self.client.delete(OPEN_SET, HISTORY_SET, EXEC_CHECKS_LIST) or 0)
 
             stats["deleted_keys"] = deleted
