@@ -22,13 +22,26 @@ from reporting.report_format import (
 )
 
 
+ACCEPTED_STATUSES = {
+    "accepted_preview",
+    "pending_pullback_preview",
+    "executed",
+    "open",
+    "tp1",
+    "tp2",
+    "trailing",
+}
+
+REJECTED_EXTRA_STATUSES = {"candidate_only"}
+
+
 def _is_accepted_status(status: str | None) -> bool:
-    return str(status or "") in {"accepted_preview", "pending_pullback_preview", "executed", "open", "tp1", "tp2", "trailing"}
+    return str(status or "") in ACCEPTED_STATUSES
 
 
 def _is_rejected_status(status: str | None) -> bool:
     text = str(status or "")
-    return text.startswith("rejected") or text in {"candidate_only"}
+    return text.startswith("rejected") or text in REJECTED_EXTRA_STATUSES
 
 
 def _closed_wr_parts(trades: list[TrackedTrade]) -> tuple[int, int, float]:
@@ -66,22 +79,28 @@ def _row_key_for_trade(t: TrackedTrade, table_period: str) -> str:
     return dt.strftime("%d-%m")
 
 
+def _accepted_gate_checks(execution_results: list[dict]) -> list[dict]:
+    return [r for r in execution_results if _is_accepted_status(r.get("status"))]
+
+
+def _rejected_checks(execution_results: list[dict]) -> list[dict]:
+    return [r for r in execution_results if _is_rejected_status(r.get("status"))]
+
+
 def build_execution_period_table(
     execution_results: list[dict],
     trades: list[TrackedTrade] | None = None,
     title: str = "🚀 تقرير الصفقات المرشحة للتنفيذ",
     period: str = "last_7d",
 ) -> str:
-    """Old Excel-like candidates report.
+    """Excel-like execution snapshot.
 
-    7D/month tables are grouped by day. Today is grouped by hour. Last 1H is a
-    compact single-period snapshot. Wallet/Net values use execution accepted
-    tracked trades only; rejected/candidate-only checks are excluded from PnL.
+    Checked / Accepted / Rejected come from execution checks.
+    Open / Closed / Net come from tracked trades only.
     """
     trades = filter_trades_by_period(trades or [], period)
     checks = filter_checks_by_period(execution_results or [], period)
 
-    # 1H uses one summary row; week/month/today use period buckets.
     if period == "last_1h":
         keys = ["Last 1H"]
         check_buckets = {"Last 1H": checks}
@@ -96,13 +115,13 @@ def build_execution_period_table(
         keys = sorted(set(check_buckets) | set(trade_buckets))
 
     lines = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
-    lines.append("<code>Period     Checked Accepted Rejected Open Closed WR    Net$")
+    lines.append("<code>Period     Checked GatePass Rejected Open Closed WR    Net$")
     for key in keys:
         rows = check_buckets.get(key, [])
         row_trades = trade_buckets.get(key, [])
         checked = len(rows)
-        accepted = sum(1 for r in rows if _is_accepted_status(r.get("status")))
-        rejected = sum(1 for r in rows if _is_rejected_status(r.get("status")))
+        accepted = len(_accepted_gate_checks(rows))
+        rejected = len(_rejected_checks(rows))
         opened = len(open_trades(row_trades))
         closed = len(closed_trades(row_trades))
         wins, losses, wr = _closed_wr_parts(row_trades)
@@ -110,13 +129,14 @@ def build_execution_period_table(
         lines.append(f"{key:<10} {checked:>7} {accepted:>8} {rejected:>8} {opened:>4} {closed:>6} {wr:>4.0f}% {net:>+7.2f}")
     lines.append("</code>")
 
-    total_rejected = sum(1 for r in checks if _is_rejected_status(r.get("status")))
-    total_accepted = sum(1 for r in checks if _is_accepted_status(r.get("status")))
+    total_rejected = len(_rejected_checks(checks))
+    total_accepted = len(_accepted_gate_checks(checks))
     total_checked = len(checks)
     acc_rate = total_accepted / max(1, total_checked) * 100.0 if total_checked else 0.0
     lines.extend([
         "",
-        f"📊 Summary: Checked {total_checked} | Accepted {total_accepted} | Rejected {total_rejected} | Accept Rate {acc_rate:.1f}%",
+        f"📊 Summary: Checked {total_checked} | Gate Pass {total_accepted} | Rejected {total_rejected} | Accept Rate {acc_rate:.1f}%",
+        "📌 Gate Pass = قبول بعد الفلاتر. Open/Closed = من الصفقات المتتبعة فقط.",
         "📌 المرفوضات محفوظة للتحليل فقط ولا تدخل في Wallet/Open/Win Rate.",
     ])
     return "\n".join(lines)
@@ -130,15 +150,21 @@ def build_execution_report(
     table: bool = False,
 ) -> str:
     if table:
-        return build_execution_period_table(execution_results, trades, title="🚀 تقرير الصفقات المرشحة — Execution", period=period)
+        return build_execution_period_table(
+            execution_results,
+            trades,
+            title="🚀 تقرير الصفقات المرشحة — Execution",
+            period=period,
+        )
 
     trades = filter_trades_by_period(trades or [], period)
     execution_results = filter_checks_by_period(execution_results or [], period)
-    accepted = [r for r in execution_results if _is_accepted_status(r.get("status"))]
-    rejected = [r for r in execution_results if _is_rejected_status(r.get("status"))]
+
+    accepted_checks = _accepted_gate_checks(execution_results)
+    rejected_checks = _rejected_checks(execution_results)
     checked = len(execution_results)
     counts = _execution_path_counts(execution_results)
-    acc_rate = (len(accepted) / max(1, checked)) * 100 if checked else 0.0
+    acc_rate = (len(accepted_checks) / max(1, checked)) * 100 if checked else 0.0
 
     opened = open_trades(trades)
     closed = closed_trades(trades)
@@ -151,14 +177,23 @@ def build_execution_report(
     lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
         "📊 <b>Quick Stats</b>",
-        f"• Candidates: {checked}",
-        f"• Open: {len(opened)}",
-        f"• Closed: {len(closed)}",
+        f"• Checked Candidates: {checked}",
+        f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
+        f"• Currently Open Tracked Trades: {len(opened)}",
+        f"• Closed Tracked Trades: {len(closed)}",
         f"🏆 Win Rate: <b>{wr:.1f}%</b>",
         f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
-        f"📌 Rejected After Check: {len(rejected)} محفوظة للتحليل ولا تُحسب كصفقات مفتوحة.",
+        f"📌 Rejected After Check: {len(rejected_checks)} محفوظة للتحليل فقط ولا تُحسب كصفقات مفتوحة.",
         f"🛣 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
+
+    if accepted_checks and not opened and not closed:
+        lines.extend([
+            "",
+            "⚠️ <b>ملاحظة تفسيرية</b>",
+            "• يوجد قبول بعد الفلاتر في السجل، لكن لا توجد صفقات متتبعة مفتوحة/مغلقة حاليًا داخل نفس الفترة.",
+            "• ده يعني إن أرقام Gate Pass و Rejected هي سجل checks، بينما Open/Closed تأتي فقط من trade tracking.",
+        ])
 
     lines.extend([SEP, *wallet_impact_lines(trades, title="Wallet Impact")])
     lines.extend([SEP, *behavior_summary_lines(trades, label="Execution Behavior Summary")])
@@ -171,11 +206,12 @@ def build_execution_report(
     append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
     append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
 
-    if rejected:
-        reason_counts = Counter(item.get("reason", "unknown") for item in rejected)
+    if rejected_checks:
+        reason_counts = Counter(item.get("reason", "unknown") for item in rejected_checks)
         lines.extend([SEP, "📉 <b>Rejected After Check — Top Reasons</b>"])
         for reason, count in reason_counts.most_common(5):
             lines.append(f"• {reason}: {count}")
+        lines.append("📌 هذه الأسباب تخص فترة التقرير، وليست بالضرورة الحالة الحالية للصفقات المفتوحة الآن.")
 
     lines.extend([SEP, "💡 إدارة الصفقات: Normal/Strong/Block 40/40/20 | Recovery 50/25/25"])
     return "\n".join(lines)
