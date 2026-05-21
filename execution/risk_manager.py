@@ -1,10 +1,11 @@
-# risk_manager.py   (أو risk_manager_6.py)
+# risk_manager.py
 """
-مدير المخاطر - OKX Scanner Bot
+مدير المخاطر - OKX Bot
 """
 
 from __future__ import annotations
 from risk.drawdown_monitor import DrawdownStatus
+
 
 # ====================== المتغيرات العامة ======================
 reference_portfolio: float | None = None
@@ -23,28 +24,26 @@ risk_mode: str = "normal"
 
 # ====================== دوال مساعدة ======================
 def get_reference_portfolio() -> float:
-    """جلب رصيد أول اليوم من OKX"""
     try:
-        balance = get_okx_balance()          # ← لازم تكون معرفة
+        balance = get_okx_balance()
         if balance <= 0:
             raise ValueError("رصيد الحساب غير صالح")
         return float(balance)
     except Exception as e:
-        # هنا نحمي الكود من الـ crash
         try:
             send_alert_with_demo_option(
                 f"خطأ: لم يتم جلب رصيد أول اليوم من OKX.\nالتفاصيل: {str(e)}"
             )
-        except NameError:
-            print(f"⚠️ ALERT: {str(e)}")   # fallback في حالة عدم وجود الدالة
+        except:
+            print(f"⚠️ ALERT: {str(e)}")
         
         try:
             stop_all_trades()
-        except NameError:
-            print("⚠️ stop_all_trades() غير معرفة")
-        
+        except:
+            pass
+            
         print("⚠️ Working in SAFE FALLBACK mode")
-        return 1000.0   # قيمة آمنة
+        return 1000.0
 
 
 def reload_reference_portfolio() -> None:
@@ -57,19 +56,19 @@ def reload_reference_portfolio() -> None:
 
 # ====================== تهيئة ======================
 reference_portfolio = get_reference_portfolio()
-
 total_allocation = reference_portfolio * max_portion_pct / 100
 position_size = total_allocation / max_positions_total_normal_strong
 position_pct = (position_size / reference_portfolio) * 100
 
 
-# ====================== الدالة الرئيسية ======================
+# ====================== الدالة الرئيسية (مُعدلة للتوافق) ======================
 def evaluate_execution_risk(
     score: float,
     current_open_positions: int,
     min_execution_score: float,
     risk_mode: str = "normal",
-    drawdown_status: DrawdownMonitor | None = None,   # DrawdownStatus
+    drawdown_status: DrawdownStatus | None = None,
+    max_open_positions: int | None = None,   # ← أضفناه للتوافق مع الكود القديم
 ) -> dict:
     
     drawdown_level = getattr(drawdown_status, "level", 0)
@@ -84,7 +83,7 @@ def evaluate_execution_risk(
             "slots": {"allowed": 0, "counted": current_open_positions, "remaining": 0},
         }
 
-    # تحديد max positions
+    # تحديد الحد الأقصى حسب الـ risk_mode
     if risk_mode in ["block", "recovery"]:
         max_open_positions = max_positions_total_normal_strong + max_positions_block
     else:
