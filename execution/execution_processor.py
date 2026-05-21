@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from analysis.models import SignalCandidate
 from analysis.execution_candidate import decide_execution_candidate
 
@@ -53,16 +55,12 @@ def _get_execution_score(signal: SignalCandidate) -> float:
 
     signal.score = UI display only.
     """
-
     meta = signal.meta or {}
 
     boost_score = meta.get("boost_score")
-
     if boost_score is not None:
-
         try:
             return float(boost_score)
-
         except Exception:
             pass
 
@@ -133,6 +131,125 @@ def _same_symbol_trade_is_active(trade, signal: SignalCandidate) -> tuple[bool, 
     return True, trade_status or "active_unfinished_trade"
 
 
+def _managed_target_model(signal: SignalCandidate, path: str) -> tuple[str, float, float, float]:
+    normalized_path = str(path or "").strip().lower()
+    if normalized_path == "recovery":
+        return "recovery_50_25_25", 50.0, 25.0, 25.0
+    return "standard_40_40_20", 40.0, 40.0, 20.0
+
+
+def _build_managed_trade_preview(signal: SignalCandidate, path: str) -> dict[str, Any]:
+    target_model, tp1_pct, tp2_pct, runner_pct = _managed_target_model(signal, path)
+    entry = float(getattr(signal, "entry", 0.0) or 0.0)
+    sl = float(getattr(signal, "sl", 0.0) or 0.0)
+    tp1 = float(getattr(signal, "tp1", 0.0) or 0.0)
+    tp2 = float(getattr(signal, "tp2", 0.0) or 0.0)
+
+    def _portion(exit_price: float, pct: float) -> dict[str, Any]:
+        return {
+            "price": exit_price,
+            "close_pct": pct,
+            "close_fraction": round(pct / 100.0, 6),
+        }
+
+    return {
+        "target_model": target_model,
+        "entry": {
+            "symbol": getattr(signal, "symbol", ""),
+            "price": entry,
+            "entry_mode": "pullback_pending" if getattr(signal, "entry_timing", "") == "pullback" else "market",
+        },
+        "stop_loss": {
+            "price": sl,
+            "attach_on_entry": sl > 0,
+            "ord_px": "-1" if sl > 0 else "",
+        },
+        "tp1": _portion(tp1, tp1_pct),
+        "tp2": _portion(tp2, tp2_pct),
+        "runner": {
+            "close_pct": runner_pct,
+            "close_fraction": round(runner_pct / 100.0, 6),
+            "requires_trailing_after_tp2": True,
+            "requires_block_sl_sync": True,
+        },
+        "block_protection": {
+            "enabled": True,
+            "amend_live_stop_loss": True,
+        },
+    }
+
+
+def _base_response(
+    *,
+    signal: SignalCandidate,
+    gate: dict[str, Any],
+    risk: dict[str, Any] | None = None,
+    status: str,
+    reason: str,
+    slot_scope: str = "",
+    order: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    execution_score = _get_execution_score(signal)
+    path = gate.get("path") if isinstance(gate, dict) else ""
+    managed_trade_plan = _build_managed_trade_preview(signal, str(path or ""))
+    target_model, tp1_pct, tp2_pct, runner_pct = _managed_target_model(signal, str(path or ""))
+
+    payload: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "path": path,
+        "slot_scope": slot_scope,
+        "gate": gate,
+        "nour_filter_name": gate.get("nour_filter_name") if isinstance(gate, dict) else None,
+        "nour_filter_passed": gate.get("nour_filter_passed") if isinstance(gate, dict) else None,
+        "nour_filter_reason": gate.get("nour_filter_reason") if isinstance(gate, dict) else None,
+        "execution_score": round(execution_score, 2),
+        "display_score": round(float(signal.score), 2),
+        "target_model": target_model,
+        "tp1_close_pct": tp1_pct,
+        "tp2_close_pct": tp2_pct,
+        "runner_close_pct": runner_pct,
+        "managed_trade_plan": managed_trade_plan,
+        "sl_attached_on_entry": bool((managed_trade_plan.get("stop_loss") or {}).get("attach_on_entry")),
+        "runner_requires_trailing_after_tp2": bool((managed_trade_plan.get("runner") or {}).get("requires_trailing_after_tp2")),
+        "tp_split_expected": True,
+        "exchange_sync_state": (
+            "queued_for_submission"
+            if status == "accepted_preview"
+            else "awaiting_pullback"
+            if status == "pending_pullback_preview"
+            else "not_submitted"
+        ),
+        "exchange_order_ok": False,
+        "exchange_order_reason": "not_submitted",
+        "entry_order_id": "",
+        "entry_client_order_id": "",
+        "entry_order_payload": {},
+        "sl_attached_payload": [],
+        "live_stop_loss_px": float(getattr(signal, "sl", 0.0) or 0.0),
+        "tp_split_ok": False,
+        "tp_split_reason": "not_submitted",
+        "tp1_order_id": "",
+        "tp2_order_id": "",
+        "tp1_client_order_id": "",
+        "tp2_client_order_id": "",
+        "runner_expected_size": "",
+        "runner_algo_id": "",
+        "runner_algo_client_order_id": "",
+        "last_exchange_error": "",
+    }
+
+    if order is not None:
+        payload["order"] = order
+
+    if isinstance(risk, dict):
+        payload["slots"] = risk.get("slots")
+        payload["drawdown_level"] = risk.get("drawdown_level")
+        payload["drawdown_pct"] = risk.get("drawdown_pct")
+
+    return payload
+
+
 def process_trade_candidate(
     signal: SignalCandidate,
     open_trades: list | None = None,
@@ -163,7 +280,6 @@ def process_trade_candidate(
     # Candidate rejected by execution gate
     # ─────────────────────────────────────────
     if not gate["allowed"]:
-
         status = "candidate_only"
 
         if gate["reason"] in {
@@ -180,28 +296,12 @@ def process_trade_candidate(
         }:
             status = "rejected_limit"
 
-        return {
-
-            "status": status,
-
-            "reason": gate["reason"],
-
-            "path": gate["path"],
-
-            "gate": gate,
-
-            "nour_filter_name": gate.get(
-                "nour_filter_name"
-            ),
-
-            "nour_filter_passed": gate.get(
-                "nour_filter_passed"
-            ),
-
-            "nour_filter_reason": gate.get(
-                "nour_filter_reason"
-            ),
-        }
+        return _base_response(
+            signal=signal,
+            gate=gate,
+            status=status,
+            reason=gate["reason"],
+        )
 
     # ─────────────────────────────────────────
     # Same symbol protection
@@ -220,17 +320,13 @@ def process_trade_candidate(
         )
 
         if is_active:
-            return {
-
-                "status": "rejected_same_symbol",
-
-                "reason": (
-                    "same_symbol_active_trade"
-                ),
-
-                "existing_trade_status": (
-                    trade_status
-                ),
+            return _base_response(
+                signal=signal,
+                gate=gate,
+                status="rejected_same_symbol",
+                reason="same_symbol_active_trade",
+            ) | {
+                "existing_trade_status": trade_status,
             }
 
     # ─────────────────────────────────────────
@@ -246,7 +342,6 @@ def process_trade_candidate(
     # BLOCK exception routing
     # ─────────────────────────────────────────
     if path == "block_exception":
-
         risk = evaluate_execution_risk(
             score=execution_score,
             max_open_positions=max_block_positions,
@@ -254,14 +349,12 @@ def process_trade_candidate(
             min_execution_score=min_execution_score,
             drawdown_status=drawdown_status,
         )
-
         slot_scope = "block_exception"
 
     # ─────────────────────────────────────────
     # RECOVERY routing
     # ─────────────────────────────────────────
     elif path == "recovery":
-
         risk = evaluate_execution_risk(
             score=execution_score,
             max_open_positions=max_recovery_positions,
@@ -269,14 +362,12 @@ def process_trade_candidate(
             min_execution_score=min_execution_score,
             drawdown_status=drawdown_status,
         )
-
         slot_scope = "recovery"
 
     # ─────────────────────────────────────────
     # NORMAL / STRONG routing
     # ─────────────────────────────────────────
     else:
-
         risk = evaluate_execution_risk(
             score=execution_score,
             max_open_positions=max_open_positions,
@@ -284,63 +375,24 @@ def process_trade_candidate(
             min_execution_score=min_execution_score,
             drawdown_status=drawdown_status,
         )
-
         slot_scope = "general"
 
     # ─────────────────────────────────────────
     # Risk rejected
     # ─────────────────────────────────────────
     if not risk["allowed"]:
-
-        return {
-
-            "status": (
+        return _base_response(
+            signal=signal,
+            gate=gate,
+            risk=risk,
+            status=(
                 "rejected_limit"
                 if risk["reason"] == "max_positions_reached"
                 else "rejected_risk"
             ),
-
-            "reason": risk["reason"],
-
-            "path": gate["path"],
-
-            "slot_scope": slot_scope,
-
-            "slots": risk["slots"],
-
-            "gate": gate,
-
-            "nour_filter_name": gate.get(
-                "nour_filter_name"
-            ),
-
-            "nour_filter_passed": gate.get(
-                "nour_filter_passed"
-            ),
-
-            "nour_filter_reason": gate.get(
-                "nour_filter_reason"
-            ),
-
-            "drawdown_level": risk.get(
-                "drawdown_level"
-            ),
-
-            "drawdown_pct": risk.get(
-                "drawdown_pct"
-            ),
-
-            # debug visibility
-            "execution_score": round(
-                execution_score,
-                2,
-            ),
-
-            "display_score": round(
-                float(signal.score),
-                2,
-            ),
-        }
+            reason=risk["reason"],
+            slot_scope=slot_scope,
+        )
 
     # ─────────────────────────────────────────
     # Final acceptance state
@@ -351,50 +403,14 @@ def process_trade_candidate(
         else "accepted_preview"
     )
 
-    return {
+    order = build_preview_order(signal)
 
-        "status": status,
-
-        "reason": gate["reason"],
-
-        "path": gate["path"],
-
-        "slot_scope": slot_scope,
-
-        "order": build_preview_order(signal),
-
-        "slots": risk["slots"],
-
-        "gate": gate,
-
-        "nour_filter_name": gate.get(
-            "nour_filter_name"
-        ),
-
-        "nour_filter_passed": gate.get(
-            "nour_filter_passed"
-        ),
-
-        "nour_filter_reason": gate.get(
-            "nour_filter_reason"
-        ),
-
-        "drawdown_level": risk.get(
-            "drawdown_level"
-        ),
-
-        "drawdown_pct": risk.get(
-            "drawdown_pct"
-        ),
-
-        # debug visibility
-        "execution_score": round(
-            execution_score,
-            2,
-        ),
-
-        "display_score": round(
-            float(signal.score),
-            2,
-        ),
-    }
+    return _base_response(
+        signal=signal,
+        gate=gate,
+        risk=risk,
+        status=status,
+        reason=gate["reason"],
+        slot_scope=slot_scope,
+        order=order,
+    )
