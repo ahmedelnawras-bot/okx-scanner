@@ -1,12 +1,13 @@
-
 """OKX REST client with managed-entry helpers for live/paper trading.
 
-Goals of this version:
+Enhanced in this revision:
 - Keep full backward compatibility with the old `place_market_long(...)`.
 - Add support for attached stop loss on entry.
 - Add explicit helpers for TP1 / TP2 partial exits.
 - Add trailing-runner helpers for the last 20%.
 - Add stop-loss amendment helpers for block protection / post-TP updates.
+- Add order/algo status + fill confirmation helpers for live sync.
+- Add attached-SL sync helpers so internal protected SL can be pushed to OKX.
 
 Notes:
 - This file only provides exchange primitives.
@@ -19,6 +20,7 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -111,6 +113,15 @@ class OKXTradeClient:
 
         return None
 
+    def _read_guard_error(self) -> dict[str, Any] | None:
+        if not self.configured:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "okx_not_configured",
+            }
+        return None
+
     def _client_id(self, prefix: str) -> str:
         raw = uuid.uuid4().hex[:18]
         safe_prefix = "".join(ch for ch in str(prefix or "bot") if ch.isalnum())[:10] or "bot"
@@ -120,7 +131,7 @@ class OKXTradeClient:
         self,
         method: str,
         path: str,
-        payload: dict[str, Any] | None = None,
+        payload: dict[str, Any] | list[dict[str, Any]] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ts = self._timestamp()
@@ -178,6 +189,25 @@ class OKXTradeClient:
                 result["algo_client_order_id"] = first.get("algoClOrdId")
         return result
 
+    def _normalize_query_response(
+        self,
+        response: dict[str, Any],
+        *,
+        query_kind: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ok = str(response.get("code", "")) == "0"
+        rows = response.get("data") or []
+        return {
+            "ok": ok,
+            "simulated": self.credentials.simulated,
+            "reason": response.get("msg") or ("ok" if ok else f"okx_{query_kind}_failed"),
+            "params": params or {},
+            "response": response,
+            "rows": rows if isinstance(rows, list) else [],
+            "row": rows[0] if isinstance(rows, list) and rows else {},
+        }
+
     def _build_position_size(self, entry_price: float, margin_usdt: float, leverage: int) -> str:
         notional = max(float(margin_usdt), 0.0) * max(int(leverage), 1)
         price = max(float(entry_price), 0.0)
@@ -203,6 +233,13 @@ class OKXTradeClient:
         if attach_algo_cl_ord_id:
             item["attachAlgoClOrdId"] = str(attach_algo_cl_ord_id)[:32]
         return [item]
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
 
     def get_balance(self) -> dict[str, Any]:
         if not self.configured:
@@ -677,4 +714,355 @@ class OKXTradeClient:
                 "size": f"{runner_sz:.6f}",
                 "requires_trailing_after_tp2": True,
             },
+        }
+
+    # ---------------------------------------------------------------------
+    # Read/query helpers for fill confirmation and exchange sync.
+    # Based on OKX trade query endpoints.
+    # ---------------------------------------------------------------------
+    def get_order_details(
+        self,
+        inst_id: str,
+        *,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> dict[str, Any]:
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+        if not ord_id and not cl_ord_id:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "missing_order_identifier",
+            }
+
+        path = "/api/v5/trade/order"
+        params: dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = str(ord_id)
+        if cl_ord_id:
+            params["clOrdId"] = str(cl_ord_id)[:32]
+        response = self._request("GET", path, params=params)
+        return self._normalize_query_response(response, query_kind="order_details", params=params)
+
+    def list_pending_orders(
+        self,
+        *,
+        inst_type: str = "SWAP",
+        inst_id: str | None = None,
+        ord_type: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+
+        path = "/api/v5/trade/orders-pending"
+        params: dict[str, Any] = {"instType": inst_type}
+        if inst_id:
+            params["instId"] = inst_id
+        if ord_type:
+            params["ordType"] = ord_type
+        if limit:
+            params["limit"] = int(limit)
+        response = self._request("GET", path, params=params)
+        return self._normalize_query_response(response, query_kind="orders_pending", params=params)
+
+    def get_fills(
+        self,
+        *,
+        inst_id: str | None = None,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+
+        path = "/api/v5/trade/fills"
+        params: dict[str, Any] = {}
+        if inst_id:
+            params["instId"] = inst_id
+        if ord_id:
+            params["ordId"] = str(ord_id)
+        if cl_ord_id:
+            params["clOrdId"] = str(cl_ord_id)[:32]
+        if limit:
+            params["limit"] = int(limit)
+        response = self._request("GET", path, params=params)
+        return self._normalize_query_response(response, query_kind="fills", params=params)
+
+    def get_order_fill_summary(
+        self,
+        inst_id: str,
+        *,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> dict[str, Any]:
+        details = self.get_order_details(inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+        if not details.get("ok"):
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": details.get("reason") or "order_details_failed",
+                "details": details,
+            }
+
+        row = details.get("row") or {}
+        order_state = str(row.get("state") or row.get("ordState") or "").lower()
+        requested_sz = self._safe_float(row.get("sz"))
+        filled_sz = self._safe_float(row.get("accFillSz") or row.get("fillSz"))
+        avg_fill_price = self._safe_float(row.get("avgPx"))
+        fill_ratio = (filled_sz / requested_sz) if requested_sz > 0 else 0.0
+        attach_algo_ords = row.get("attachAlgoOrds") or []
+
+        fills = self.get_fills(inst_id=inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id, limit=100)
+        fills_rows = fills.get("rows") or [] if isinstance(fills, dict) else []
+
+        return {
+            "ok": True,
+            "simulated": self.credentials.simulated,
+            "reason": "ok",
+            "inst_id": inst_id,
+            "order_id": row.get("ordId") or ord_id,
+            "client_order_id": row.get("clOrdId") or cl_ord_id,
+            "state": order_state,
+            "requested_size": requested_sz,
+            "filled_size": filled_sz,
+            "remaining_size": max(requested_sz - filled_sz, 0.0),
+            "fill_ratio": fill_ratio,
+            "avg_fill_price": avg_fill_price,
+            "is_live": order_state in {"live", "partially_filled"},
+            "is_filled": order_state == "filled" or (requested_sz > 0 and filled_sz >= requested_sz),
+            "is_terminal": order_state in {"filled", "canceled", "mmp_canceled"},
+            "is_canceled": order_state in {"canceled", "mmp_canceled"},
+            "attach_algo_ords": attach_algo_ords if isinstance(attach_algo_ords, list) else [],
+            "details": details,
+            "fills": fills_rows,
+        }
+
+    def wait_for_order_fill(
+        self,
+        inst_id: str,
+        *,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        timeout_seconds: float = 15.0,
+        poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        deadline = time.time() + max(float(timeout_seconds), 0.5)
+        last_summary: dict[str, Any] = {
+            "ok": False,
+            "reason": "wait_not_started",
+            "simulated": self.credentials.simulated,
+        }
+
+        while time.time() <= deadline:
+            last_summary = self.get_order_fill_summary(inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+            if not last_summary.get("ok"):
+                return last_summary
+            if last_summary.get("is_filled") or last_summary.get("is_terminal"):
+                return last_summary
+            time.sleep(max(float(poll_interval), 0.1))
+
+        last_summary = dict(last_summary)
+        last_summary["timed_out"] = True
+        last_summary["reason"] = "fill_wait_timeout"
+        return last_summary
+
+    def list_algo_orders(
+        self,
+        *,
+        ord_type: str = "conditional",
+        inst_id: str | None = None,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+        history: bool = False,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+
+        path = "/api/v5/trade/orders-algo-history" if history else "/api/v5/trade/orders-algo-pending"
+        params: dict[str, Any] = {"ordType": ord_type}
+        if inst_id:
+            params["instId"] = inst_id
+        if algo_id:
+            params["algoId"] = str(algo_id)
+        if algo_cl_ord_id:
+            params["algoClOrdId"] = str(algo_cl_ord_id)[:32]
+        if limit:
+            params["limit"] = int(limit)
+        response = self._request("GET", path, params=params)
+        return self._normalize_query_response(response, query_kind="algo_orders", params=params)
+
+    def get_algo_order_details(
+        self,
+        *,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+        inst_id: str | None = None,
+        ord_type: str = "conditional",
+    ) -> dict[str, Any]:
+        if not algo_id and not algo_cl_ord_id:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "missing_algo_identifier",
+            }
+
+        pending = self.list_algo_orders(
+            ord_type=ord_type,
+            inst_id=inst_id,
+            algo_id=algo_id,
+            algo_cl_ord_id=algo_cl_ord_id,
+            history=False,
+            limit=100,
+        )
+        if pending.get("ok") and pending.get("rows"):
+            return {
+                "ok": True,
+                "simulated": self.credentials.simulated,
+                "reason": "ok",
+                "source": "pending",
+                "rows": pending.get("rows") or [],
+                "row": (pending.get("rows") or [None])[0],
+                "response": pending.get("response"),
+            }
+
+        history = self.list_algo_orders(
+            ord_type=ord_type,
+            inst_id=inst_id,
+            algo_id=algo_id,
+            algo_cl_ord_id=algo_cl_ord_id,
+            history=True,
+            limit=100,
+        )
+        if history.get("ok") and history.get("rows"):
+            return {
+                "ok": True,
+                "simulated": self.credentials.simulated,
+                "reason": "ok",
+                "source": "history",
+                "rows": history.get("rows") or [],
+                "row": (history.get("rows") or [None])[0],
+                "response": history.get("response"),
+            }
+
+        return {
+            "ok": False,
+            "simulated": self.credentials.simulated,
+            "reason": history.get("reason") or pending.get("reason") or "algo_not_found",
+            "pending": pending,
+            "history": history,
+        }
+
+    def get_attached_stop_from_order(
+        self,
+        inst_id: str,
+        *,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> dict[str, Any]:
+        summary = self.get_order_fill_summary(inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+        if not summary.get("ok"):
+            return summary
+
+        attach_items = summary.get("attach_algo_ords") or []
+        stop_item = None
+        if isinstance(attach_items, list):
+            for item in attach_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("slTriggerPx") or item.get("newSlTriggerPx") or item.get("attachAlgoId"):
+                    stop_item = item
+                    break
+
+        current_trigger = self._safe_float(
+            (stop_item or {}).get("slTriggerPx") or (stop_item or {}).get("newSlTriggerPx")
+        )
+
+        return {
+            "ok": True,
+            "simulated": self.credentials.simulated,
+            "reason": "ok",
+            "current_sl_trigger_px": current_trigger,
+            "attach_algo": stop_item or {},
+            "summary": summary,
+        }
+
+    def sync_attached_stop_loss(
+        self,
+        inst_id: str,
+        ord_id: str,
+        desired_sl_trigger_px: float,
+        *,
+        current_sl_trigger_px: float | None = None,
+        attach_algo_id: str | None = None,
+        attach_algo_cl_ord_id: str | None = None,
+        min_improvement_px: float = 0.0,
+        req_id: str | None = None,
+    ) -> dict[str, Any]:
+        desired = float(desired_sl_trigger_px)
+        if desired <= 0:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "invalid_desired_sl_trigger_px",
+            }
+
+        observed_current = current_sl_trigger_px
+        observed_attach_algo_id = attach_algo_id
+        observed_attach_algo_cl_ord_id = attach_algo_cl_ord_id
+
+        if observed_current is None or observed_current <= 0:
+            current_info = self.get_attached_stop_from_order(inst_id, ord_id=ord_id)
+            if not current_info.get("ok"):
+                return {
+                    "ok": False,
+                    "simulated": self.credentials.simulated,
+                    "reason": current_info.get("reason") or "failed_to_read_current_sl",
+                    "current_info": current_info,
+                }
+            observed_current = self._safe_float(current_info.get("current_sl_trigger_px"))
+            attach_item = current_info.get("attach_algo") or {}
+            if not observed_attach_algo_id:
+                observed_attach_algo_id = attach_item.get("attachAlgoId") or attach_item.get("algoId")
+            if not observed_attach_algo_cl_ord_id:
+                observed_attach_algo_cl_ord_id = attach_item.get("attachAlgoClOrdId")
+
+        improvement_needed = float(min_improvement_px or 0.0)
+        if observed_current > 0 and desired <= (observed_current + improvement_needed):
+            return {
+                "ok": True,
+                "simulated": self.credentials.simulated,
+                "reason": "sl_sync_skipped_no_upgrade",
+                "action": "skipped",
+                "current_sl_trigger_px": observed_current,
+                "desired_sl_trigger_px": desired,
+                "attach_algo_id": observed_attach_algo_id,
+                "attach_algo_cl_ord_id": observed_attach_algo_cl_ord_id,
+            }
+
+        amend = self.amend_attached_stop_loss(
+            inst_id=inst_id,
+            ord_id=ord_id,
+            new_sl_trigger_px=desired,
+            attach_algo_id=observed_attach_algo_id,
+            attach_algo_cl_ord_id=observed_attach_algo_cl_ord_id,
+            req_id=req_id,
+        )
+        return {
+            "ok": bool(amend.get("ok")),
+            "simulated": self.credentials.simulated,
+            "reason": amend.get("reason") or ("sl_sync_amended" if amend.get("ok") else "sl_sync_failed"),
+            "action": "amended" if amend.get("ok") else "failed",
+            "current_sl_trigger_px": observed_current,
+            "desired_sl_trigger_px": desired,
+            "attach_algo_id": observed_attach_algo_id,
+            "attach_algo_cl_ord_id": observed_attach_algo_cl_ord_id,
+            "amend": amend,
         }
