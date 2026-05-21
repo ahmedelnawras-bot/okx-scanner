@@ -384,7 +384,7 @@ def run_once(
     signal_items = []
     current_execution_results = []
     technical_snapshot_records = []
-    new_trades = []
+    local_gate_trades = []
     slot_counts = _execution_slot_counts(persisted_trades)
     recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
 
@@ -407,7 +407,6 @@ def run_once(
         except Exception:
             pass
 
-        # ✅ FIX 2: استخدام scan_mode بدل state.mode داخل اللوب
         signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
             continue
@@ -425,7 +424,7 @@ def run_once(
         else:
             exec_result = process_trade_candidate(
                 signal,
-                open_trades=[*persisted_trades, *new_trades],
+                open_trades=[*persisted_trades, *local_gate_trades],
                 current_open_positions=slot_counts.get("general", 0),
                 max_open_positions=settings.max_execution_positions,
                 min_execution_score=settings.min_execution_score,
@@ -437,7 +436,10 @@ def run_once(
                 drawdown_status=drawdown_status,
             )
 
-        if exec_result.get("status") in {"accepted_preview", "pending_pullback_preview"}:
+        exec_status = str(exec_result.get("status") or "").strip().lower()
+        consumes_live_slot = exec_status == "accepted_preview"
+
+        if consumes_live_slot:
             path = str(exec_result.get("path") or "general")
             if path == "block_exception":
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
@@ -449,8 +451,27 @@ def run_once(
             else:
                 slot_counts["general"] = slot_counts.get("general", 0) + 1
 
-        signal_items.append({"signal": signal, "execution": exec_result, "message": build_signal_message(signal, exec_result)})
+        candidate_trade = register_trade(signal, exec_result)
+        setattr(candidate_trade, "telegram_announced", False)
+        setattr(candidate_trade, "announced_to_telegram", False)
+
+        should_block_same_scan = consumes_live_slot and not _has_active_same_symbol(
+            [*persisted_trades, *local_gate_trades],
+            candidate_trade,
+        )
+        if should_block_same_scan:
+            local_gate_trades.append(candidate_trade)
+
+        signal_items.append({
+            "signal": signal,
+            "execution": exec_result,
+            "message": build_signal_message(signal, exec_result),
+            "candidate_trade": candidate_trade,
+            "telegram_announced": False,
+            "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
+        })
         current_execution_results.append(exec_result)
+
         if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)):
             technical_snapshot_records.append(
                 build_signal_snapshot(
@@ -468,14 +489,13 @@ def run_once(
                 )
             )
 
-        candidate_trade = register_trade(signal, exec_result)
-        if not _has_active_same_symbol([*persisted_trades, *new_trades], candidate_trade):
-            new_trades.append(candidate_trade)
-
-    all_trades = [*persisted_trades, *new_trades]
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     protection = block_protection_status(state)
-    trades = update_open_trades(all_trades, price_map, protection_level=protection.get("level", 0))
+    trades = update_open_trades(
+        list(persisted_trades),
+        price_map,
+        protection_level=protection.get("level", 0),
+    )
 
     if trade_store:
         trade_store.save_trades(trades)
@@ -528,6 +548,68 @@ def run_once(
         "command_outputs": command_outputs,
         **reports,
     }
+
+
+def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore | None = None) -> None:
+    trades = list(result.get("trades", []) or [])
+    execution_results = result.get("execution_results", []) or []
+    signal_items = result.get("signal_items", []) or []
+
+    reports = build_report_bundle(trades, execution_results, signal_items)
+    command_outputs = build_command_outputs(trades, execution_results, signal_items)
+
+    result["trades"] = trades
+    result["command_outputs"] = command_outputs
+    result.update(reports)
+
+    portfolio_state = build_portfolio_state_from_trades(trades)
+    result["portfolio_state"] = portfolio_state
+    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+    result["drawdown_report"] = build_drawdown_report(portfolio_state)
+
+    if trade_store:
+        trade_store.save_trades(trades)
+
+
+def _activate_announced_trade(
+    result: dict,
+    item: dict,
+    trade_store: RedisTradeStore | None = None,
+) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    exec_result = item.get("execution") or {}
+    exec_status = str(exec_result.get("status") or "").strip().lower()
+    if exec_status not in {"accepted_preview", "pending_pullback_preview"}:
+        return False
+
+    if bool(item.get("telegram_announced")):
+        return False
+
+    candidate_trade = item.get("candidate_trade")
+    if candidate_trade is None:
+        return False
+
+    announced_at = datetime.now(timezone.utc)
+    setattr(candidate_trade, "telegram_announced", True)
+    setattr(candidate_trade, "announced_to_telegram", True)
+    setattr(candidate_trade, "telegram_announced_at", announced_at)
+    item["telegram_announced"] = True
+    item["announcement_status"] = "sent"
+
+    if exec_status != "accepted_preview":
+        return True
+
+    trades = list(result.get("trades", []) or [])
+    trade_id = getattr(candidate_trade, "trade_id", None)
+    if trade_id and any(getattr(t, "trade_id", None) == trade_id for t in trades):
+        return True
+
+    trades.append(candidate_trade)
+    result["trades"] = trades
+    _refresh_runtime_result_outputs(result, trade_store=trade_store)
+    return True
 
 
 def _plain_result(result: dict) -> dict:
@@ -668,6 +750,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             trade_store,
             ttl_seconds=_signal_fingerprint_ttl(exec_result),
         ):
+            item["announcement_status"] = "deduplicated"
             continue
 
         text = item["message"]
@@ -685,7 +768,15 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 f"Simulated: {order_result.get('simulated')}",
                 f"Result: {order_result.get('reason') or order_result.get('response', {}).get('msg') or order_result.get('response', {}).get('code')}",
             ])
-        sender.send_message(text, reply_markup=build_signal_buttons(signal))
+
+        send_result = sender.send_message(text, reply_markup=build_signal_buttons(signal))
+        send_ok = True
+        if isinstance(send_result, dict):
+            send_ok = bool(send_result.get("ok", True))
+
+        item["announcement_status"] = "sent" if send_ok else "send_failed"
+        if send_ok and is_execution:
+            _activate_announced_trade(result, item, trade_store=trade_store)
 
 
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
