@@ -283,13 +283,16 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
+
+    # التعديل الوحيد هنا ────────────────────────────────
     weak_breadth = bool(
-        red_ratio >= 0.56
-        or avg <= -0.30
-        or btc <= -0.25
-        or strong <= 4
+        red_ratio >= 0.52
+        or avg <= -0.25
+        or btc <= -0.20
+        or strong <= 5
         or hourly_ma5_pressure
     )
+    # ─────────────────────────────────────────────────
 
     return {
         "broad_market_crash": broad_market_crash,
@@ -305,7 +308,6 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         "recovery_to_strong_ready": bool(recovery_to_strong_ready and not real_block),
         "real_block": real_block,
     }
-
 
 
 def _recovery_hard_fail(snapshot: MarketSnapshot) -> bool:
