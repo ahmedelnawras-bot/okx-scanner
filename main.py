@@ -1166,7 +1166,8 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         exec_status = str(exec_result.get("status") or "")
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         can_place_order = exec_status == "accepted_preview"
-        if not settings.send_normal_signals and not is_execution:
+        if not _should_dispatch_signal_item(item, settings):
+            item["announcement_status"] = "filtered_signal_mode"
             continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
         if _is_duplicate_signal_fingerprint(
@@ -1245,6 +1246,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧪 OKX Paper Orders: {'ON' if settings.okx_place_orders else 'OFF'}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
+        f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
@@ -1287,13 +1289,61 @@ def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
             return False
 
 
+def _get_signal_delivery_mode(settings: Settings) -> str:
+    mode = str(getattr(settings, "signal_delivery_mode", "scan") or "scan").strip().lower()
+    return mode if mode in {"scan", "trading"} else "scan"
+
+
+def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
+    normalized = str(mode or "scan").strip().lower()
+    if normalized not in {"scan", "trading"}:
+        return False
+    try:
+        setattr(settings, "signal_delivery_mode", normalized)
+        return _get_signal_delivery_mode(settings) == normalized
+    except Exception:
+        try:
+            object.__setattr__(settings, "signal_delivery_mode", normalized)
+            return _get_signal_delivery_mode(settings) == normalized
+        except Exception:
+            return False
+
+
+def _signal_delivery_mode_label(settings: Settings) -> str:
+    return "وضع التداول" if _get_signal_delivery_mode(settings) == "trading" else "وضع الاسكان"
+
+
+def _is_actionable_signal_status(exec_status: str) -> bool:
+    status = str(exec_status or "").strip().lower()
+    return bool(
+        status in {"accepted_preview", "pending_pullback_preview"}
+        or status.startswith("rejected")
+    )
+
+
+def _should_dispatch_signal_item(item: dict, settings: Settings) -> bool:
+    exec_status = str(((item or {}).get("execution") or {}).get("status") or "").strip().lower()
+    if _get_signal_delivery_mode(settings) == "scan":
+        is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
+        if not settings.send_normal_signals and not is_execution:
+            return False
+        return True
+    return _is_actionable_signal_status(exec_status)
+
+
 def _build_okx_control_keyboard(settings: Settings) -> dict:
     orders_on = bool(getattr(settings, "okx_place_orders", False))
     toggle_text = "⏸ إيقاف تنفيذ OKX" if orders_on else "▶️ تشغيل تنفيذ OKX"
     toggle_data = "okx_orders:off" if orders_on else "okx_orders:on"
+
+    signal_mode = _get_signal_delivery_mode(settings)
+    signal_toggle_text = "🎯 وضع التداول" if signal_mode == "scan" else "📡 وضع الاسكان"
+    signal_toggle_data = "signal_mode:trading" if signal_mode == "scan" else "signal_mode:scan"
+
     return {
         "inline_keyboard": [
             [{"text": toggle_text, "callback_data": toggle_data}],
+            [{"text": signal_toggle_text, "callback_data": signal_toggle_data}],
             [
                 {"text": "📘 حالة OKX", "callback_data": "cmd:/status"},
                 {"text": "🔄 تحديث", "callback_data": "menu:okx_control"},
@@ -1480,6 +1530,25 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
                 "┄┄┄┄┄┄┄┄",
                 f"Requested State: {state_text}",
                 f"Applied: {'YES' if applied else 'NO'}",
+            ]),
+            reply_markup=_build_okx_control_keyboard(runtime_settings),
+        )
+        return
+
+    if data.startswith("signal_mode:"):
+        desired_mode = data.split(":", 1)[1].strip().lower()
+        runtime_settings = settings or get_settings()
+        applied = _set_runtime_signal_delivery_mode(runtime_settings, desired_mode)
+        mode_text = _signal_delivery_mode_label(runtime_settings)
+        prefix = "✅" if applied else "⚠️"
+        _send_text(
+            sender,
+            "\n".join([
+                f"{prefix} Signal Mode Runtime Toggle",
+                "┄┄┄┄┄┄┄┄",
+                f"Requested Mode: {desired_mode.upper() if desired_mode else '-'}",
+                f"Applied: {'YES' if applied else 'NO'}",
+                f"Current Mode: {mode_text}",
             ]),
             reply_markup=_build_okx_control_keyboard(runtime_settings),
         )
