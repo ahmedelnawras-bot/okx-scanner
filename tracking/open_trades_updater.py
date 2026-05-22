@@ -219,17 +219,21 @@ def update_open_trades(
     protection_level: int = 0,
     okx_client: Any | None = None,
     sync_exchange: bool = False,
+    sync_exchange_stop: bool = False,
 ) -> list[TrackedTrade]:
-    """Update tracked trades with price, optional exchange fill sync, and SL sync.
+    """Update tracked trades with price and optional read-only exchange reconciliation.
 
     Backward compatible:
     - existing callers can still use update_open_trades(trades, price_map, protection_level)
 
-    New behavior when sync_exchange=True and okx_client is provided:
+    Read-only behavior when sync_exchange=True and okx_client is provided:
     - sync entry fill snapshot from OKX
     - sync TP1/TP2 order states snapshot
     - read currently attached stop loss from OKX
-    - after lifecycle/block protection updates, amend live SL if protected SL moved higher
+
+    Optional write-back remains disabled by default and only runs when
+    sync_exchange_stop=True. The main worker can use that only during
+    BLOCK protection scans to push a tighter SL to OKX once per full scan.
     """
     updated: list[TrackedTrade] = []
     for trade in trades:
@@ -240,7 +244,7 @@ def update_open_trades(
 
         trade = update_trade_with_price(trade, current_price, protection_level=protection_level)
 
-        if sync_exchange and okx_client is not None:
+        if sync_exchange and sync_exchange_stop and okx_client is not None:
             trade = _sync_stop_loss_to_exchange(trade, okx_client)
 
         updated.append(trade)
