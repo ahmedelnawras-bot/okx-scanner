@@ -34,6 +34,10 @@ from analysis.market_guard import build_market_guard_snapshot
 from analysis.scoring import build_signal_candidate
 from execution.execution_processor import process_trade_candidate
 from execution.okx_trade_client import OKXTradeClient
+try:
+    from risk import risk_manager as risk_manager_module
+except Exception:
+    risk_manager_module = None
 from risk.portfolio_state import build_portfolio_state_from_trades
 from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
 from tracking.trade_registry import register_trade
@@ -176,6 +180,139 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+
+def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
+    if not isinstance(balance_response, dict):
+        return 0.0
+
+    data = balance_response.get("data") or []
+    if not isinstance(data, list):
+        data = []
+
+    # Prefer account-level totals when available.
+    for account in data:
+        if not isinstance(account, dict):
+            continue
+        for key in ("totalEq", "adjEq", "availEq"):
+            value = _safe_float(account.get(key), 0.0)
+            if value > 0:
+                return value
+
+    # Fallback: sum stable-coin details when totals are unavailable.
+    total = 0.0
+    for account in data:
+        if not isinstance(account, dict):
+            continue
+        for detail in account.get("details") or []:
+            if not isinstance(detail, dict):
+                continue
+            ccy = str(detail.get("ccy") or "").upper()
+            if ccy not in {"USDT", "USDC"}:
+                continue
+            value = 0.0
+            for key in ("eqUsd", "eq", "cashBal", "availEq"):
+                value = _safe_float(detail.get(key), 0.0)
+                if value > 0:
+                    break
+            total += max(0.0, value)
+    return total
+
+
+def _risk_sizing_constants(settings: Settings) -> tuple[float, int]:
+    allocation_pct = 24.0
+    slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
+
+    if risk_manager_module is not None:
+        allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
+        slot_count = max(
+            1,
+            int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
+        )
+
+    return allocation_pct, slot_count
+
+
+def _compute_margin_from_reference(reference_balance_usdt: float, settings: Settings) -> float:
+    allocation_pct, slot_count = _risk_sizing_constants(settings)
+    if reference_balance_usdt <= 0 or slot_count <= 0:
+        return 0.0
+    total_allocation = float(reference_balance_usdt) * (allocation_pct / 100.0)
+    return total_allocation / float(slot_count)
+
+
+def _snapshot_risk_manager_state(settings: Settings) -> dict:
+    if risk_manager_module is None:
+        return {}
+
+    reference_balance = _safe_float(getattr(risk_manager_module, "reference_portfolio", 0.0), 0.0)
+    position_margin = _safe_float(getattr(risk_manager_module, "position_size", 0.0), 0.0)
+    position_pct = _safe_float(getattr(risk_manager_module, "position_pct", 0.0), 0.0)
+
+    if reference_balance > 0 and position_margin > 0:
+        return {
+            "source": "risk_manager",
+            "reference_balance_usdt": reference_balance,
+            "margin_usdt": position_margin,
+            "position_pct": position_pct,
+        }
+
+    fallback_margin = _compute_margin_from_reference(reference_balance, settings)
+    if reference_balance > 0 and fallback_margin > 0:
+        return {
+            "source": "risk_manager_balance_only",
+            "reference_balance_usdt": reference_balance,
+            "margin_usdt": fallback_margin,
+            "position_pct": (fallback_margin / reference_balance) * 100.0 if reference_balance > 0 else 0.0,
+        }
+
+    return {}
+
+
+def _resolve_entry_margin_plan(
+    okx_client: OKXTradeClient,
+    settings: Settings,
+) -> dict:
+    fallback_margin = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
+    fallback_plan = {
+        "source": "settings.paper_margin_usdt",
+        "reference_balance_usdt": 0.0,
+        "margin_usdt": fallback_margin,
+        "position_pct": 0.0,
+        "reason": "fallback_static_margin",
+    }
+
+    balance_response = None
+    if okx_client is not None and getattr(okx_client, "configured", False):
+        try:
+            balance_response = okx_client.get_balance()
+        except Exception:
+            balance_response = None
+
+    okx_reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
+    okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
+    if okx_reference_balance > 0 and okx_margin > 0:
+        return {
+            "source": "okx_balance",
+            "reference_balance_usdt": okx_reference_balance,
+            "margin_usdt": okx_margin,
+            "position_pct": (okx_margin / okx_reference_balance) * 100.0 if okx_reference_balance > 0 else 0.0,
+            "reason": "daily_reference_from_okx_balance",
+        }
+
+    risk_snapshot = _snapshot_risk_manager_state(settings)
+    if risk_snapshot.get("margin_usdt", 0.0):
+        risk_snapshot.setdefault("reason", "risk_manager_reference")
+        return risk_snapshot
+
+    if isinstance(balance_response, dict):
+        fallback_plan["balance_fetch_msg"] = str(balance_response.get("msg") or "")
+
+    return fallback_plan
+
+
+def _fmt_money(value: object) -> str:
+    number = _safe_float(value, 0.0)
+    return f"{number:.2f}" if abs(number) >= 1 else f"{number:.4f}"
 def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[str, float]:
     price_map: dict[str, float] = {}
     for raw in raw_tickers or []:
@@ -858,10 +995,13 @@ def _execute_managed_okx_order(
     tp2_value = float(getattr(signal, "tp2", 0.0) or 0.0)
     entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
 
+    sizing = _resolve_entry_margin_plan(okx_client, settings)
+    margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0) or max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
+
     entry_result = okx_client.place_market_long(
         signal.symbol,
         entry_value,
-        margin_usdt=settings.paper_margin_usdt,
+        margin_usdt=margin_usdt,
         leverage=settings.default_leverage,
         td_mode=settings.okx_td_mode,
         sl_trigger_px=sl_value if sl_value > 0 else None,
@@ -873,7 +1013,7 @@ def _execute_managed_okx_order(
         plan = okx_client.build_managed_trade_plan(
             signal.symbol,
             entry_value,
-            settings.paper_margin_usdt,
+            margin_usdt,
             settings.default_leverage,
             sl_value,
             tp1_value,
@@ -885,7 +1025,7 @@ def _execute_managed_okx_order(
         tp_split_result = okx_client.place_reduce_only_tp_split(
             signal.symbol,
             entry_value,
-            settings.paper_margin_usdt,
+            margin_usdt,
             settings.default_leverage,
             tp1_price=tp1_value,
             tp2_price=tp2_value,
@@ -898,6 +1038,8 @@ def _execute_managed_okx_order(
         "entry": entry_result,
         "tp_split": tp_split_result,
         "plan": plan,
+        "sizing": sizing,
+        "used_margin_usdt": margin_usdt,
         "sl_attached": bool(sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))),
         "tp_orders_ok": None if tp_split_result is None else bool(tp_split_result.get("ok")),
         "requires_runner_trailing": bool((plan.get("runner") or {}).get("requires_trailing_after_tp2")) if isinstance(plan, dict) else False,
@@ -925,6 +1067,7 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
     entry = managed_order_result.get("entry") or {}
     tp_split = managed_order_result.get("tp_split") or {}
     plan = managed_order_result.get("plan") or {}
+    sizing = managed_order_result.get("sizing") or {}
 
     symbol = str(getattr(signal, "symbol", "-") or "-")
     path = str((getattr(signal, "meta", {}) or {}).get("execution_path") or "")
@@ -951,11 +1094,18 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
             f"• SL: {sl_price}",
             f"• TP1: {tp1_price}",
             f"• TP2: {tp2_price}",
+        ])
+        if sizing:
+            lines.extend([
+                f"• Reference Balance: {_fmt_money(sizing.get('reference_balance_usdt'))} USDT",
+                f"• Position Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT",
+                f"• Sizing Source: {sizing.get('source') or '-'}",
+            ])
+        lines.extend([
             "",
             "📌 لم يتم فتح الصفقة على OKX.",
         ])
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     lines = [
         "✅ <b>OKX EXECUTION CONFIRMED</b>",
@@ -973,6 +1123,16 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
         f"• Entry Order ID: {_reason_label(entry.get('order_id'))}",
         f"• SL Attached: {_bool_label(managed_order_result.get('sl_attached'))}",
     ])
+
+    if sizing:
+        lines.extend([
+            "",
+            "💼 <b>Sizing</b>",
+            f"• Reference Balance: {_fmt_money(sizing.get('reference_balance_usdt'))} USDT",
+            f"• Position Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT",
+            f"• Position Size: {_safe_float(sizing.get('position_pct'), 0.0):.2f}% من الرصيد",
+            f"• Source: {sizing.get('source') or '-'}",
+        ])
 
     if isinstance(tp_split, dict) and tp_split:
         lines.extend([
@@ -994,8 +1154,8 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
         "",
         "✅ تم إرسال أمر OKX بنجاح.",
     ])
-    return "
-".join(lines)
+    return "\n".join(lines)
+
 
 
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
@@ -1005,6 +1165,7 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
     entry = managed_order_result.get("entry") or {}
     tp_split = managed_order_result.get("tp_split") or {}
     plan = managed_order_result.get("plan") or {}
+    sizing = managed_order_result.get("sizing") or {}
 
     lines = [
         "🤖 <b>OKX Execution</b>",
@@ -1014,6 +1175,16 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
         f"• Result: {_reason_label(entry.get('reason') or entry.get('response', {}).get('msg') or entry.get('response', {}).get('code'))}",
         f"• SL Attached On Entry: {_bool_label(managed_order_result.get('sl_attached'))}",
     ]
+
+    if sizing:
+        lines.extend([
+            "",
+            "💼 <b>Sizing</b>",
+            f"• Reference Balance: {_fmt_money(sizing.get('reference_balance_usdt'))} USDT",
+            f"• Position Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT",
+            f"• Position Size: {_safe_float(sizing.get('position_pct'), 0.0):.2f}% من الرصيد",
+            f"• Source: {sizing.get('source') or '-'}",
+        ])
 
     if isinstance(plan, dict) and plan.get("ok"):
         lines.extend([
