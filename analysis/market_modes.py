@@ -46,8 +46,8 @@ class MarketModeState:
 
 # Keep transitions stable without trapping the bot inside BLOCK.
 MODE_CHANGE_COOLDOWN_MINUTES = 10
-NORMAL_EXIT_COOLDOWN_MINUTES = 4
-RETURN_TO_NORMAL_COOLDOWN_MINUTES = 8
+NORMAL_EXIT_COOLDOWN_MINUTES = 2
+RETURN_TO_NORMAL_COOLDOWN_MINUTES = 12
 
 # BLOCK should be defensive: fast in on real breakdown, slower out after pressure.
 # Recovery can still exit BLOCK immediately when a clear fast rebound appears.
@@ -227,10 +227,10 @@ def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
 def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
     red_ratio, avg, btc, strong = _values(snapshot)
     return bool(
-        red_ratio < NORMAL_READY_RED_RATIO
-        and avg > NORMAL_READY_AVG
-        and btc > NORMAL_READY_BTC
-        and strong >= 6
+        red_ratio < 0.48
+        and avg > -0.12
+        and btc > -0.08
+        and strong >= 7
         and not _has_hourly_ma5_pressure(snapshot)
     )
 
@@ -286,9 +286,9 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     # التعديل الوحيد هنا ────────────────────────────────
     weak_breadth = bool(
-        red_ratio >= 0.52
-        or avg <= -0.25
-        or btc <= -0.20
+        red_ratio >= 0.50
+        or avg <= -0.20
+        or btc <= -0.18
         or strong <= 5
         or hourly_ma5_pressure
     )
