@@ -1356,13 +1356,17 @@ def _build_okx_control_panel(settings: Settings) -> str:
     runtime_status = "ON" if bool(getattr(settings, "okx_place_orders", False)) else "OFF"
     live_guard = "ALLOWED" if bool(getattr(settings, "allow_live_trading", False)) else "BLOCKED"
     simulated = "ON" if bool(getattr(settings, "okx_simulated", True)) else "OFF"
+    signal_mode = _signal_delivery_mode_label(settings)
     return "\n".join([
         build_okx_control_help(),
         "",
         "⚙️ <b>Runtime OKX Control</b>",
         f"• OKX Orders: <b>{runtime_status}</b>",
+        f"• Signal Mode: <b>{signal_mode}</b>",
         f"• Simulated Mode: <b>{simulated}</b>",
         f"• Live Trading Guard: <b>{live_guard}</b>",
+        "• وضع التداول: المرشح + كل rejected + رسائل OKX فقط.",
+        "• وضع الاسكان: كل الرسائل كما هو معتاد.",
         "• الزر يوقف/يرجع إرسال أوامر OKX فورًا بدون إعادة تشغيل البوت.",
     ])
 
