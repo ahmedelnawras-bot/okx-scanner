@@ -1,15 +1,19 @@
-"""Unified market mode engine with tuned sensitivity.
+"""Unified market mode engine with old-core BLOCK entry/exit logic.
 
-v129d tuning goals:
-- NORMAL_LONG should stop dominating grey/weak sessions.
-- STRONG_LONG_ONLY should trigger earlier on broad pressure.
-- Return to NORMAL_LONG should require cleaner conditions.
-- BLOCK_LONGS remains reserved for real breakdowns, not every weak scan.
+v129 focus:
+- Market mode uses broad Market Guard snapshot from main.py.
+- BLOCK_LONGS entry is harder: breadth-only weakness is usually STRONG.
+- BLOCK_LONGS exit has two paths:
+  1) fast exit to RECOVERY_LONG when rebound edge is clear;
+  2) safe exit to STRONG_LONG_ONLY when market is no longer crashing.
+- RECOVERY_LONG is temporary and should only be reached from BLOCK/confirmed crash rebound paths.
+- NORMAL_LONG remains the healthy/green market mode; STRONG_LONG_ONLY is defensive pressure mode.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from utils.constants import *
 
@@ -42,16 +46,14 @@ class MarketModeState:
 
 # Keep transitions stable without trapping the bot inside BLOCK.
 MODE_CHANGE_COOLDOWN_MINUTES = 10
-NORMAL_EXIT_COOLDOWN_MINUTES = 2
-RETURN_TO_NORMAL_COOLDOWN_MINUTES = 10
+NORMAL_EXIT_COOLDOWN_MINUTES = 4
+RETURN_TO_NORMAL_COOLDOWN_MINUTES = 8
 
 # BLOCK should be defensive: fast in on real breakdown, slower out after pressure.
 # Recovery can still exit BLOCK immediately when a clear fast rebound appears.
 BLOCK_MIN_HOLD_MINUTES = 10
 BLOCK_EXIT_CONFIRM_SCANS = 3
 STRONG_TO_BLOCK_CONFIRM_SCANS = 1
-STRONG_TO_NORMAL_CONFIRM_SCANS = 2
-RECOVERY_TO_NORMAL_CONFIRM_SCANS = 3
 
 # Old-core style thresholds.
 BLOCK_RED_RATIO = 0.68
@@ -73,11 +75,9 @@ RECOVERY_READY_RED_RATIO = 0.58
 RECOVERY_READY_AVG = -0.55
 RECOVERY_READY_BTC = -0.32
 
-# Stricter return to NORMAL: market must be genuinely healthy, not just less bad.
-NORMAL_READY_RED_RATIO = 0.48
-NORMAL_READY_AVG = -0.12
-NORMAL_READY_BTC = -0.08
-NORMAL_READY_MIN_STRONG = 7
+NORMAL_READY_RED_RATIO = 0.52
+NORMAL_READY_AVG = -0.25
+NORMAL_READY_BTC = -0.15
 
 RECOVERY_SOFT_FAIL_RED_RATIO = 0.62
 RECOVERY_SOFT_FAIL_AVG = -0.45
@@ -95,15 +95,76 @@ RECOVERY_TO_STRONG_AVG = -0.35
 RECOVERY_TO_STRONG_BTC = -0.30
 RECOVERY_TO_STRONG_MIN_STRONG_COINS = 4
 
-# Earlier STRONG trigger so NORMAL_LONG doesn't dominate weak sessions.
-WEAK_BREADTH_RED_RATIO = 0.54
-WEAK_BREADTH_AVG = -0.20
-WEAK_BREADTH_BTC = -0.18
-WEAK_BREADTH_MIN_STRONG = 5
-WEAK_BREADTH_RED_PLUS_AVG = 0.58
-WEAK_BREADTH_RED_PLUS_AVG_FLOOR = -0.12
-WEAK_BREADTH_RED_PLUS_BTC = 0.56
-WEAK_BREADTH_RED_PLUS_BTC_FLOOR = -0.12
+
+MODE_DECISION_DEBUG = os.getenv("MODE_DECISION_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _mode_debug_line(
+    snapshot: MarketSnapshot,
+    previous_mode: str,
+    raw_mode: str,
+    candidate_before_cooldown: str,
+    final_mode: str,
+    *,
+    minutes_in_mode: int,
+    flags: dict,
+    cooldown_applied: bool,
+    required_cooldown: int,
+) -> str:
+    red_ratio, avg, btc, strong = _values(snapshot)
+    return (
+        "ðŸ§­ MODE DECISION"
+        f" | prev={previous_mode}"
+        f" | raw={raw_mode}"
+        f" | candidate={candidate_before_cooldown}"
+        f" | final={final_mode}"
+        f" | mins={minutes_in_mode}"
+        f" | need_cd={required_cooldown}"
+        f" | cd_blocked={cooldown_applied}"
+        f" | weak={int(bool(flags.get('weak_breadth')))}"
+        f" | block={int(bool(flags.get('real_block')))}"
+        f" | rec_ready={int(bool(flags.get('recovery_ready')))}"
+        f" | norm_ready={int(bool(flags.get('normal_ready')))}"
+        f" | stabilize={int(bool(flags.get('stabilizing')))}"
+        f" | hourly_p={int(bool(flags.get('hourly_ma5_pressure')))}"
+        f" | red={red_ratio:.2f}"
+        f" | avg={avg:+.2f}"
+        f" | btc={btc:+.2f}"
+        f" | strong={strong}"
+    )
+
+
+def _print_mode_debug(
+    snapshot: MarketSnapshot,
+    previous_mode: str,
+    raw_mode: str,
+    candidate_before_cooldown: str,
+    final_mode: str,
+    *,
+    minutes_in_mode: int,
+    flags: dict,
+    cooldown_applied: bool,
+    required_cooldown: int,
+) -> None:
+    if not MODE_DECISION_DEBUG:
+        return
+    try:
+        print(
+            _mode_debug_line(
+                snapshot,
+                previous_mode,
+                raw_mode,
+                candidate_before_cooldown,
+                final_mode,
+                minutes_in_mode=minutes_in_mode,
+                flags=flags,
+                cooldown_applied=cooldown_applied,
+                required_cooldown=required_cooldown,
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _values(snapshot: MarketSnapshot) -> tuple[float, float, float, int]:
@@ -155,8 +216,9 @@ def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
         and btc > -0.35
         and strong >= 5
     )
+    # Do not treat a plain healthy/strong snapshot as Recovery. Recovery is a
+    # fast post-crash rebound path, not a replacement for NORMAL/STRONG.
     return bool(old_core_recovery and (snapshot.fast_rebound or controlled_rebound_edge) or fast_recovery_edge)
-
 
 def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
     return bool(getattr(snapshot, "hourly_ma5_pressure", False))
@@ -168,7 +230,7 @@ def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
         red_ratio < NORMAL_READY_RED_RATIO
         and avg > NORMAL_READY_AVG
         and btc > NORMAL_READY_BTC
-        and strong >= NORMAL_READY_MIN_STRONG
+        and strong >= 6
         and not _has_hourly_ma5_pressure(snapshot)
     )
 
@@ -184,14 +246,21 @@ def _is_recovery_to_strong_ready(snapshot: MarketSnapshot) -> bool:
     recovery_edge_fading = bool(not snapshot.fast_rebound or snapshot.breadth_improving or snapshot.btc_reclaim)
     return bool(pressure_but_stable and recovery_edge_fading)
 
-
 def _risk_flags(snapshot: MarketSnapshot) -> dict:
+    """Classify market risk using old-core entry/exit paths.
+
+    BLOCK entry paths:
+    1) broad market crash: red_ratio high + avg change sharply negative;
+    2) BTC breakdown: BTC sharply negative + enough red breadth;
+    3) alt weakness only becomes BLOCK if it has breakdown pressure and no stabilization.
+    """
     red_ratio, avg, btc, strong = _values(snapshot)
 
     broad_market_crash = red_ratio >= BLOCK_RED_RATIO and avg <= BLOCK_AVG_CHANGE
     btc_breakdown = btc <= BLOCK_BTC_CHANGE and red_ratio >= BLOCK_BTC_RED_RATIO
     alt_weak_pressure = red_ratio >= ALT_WEAK_RED_RATIO and avg <= -0.85 and btc <= -0.45
 
+    # Fast emergency panic path.
     fast_block_trigger = bool(
         (
             btc <= FAST_BLOCK_BTC_15M
@@ -209,18 +278,17 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     normal_ready = _is_normal_ready(snapshot)
     recovery_to_strong_ready = _is_recovery_to_strong_ready(snapshot)
 
+    # Stabilization prevents breadth-only BLOCK and pushes the system toward STRONG.
     stabilizing = bool(no_longer_crashing or snapshot.breadth_improving or snapshot.btc_reclaim)
 
     real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
     weak_breadth = bool(
-        red_ratio >= WEAK_BREADTH_RED_RATIO
-        or avg <= WEAK_BREADTH_AVG
-        or btc <= WEAK_BREADTH_BTC
-        or strong <= WEAK_BREADTH_MIN_STRONG
+        red_ratio >= 0.56
+        or avg <= -0.30
+        or btc <= -0.25
+        or strong <= 4
         or hourly_ma5_pressure
-        or (red_ratio >= WEAK_BREADTH_RED_PLUS_AVG and avg <= WEAK_BREADTH_RED_PLUS_AVG_FLOOR)
-        or (red_ratio >= WEAK_BREADTH_RED_PLUS_BTC and btc <= WEAK_BREADTH_RED_PLUS_BTC_FLOOR)
     )
 
     return {
@@ -237,6 +305,7 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         "recovery_to_strong_ready": bool(recovery_to_strong_ready and not real_block),
         "real_block": real_block,
     }
+
 
 
 def _recovery_hard_fail(snapshot: MarketSnapshot) -> bool:
@@ -257,37 +326,46 @@ def _recovery_soft_fail(snapshot: MarketSnapshot) -> bool:
         or strong <= 3
     )
 
-
 def _base_mode(snapshot: MarketSnapshot) -> str:
     flags = _risk_flags(snapshot)
+
+    # Fast emergency BLOCK path.
     if flags["fast_block_trigger"]:
         return MODE_BLOCK_LONGS
+
     if flags["real_block"]:
         return MODE_BLOCK_LONGS
+
     if flags["weak_breadth"]:
         return MODE_STRONG_LONG_ONLY
-    return MODE_NORMAL_LONG
 
+    return MODE_NORMAL_LONG
 
 def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | None = None, now: datetime | None = None) -> MarketModeState:
     now = now or datetime.now(timezone.utc)
     previous = previous or MarketModeState()
     minutes_in_mode = int((now - previous.changed_at).total_seconds() // 60)
     flags = _risk_flags(snapshot)
+    raw = _base_mode(snapshot)
 
     next_state = replace(previous)
     improving = flags["no_longer_crashing"] or flags["recovery_ready"] or flags["recovery_to_strong_ready"] or flags["stabilizing"]
-    weakening = flags["real_block"] or flags["weak_breadth"]
+    weakening = flags["real_block"]
     next_state.consecutive_improvement_scans = previous.consecutive_improvement_scans + 1 if improving else 0
     next_state.consecutive_weak_scans = previous.consecutive_weak_scans + 1 if weakening else 0
 
     candidate_mode = previous.mode
+    required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
+    cooldown_applied = False
 
     if previous.mode == MODE_BLOCK_LONGS:
+        # Fast exit path: BLOCK -> RECOVERY only on a real rebound edge.
         if flags["recovery_ready"]:
             candidate_mode = MODE_RECOVERY_LONG
+        # Keep BLOCK stable for a short minimum hold unless a real rebound is present.
         elif minutes_in_mode < BLOCK_MIN_HOLD_MINUTES:
             candidate_mode = MODE_BLOCK_LONGS
+        # Slow/safe exit path: crash stopped but market is still pressured -> STRONG.
         elif flags["no_longer_crashing"] or flags["stabilizing"] or not flags["real_block"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
                 candidate_mode = MODE_STRONG_LONG_ONLY
@@ -297,29 +375,40 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
             candidate_mode = MODE_BLOCK_LONGS
 
     elif previous.mode == MODE_STRONG_LONG_ONLY:
+        # Enter BLOCK from STRONG immediately on confirmed real breakdown.
         if flags["real_block"] and next_state.consecutive_weak_scans >= STRONG_TO_BLOCK_CONFIRM_SCANS:
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= STRONG_TO_NORMAL_CONFIRM_SCANS:
+        elif flags["normal_ready"]:
             candidate_mode = MODE_NORMAL_LONG
         else:
+            # STRONG is the pressure mode. Do not jump to RECOVERY unless a
+            # BLOCK/crash path happened first.
             candidate_mode = MODE_STRONG_LONG_ONLY
 
     elif previous.mode == MODE_RECOVERY_LONG:
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= RECOVERY_TO_NORMAL_CONFIRM_SCANS:
+        elif flags["normal_ready"]:
             candidate_mode = MODE_NORMAL_LONG
         else:
+            # Recovery may continue while the runner-style rebound remains active.
+            # Direct RECOVERY -> STRONG transition is not allowed in this project.
             candidate_mode = MODE_RECOVERY_LONG
 
     else:  # NORMAL_LONG
         if flags["real_block"]:
             candidate_mode = MODE_BLOCK_LONGS
         elif flags["weak_breadth"]:
+            # NORMAL is the healthy/green market. Weakness from NORMAL becomes
+            # STRONG pressure mode. Rebound-like noise alone does not create
+            # RECOVERY from NORMAL.
             candidate_mode = MODE_STRONG_LONG_ONLY
         else:
             candidate_mode = MODE_NORMAL_LONG
 
+    candidate_before_cooldown = candidate_mode
+
+    # Anti-flapping cooldown with faster defensive exits from NORMAL and slower return to NORMAL.
     if candidate_mode != previous.mode:
         required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
         if previous.mode == MODE_NORMAL_LONG and candidate_mode == MODE_STRONG_LONG_ONLY:
@@ -333,6 +422,7 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
             elif candidate_mode == MODE_BLOCK_LONGS and (flags["real_block"] or previous.mode == MODE_RECOVERY_LONG):
                 pass
             elif candidate_mode != MODE_BLOCK_LONGS:
+                cooldown_applied = True
                 candidate_mode = previous.mode
 
     changed = candidate_mode != previous.mode
@@ -351,13 +441,22 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         next_state.recovery_cycle_started_at = None
         next_state.recovery_trade_count = 0
 
+    _print_mode_debug(
+        snapshot,
+        previous.mode,
+        raw,
+        candidate_before_cooldown,
+        next_state.mode,
+        minutes_in_mode=minutes_in_mode,
+        flags=flags,
+        cooldown_applied=cooldown_applied,
+        required_cooldown=required_cooldown,
+    )
     return next_state
-
 
 
 def increment_reminder_count(state: MarketModeState) -> MarketModeState:
     return replace(state, reminder_count=state.reminder_count + 1)
-
 
 
 def register_recovery_trade(state: MarketModeState) -> MarketModeState:
@@ -366,12 +465,10 @@ def register_recovery_trade(state: MarketModeState) -> MarketModeState:
     return replace(state, recovery_trade_count=min(MAX_RECOVERY_TRADES_PER_CYCLE, state.recovery_trade_count + 1))
 
 
-
 def recovery_slots_remaining(state: MarketModeState) -> int:
     if state.mode != MODE_RECOVERY_LONG:
         return MAX_RECOVERY_TRADES_PER_CYCLE
     return max(0, MAX_RECOVERY_TRADES_PER_CYCLE - state.recovery_trade_count)
-
 
 
 def block_protection_status(state: MarketModeState, now: datetime | None = None) -> dict:
@@ -380,9 +477,9 @@ def block_protection_status(state: MarketModeState, now: datetime | None = None)
         return {"level": 0, "current": "inactive", "next": "inactive", "remaining_minutes": 0}
     minutes_in_mode = int((now - state.changed_at).total_seconds() // 60)
     if minutes_in_mode < 15:
-        return {"level": 1, "current": "LEVEL 1 — Monitor Only", "next": "Soft Protection", "remaining_minutes": 15 - minutes_in_mode}
+        return {"level": 1, "current": "LEVEL 1 â€” Monitor Only", "next": "Soft Protection", "remaining_minutes": 15 - minutes_in_mode}
     if minutes_in_mode < 30:
-        return {"level": 2, "current": "LEVEL 2 — Soft Protection", "next": "Defensive Protection", "remaining_minutes": 30 - minutes_in_mode}
+        return {"level": 2, "current": "LEVEL 2 â€” Soft Protection", "next": "Defensive Protection", "remaining_minutes": 30 - minutes_in_mode}
     if minutes_in_mode < 40:
-        return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 40 - minutes_in_mode}
-    return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
+        return {"level": 3, "current": "LEVEL 3 â€” Defensive Protection", "next": "Max protection active", "remaining_minutes": 40 - minutes_in_mode}
+    return {"level": 3, "current": "LEVEL 3 â€” Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
