@@ -1107,8 +1107,7 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
         lines.append(f"📤 TP Orders: {'جاهزة' if tp_split.get('ok') else 'بحاجة مراجعة'}")
 
     lines.append("✅ تم إرسال أمر OKX بنجاح." if ok else "📌 الصفقة لم تُفتح على OKX.")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
