@@ -24,6 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 import requests
@@ -61,6 +62,7 @@ class OKXTradeClient:
         self.allow_live_trading = bool(allow_live_trading)
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._instrument_specs_cache: dict[str, dict[str, Any]] = {}
 
     @property
     def configured(self) -> bool:
@@ -208,12 +210,256 @@ class OKXTradeClient:
             "row": rows[0] if isinstance(rows, list) and rows else {},
         }
 
-    def _build_position_size(self, entry_price: float, margin_usdt: float, leverage: int) -> str:
+
+    def _public_get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        try:
+            response = requests.get(url, params=params, timeout=self.timeout)
+            try:
+                data = response.json()
+            except Exception:
+                data = {"code": str(response.status_code), "msg": response.text, "data": []}
+            return data
+        except Exception as exc:
+            return {"code": "-1", "msg": str(exc), "data": []}
+
+    @staticmethod
+    def _to_decimal(value: Any, default: str = "0") -> Decimal:
+        try:
+            if isinstance(value, Decimal):
+                return value
+            text = str(value if value is not None else default).strip()
+            if not text:
+                text = default
+            return Decimal(text)
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal(default)
+
+    @staticmethod
+    def _decimal_to_str(value: Decimal, default: str = "0") -> str:
+        text = format(value.normalize(), "f") if value != 0 else "0"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or default
+
+    @classmethod
+    def _floor_to_step(cls, value: Decimal, step: Decimal) -> Decimal:
+        if step <= 0:
+            return value
+        return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+    @classmethod
+    def _ceil_to_step(cls, value: Decimal, step: Decimal) -> Decimal:
+        if step <= 0:
+            return value
+        return (value / step).to_integral_value(rounding=ROUND_UP) * step
+
+    def get_instrument_specs(
+        self,
+        inst_id: str,
+        *,
+        inst_type: str = "SWAP",
+        use_cache: bool = True,
+    ) -> dict[str, Any]:
+        cache_key = f"{inst_type}:{inst_id}"
+        if use_cache and cache_key in self._instrument_specs_cache:
+            cached = dict(self._instrument_specs_cache[cache_key])
+            cached["cached"] = True
+            return cached
+
+        params = {"instType": inst_type, "instId": inst_id}
+        response = self._public_get("/api/v5/public/instruments", params=params)
+        ok = str(response.get("code", "")) == "0"
+        rows = response.get("data") or []
+        row = rows[0] if isinstance(rows, list) and rows else {}
+
+        result = {
+            "ok": bool(ok and row),
+            "reason": response.get("msg") or ("ok" if ok and row else "instrument_not_found"),
+            "inst_id": inst_id,
+            "inst_type": inst_type,
+            "response": response,
+            "row": row if isinstance(row, dict) else {},
+            "lot_sz": str((row or {}).get("lotSz") or ""),
+            "min_sz": str((row or {}).get("minSz") or ""),
+            "max_mkt_sz": str((row or {}).get("maxMktSz") or ""),
+            "ct_val": str((row or {}).get("ctVal") or ""),
+            "ct_type": str((row or {}).get("ctType") or ""),
+            "state": str((row or {}).get("state") or ""),
+            "cached": False,
+        }
+        if result["ok"]:
+            self._instrument_specs_cache[cache_key] = dict(result)
+        return result
+
+    def _build_position_size_meta(
+        self,
+        entry_price: float,
+        margin_usdt: float,
+        leverage: int,
+        *,
+        inst_id: str | None = None,
+    ) -> dict[str, Any]:
         notional = max(float(margin_usdt), 0.0) * max(int(leverage), 1)
         price = max(float(entry_price), 0.0)
         if price <= 0 or notional <= 0:
             raise ValueError("invalid_entry_or_margin")
-        return f"{notional / price:.6f}"
+
+        raw_base_size = Decimal(str(notional / price))
+        result: dict[str, Any] = {
+            "inst_id": inst_id or "",
+            "notional_usdt": float(notional),
+            "entry_price": float(price),
+            "raw_base_size": float(raw_base_size),
+            "sizing_source": "base_qty_fallback",
+            "instrument_specs": None,
+        }
+
+        if not inst_id:
+            size = self._floor_to_step(raw_base_size, Decimal("0.000001"))
+            result.update({
+                "size_decimal": size,
+                "size_str": self._decimal_to_str(size),
+                "lot_sz": "",
+                "min_sz": "",
+                "ct_val": "",
+                "ct_type": "",
+            })
+            return result
+
+        specs = self.get_instrument_specs(inst_id)
+        result["instrument_specs"] = specs
+        if not specs.get("ok"):
+            size = self._floor_to_step(raw_base_size, Decimal("0.000001"))
+            result.update({
+                "size_decimal": size,
+                "size_str": self._decimal_to_str(size),
+                "lot_sz": "",
+                "min_sz": "",
+                "ct_val": "",
+                "ct_type": "",
+                "sizing_source": "base_qty_no_specs",
+                "size_warning": specs.get("reason") or "instrument_specs_unavailable",
+            })
+            return result
+
+        lot_sz = self._to_decimal(specs.get("lot_sz") or "0", "0")
+        min_sz = self._to_decimal(specs.get("min_sz") or "0", "0")
+        ct_val = self._to_decimal(specs.get("ct_val") or "0", "0")
+        ct_type = str(specs.get("ct_type") or "").strip().lower()
+
+        qty = raw_base_size
+        sizing_source = "base_qty"
+
+        if ct_val > 0:
+            if ct_type == "inverse":
+                qty = Decimal(str(notional)) / ct_val
+                sizing_source = "contracts_inverse"
+            else:
+                denom = Decimal(str(price)) * ct_val
+                if denom <= 0:
+                    raise ValueError("invalid_contract_value")
+                qty = Decimal(str(notional)) / denom
+                sizing_source = "contracts_linear"
+
+        step = lot_sz if lot_sz > 0 else Decimal("0.000001")
+        normalized_qty = self._floor_to_step(qty, step)
+
+        if normalized_qty <= 0:
+            raise ValueError("normalized_size_zero")
+
+        if min_sz > 0 and normalized_qty < min_sz:
+            min_normalized = self._ceil_to_step(min_sz, step)
+            if qty < min_normalized:
+                raise ValueError(
+                    f"size_below_min_sz raw={self._decimal_to_str(qty)} min={self._decimal_to_str(min_normalized)}"
+                )
+            normalized_qty = min_normalized
+
+        result.update({
+            "size_decimal": normalized_qty,
+            "size_str": self._decimal_to_str(normalized_qty),
+            "raw_contract_size": float(qty),
+            "lot_sz": self._decimal_to_str(lot_sz) if lot_sz > 0 else "",
+            "min_sz": self._decimal_to_str(min_sz) if min_sz > 0 else "",
+            "ct_val": self._decimal_to_str(ct_val) if ct_val > 0 else "",
+            "ct_type": ct_type,
+            "sizing_source": sizing_source,
+        })
+        return result
+
+    def _build_split_size_meta(
+        self,
+        full_size_str: str,
+        *,
+        inst_id: str,
+        tp1_pct: float,
+        tp2_pct: float,
+        runner_pct: float,
+    ) -> dict[str, Any]:
+        full_size = self._to_decimal(full_size_str, "0")
+        if full_size <= 0:
+            raise ValueError("invalid_full_size")
+
+        specs = self.get_instrument_specs(inst_id)
+        lot_sz = self._to_decimal((specs.get("lot_sz") if isinstance(specs, dict) else "") or "0", "0")
+        step = lot_sz if lot_sz > 0 else Decimal("0.000001")
+
+        tp1 = self._floor_to_step(full_size * self._to_decimal(tp1_pct, "0") / Decimal("100"), step)
+        tp2 = self._floor_to_step(full_size * self._to_decimal(tp2_pct, "0") / Decimal("100"), step)
+
+        if tp1 + tp2 > full_size:
+            overflow = (tp1 + tp2) - full_size
+            tp2 = max(tp2 - overflow, Decimal("0"))
+            tp2 = self._floor_to_step(tp2, step)
+
+        runner = full_size - tp1 - tp2
+        runner = self._floor_to_step(runner, step) if step > 0 else runner
+
+        warnings: list[str] = []
+        if tp1 <= 0:
+            warnings.append("tp1_size_zero_after_lot_rounding")
+        if tp2 <= 0:
+            warnings.append("tp2_size_zero_after_lot_rounding")
+        if runner < 0:
+            warnings.append("runner_negative_after_rounding")
+            runner = Decimal("0")
+
+        return {
+            "ok": True,
+            "instrument_specs": specs,
+            "full_size_decimal": full_size,
+            "full_size": self._decimal_to_str(full_size),
+            "tp1_size_decimal": tp1,
+            "tp1_size": self._decimal_to_str(tp1),
+            "tp2_size_decimal": tp2,
+            "tp2_size": self._decimal_to_str(tp2),
+            "runner_size_decimal": runner,
+            "runner_size": self._decimal_to_str(runner),
+            "lot_sz": self._decimal_to_str(lot_sz) if lot_sz > 0 else "",
+            "warnings": warnings,
+        }
+
+    def _build_position_size(
+        self,
+        entry_price: float,
+        margin_usdt: float,
+        leverage: int,
+        *,
+        inst_id: str | None = None,
+    ) -> str:
+        meta = self._build_position_size_meta(
+            entry_price,
+            margin_usdt,
+            leverage,
+            inst_id=inst_id,
+        )
+        return str(meta.get("size_str") or "0")
 
     def _build_attached_stop_loss(
         self,
@@ -357,7 +603,13 @@ class OKXTradeClient:
         - sl_ord_px: stop order price. '-1' keeps market-style stop execution.
         """
         try:
-            sz = self._build_position_size(entry_price, margin_usdt, leverage)
+            size_meta = self._build_position_size_meta(
+                entry_price,
+                margin_usdt,
+                leverage,
+                inst_id=inst_id,
+            )
+            sz = str(size_meta.get("size_str") or "0")
         except Exception as exc:
             return {
                 "ok": False,
@@ -394,6 +646,13 @@ class OKXTradeClient:
         result["entry_price_hint"] = float(entry_price)
         result["requested_leverage"] = int(leverage)
         result["requested_margin_usdt"] = float(margin_usdt)
+        result["size_meta"] = size_meta
+        result["instrument_specs"] = size_meta.get("instrument_specs")
+        result["lot_sz"] = size_meta.get("lot_sz")
+        result["min_sz"] = size_meta.get("min_sz")
+        result["ct_val"] = size_meta.get("ct_val")
+        result["ct_type"] = size_meta.get("ct_type")
+        result["sizing_source"] = size_meta.get("sizing_source")
         return result
 
     def place_market_long_with_attached_sl(
@@ -463,7 +722,19 @@ class OKXTradeClient:
         tag: str | None = None,
     ) -> dict[str, Any]:
         try:
-            full_sz = float(self._build_position_size(entry_price, margin_usdt, leverage))
+            size_meta = self._build_position_size_meta(
+                entry_price,
+                margin_usdt,
+                leverage,
+                inst_id=inst_id,
+            )
+            split_meta = self._build_split_size_meta(
+                str(size_meta.get("size_str") or "0"),
+                inst_id=inst_id,
+                tp1_pct=tp1_pct,
+                tp2_pct=tp2_pct,
+                runner_pct=max(0.0, 100.0 - float(tp1_pct) - float(tp2_pct)),
+            )
         except Exception as exc:
             return {
                 "ok": False,
@@ -471,8 +742,18 @@ class OKXTradeClient:
                 "reason": f"size_build_failed: {exc}",
             }
 
-        tp1_sz = f"{max(full_sz * max(float(tp1_pct), 0.0) / 100.0, 0.0):.6f}"
-        tp2_sz = f"{max(full_sz * max(float(tp2_pct), 0.0) / 100.0, 0.0):.6f}"
+        tp1_sz = str(split_meta.get("tp1_size") or "0")
+        tp2_sz = str(split_meta.get("tp2_size") or "0")
+        full_sz = float(size_meta.get("size_str") or 0.0)
+
+        if self._safe_float(tp1_sz) <= 0 or self._safe_float(tp2_sz) <= 0:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "tp_split_size_zero_after_lot_rounding",
+                "size_meta": size_meta,
+                "split_meta": split_meta,
+            }
 
         tp1_result = self.place_reduce_only_tp_limit(
             inst_id=inst_id,
@@ -499,10 +780,13 @@ class OKXTradeClient:
             "reason": "tp_split_placed" if tp1_result.get("ok") and tp2_result.get("ok") else "tp_split_partial_or_failed",
             "tp1": tp1_result,
             "tp2": tp2_result,
-            "full_size": f"{full_sz:.6f}",
+            "full_size": str(size_meta.get("size_str") or f"{full_sz:.6f}"),
             "tp1_size": tp1_sz,
             "tp2_size": tp2_sz,
-            "runner_size": f"{max(full_sz - float(tp1_sz) - float(tp2_sz), 0.0):.6f}",
+            "runner_size": str(split_meta.get("runner_size") or "0"),
+            "size_meta": size_meta,
+            "split_meta": split_meta,
+            "warnings": list(split_meta.get("warnings") or []),
         }
 
     def place_reduce_only_market_close(
@@ -677,7 +961,19 @@ class OKXTradeClient:
         runner_pct: float = 20.0,
     ) -> dict[str, Any]:
         try:
-            full_sz = float(self._build_position_size(entry_price, margin_usdt, leverage))
+            size_meta = self._build_position_size_meta(
+                entry_price,
+                margin_usdt,
+                leverage,
+                inst_id=inst_id,
+            )
+            split_meta = self._build_split_size_meta(
+                str(size_meta.get("size_str") or "0"),
+                inst_id=inst_id,
+                tp1_pct=tp1_pct,
+                tp2_pct=tp2_pct,
+                runner_pct=runner_pct,
+            )
         except Exception as exc:
             return {
                 "ok": False,
@@ -685,16 +981,12 @@ class OKXTradeClient:
                 "reason": f"size_build_failed: {exc}",
             }
 
-        tp1_sz = max(full_sz * max(float(tp1_pct), 0.0) / 100.0, 0.0)
-        tp2_sz = max(full_sz * max(float(tp2_pct), 0.0) / 100.0, 0.0)
-        runner_sz = max(full_sz * max(float(runner_pct), 0.0) / 100.0, 0.0)
-
         return {
             "ok": True,
             "simulated": self.credentials.simulated,
             "inst_id": inst_id,
             "entry_price": float(entry_price),
-            "full_size": f"{full_sz:.6f}",
+            "full_size": str(size_meta.get("size_str") or "0"),
             "attached_stop_loss": {
                 "slTriggerPx": f"{float(sl_trigger_px):.10f}".rstrip("0").rstrip("."),
                 "slOrdPx": "-1",
@@ -702,18 +994,22 @@ class OKXTradeClient:
             "tp1": {
                 "price": float(tp1_price),
                 "close_pct": float(tp1_pct),
-                "size": f"{tp1_sz:.6f}",
+                "size": str(split_meta.get("tp1_size") or "0"),
             },
             "tp2": {
                 "price": float(tp2_price),
                 "close_pct": float(tp2_pct),
-                "size": f"{tp2_sz:.6f}",
+                "size": str(split_meta.get("tp2_size") or "0"),
             },
             "runner": {
                 "close_pct": float(runner_pct),
-                "size": f"{runner_sz:.6f}",
+                "size": str(split_meta.get("runner_size") or "0"),
                 "requires_trailing_after_tp2": True,
             },
+            "size_meta": size_meta,
+            "split_meta": split_meta,
+            "instrument_specs": size_meta.get("instrument_specs"),
+            "warnings": list(split_meta.get("warnings") or []),
         }
 
     # ---------------------------------------------------------------------
