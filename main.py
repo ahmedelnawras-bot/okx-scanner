@@ -1066,35 +1066,50 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
     managed_order_result = managed_order_result or {}
     entry = managed_order_result.get("entry") or {}
     tp_split = managed_order_result.get("tp_split") or {}
+    plan = managed_order_result.get("plan") or {}
     sizing = managed_order_result.get("sizing") or {}
 
     symbol = str(getattr(signal, "symbol", "-") or "-")
+    path = str((getattr(signal, "meta", {}) or {}).get("execution_path") or "")
+    entry_price = getattr(signal, "entry", "-")
+    sl_price = getattr(signal, "sl", "-")
+    tp1_price = getattr(signal, "tp1", "-")
+    tp2_price = getattr(signal, "tp2", "-")
     mode_text = _mode_label(entry.get("simulated"))
-    reason_text = _reason_label(entry.get("reason") or managed_order_result.get("reason") or ("submitted" if ok else "not_submitted"))
-    margin_text = f"{_fmt_money(sizing.get('margin_usdt'))} USDT" if sizing else "-"
+    reason_text = _reason_label(
+        entry.get("reason") or managed_order_result.get("reason") or ("submitted" if ok else "not_submitted")
+    )
 
-    if not ok:
-        lines = [
-            "⚠️ <b>OKX FAILED</b>",
-            f"💎 <b>{symbol}</b>",
-            f"• Mode: {mode_text}",
-            f"• Result: {reason_text}",
-            f"• Margin: {margin_text}",
-            "• لم يتم فتح الصفقة على OKX",
-        ]
-        return "\n".join(lines)
+    title = "✅ <b>OKX Confirmed</b>" if ok else "⚠️ <b>OKX Failed</b>"
+    path_text = f" | {path}" if path else ""
 
-    tp_orders_text = "جاهزة" if isinstance(tp_split, dict) and tp_split.get("ok") else "مراجعة"
     lines = [
-        "✅ <b>OKX CONFIRMED</b>",
-        f"💎 <b>{symbol}</b>",
-        f"• Mode: {mode_text}",
-        f"• Order ID: {_reason_label(entry.get('order_id'))}",
-        f"• SL: {_bool_label(managed_order_result.get('sl_attached'))}",
-        f"• TP Orders: {tp_orders_text}",
-        f"• Margin: {margin_text}",
+        title,
+        f"💎 <b>{symbol}</b>{path_text}",
+        f"⚙️ {mode_text} | {'Accepted' if ok else 'Failed'}",
+        f"📝 {reason_text}",
     ]
-    return "\n".join(lines)
+
+    if ok:
+        lines.append(f"🆔 Order: {_reason_label(entry.get('order_id'))} | SL: {_bool_label(managed_order_result.get('sl_attached'))}")
+    else:
+        lines.append(f"📍 Entry {entry_price} | SL {sl_price}")
+
+    if sizing:
+        lines.append(
+            f"💼 Balance {_fmt_money(sizing.get('reference_balance_usdt'))} | Margin {_fmt_money(sizing.get('margin_usdt'))} USDT | {_safe_float(sizing.get('position_pct'), 0.0):.2f}%"
+        )
+
+    runner_pct = (plan.get('runner', {}) or {}).get('close_pct', '-') if isinstance(plan, dict) else '-'
+    lines.append(f"🎯 TP1 {tp1_price} | TP2 {tp2_price} | Runner {runner_pct}%")
+
+    if isinstance(tp_split, dict) and tp_split:
+        lines.append(f"📤 TP Orders: {'جاهزة' if tp_split.get('ok') else 'بحاجة مراجعة'}")
+
+    lines.append("✅ تم إرسال أمر OKX بنجاح." if ok else "📌 الصفقة لم تُفتح على OKX.")
+    return "
+".join(lines)
+
 
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
     if not isinstance(managed_order_result, dict):
@@ -1108,52 +1123,42 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
     lines = [
         "🤖 <b>OKX Execution</b>",
         "┄┄┄┄┄┄┄┄",
-        f"• Mode: {_mode_label(entry.get('simulated'))}",
-        f"• Entry Status: {'Accepted' if entry.get('ok') else 'Failed'}",
+        f"• {_mode_label(entry.get('simulated'))} | {'Accepted' if entry.get('ok') else 'Failed'}",
         f"• Result: {_reason_label(entry.get('reason') or entry.get('response', {}).get('msg') or entry.get('response', {}).get('code'))}",
-        f"• SL Attached On Entry: {_bool_label(managed_order_result.get('sl_attached'))}",
+        f"• SL Attached: {_bool_label(managed_order_result.get('sl_attached'))}",
     ]
 
     if sizing:
-        lines.extend([
-            "",
-            "💼 <b>Sizing</b>",
-            f"• Reference Balance: {_fmt_money(sizing.get('reference_balance_usdt'))} USDT",
-            f"• Position Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT",
-            f"• Position Size: {_safe_float(sizing.get('position_pct'), 0.0):.2f}% من الرصيد",
-            f"• Source: {sizing.get('source') or '-'}",
-        ])
+        lines.append(
+            f"• Balance {_fmt_money(sizing.get('reference_balance_usdt'))} | Margin {_fmt_money(sizing.get('margin_usdt'))} USDT | {_safe_float(sizing.get('position_pct'), 0.0):.2f}%"
+        )
 
     if isinstance(plan, dict) and plan.get("ok"):
         lines.extend([
             "",
             "📍 <b>Plan</b>",
-            f"• SL: {plan.get('attached_stop_loss', {}).get('slTriggerPx', '-')}",
-            f"• TP1: {plan.get('tp1', {}).get('close_pct', '-')}% @ {plan.get('tp1', {}).get('price', '-')}",
-            f"• TP2: {plan.get('tp2', {}).get('close_pct', '-')}% @ {plan.get('tp2', {}).get('price', '-')}",
-            f"• Runner: {plan.get('runner', {}).get('close_pct', '-')}%",
+            f"• SL {plan.get('attached_stop_loss', {}).get('slTriggerPx', '-')} | TP1 {plan.get('tp1', {}).get('close_pct', '-')}% @ {plan.get('tp1', {}).get('price', '-')}",
+            f"• TP2 {plan.get('tp2', {}).get('close_pct', '-')}% @ {plan.get('tp2', {}).get('price', '-')} | Runner {plan.get('runner', {}).get('close_pct', '-')}%",
         ])
 
     if isinstance(tp_split, dict) and tp_split:
+        tp1_reason = _reason_label((tp_split.get('tp1') or {}).get('reason'))
+        tp2_reason = _reason_label((tp_split.get('tp2') or {}).get('reason'))
         lines.extend([
             "",
             "📤 <b>Exit Orders</b>",
-            f"• TP Orders: {'OK' if tp_split.get('ok') else 'WARN'}",
-            f"• TP1: {_reason_label((tp_split.get('tp1') or {}).get('reason'))}",
-            f"• TP2: {_reason_label((tp_split.get('tp2') or {}).get('reason'))}",
+            f"• {'جاهزة' if tp_split.get('ok') else 'بحاجة مراجعة'} | TP1: {tp1_reason} | TP2: {tp2_reason}",
         ])
-        runner_size = tp_split.get("runner_size")
-        if runner_size is not None:
-            lines.append(f"• Runner Reserved Size: {runner_size}")
 
     if managed_order_result.get("requires_runner_trailing"):
         lines.extend([
             "",
             "🏃 <b>Runner</b>",
-            "• trailing سيتم تفعيله بعد TP2 / Block SL sync",
+            "• trailing بعد TP2 / Block SL sync",
         ])
 
     return lines
+
 
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in _iter_signal_items_for_dispatch(result):
@@ -1182,6 +1187,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         if exchange_required:
             managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
             exchange_order_ok = bool(managed_order_result.get("ok"))
+            text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
 
         item["exchange_required"] = exchange_required
         item["exchange_order_result"] = managed_order_result
