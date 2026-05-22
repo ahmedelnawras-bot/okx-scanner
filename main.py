@@ -401,11 +401,20 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
     }
 
 
-def _build_mode_message(state: MarketModeState, snapshot: MarketSnapshot, protection: dict, variant: str = "status", reminder_count: int = 1) -> str:
+def _build_mode_message(
+    state: MarketModeState,
+    snapshot: MarketSnapshot,
+    protection: dict,
+    variant: str = "status",
+    reminder_count: int = 1,
+    old_mode: str | None = None,
+) -> str:
     context = _build_mode_context(state, snapshot, protection)
     if variant == "reminder":
         minutes_in_mode = int((datetime.now(timezone.utc) - state.changed_at).total_seconds() // 60)
         context.update({"reminder_count": reminder_count, "minutes_in_mode": minutes_in_mode})
+    if old_mode:
+        context["old_mode"] = old_mode
     return build_market_mode_sections(state.mode, context, variant=variant)
 
 
@@ -415,6 +424,7 @@ def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: Market
     result["mode"] = state.mode
     result["mode_context"] = _build_mode_context(state, snapshot, protection)
     result["mode_message"] = _build_mode_message(state, snapshot, protection)
+    result["mode_transition_message"] = None
     result["block_alert_preview"] = (
         build_block_escalation_alert(
             state,
@@ -444,7 +454,17 @@ def _run_market_mode_guard(
     _refresh_mode_outputs(result, guarded_state, snapshot)
     if guarded_state.mode != previous_mode:
         reminder_tracker.clear()
-        sender.send_message(result.get("mode_message", ""))
+        transition_message = _build_mode_message(
+            guarded_state,
+            snapshot,
+            block_protection_status(guarded_state),
+            variant="transition",
+            old_mode=previous_mode,
+        )
+        result["mode_transition_message"] = transition_message
+        _send_text(sender, transition_message)
+    else:
+        result["mode_transition_message"] = None
     return guarded_state
 
 
@@ -564,11 +584,25 @@ def run_once(
 
     initial_protection = block_protection_status(state)
     initial_price_map = _build_live_price_map(tickers, fallback_pairs=ranked_pairs)
+    exchange_reconcile_enabled = bool(
+        okx_client is not None
+        and getattr(okx_client, "configured", False)
+        and not bool(getattr(settings, "offline_test_mode", False))
+    )
+    exchange_stop_sync_enabled = bool(
+        exchange_reconcile_enabled
+        and bool(getattr(settings, "okx_place_orders", False))
+        and state.mode == MODE_BLOCK_LONGS
+        and int(initial_protection.get("level", 0) or 0) >= 2
+    )
     if persisted_trades:
         persisted_trades = update_open_trades(
             persisted_trades,
             initial_price_map,
             protection_level=initial_protection.get("level", 0),
+            okx_client=okx_client if exchange_reconcile_enabled else None,
+            sync_exchange=exchange_reconcile_enabled,
+            sync_exchange_stop=exchange_stop_sync_enabled,
         )
 
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
@@ -722,6 +756,13 @@ def run_once(
         "state": state,
         "mode": state.mode,
         "mode_message": mode_message,
+        "mode_transition_message": _build_mode_message(
+            state,
+            snapshot,
+            protection,
+            variant="transition",
+            old_mode=initial_mode.mode,
+        ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
         "menu_keyboard": build_main_inline_keyboard(),
@@ -1984,12 +2025,17 @@ def live_worker() -> None:
 
     while True:
         try:
+            previous_scan_mode = state.mode if state is not None else None
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
             state = result["state"]
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     # ✅ FIX: _send_text بدل send_message لدعم HTML tags
-                    _send_text(sender, result.get("mode_message", ""))
+                    mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
+                    if mode_changed_in_scan and result.get("mode_transition_message"):
+                        _send_text(sender, result.get("mode_transition_message", ""))
+                    else:
+                        _send_text(sender, result.get("mode_message", ""))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
