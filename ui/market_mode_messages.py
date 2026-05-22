@@ -280,16 +280,15 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
         "",
         "🧠 سبب المود",
         _MODE_AR_REASON.get(mode, str(context.get("mode_reason", "core market breadth decision"))),
-        f"Reason: {context.get('mode_reason', 'core market breadth decision')}",
         "",
         "📈 قواعد الإشارات",
         *[f"• {line}" for line in _signal_rules(mode, context)],
         "",
         "⚙️ التنفيذ",
         f"• الحالة: {_MODE_AR_EXECUTION.get(mode, 'التنفيذ يتبع إعدادات الجودة الحالية.')}",
-        f"• Execution Candidates: {context.get('execution_notes', 'whitelist + quality gates')}",
-        "• OKX Orders: حسب إعداد Railway الحالي",
-        "• Live Trading: BLOCKED unless explicitly enabled",
+        f"• المرشحات: {context.get('execution_notes', 'whitelist / elite / recovery / block-exception')}",
+        "• أوامر OKX: حسب إعداد Railway",
+        "• التداول الحي: محظور إلا إذا تم تفعيله صراحة",
     ])
 
     if mode == MODE_BLOCK_LONGS:
