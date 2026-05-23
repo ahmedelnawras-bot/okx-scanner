@@ -582,9 +582,10 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build the official compact Telegram signal message.
 
-    Preserved:
-    - Top header identity for normal vs execution messages.
-    - Inline buttons remain handled by main.py via build_signal_buttons().
+    UI-only formatting:
+    - Normal signals stay calm and never look like execution failures.
+    - Execution candidates keep a premium header with the current mode color.
+    - Track/TradingView buttons are attached by main.py via build_signal_buttons().
     """
     status = (execution_result or {}).get("status")
     reason = (execution_result or {}).get("reason")
@@ -609,15 +610,14 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
             f"💎 {signal.symbol}",
-            "━━━━━━━━━━━━",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}",
             f"• Price: {_fmt_price(signal.entry)}",
-            f"• TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
-            f"• TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
-            f"• Runner: {runner_pct}% after TP2",
-            f"• SL: {_fmt_price(signal.sl)}",
+            f"🎯 TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
+            f"🏁 TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
+            f"🏃 Runner: {runner_pct}% after TP2",
+            f"🛡 SL: {_fmt_price(signal.sl)}",
         ]
 
         if evidence_block:
@@ -625,11 +625,18 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
 
         lines.extend([
             "",
-            "┌─ 🏷 Tag Badge ─┐",
+            "┌─ 🚀 Tag Badge ─┐",
             f"Setup: {setup_clean}",
             f"Path: {path}",
             f"Context: {tags_clean}",
             "└──────────────┘",
+            "",
+            "📊 Trade Details",
+            f"Setup: {setup_clean}",
+            f"Entry Timing: {signal.entry_timing}",
+            f"Current Wave: {signal.meta.get('wave', 'n/a')}",
+            f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
+            f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
             "",
             _compact_market_label(signal.market_mode),
             "",
@@ -660,15 +667,14 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
         f"💎 {signal.symbol}",
-        "━━━━━━━━━━━━",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}",
         f"• Price: {_fmt_price(signal.entry)}",
-        f"• TP1: {_fmt_price(signal.tp1)}",
-        f"• TP2: {_fmt_price(signal.tp2)}",
-        "• Runner: 20% after TP2",
-        f"• SL: {_fmt_price(signal.sl)}",
+        f"🎯 TP1: {_fmt_price(signal.tp1)}",
+        f"🏁 TP2: {_fmt_price(signal.tp2)}",
+        "🏃 Runner: 20% after TP2",
+        f"🛡 SL: {_fmt_price(signal.sl)}",
     ]
 
     if evidence_block:
@@ -681,6 +687,13 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"Context: {tags_clean}",
         "└──────────────┘",
         "",
+        "📊 Trade Details",
+        f"Setup: {setup_clean}",
+        f"Entry Timing: {signal.entry_timing}",
+        f"Current Wave: {signal.meta.get('wave', 'n/a')}",
+        f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
+        f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
+        "",
         _compact_market_label(signal.market_mode),
     ])
 
@@ -688,14 +701,13 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
     if execution_result:
-        pretty_status = str(status or 'candidate_only').replace('_', ' ').title()
-        pretty_reason = str(reason or 'normal_signal_only').replace('_', ' ').title()
-
+        pretty_status = str(status or "not_candidate").replace("_", " ").title()
+        pretty_reason = str(reason or "normal_signal_only").replace("_", " ").title()
         lines.extend([
             "",
-            "⚙️ Execution",
-            f"• {pretty_status}",
-            f"• {pretty_reason}",
+            "⚙️ Execution Check",
+            f"Status: {pretty_status}",
+            f"Reason: {pretty_reason}",
         ])
 
     return "\n".join(lines)
