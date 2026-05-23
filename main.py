@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from utils.config import get_settings, Settings
 from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG, MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE, MAX_RECOVERY_TRADES_PER_CYCLE
@@ -95,6 +95,10 @@ GENERAL_MODE_REMINDER_MINUTES = 30
 SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS = 45 * 60
 SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
+
+# Loss Streak Guard: pause new execution after repeated SL hits before TP1.
+LOSS_STREAK_NO_TP1_LIMIT = 5
+LOSS_STREAK_COOLDOWN_MINUTES = 120
 
 from services.telegram_sender import TelegramSender
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
@@ -533,6 +537,99 @@ def _blocks_same_symbol_reentry(trade) -> bool:
     return _is_counted_open_trade(trade)
 
 
+
+def _trade_closed_at(trade) -> datetime:
+    value = getattr(trade, "closed_at", None) or getattr(trade, "updated_at", None) or getattr(trade, "opened_at", None)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _is_execution_closed_trade(trade) -> bool:
+    if not getattr(trade, "execution_trade", False):
+        return False
+    return bool(_is_trade_closed(trade) or getattr(trade, "closed_at", None))
+
+
+def _is_sl_before_tp1_loss(trade) -> bool:
+    status = str(getattr(trade, "status", "") or "").strip().lower()
+    return bool(status == "closed_loss" and not bool(getattr(trade, "tp1_hit", False)))
+
+
+def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
+    """Return execution pause state after consecutive SL losses before TP1.
+
+    The streak counts only bot execution trades that closed by SL before TP1.
+    Any closed bot execution trade that reached TP1 resets the streak.
+    """
+    now = now or datetime.now(timezone.utc)
+    closed_trades = sorted(
+        [trade for trade in (trades or []) if _is_execution_closed_trade(trade)],
+        key=_trade_closed_at,
+    )
+
+    streak = 0
+    streak_symbols: list[str] = []
+    last_loss_at: datetime | None = None
+
+    for trade in closed_trades:
+        if bool(getattr(trade, "tp1_hit", False)):
+            streak = 0
+            streak_symbols = []
+            last_loss_at = None
+            continue
+
+        if _is_sl_before_tp1_loss(trade):
+            streak += 1
+            streak_symbols.append(str(getattr(trade, "symbol", "") or "-"))
+            last_loss_at = _trade_closed_at(trade)
+        else:
+            # Non-SL/non-TP1 closure breaks a pure SL streak.
+            streak = 0
+            streak_symbols = []
+            last_loss_at = None
+
+    cooldown_until = None
+    active = False
+    remaining_minutes = 0
+    if streak >= LOSS_STREAK_NO_TP1_LIMIT and last_loss_at is not None:
+        cooldown_until = last_loss_at + timedelta(minutes=LOSS_STREAK_COOLDOWN_MINUTES)
+        active = now < cooldown_until
+        if active:
+            remaining_minutes = max(1, int((cooldown_until - now).total_seconds() // 60))
+
+    return {
+        "active": active,
+        "streak": streak,
+        "limit": LOSS_STREAK_NO_TP1_LIMIT,
+        "cooldown_minutes": LOSS_STREAK_COOLDOWN_MINUTES,
+        "remaining_minutes": remaining_minutes,
+        "cooldown_until": cooldown_until.isoformat() if cooldown_until else "",
+        "last_loss_at": last_loss_at.isoformat() if last_loss_at else "",
+        "symbols": streak_symbols[-LOSS_STREAK_NO_TP1_LIMIT:],
+        "reason": "loss_streak_no_tp1_guard",
+    }
+
+
+def _loss_streak_rejection(guard: dict) -> dict:
+    return {
+        "status": "rejected_loss_streak_guard",
+        "reason": guard.get("reason") or "loss_streak_no_tp1_guard",
+        "path": "",
+        "slot_scope": "loss_streak_guard",
+        "loss_streak": int(guard.get("streak", 0) or 0),
+        "loss_streak_limit": int(guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT),
+        "cooldown_minutes": int(guard.get("cooldown_minutes", LOSS_STREAK_COOLDOWN_MINUTES) or LOSS_STREAK_COOLDOWN_MINUTES),
+        "cooldown_remaining_minutes": int(guard.get("remaining_minutes", 0) or 0),
+        "cooldown_until": guard.get("cooldown_until", ""),
+        "message_ar": f"تم إيقاف التنفيذ مؤقتًا بعد {int(guard.get('streak', 0) or 0)} ضربات SL متتالية بدون TP1.",
+    }
+
+
 def _trade_slot_path(trade) -> str:
     path = str(getattr(trade, "execution_path", "") or "")
     if path == "block_exception":
@@ -608,6 +705,7 @@ def run_once(
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
     portfolio_state = build_portfolio_state_from_trades(persisted_trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
+    loss_streak_guard = _build_loss_streak_guard(persisted_trades)
 
     signal_items = []
     current_execution_results = []
@@ -649,6 +747,8 @@ def run_once(
                 "drawdown_pct": drawdown_status.drawdown_pct,
                 "drawdown_message": drawdown_status.message_ar,
             }
+        elif loss_streak_guard.get("active"):
+            exec_result = _loss_streak_rejection(loss_streak_guard)
         else:
             exec_result = process_trade_candidate(
                 signal,
@@ -748,6 +848,7 @@ def run_once(
     portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
     drawdown_report = build_drawdown_report(portfolio_state)
+    loss_streak_guard = _build_loss_streak_guard(trades)
 
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items)
     command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items)
@@ -773,6 +874,7 @@ def run_once(
         "portfolio_state": portfolio_state,
         "drawdown_status": drawdown_status,
         "drawdown_report": drawdown_report,
+        "loss_streak_guard": loss_streak_guard,
         "portfolio_state_inputs": portfolio_state_inputs,
         "help": build_master_help(
             mode=state.mode,
@@ -809,6 +911,7 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    result["loss_streak_guard"] = _build_loss_streak_guard(trades)
 
     if trade_store:
         trade_store.save_trades(trades)
@@ -1323,6 +1426,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"💼 Drawdown: {drawdown_line}",
+        f"🛑 Loss Streak Guard: {loss_guard_line}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
@@ -1544,6 +1648,7 @@ def _reset_runtime_state_after_clean(result: dict, *, keep_mode_state: bool = Tr
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = drawdown_status
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    result["loss_streak_guard"] = _build_loss_streak_guard(empty_trades)
 
     if not keep_mode_state:
         result["mode"] = MODE_NORMAL_LONG
@@ -1575,6 +1680,7 @@ def _handle_admin_clean_command(
             result["portfolio_state"] = portfolio_state
             result["drawdown_status"] = evaluate_drawdown(portfolio_state)
             result["drawdown_report"] = build_drawdown_report(portfolio_state)
+            result["loss_streak_guard"] = _build_loss_streak_guard(refreshed_trades)
         return _format_clean_result(stats, "🧹 Soft Clean Done")
     if command in {"/deep_clean", "/deep_clean_preview"}:
         stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
