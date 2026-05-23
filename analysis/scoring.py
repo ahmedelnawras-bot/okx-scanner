@@ -36,6 +36,20 @@ from __future__ import annotations
 
 from .models import PairCandidate, SignalCandidate
 
+try:
+    from .price_action_evidence import build_smart_evidence
+except Exception:
+    def build_smart_evidence(*args, **kwargs) -> dict:
+        return {
+            "available": False,
+            "reason": "price_action_evidence_import_failed",
+            "displacement_hint": False,
+            "compression_release_hint": False,
+            "sweep_reclaim_hint": False,
+            "failed_breakout_risk": False,
+            "auction_acceptance_hint": False,
+        }
+
 from utils.constants import (
     MODE_NORMAL_LONG,
     MODE_STRONG_LONG_ONLY,
@@ -983,6 +997,15 @@ def build_signal_candidate(
         )
     )
 
+    # Pre-Nour evidence injection only.
+    # This does NOT change scoring, thresholds, modes, or execution decisions.
+    smart_evidence = build_smart_evidence(
+        candles=[],
+        pair=pair,
+        signal_setup=setup_type,
+        market_mode=market_mode,
+    )
+
     return SignalCandidate(
 
         symbol=pair.symbol,
@@ -1070,6 +1093,9 @@ def build_signal_candidate(
 
             "confirmation_bonus":
                 confirmation_bonus,
+
+            "smart_evidence":
+                smart_evidence,
 
             **quality_meta,
         },
