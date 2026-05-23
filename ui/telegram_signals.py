@@ -10,6 +10,11 @@ from utils.constants import (
     MODE_STRONG_LONG_ONLY,
 )
 
+from ui.smart_evidence_formatter import (
+    format_smart_evidence_block,
+    extract_smart_evidence_from_signal,
+)
+
 LIGHT_LINE = "┄┄┄┄┄┄┄┄"
 EXEC_LINE = "════════════"
 
@@ -574,6 +579,8 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
     setup_clean = _clean_name(signal.setup_type)
     tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
+    evidence = extract_smart_evidence_from_signal(signal)
+    evidence_block = format_smart_evidence_block(evidence)
     is_pullback_preview = status == "pending_pullback_preview"
     path = _execution_path(signal, execution_result)
     tp1_pct, tp2_pct, runner_pct = _managed_split_for_path(path)
@@ -628,6 +635,10 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
                 "",
                 f"📊 Slots: allowed {slots.get('allowed')} | open {slots.get('counted')} | remaining {slots.get('remaining')}",
             ])
+
+        if evidence_block:
+            lines.append(evidence_block)
+
         return "\n".join(lines)
 
     lines = [
@@ -672,5 +683,8 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"Status: {status or 'not_candidate'}",
             f"Reason: {reason or 'normal_signal_only'}",
         ])
+
+    if evidence_block:
+        lines.append(evidence_block)
 
     return "\n".join(lines)
