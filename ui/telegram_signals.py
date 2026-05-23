@@ -649,7 +649,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         if slots:
             lines.extend([
                 "",
-                f"📊 Slots: allowed {slots.get('allowed')} | open {slots.get('counted')} | remaining {slots.get('remaining')}",
+                f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining",
             ])
 
         return "\n".join(lines)
@@ -688,11 +688,14 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
     if execution_result:
+        pretty_status = str(status or 'candidate_only').replace('_', ' ').title()
+        pretty_reason = str(reason or 'normal_signal_only').replace('_', ' ').title()
+
         lines.extend([
             "",
-            "⚙️ Execution Check",
-            f"Status: {status or 'not_candidate'}",
-            f"Reason: {reason or 'normal_signal_only'}",
+            "⚙️ Execution",
+            f"• {pretty_status}",
+            f"• {pretty_reason}",
         ])
 
     return "\n".join(lines)
