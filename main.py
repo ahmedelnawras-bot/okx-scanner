@@ -30,7 +30,7 @@ from analysis.market_modes import (
     register_recovery_trade,
 )
 from analysis.pair_selection import select_ranked_pairs
-from analysis.market_guard import build_market_guard_snapshot
+from analysis.market_guard import build_market_guard_snapshot, fetch_okx_candles
 from analysis.scoring import build_signal_candidate
 from execution.execution_processor import process_trade_candidate
 from execution.okx_trade_client import OKXTradeClient
@@ -357,6 +357,55 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
         if symbol and price > 0 and symbol not in price_map:
             price_map[symbol] = price
     return price_map
+
+
+
+
+def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "15m", limit: int = 10) -> list[dict]:
+    """Fetch recent closed candles for the Price Action Evidence layer.
+
+    Surgical note:
+    - This helper only attaches observational candle data to the pair.
+    - It does not change scoring, modes, thresholds, or execution decisions.
+    - OKX returns latest candle first; the latest row may still be forming,
+      so we prefer closed candles from index 1 onward and return chronological order.
+    """
+    symbol = str(getattr(pair, "symbol", "") or "")
+    if not symbol:
+        return []
+
+    try:
+        rows = fetch_okx_candles(
+            settings.okx_base_url,
+            symbol,
+            bar=bar,
+            limit=limit,
+            timeout=settings.request_timeout,
+        )
+    except Exception:
+        return []
+
+    if not isinstance(rows, list) or not rows:
+        return []
+
+    closed_rows = rows[1:] if len(rows) > 1 else rows
+    candles: list[dict] = []
+
+    for row in reversed(closed_rows):
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        try:
+            candles.append({
+                "timestamp": row[0],
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+            })
+        except Exception:
+            continue
+
+    return candles
 
 
 def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
@@ -730,6 +779,15 @@ def run_once(
     for pair in filtered_pairs:
         try:
             setattr(pair, "btc_bounce_pct", btc_bounce_pct)
+        except Exception:
+            pass
+
+        try:
+            setattr(
+                pair,
+                "recent_candles",
+                _build_price_action_candles_for_pair(pair, settings),
+            )
         except Exception:
             pass
 
