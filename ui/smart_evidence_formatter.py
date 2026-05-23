@@ -20,17 +20,24 @@ def extract_smart_evidence_from_signal(signal: Any) -> dict:
 def format_smart_evidence_block(evidence: dict | None) -> str:
     """Format Smart Evidence for Telegram signal messages in Arabic.
 
-    Display-only:
-    - Does not affect score.
-    - Does not affect modes.
-    - Does not affect Nour filters.
-    - Does not affect execution decisions.
+    Debug-friendly version:
+    - If evidence is missing/unavailable, it shows a short diagnostic line.
+    - Display-only: no effect on score, modes, Nour filters, or execution.
     """
-    if not isinstance(evidence, dict):
-        return ""
+    if not isinstance(evidence, dict) or not evidence:
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            "• بيانات القراءة غير موجودة",
+        ])
 
     if not evidence.get("available"):
-        return ""
+        reason = str(evidence.get("reason") or "بيانات الشموع غير كافية")
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            f"• {reason}",
+        ])
 
     lines = [
         "",
