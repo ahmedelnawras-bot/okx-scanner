@@ -51,6 +51,23 @@ def _mode_theme(mode: str) -> str:
     return f"{emoji} {names.get(mode, mode)}"
 
 
+
+def _compact_market_label(mode: str) -> str:
+    names = {
+        MODE_NORMAL_LONG: "Normal Market",
+        MODE_STRONG_LONG_ONLY: "Strong Market",
+        MODE_BLOCK_LONGS: "Block Market",
+        MODE_RECOVERY_LONG: "Recovery Market",
+    }
+    icons = {
+        MODE_NORMAL_LONG: "🟢",
+        MODE_STRONG_LONG_ONLY: "🟡",
+        MODE_BLOCK_LONGS: "🔴",
+        MODE_RECOVERY_LONG: "🔵",
+    }
+    return f"{icons.get(mode, '⚪')} {names.get(mode, str(mode or '-'))}"
+
+
 def _execution_header(mode: str) -> str:
     emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
     if mode == MODE_STRONG_LONG_ONLY:
@@ -565,13 +582,10 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build the official compact Telegram signal message.
 
-    UI-only formatting:
-    - Normal signals stay calm and never look like execution failures.
-    - Execution candidates keep a premium header with the current mode color.
-    - Track/TradingView buttons are attached by main.py via build_signal_buttons().
+    Preserved:
+    - Top header identity for normal vs execution messages.
+    - Inline buttons remain handled by main.py via build_signal_buttons().
     """
-    mode_emoji = MODE_COLOR_EMOJI.get(signal.market_mode, "⚪")
-    mode_theme = _mode_theme(signal.market_mode)
     status = (execution_result or {}).get("status")
     reason = (execution_result or {}).get("reason")
     is_execution = status in {"accepted_preview", "pending_pullback_preview"}
@@ -581,6 +595,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
     evidence = extract_smart_evidence_from_signal(signal)
     evidence_block = format_smart_evidence_block(evidence)
+
     is_pullback_preview = status == "pending_pullback_preview"
     path = _execution_path(signal, execution_result)
     tp1_pct, tp2_pct, runner_pct = _managed_split_for_path(path)
@@ -594,50 +609,48 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
             f"💎 {signal.symbol}",
+            "━━━━━━━━━━━━",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}",
             f"• Price: {_fmt_price(signal.entry)}",
-            f"🎯 TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
-            f"🏁 TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
-            f"🏃 Runner: {runner_pct}% after TP2",
-            f"🛡 SL: {_fmt_price(signal.sl)}",
+            f"• TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
+            f"• TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
+            f"• Runner: {runner_pct}% after TP2",
+            f"• SL: {_fmt_price(signal.sl)}",
+        ]
+
+        if evidence_block:
+            lines.append(evidence_block)
+
+        lines.extend([
             "",
-            "┌─ 🚀 Tag Badge ─┐",
+            "┌─ 🏷 Tag Badge ─┐",
             f"Setup: {setup_clean}",
             f"Path: {path}",
             f"Context: {tags_clean}",
             "└──────────────┘",
             "",
-            "📊 Trade Details",
-            f"Setup: {setup_clean}",
-            f"Entry Timing: {signal.entry_timing}",
-            f"Current Wave: {signal.meta.get('wave', 'n/a')}",
-            f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
-            f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-            "",
-            "🌐 Market",
-            f"Mode: {mode_emoji} {signal.market_mode}",
-            f"Theme: {mode_theme}",
+            _compact_market_label(signal.market_mode),
             "",
             "⚙️ Execution",
             f"Status: {status}",
             "🟡 Pending pullback does NOT place a market order yet" if is_pullback_preview else "🧪 OKX managed execution will confirm separately",
             "📌 Separate confirmation message will be sent after actual OKX execution" if not is_pullback_preview else "📌 Preview only — waiting pullback trigger before any execution",
-        ]
+        ])
+
         if reason:
             lines.append(f"• Reason: {reason}")
+
         if signal.warnings:
             lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+
         slots = (execution_result or {}).get("slots")
         if slots:
             lines.extend([
                 "",
                 f"📊 Slots: allowed {slots.get('allowed')} | open {slots.get('counted')} | remaining {slots.get('remaining')}",
             ])
-
-        if evidence_block:
-            lines.append(evidence_block)
 
         return "\n".join(lines)
 
@@ -647,31 +660,29 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
         f"💎 {signal.symbol}",
+        "━━━━━━━━━━━━",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}",
         f"• Price: {_fmt_price(signal.entry)}",
-        f"🎯 TP1: {_fmt_price(signal.tp1)}",
-        f"🏁 TP2: {_fmt_price(signal.tp2)}",
-        "🏃 Runner: 20% after TP2",
-        f"🛡 SL: {_fmt_price(signal.sl)}",
+        f"• TP1: {_fmt_price(signal.tp1)}",
+        f"• TP2: {_fmt_price(signal.tp2)}",
+        "• Runner: 20% after TP2",
+        f"• SL: {_fmt_price(signal.sl)}",
+    ]
+
+    if evidence_block:
+        lines.append(evidence_block)
+
+    lines.extend([
         "",
         "┌─ 🏷 Tag Badge ─┐",
         f"Setup: {setup_clean}",
         f"Context: {tags_clean}",
         "└──────────────┘",
         "",
-        "📊 Trade Details",
-        f"Setup: {setup_clean}",
-        f"Entry Timing: {signal.entry_timing}",
-        f"Current Wave: {signal.meta.get('wave', 'n/a')}",
-        f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
-        f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-        "",
-        "🌐 Market",
-        f"Mode: {mode_emoji} {signal.market_mode}",
-        f"Theme: {mode_theme}",
-    ]
+        _compact_market_label(signal.market_mode),
+    ])
 
     if signal.warnings:
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
@@ -684,7 +695,5 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"Reason: {reason or 'normal_signal_only'}",
         ])
 
-    if evidence_block:
-        lines.append(evidence_block)
-
     return "\n".join(lines)
+
