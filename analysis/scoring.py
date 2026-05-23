@@ -858,6 +858,25 @@ def build_signal_candidate(
     if entry_timing == "pullback":
         boost_score += 0.06
 
+    smart_evidence = build_smart_evidence(
+        candles=getattr(pair, "recent_candles", []) or [],
+        pair=pair,
+        signal_setup=setup_type,
+        market_mode=market_mode,
+    )
+
+    print(
+        f"SMART_EVIDENCE | "
+        f"{pair.symbol} | "
+        f"available={smart_evidence.get('available')} | "
+        f"disp={smart_evidence.get('displacement_hint')} | "
+        f"sweep={smart_evidence.get('sweep_reclaim_hint')} | "
+        f"compress={smart_evidence.get('compression_release_hint')} | "
+        f"failed={smart_evidence.get('failed_breakout_risk')} | "
+        f"accept={smart_evidence.get('auction_acceptance_hint')}",
+        flush=True,
+    )
+
     if (
         market_mode == MODE_RECOVERY_LONG
         and "recovery_execution" not in tags
