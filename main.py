@@ -1359,8 +1359,7 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
     """Compact OKX execution block inside the main signal card.
 
-    Keeps the important details here, while the separate OKX result
-    message still carries the full failure/success information.
+    Full OKX details remain in the separate OKX result message.
     """
     if not isinstance(managed_order_result, dict):
         return []
@@ -1372,10 +1371,11 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
     ok = bool(entry.get("ok"))
     simulated = entry.get("simulated")
     status_text = "Accepted" if ok else "Failed"
+    mode_text = "Paper Mode" if bool(simulated) else "Live Mode"
 
     lines = [
         "🤖 <b>OKX</b>",
-        f"• {'Paper Mode' if bool(simulated) else 'Live Mode'} | {status_text}",
+        f"• {mode_text} | {status_text}",
         f"• SL Attached: {'✅' if managed_order_result.get('sl_attached') else '❌'}",
     ]
 
@@ -1393,8 +1393,16 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
         tp2_pct = (plan.get("tp2") or {}).get("close_pct", "-")
         runner_pct = (plan.get("runner") or {}).get("close_pct", "-")
 
+    def _pct_text(value) -> str:
+        try:
+            return str(int(round(float(value))))
+        except Exception:
+            return str(value or "-")
+
     if tp1_pct != "-" or tp2_pct != "-" or runner_pct != "-":
-        lines.append(f"📌 <b>Plan</b>: TP1 {tp1_pct}% • TP2 {tp2_pct}% • Runner {runner_pct}%")
+        lines.append(
+            f"📌 <b>Plan</b>: TP1 {_pct_text(tp1_pct)}% • TP2 {_pct_text(tp2_pct)}% • Runner {_pct_text(runner_pct)}%"
+        )
 
     if managed_order_result.get("requires_runner_trailing"):
         lines.append("🏃 Runner Trail after TP2")
