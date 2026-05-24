@@ -681,18 +681,18 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"Setup: {setup_clean}",
             f"Context: {tags_clean}",
             "└──────────────┘",
+            f"{mode_theme} Market",
             "📊 Trade Details",
             f"• Setup: {setup_clean}",
             f"• Entry Timing: {signal.entry_timing}",
             f"• Current Wave: {signal.meta.get('wave', 'n/a')}",
             f"• Volume State: {signal.meta.get('volume_state', 'n/a')}",
             f"• 1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-            f"{mode_theme} Market",
         ])
 
         slots = (execution_result or {}).get("slots")
         if slots:
-            lines.append(f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining")
+            lines.append(f"<b>📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining</b>")
 
         lines.extend([
             "⚙️ Execution",
