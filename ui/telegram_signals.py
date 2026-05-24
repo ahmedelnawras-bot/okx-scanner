@@ -50,49 +50,33 @@ def _extract_smart_evidence(signal: SignalCandidate) -> dict:
     except Exception:
         return {}
 
-def _format_smart_evidence_block(signal: SignalCandidate) -> str:
-    """Telegram-only Smart Evidence display.
 
-    Display-only:
-    - Does not affect score.
-    - Does not affect modes.
-    - Does not affect Nour filters.
-    - Does not affect execution decisions.
-    """
-    evidence = _extract_smart_evidence(signal)
-
+def _format_smart_evidence_block(evidence: dict | None) -> str:
     if not evidence:
-        return "\n".join([
-            "",
-            "🧠 قراءة السوق",
-            "• بيانات القراءة غير موجودة",
-        ])
+        return ""
 
-    if not evidence.get("available"):
-        reason = str(evidence.get("reason") or "بيانات الشموع غير كافية")
-        return "\n".join([
-            "",
-            "🧠 قراءة السوق",
-            f"• {reason}",
-        ])
+    items = []
 
-    yes = lambda value: "✅" if bool(value) else "❌"
+    if evidence.get("displacement_hint"):
+        items.append("Expansion✅")
 
-    lines = [
-        "",
-        "🧠 قراءة السوق",
-        f"• تمدد قوي: {yes(evidence.get('displacement_hint'))}",
-        f"• قبول سعري: {yes(evidence.get('auction_acceptance_hint'))}",
-        f"• اختراق ضعيف: {'⚠️' if evidence.get('failed_breakout_risk') else '❌'}",
-    ]
+    if evidence.get("auction_acceptance_hint"):
+        items.append("Acceptance✅")
 
-    if evidence.get("sweep_reclaim_hint"):
-        lines.append("• سحب سيولة ✅")
+    if evidence.get("failed_breakout_risk"):
+        items.append("WeakBreakout⚠️")
 
     if evidence.get("compression_release_hint"):
-        lines.append("• فك ضغط ✅")
+        items.append("Compression✅")
 
-    return "\n".join(lines)
+    if evidence.get("sweep_reclaim_hint"):
+        items.append("SweepReclaim✅")
+
+    if not items:
+        return ""
+
+    return "🧠 PA: " + " | ".join(items)
+
 
 def _compact_market_label(mode: str) -> str:
     names = {
@@ -430,7 +414,7 @@ def build_trade_track_message(trade) -> str:
 
     lines = [
         f"📊 Track — {symbol}",
-        "━━━━━━━━━━━━",
+        "",
         f"{'🔴 CLOSED' if is_closed else '🟢'} Status: {title_status}",
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {mode}",
@@ -504,7 +488,7 @@ def build_rejected_track_message(signal: SignalCandidate, execution_result: dict
     gate = execution_result.get("gate") or {}
     return "\n".join([
         f"📊 Track — {signal.symbol}",
-        "━━━━━━━━━━━━",
+        "",
         "⚪ Status: EXECUTION CHECKED",
         "📍 Signal: Normal Signal",
         f"🚀 Execution: {str(status).replace('_', ' ').title()}",
@@ -546,7 +530,7 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
     lines = [
         f"📊 Track — {signal.symbol}",
-        "━━━━━━━━━━━━",
+        "",
         _preview_status_label(status),
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {signal.market_mode}",
@@ -627,7 +611,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "🟢 Quality Filters: PASS",
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
-                        f"━━━ 🚦 {signal.symbol} 🚦 ━━━",
+                        f"<b>🚦 {signal.symbol}</b>",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}",
@@ -672,7 +656,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         LIGHT_LINE,
         "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
-                f"━━━ 🚦 {signal.symbol} 🚦 ━━━",
+                f"<b>🚦 {signal.symbol}</b>",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}",
