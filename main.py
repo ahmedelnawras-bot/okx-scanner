@@ -1352,6 +1352,11 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
 
 
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
+    """Compact OKX execution block for Telegram.
+
+    Display-only formatting. Does not affect order placement,
+    risk sizing, scoring, modes, or execution decisions.
+    """
     if not isinstance(managed_order_result, dict):
         return []
 
@@ -1360,34 +1365,48 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
     plan = managed_order_result.get("plan") or {}
     sizing = managed_order_result.get("sizing") or {}
 
+    ok = bool(entry.get("ok"))
+    simulated = entry.get("simulated")
+    status_text = "Accepted" if ok else "Failed"
+    reason_text = _reason_label(
+        entry.get("reason")
+        or entry.get("response", {}).get("msg")
+        or entry.get("response", {}).get("code")
+        or managed_order_result.get("reason")
+    )
+
     lines = [
         "🤖 <b>OKX Execution</b>",
         "┄┄┄┄┄┄┄┄",
-        f"• {_mode_label(entry.get('simulated'))} | {'Accepted' if entry.get('ok') else 'Failed'}",
-        f"• Result: {_reason_label(entry.get('reason') or entry.get('response', {}).get('msg') or entry.get('response', {}).get('code'))}",
-        f"• SL Attached: {_bool_label(managed_order_result.get('sl_attached'))}",
+        f"• Mode: {_mode_label(simulated)} | Status: {status_text}",
+        f"• Result: {reason_text}",
+        f"• SL Attached: {'✅' if managed_order_result.get('sl_attached') else '❌'}",
     ]
 
     if sizing:
         lines.append(
-            f"• Balance {_fmt_money(sizing.get('reference_balance_usdt'))} | Margin {_fmt_money(sizing.get('margin_usdt'))} USDT | {_safe_float(sizing.get('position_pct'), 0.0):.2f}%"
+            f"• Balance: {_fmt_money(sizing.get('reference_balance_usdt'))} USDT | Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT ({_safe_float(sizing.get('position_pct'), 0.0):.2f}%)"
         )
 
     if isinstance(plan, dict) and plan.get("ok"):
         lines.extend([
             "",
             "📍 <b>Plan</b>",
-            f"• SL {plan.get('attached_stop_loss', {}).get('slTriggerPx', '-')} | TP1 {plan.get('tp1', {}).get('close_pct', '-')}% @ {plan.get('tp1', {}).get('price', '-')}",
-            f"• TP2 {plan.get('tp2', {}).get('close_pct', '-')}% @ {plan.get('tp2', {}).get('price', '-')} | Runner {plan.get('runner', {}).get('close_pct', '-')}%",
+            f"• SL: {plan.get('attached_stop_loss', {}).get('slTriggerPx', '-')}",
+            f"• TP1: {plan.get('tp1', {}).get('price', '-')} | Close {plan.get('tp1', {}).get('close_pct', '-')}%",
+            f"• TP2: {plan.get('tp2', {}).get('price', '-')} | Close {plan.get('tp2', {}).get('close_pct', '-')}%",
+            f"• Runner: {plan.get('runner', {}).get('close_pct', '-')}%",
         ])
 
     if isinstance(tp_split, dict) and tp_split:
-        tp1_reason = _reason_label((tp_split.get('tp1') or {}).get('reason'))
-        tp2_reason = _reason_label((tp_split.get('tp2') or {}).get('reason'))
+        tp1_reason = _reason_label((tp_split.get("tp1") or {}).get("reason"))
+        tp2_reason = _reason_label((tp_split.get("tp2") or {}).get("reason"))
         lines.extend([
             "",
             "📤 <b>Exit Orders</b>",
-            f"• {'جاهزة' if tp_split.get('ok') else 'بحاجة مراجعة'} | TP1: {tp1_reason} | TP2: {tp2_reason}",
+            f"• Status: {'جاهزة' if tp_split.get('ok') else 'بحاجة مراجعة'}",
+            f"• TP1: {tp1_reason}",
+            f"• TP2: {tp2_reason}",
         ])
 
     if managed_order_result.get("requires_runner_trailing"):
@@ -1397,7 +1416,15 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
             "• trailing بعد TP2 / Block SL sync",
         ])
 
+    if not ok:
+        lines.extend([
+            "",
+            "📌 لم يتم فتح الصفقة على OKX",
+        ])
+
     return lines
+
+
 
 
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
