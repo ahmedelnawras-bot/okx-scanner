@@ -589,7 +589,7 @@ def _format_pa_line_from_signal(signal: SignalCandidate) -> str:
         parts.append("Sweep✅")
 
     if not parts:
-        return ""
+        return "🧠 PA: Neutral"
 
     return "🧠 PA: " + " | ".join(parts)
 
