@@ -611,7 +611,19 @@ def _format_pa_line_from_signal(signal) -> str:
     if weak_breakout:
         parts.append("WeakBreakout⚠️")
 
-    score_icon = "🟢" if pa_score > 0 else ("🔴" if pa_score < 0 else "⚪")
+    score_icon = "🟢" if pa_score > 0 else ("🔴" if pa_score < 0 else "🟡")
+
+    # Neutral/no-structure state:
+    # show only score line to avoid fake negative visual noise.
+    if (
+        abs(pa_score) < 0.01
+        and not expansion
+        and not acceptance
+        and not compression
+        and not weak_breakout
+    ):
+        return f"🧠 PA Score: {score_icon} {pa_score:+.2f}"
+
     return "\n".join([
         f"🧠 PA Score: {score_icon} {pa_score:+.2f}",
         "PA: " + " | ".join(parts),
