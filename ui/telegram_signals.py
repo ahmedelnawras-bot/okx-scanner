@@ -559,7 +559,7 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
 
 def _format_pa_line_from_signal(signal: SignalCandidate) -> str:
-    """Compact PA evidence line for execution messages only.
+    """Compact PA evidence line for execution and normal messages.
 
     Display-only. Does not affect score, modes, Nour, or execution.
     """
@@ -689,6 +689,13 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"🏁 TP2: {_fmt_price(signal.tp2)}",
         "🏃 Runner: 20% after TP2",
         f"🛡 SL: {_fmt_price(signal.sl)}",
+    ]
+
+    pa_line = _format_pa_line_from_signal(signal)
+    if pa_line:
+        lines.append(pa_line)
+
+    lines.extend([
         "",
         "┌─ 🏷 Tag Badge ─┐",
         f"Setup: {setup_clean}",
@@ -705,7 +712,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         "🌐 Market",
         f"Mode: {mode_emoji} {signal.market_mode}",
         f"Theme: {mode_theme}",
-    ]
+    ])
 
     if signal.warnings:
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
