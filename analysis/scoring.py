@@ -279,7 +279,7 @@ def _build_trade_context_meta(
     elif setup_type == "vwap_reclaim":
         wave = "VWAP Reclaim"
     else:
-        wave = _clean_setup_name(setup_type)
+        wave = str(setup_type or "-").replace("_", " ").title()
 
     # 2) Volume / pressure state
     # We do not rely on raw exchange volume here because the PA candle helper
