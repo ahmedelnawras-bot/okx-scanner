@@ -783,13 +783,21 @@ def run_once(
             pass
 
         try:
+            recent_candles = _build_price_action_candles_for_pair(pair, settings)
             setattr(
                 pair,
                 "recent_candles",
-                _build_price_action_candles_for_pair(pair, settings),
+                recent_candles,
             )
-        except Exception:
-            pass
+            print(
+                f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
+                flush=True,
+            )
 
         signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
