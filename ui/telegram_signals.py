@@ -51,8 +51,25 @@ def _extract_smart_evidence(signal: SignalCandidate) -> dict:
         return {}
 
 
-def _format_smart_evidence_block(evidence: dict | None) -> str:
-    if not evidence:
+def _format_smart_evidence_block(value) -> str:
+    """Compact one-line PA evidence for Telegram.
+
+    Accepts either:
+    - SignalCandidate-like object with meta["smart_evidence"]
+    - raw evidence dict
+
+    Display-only. Does not affect scoring, modes, Nour, or execution.
+    """
+    if isinstance(value, dict):
+        evidence = value
+    else:
+        try:
+            meta = getattr(value, "meta", {}) or {}
+            evidence = meta.get("smart_evidence") or {}
+        except Exception:
+            evidence = {}
+
+    if not isinstance(evidence, dict) or not evidence.get("available"):
         return ""
 
     items = []
