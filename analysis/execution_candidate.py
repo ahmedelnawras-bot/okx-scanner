@@ -854,13 +854,14 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
 
 
 def _pa_execution_gate(signal: SignalCandidate) -> dict:
-    """PA threshold gate before Nour.
+    """PA advisory gate before Nour.
 
-    Execution-only:
-    - Blocks execution candidates with clearly weak structure.
+    Execution-only advisory:
+    - PA score is already applied in scoring.py.
+    - Does NOT hard block normal/strong healthy breakouts.
+    - Only hard blocks extreme PA danger: weak breakout with strongly negative PA score.
     - Does NOT block normal Telegram signals.
     - Does NOT change market modes.
-    - Uses pa_score created by scoring.py.
     """
 
     meta = signal.meta or {}
@@ -871,26 +872,26 @@ def _pa_execution_gate(signal: SignalCandidate) -> dict:
         pa_score = 0.0
 
     reason = str(meta.get("pa_score_reason") or "neutral")
+    flags = meta.get("pa_score_flags") or {}
+    weak_breakout = bool(
+        (isinstance(flags, dict) and flags.get("weak_breakout"))
+        or "weak_breakout" in reason
+    )
 
-    threshold = -0.35
-
-    if signal.market_mode == MODE_STRONG_LONG_ONLY:
-        threshold = -0.15
-
-    elif signal.market_mode == MODE_RECOVERY_LONG:
-        threshold = -0.20
-
-    elif signal.market_mode == MODE_BLOCK_LONGS:
-        threshold = -0.22
-
-    passed = pa_score > threshold
+    # Emergency-only hard block.
+    # Soft PA scoring already affects ranking. We block only fake/weak breakouts
+    # where the PA score is deeply negative.
+    emergency_threshold = -0.45
+    hard_block = bool(weak_breakout and pa_score <= emergency_threshold)
 
     return {
-        "passed": passed,
+        "passed": not hard_block,
+        "hard_block": hard_block,
+        "advisory_only": not hard_block,
         "pa_score": pa_score,
-        "threshold": threshold,
+        "threshold": emergency_threshold,
         "reason": reason,
-        "block_reason": "pa_structure_weak" if not passed else "ok",
+        "block_reason": "pa_weak_breakout_danger" if hard_block else "ok",
     }
 
 def decide_execution_candidate(
@@ -957,6 +958,12 @@ def decide_execution_candidate(
 
     pa_gate = _pa_execution_gate(signal)
 
+    print(
+        f"PA_GATE | {signal.symbol} | score={pa_gate.get('pa_score')} | "
+        f"hard_block={pa_gate.get('hard_block')} | reason={pa_gate.get('reason')}",
+        flush=True,
+    )
+
     allowed = False
 
     path = "candidate_only"
@@ -993,11 +1000,11 @@ def decide_execution_candidate(
             "recovery_quality": recovery_quality,
         }
 
-    if not pa_gate.get("passed"):
+    if pa_gate.get("hard_block"):
         return {
             "allowed": False,
             "path": "precision_filter",
-            "reason": pa_gate.get("block_reason") or "pa_structure_weak",
+            "reason": pa_gate.get("block_reason") or "pa_weak_breakout_danger",
             "complete_plan": complete_plan,
             "strict_allowed": strict_allowed,
             "normal_extra_allowed": normal_extra_allowed,
