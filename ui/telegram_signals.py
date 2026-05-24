@@ -558,40 +558,46 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
 
 
-def _format_pa_line_from_signal(signal: SignalCandidate) -> str:
-    """Compact PA evidence line for execution and normal messages.
+def _format_pa_line_from_signal(signal) -> str:
+    """Fixed-slot PA line for consistent Telegram layout."""
+    meta = getattr(signal, "meta", {}) or {}
+    evidence = meta.get("smart_evidence") or {}
 
-    Display-only. Does not affect score, modes, Nour, or execution.
-    """
-    try:
-        evidence = (getattr(signal, "meta", {}) or {}).get("smart_evidence") or {}
-    except Exception:
-        evidence = {}
+    expansion = bool(
+        evidence.get("displacement")
+        or evidence.get("expansion")
+        or evidence.get("momentum_expansion")
+    )
 
-    if not isinstance(evidence, dict) or not evidence.get("available"):
-        return ""
+    acceptance = bool(
+        evidence.get("acceptance")
+        or evidence.get("value_acceptance")
+        or evidence.get("accepted")
+    )
 
-    parts: list[str] = []
+    compression = bool(
+        evidence.get("compression")
+        or evidence.get("compression_release")
+        or evidence.get("squeeze")
+    )
 
-    if evidence.get("displacement_hint"):
-        parts.append("Expansion✅")
+    weak_breakout = bool(
+        evidence.get("weak_breakout")
+        or evidence.get("failed_breakout")
+        or evidence.get("fake_breakout")
+    )
 
-    if evidence.get("auction_acceptance_hint"):
-        parts.append("Acceptance✅")
+    parts = [
+        f"Expansion{'✅' if expansion else '❌'}",
+        f"Acceptance{'✅' if acceptance else '❌'}",
+        f"Compression{'✅' if compression else '❌'}",
+    ]
 
-    if evidence.get("failed_breakout_risk"):
+    if weak_breakout:
         parts.append("WeakBreakout⚠️")
 
-    if evidence.get("compression_release_hint"):
-        parts.append("Compression✅")
-
-    if evidence.get("sweep_reclaim_hint"):
-        parts.append("Sweep✅")
-
-    if not parts:
-        return "🧠 PA: Neutral"
-
     return "🧠 PA: " + " | ".join(parts)
+
 
 
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
