@@ -872,16 +872,16 @@ def _pa_execution_gate(signal: SignalCandidate) -> dict:
 
     reason = str(meta.get("pa_score_reason") or "neutral")
 
-    threshold = -0.25
+    threshold = -0.35
 
     if signal.market_mode == MODE_STRONG_LONG_ONLY:
-        threshold = -0.30
+        threshold = -0.15
 
     elif signal.market_mode == MODE_RECOVERY_LONG:
         threshold = -0.20
 
     elif signal.market_mode == MODE_BLOCK_LONGS:
-        threshold = -0.15
+        threshold = -0.22
 
     passed = pa_score > threshold
 
