@@ -1375,7 +1375,7 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
 
     lines = [
         "🤖 <b>OKX</b>",
-        f"• {_mode_label(simulated)} {status_text}",
+        f"• {'Paper Mode' if bool(simulated) else 'Live Mode'} | {status_text}",
         f"• SL Attached: {'✅' if managed_order_result.get('sl_attached') else '❌'}",
     ]
 
@@ -1397,7 +1397,7 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
         lines.append(f"📌 <b>Plan</b>: TP1 {tp1_pct}% • TP2 {tp2_pct}% • Runner {runner_pct}%")
 
     if managed_order_result.get("requires_runner_trailing"):
-        lines.append("🏃 Runner: trailing بعد TP2 / Block SL sync")
+        lines.append("🏃 Runner Trail after TP2")
 
     if not ok:
         lines.append("📌 لم يتم فتح الصفقة على OKX")
