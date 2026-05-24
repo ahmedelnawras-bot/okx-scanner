@@ -83,7 +83,7 @@ def _format_smart_evidence_block(signal: SignalCandidate) -> str:
         "🧠 قراءة السوق",
         f"• تمدد قوي: {yes(evidence.get('displacement_hint'))}",
         f"• قبول سعري: {yes(evidence.get('auction_acceptance_hint'))}",
-        f"• اختراق ضعيف {''❌' if evidence.get('failed_breakout_risk') else '✅'}",
+        f"• اختراق ضعيف: {'⚠️' if evidence.get('failed_breakout_risk') else '❌'}",
     ]
 
     if evidence.get("sweep_reclaim_hint"):
