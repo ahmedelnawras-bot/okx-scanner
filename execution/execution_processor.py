@@ -289,6 +289,7 @@ def process_trade_candidate(
             "velocity_instability",
             "expansion_exhaustion",
             "pa_structure_weak",
+            "pa_weak_breakout_danger",
         }:
             status = "rejected_quality"
 
