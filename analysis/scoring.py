@@ -247,6 +247,122 @@ def _heat_penalty(
 
 
 
+def _calculate_pa_score(
+    smart_evidence: dict,
+    market_mode: str,
+) -> dict:
+    """Price Action sub-score.
+
+    Surgical scoring layer:
+    - Runs before Nour.
+    - Adjusts boost_score only within a small bounded range.
+    - Does NOT change market mode logic.
+    - Does NOT hard reject by itself.
+    """
+
+    if not isinstance(smart_evidence, dict) or not smart_evidence.get("available"):
+        return {
+            "pa_score": 0.0,
+            "pa_score_raw": 0.0,
+            "pa_score_model": "pa_score_v1",
+            "pa_score_reason": smart_evidence.get("reason", "not_available") if isinstance(smart_evidence, dict) else "not_available",
+            "pa_score_flags": {},
+        }
+
+    expansion = bool(smart_evidence.get("displacement_hint"))
+    acceptance = bool(smart_evidence.get("auction_acceptance_hint"))
+    compression = bool(smart_evidence.get("compression_release_hint"))
+    sweep = bool(smart_evidence.get("sweep_reclaim_hint"))
+    weak_breakout = bool(smart_evidence.get("failed_breakout_risk"))
+
+    raw = 0.0
+    flags: dict[str, bool] = {
+        "expansion": expansion,
+        "acceptance": acceptance,
+        "compression": compression,
+        "sweep": sweep,
+        "weak_breakout": weak_breakout,
+    }
+
+    if expansion:
+        raw += 0.22
+
+    if acceptance:
+        raw += 0.22
+
+    if compression:
+        raw += 0.12
+
+    if sweep:
+        raw += 0.10
+
+    if weak_breakout:
+        raw -= 0.35
+
+    # Mode-aware weighting.
+    # The same PA event does not mean the same thing in every mode.
+    if market_mode == MODE_STRONG_LONG_ONLY:
+        if expansion:
+            raw += 0.08
+        if acceptance:
+            raw += 0.05
+        if weak_breakout and not acceptance:
+            raw -= 0.12
+
+    elif market_mode == MODE_RECOVERY_LONG:
+        if sweep:
+            raw += 0.15
+        if acceptance:
+            raw += 0.08
+        if expansion and not (sweep or acceptance):
+            raw -= 0.05
+
+    elif market_mode == MODE_BLOCK_LONGS:
+        if acceptance:
+            raw += 0.06
+        if weak_breakout:
+            raw -= 0.20
+        if not acceptance:
+            raw -= 0.08
+
+    pa_score = round(
+        _clamp(
+            raw,
+            -0.65,
+            0.55,
+        ),
+        3,
+    )
+
+    reason_parts: list[str] = []
+
+    if expansion:
+        reason_parts.append("expansion")
+
+    if acceptance:
+        reason_parts.append("acceptance")
+
+    if compression:
+        reason_parts.append("compression")
+
+    if sweep:
+        reason_parts.append("sweep")
+
+    if weak_breakout:
+        reason_parts.append("weak_breakout")
+
+    if not reason_parts:
+        reason_parts.append("neutral")
+
+    return {
+        "pa_score": pa_score,
+        "pa_score_raw": round(raw, 3),
+        "pa_score_model": "pa_score_v1_mode_aware",
+        "pa_score_reason": ",".join(reason_parts),
+        "pa_score_flags": flags,
+    }
+
+
 # ─────────────────────────────────────────
 # Execution Stability Intelligence
 # IMPORTANT:
@@ -865,6 +981,15 @@ def build_signal_candidate(
         market_mode=market_mode,
     )
 
+    pa_score_context = _calculate_pa_score(
+        smart_evidence=smart_evidence,
+        market_mode=market_mode,
+    )
+
+    # PA sub-score is intentionally small and bounded.
+    # It improves ranking/eligibility before Nour without becoming a hard filter.
+    boost_score += float(pa_score_context.get("pa_score") or 0.0)
+
     print(
         f"SMART_EVIDENCE | "
         f"{pair.symbol} | "
@@ -873,7 +998,9 @@ def build_signal_candidate(
         f"sweep={smart_evidence.get('sweep_reclaim_hint')} | "
         f"compress={smart_evidence.get('compression_release_hint')} | "
         f"failed={smart_evidence.get('failed_breakout_risk')} | "
-        f"accept={smart_evidence.get('auction_acceptance_hint')}",
+        f"accept={smart_evidence.get('auction_acceptance_hint')} | "
+        f"pa_score={pa_score_context.get('pa_score')} | "
+        f"pa_reason={pa_score_context.get('pa_score_reason')}",
         flush=True,
     )
 
@@ -1046,6 +1173,7 @@ def build_signal_candidate(
             "adaptive targets improved",
             "nour filter moved downstream",
             "global anti-chase score refinement",
+            "pa sub-score pre-nour enabled",
         ],
 
         meta={
@@ -1106,6 +1234,21 @@ def build_signal_candidate(
 
             "smart_evidence":
                 smart_evidence,
+
+            "pa_score":
+                pa_score_context.get("pa_score"),
+
+            "pa_score_raw":
+                pa_score_context.get("pa_score_raw"),
+
+            "pa_score_model":
+                pa_score_context.get("pa_score_model"),
+
+            "pa_score_reason":
+                pa_score_context.get("pa_score_reason"),
+
+            "pa_score_flags":
+                pa_score_context.get("pa_score_flags"),
 
             **quality_meta,
         },
