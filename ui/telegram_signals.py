@@ -623,6 +623,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "",
             f"<b>🚦 {signal.symbol} 🚦</b>",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
+            "🟢 Quality Filters: PASS | ⚡ Preview Ready" if not is_pullback_preview else "🟢 Quality Filters: PASS | ⏳ Waiting Pullback",
             "",
             f"📍 {entry_label}",
             f"• Price: {_fmt_price(signal.entry)}",
@@ -630,8 +631,6 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"🏁 TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
             f"🏃 Runner: {runner_pct}% after TP2",
             f"🛡 SL: {_fmt_price(signal.sl)}",
-            "",
-            "🟢 Quality Filters: PASS | ⚡ Preview Ready" if not is_pullback_preview else "🟢 Quality Filters: PASS | ⏳ Waiting Pullback",
         ]
 
         pa_line = _format_pa_line_from_signal(signal)
@@ -647,27 +646,16 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "└──────────────┘",
             "",
             "📊 Trade Details",
-            f"Setup: {setup_clean}",
-            f"Entry Timing: {signal.entry_timing}",
-            f"Current Wave: {signal.meta.get('wave', 'n/a')}",
-            f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
-            f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
+            f"• Setup: {setup_clean}",
+            f"• Entry Timing: {signal.entry_timing}",
+            f"• Current Wave: {signal.meta.get('wave', 'n/a')}",
+            f"• Volume State: {signal.meta.get('volume_state', 'n/a')}",
+            f"• 1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
             "",
             "🌐 Market",
-            f"Mode: {mode_emoji} {signal.market_mode}",
-            f"Theme: {mode_theme}",
-            "",
-            "⚙️ Execution",
-            f"Status: {status}",
-            "🟡 Pending pullback does NOT place a market order yet" if is_pullback_preview else "• Awaiting OKX confirmation",
-            "📌 Separate confirmation message will be sent after actual OKX execution" if not is_pullback_preview else "📌 Preview only — waiting pullback trigger before any execution",
+            f"• Mode: {mode_emoji} {signal.market_mode}",
+            f"• Theme: {mode_theme}",
         ])
-
-        if reason:
-            lines.append(f"• Reason: {_clean_name(str(reason))}")
-
-        if signal.warnings:
-            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
         slots = (execution_result or {}).get("slots")
         if slots:
@@ -675,6 +663,20 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
                 "",
                 f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining",
             ])
+
+        lines.extend([
+            "",
+            "⚙️ Execution",
+            f"• Status: {status}",
+            "• Pending pullback — no market order yet" if is_pullback_preview else "• Awaiting OKX confirmation",
+            "• Confirmation after actual OKX execution" if not is_pullback_preview else "• Preview only — waiting pullback trigger",
+        ])
+
+        if reason:
+            lines.append(f"• Reason: {_clean_name(str(reason))}")
+
+        if signal.warnings:
+            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
         return "\n".join(lines)
 
