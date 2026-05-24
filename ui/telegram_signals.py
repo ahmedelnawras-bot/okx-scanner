@@ -559,12 +559,11 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
 
 def _format_pa_line_from_signal(signal) -> str:
-    """Fixed-slot PA line with PA score for consistent Telegram layout.
+    """Compact PA display line.
 
-    Display only:
-    - Shows PA score from signal.meta["pa_score"].
-    - Uses smart_evidence flags.
-    - Does not affect scoring, modes, Nour, or execution.
+    🟢 = Accept واضح
+    🟡 = Neutral / skipped
+    🔴 = Reject risk
     """
     meta = getattr(signal, "meta", {}) or {}
     evidence = meta.get("smart_evidence") or {}
@@ -602,6 +601,26 @@ def _format_pa_line_from_signal(signal) -> str:
         or evidence.get("fake_breakout")
     )
 
+    if pa_score >= 0.25:
+        score_icon = "🟢"
+        score_label = "Accept واضح"
+    elif pa_score <= -0.15:
+        score_icon = "🔴"
+        score_label = "Reject risk"
+    else:
+        score_icon = "🟡"
+        score_label = "Neutral / skipped"
+
+    # Neutral clean state: keep it short.
+    if (
+        abs(pa_score) < 0.01
+        and not expansion
+        and not acceptance
+        and not compression
+        and not weak_breakout
+    ):
+        return f"🧠 PA: {score_icon} {pa_score:.2f} ({score_label})"
+
     parts = [
         f"Expansion{'✅' if expansion else '❌'}",
         f"Acceptance{'✅' if acceptance else '❌'}",
@@ -611,27 +630,8 @@ def _format_pa_line_from_signal(signal) -> str:
     if weak_breakout:
         parts.append("WeakBreakout⚠️")
 
-    if pa_score >= 0.25:
-        score_icon = "🟢"
-    elif pa_score <= -0.15:
-        score_icon = "🔴"
-    else:
-        score_icon = "🟡"
-
-    # Neutral/no-structure state:
-    # show only score line to avoid fake negative visual noise.
-    if (
-        abs(pa_score) < 0.01
-        and not expansion
-        and not acceptance
-        and not compression
-        and not weak_breakout
-    ):
-        return f"🧠 PA Score: {score_icon} {pa_score:+.2f}"
-
     return "\n".join([
-        f"🧠 PA: {score_icon} {pa_score:.2f}",
-        f"🟢 Accept | 🟡 Neutral | 🔴 Reject",
+        f"🧠 PA: {score_icon} {pa_score:.2f} ({score_label})",
         "PA: " + " | ".join(parts),
     ])
 
@@ -703,8 +703,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         lines.extend([
             "⚙️ Execution",
             f"• Status: {status}",
-            "• Pending pullback — no market order yet" if is_pullback_preview else "• Awaiting OKX confirmation",
-            "• Confirmation after actual OKX execution" if not is_pullback_preview else "• Preview only — waiting pullback trigger",
+            "• Pending pullback — waiting trigger" if is_pullback_preview else "• Waiting OKX execution confirm",
         ])
 
         if reason:
