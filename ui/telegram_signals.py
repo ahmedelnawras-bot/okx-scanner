@@ -687,9 +687,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"• Current Wave: {signal.meta.get('wave', 'n/a')}",
             f"• Volume State: {signal.meta.get('volume_state', 'n/a')}",
             f"• 1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-            "🌐 Market",
-            f"• Mode: {mode_emoji} {signal.market_mode}",
-            f"• Theme: {mode_theme}",
+            f"{mode_theme} Market",
         ])
 
         slots = (execution_result or {}).get("slots")
@@ -746,9 +744,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
         f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
         "",
-        "🌐 Market",
-        f"Mode: {mode_emoji} {signal.market_mode}",
-        f"Theme: {mode_theme}",
+        f"{mode_theme} Market",
     ])
 
     if signal.warnings:
