@@ -852,6 +852,47 @@ def _recovery_quality_gate(signal: SignalCandidate) -> tuple[bool, dict]:
     }
 
 
+
+def _pa_execution_gate(signal: SignalCandidate) -> dict:
+    """PA threshold gate before Nour.
+
+    Execution-only:
+    - Blocks execution candidates with clearly weak structure.
+    - Does NOT block normal Telegram signals.
+    - Does NOT change market modes.
+    - Uses pa_score created by scoring.py.
+    """
+
+    meta = signal.meta or {}
+
+    try:
+        pa_score = float(meta.get("pa_score") or 0.0)
+    except Exception:
+        pa_score = 0.0
+
+    reason = str(meta.get("pa_score_reason") or "neutral")
+
+    threshold = -0.25
+
+    if signal.market_mode == MODE_STRONG_LONG_ONLY:
+        threshold = -0.30
+
+    elif signal.market_mode == MODE_RECOVERY_LONG:
+        threshold = -0.20
+
+    elif signal.market_mode == MODE_BLOCK_LONGS:
+        threshold = -0.15
+
+    passed = pa_score > threshold
+
+    return {
+        "passed": passed,
+        "pa_score": pa_score,
+        "threshold": threshold,
+        "reason": reason,
+        "block_reason": "pa_structure_weak" if not passed else "ok",
+    }
+
 def decide_execution_candidate(
     signal: SignalCandidate,
     recovery_slots_remaining: int | None = None,
@@ -914,6 +955,8 @@ def decide_execution_candidate(
         _is_late_risky_execution_context(signal)
     )
 
+    pa_gate = _pa_execution_gate(signal)
+
     allowed = False
 
     path = "candidate_only"
@@ -941,10 +984,37 @@ def decide_execution_candidate(
             "recovery_allowed": recovery_allowed,
             "pending_pullback": pending_pullback,
             "near_resistance_warning": near_resistance_warning,
+            "pa_gate": pa_gate,
+            "pa_gate_passed": pa_gate.get("passed"),
+            "pa_score": pa_gate.get("pa_score"),
             "weak_drift_passed": weak_drift_passed,
             "weak_drift": get_weak_trend_drift_status(signal),
             "recovery_quality_passed": recovery_quality_passed,
             "recovery_quality": recovery_quality,
+        }
+
+    if not pa_gate.get("passed"):
+        return {
+            "allowed": False,
+            "path": "precision_filter",
+            "reason": pa_gate.get("block_reason") or "pa_structure_weak",
+            "complete_plan": complete_plan,
+            "strict_allowed": strict_allowed,
+            "normal_extra_allowed": normal_extra_allowed,
+            "elite_allowed": elite_allowed,
+            "recovery_allowed": recovery_allowed,
+            "pending_pullback": pending_pullback,
+            "near_resistance_warning": near_resistance_warning,
+            "pa_gate": pa_gate,
+            "pa_gate_passed": False,
+            "pa_score": pa_gate.get("pa_score"),
+            "weak_drift_passed": weak_drift_passed,
+            "weak_drift": get_weak_trend_drift_status(signal),
+            "recovery_quality_passed": recovery_quality_passed,
+            "recovery_quality": recovery_quality,
+            "nour_filter_name": None,
+            "nour_filter_passed": None,
+            "nour_filter_reason": None,
         }
 
     if (
@@ -1089,6 +1159,9 @@ def decide_execution_candidate(
                 "recovery_allowed": True,
                 "pending_pullback": pending_pullback,
                 "near_resistance_warning": near_resistance_warning,
+                "pa_gate": pa_gate,
+                "pa_gate_passed": pa_gate.get("passed"),
+                "pa_score": pa_gate.get("pa_score"),
                 "weak_drift_passed": weak_drift_passed,
                 "weak_drift": get_weak_trend_drift_status(signal),
                 "recovery_quality_passed": recovery_quality_passed,
@@ -1157,6 +1230,9 @@ def decide_execution_candidate(
         "recovery_allowed": recovery_allowed,
         "pending_pullback": pending_pullback,
         "near_resistance_warning": near_resistance_warning,
+        "pa_gate": pa_gate,
+        "pa_gate_passed": pa_gate.get("passed"),
+        "pa_score": pa_gate.get("pa_score"),
         "weak_drift_passed": weak_drift_passed,
         "weak_drift": get_weak_trend_drift_status(signal),
         "recovery_quality_passed": recovery_quality_passed,
