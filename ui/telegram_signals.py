@@ -10,11 +10,6 @@ from utils.constants import (
     MODE_STRONG_LONG_ONLY,
 )
 
-from ui.smart_evidence_formatter import (
-    format_smart_evidence_block,
-    extract_smart_evidence_from_signal,
-)
-
 LIGHT_LINE = "┄┄┄┄┄┄┄┄"
 EXEC_LINE = "════════════"
 
@@ -50,6 +45,60 @@ def _mode_theme(mode: str) -> str:
     }
     return f"{emoji} {names.get(mode, mode)}"
 
+
+
+def _extract_smart_evidence(signal: SignalCandidate) -> dict:
+    try:
+        meta = getattr(signal, "meta", {}) or {}
+        evidence = meta.get("smart_evidence") or {}
+        return evidence if isinstance(evidence, dict) else {}
+    except Exception:
+        return {}
+
+
+def _format_smart_evidence_block(signal: SignalCandidate) -> str:
+    """Telegram-only Smart Evidence display.
+
+    Display-only:
+    - Does not affect score.
+    - Does not affect modes.
+    - Does not affect Nour filters.
+    - Does not affect execution decisions.
+    """
+    evidence = _extract_smart_evidence(signal)
+
+    if not evidence:
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            "• بيانات القراءة غير موجودة",
+        ])
+
+    if not evidence.get("available"):
+        reason = str(evidence.get("reason") or "بيانات الشموع غير كافية")
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            f"• {reason}",
+        ])
+
+    yes = lambda value: "✅" if bool(value) else "❌"
+
+    lines = [
+        "",
+        "🧠 قراءة السوق",
+        f"• تمدد قوي {yes(evidence.get('displacement_hint'))}",
+        f"• قبول سعري {yes(evidence.get('auction_acceptance_hint'))}",
+        f"• اختراق ضعيف {'⚠️' if evidence.get('failed_breakout_risk') else '❌'}",
+    ]
+
+    if evidence.get("sweep_reclaim_hint"):
+        lines.append("• سحب سيولة ✅")
+
+    if evidence.get("compression_release_hint"):
+        lines.append("• فك ضغط ✅")
+
+    return "\n".join(lines)
 
 
 def _compact_market_label(mode: str) -> str:
@@ -582,9 +631,9 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build the official compact Telegram signal message.
 
-    UI-only formatting:
-    - Normal signals stay calm and never look like execution failures.
-    - Execution candidates keep a premium header with the current mode color.
+    Separation preserved:
+    - Normal signals stay calm and do not show execution rejection blocks.
+    - Execution candidates keep the premium execution header and execution-only details.
     - Track/TradingView buttons are attached by main.py via build_signal_buttons().
     """
     status = (execution_result or {}).get("status")
@@ -594,8 +643,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
     setup_clean = _clean_name(signal.setup_type)
     tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
-    evidence = extract_smart_evidence_from_signal(signal)
-    evidence_block = format_smart_evidence_block(evidence)
+    evidence_block = _format_smart_evidence_block(signal)
 
     is_pullback_preview = status == "pending_pullback_preview"
     path = _execution_path(signal, execution_result)
@@ -606,7 +654,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             _execution_header(signal.market_mode),
             EXEC_LINE,
             "🔥 مرشحة للتنفيذ التجريبي",
-            "🧠 Quality Filters: PASS",
+            "🟢 Quality Filters: PASS",
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
             f"💎 {signal.symbol}",
@@ -618,12 +666,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"🏁 TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
             f"🏃 Runner: {runner_pct}% after TP2",
             f"🛡 SL: {_fmt_price(signal.sl)}",
-        ]
-
-        if evidence_block:
-            lines.append(evidence_block)
-
-        lines.extend([
+            evidence_block,
             "",
             "┌─ 🚀 Tag Badge ─┐",
             f"Setup: {setup_clean}",
@@ -631,26 +674,8 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"Context: {tags_clean}",
             "└──────────────┘",
             "",
-            "📊 Trade Details",
-            f"Setup: {setup_clean}",
-            f"Entry Timing: {signal.entry_timing}",
-            f"Current Wave: {signal.meta.get('wave', 'n/a')}",
-            f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
-            f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-            "",
             _compact_market_label(signal.market_mode),
-            "",
-            "⚙️ Execution",
-            f"Status: {status}",
-            "🟡 Pending pullback does NOT place a market order yet" if is_pullback_preview else "🧪 OKX managed execution will confirm separately",
-            "📌 Separate confirmation message will be sent after actual OKX execution" if not is_pullback_preview else "📌 Preview only — waiting pullback trigger before any execution",
-        ])
-
-        if reason:
-            lines.append(f"• Reason: {reason}")
-
-        if signal.warnings:
-            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+        ]
 
         slots = (execution_result or {}).get("slots")
         if slots:
@@ -659,8 +684,23 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
                 f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining",
             ])
 
+        lines.extend([
+            "",
+            "⚙️ Execution",
+            "• Pending Pullback" if is_pullback_preview else "• Execution Ready",
+            "• Preview only — waiting pullback trigger" if is_pullback_preview else "• OKX managed execution will confirm separately",
+        ])
+
+        if reason:
+            lines.append(f"• Reason: {_clean_name(str(reason))}")
+
+        if signal.warnings:
+            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+
         return "\n".join(lines)
 
+    # Normal scan signal: intentionally calm.
+    # Do NOT show execution rejection/slots/OKX details here.
     lines = [
         _normal_header(signal.market_mode),
         LIGHT_LINE,
@@ -675,40 +715,18 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         f"🏁 TP2: {_fmt_price(signal.tp2)}",
         "🏃 Runner: 20% after TP2",
         f"🛡 SL: {_fmt_price(signal.sl)}",
-    ]
-
-    if evidence_block:
-        lines.append(evidence_block)
-
-    lines.extend([
+        evidence_block,
         "",
         "┌─ 🏷 Tag Badge ─┐",
         f"Setup: {setup_clean}",
         f"Context: {tags_clean}",
         "└──────────────┘",
         "",
-        "📊 Trade Details",
-        f"Setup: {setup_clean}",
-        f"Entry Timing: {signal.entry_timing}",
-        f"Current Wave: {signal.meta.get('wave', 'n/a')}",
-        f"Volume State: {signal.meta.get('volume_state', 'n/a')}",
-        f"1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-        "",
         _compact_market_label(signal.market_mode),
-    ])
+    ]
 
     if signal.warnings:
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
-
-    if execution_result:
-        pretty_status = str(status or "not_candidate").replace("_", " ").title()
-        pretty_reason = str(reason or "normal_signal_only").replace("_", " ").title()
-        lines.extend([
-            "",
-            "⚙️ Execution Check",
-            f"Status: {pretty_status}",
-            f"Reason: {pretty_reason}",
-        ])
 
     return "\n".join(lines)
 
