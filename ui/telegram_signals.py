@@ -50,7 +50,6 @@ def _extract_smart_evidence(signal: SignalCandidate) -> dict:
     except Exception:
         return {}
 
-
 def _format_smart_evidence_block(value) -> str:
     """Compact one-line PA evidence for Telegram.
 
@@ -93,7 +92,6 @@ def _format_smart_evidence_block(value) -> str:
         return ""
 
     return "🧠 PA: " + " | ".join(items)
-
 
 def _compact_market_label(mode: str) -> str:
     names = {
@@ -628,7 +626,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             "🟢 Quality Filters: PASS",
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
-                        f"<b>🚦 {signal.symbol}</b>",
+                        f"<b>🚦 {signal.symbol} 🚦</b>",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}",
@@ -673,7 +671,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         LIGHT_LINE,
         "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
-                f"<b>🚦 {signal.symbol}</b>",
+                f"<b>🚦 {signal.symbol} 🚦</b>",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}",
