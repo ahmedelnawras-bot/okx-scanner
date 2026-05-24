@@ -637,21 +637,19 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         if pa_line:
             lines.append(pa_line)
 
+        # Keep all information, but reduce vertical gaps in the lower section.
         lines.extend([
             "",
             "┌─ 🏷 Tag Badge ─┐",
             f"Setup: {setup_clean}",
-            f"Path: {path}",
             f"Context: {tags_clean}",
             "└──────────────┘",
-            "",
             "📊 Trade Details",
             f"• Setup: {setup_clean}",
             f"• Entry Timing: {signal.entry_timing}",
             f"• Current Wave: {signal.meta.get('wave', 'n/a')}",
             f"• Volume State: {signal.meta.get('volume_state', 'n/a')}",
             f"• 1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
-            "",
             "🌐 Market",
             f"• Mode: {mode_emoji} {signal.market_mode}",
             f"• Theme: {mode_theme}",
@@ -659,13 +657,9 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
 
         slots = (execution_result or {}).get("slots")
         if slots:
-            lines.extend([
-                "",
-                f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining",
-            ])
+            lines.append(f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining")
 
         lines.extend([
-            "",
             "⚙️ Execution",
             f"• Status: {status}",
             "• Pending pullback — no market order yet" if is_pullback_preview else "• Awaiting OKX confirmation",
