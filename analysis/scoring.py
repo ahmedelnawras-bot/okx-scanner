@@ -247,6 +247,87 @@ def _heat_penalty(
 
 
 
+def _build_trade_context_meta(
+    pair: PairCandidate,
+    setup_type: str,
+    entry_timing: str,
+    smart_evidence: dict | None = None,
+) -> dict:
+    """Build lightweight display metadata for Telegram Trade Details.
+
+    Display-only context enrichment:
+    - Does not change score.
+    - Does not change execution decisions.
+    - Uses only data already available on the pair/smart_evidence.
+    """
+
+    tags = set(getattr(pair, "tags", []) or [])
+    smart_evidence = smart_evidence or {}
+    candles = list(getattr(pair, "recent_candles", []) or [])
+
+    # 1) Wave / setup state
+    if setup_type == "wave_3":
+        wave = "Wave 3"
+    elif setup_type == "retest_breakout_confirmed":
+        wave = "Breakout Retest"
+    elif setup_type == "relative_strength_vs_btc":
+        wave = "RS Continuation"
+    elif setup_type == "liquidity_sweep_reclaim":
+        wave = "Sweep Reclaim"
+    elif setup_type == "support_bounce_confirmed":
+        wave = "Support Bounce"
+    elif setup_type == "vwap_reclaim":
+        wave = "VWAP Reclaim"
+    else:
+        wave = _clean_setup_name(setup_type)
+
+    # 2) Volume / pressure state
+    # We do not rely on raw exchange volume here because the PA candle helper
+    # currently passes OHLC only. This is a price-action pressure proxy.
+    volume_state = "Normal"
+    try:
+        if len(candles) >= 4:
+            ranges = [
+                abs(float(c.get("high", 0.0) or 0.0) - float(c.get("low", 0.0) or 0.0))
+                for c in candles[-4:]
+            ]
+            avg_prev_range = sum(ranges[:-1]) / max(1, len(ranges[:-1]))
+            last_range = ranges[-1]
+            if avg_prev_range > 0 and last_range >= avg_prev_range * 1.45:
+                volume_state = "Expansion"
+            elif avg_prev_range > 0 and last_range <= avg_prev_range * 0.70:
+                volume_state = "Compression"
+    except Exception:
+        volume_state = "Normal"
+
+    if smart_evidence.get("compression_release_hint"):
+        volume_state = "Compression Release"
+    elif smart_evidence.get("displacement_hint"):
+        volume_state = "Expansion"
+    elif smart_evidence.get("failed_breakout_risk"):
+        volume_state = "Exhaustion Risk"
+
+    # 3) HTF / broader confirmation proxy
+    # Uses stable tags + PA hints. This is not a hard filter.
+    if smart_evidence.get("failed_breakout_risk"):
+        htf_confirmation = "Caution"
+    elif smart_evidence.get("auction_acceptance_hint") and smart_evidence.get("displacement_hint"):
+        htf_confirmation = "Bullish"
+    elif "rs_btc" in tags and ("continuation" in tags or "breakout" in tags):
+        htf_confirmation = "Bullish Bias"
+    elif "rebound" in tags or smart_evidence.get("sweep_reclaim_hint"):
+        htf_confirmation = "Reclaim Bias"
+    else:
+        htf_confirmation = "Neutral"
+
+    return {
+        "wave": wave,
+        "volume_state": volume_state,
+        "htf_confirmation": htf_confirmation,
+        "entry_context": "Market" if entry_timing == "market" else "Pullback",
+    }
+
+
 def _calculate_pa_score(
     smart_evidence: dict,
     market_mode: str,
@@ -986,6 +1067,13 @@ def build_signal_candidate(
         market_mode=market_mode,
     )
 
+    trade_context_meta = _build_trade_context_meta(
+        pair=pair,
+        setup_type=setup_type,
+        entry_timing=entry_timing,
+        smart_evidence=smart_evidence,
+    )
+
     # PA sub-score is intentionally small and bounded.
     # It improves ranking/eligibility before Nour without becoming a hard filter.
     boost_score += float(pa_score_context.get("pa_score") or 0.0)
@@ -1231,6 +1319,18 @@ def build_signal_candidate(
 
             "confirmation_bonus":
                 confirmation_bonus,
+
+            "wave":
+                trade_context_meta.get("wave"),
+
+            "volume_state":
+                trade_context_meta.get("volume_state"),
+
+            "htf_confirmation":
+                trade_context_meta.get("htf_confirmation"),
+
+            "entry_context":
+                trade_context_meta.get("entry_context"),
 
             "smart_evidence":
                 smart_evidence,
