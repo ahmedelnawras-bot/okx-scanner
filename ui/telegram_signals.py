@@ -10,14 +10,8 @@ from utils.constants import (
     MODE_STRONG_LONG_ONLY,
 )
 
-from ui.smart_evidence_formatter import (
-    format_smart_evidence_block,
-    extract_smart_evidence_from_signal,
-)
-
 LIGHT_LINE = "┄┄┄┄┄┄┄┄"
 EXEC_LINE = "════════════"
-
 
 def _fmt_price(value: float | int | None) -> str:
     if value is None:
@@ -32,13 +26,11 @@ def _fmt_price(value: float | int | None) -> str:
         return f"{value:.4f}"
     return f"{value:.6f}"
 
-
 def _clean_name(value: str | None) -> str:
     if not value:
         return "-"
     text = str(value).replace("_", " ").replace("|", " / ").strip()
     return " ".join(part.capitalize() if part.islower() else part for part in text.split())
-
 
 def _mode_theme(mode: str) -> str:
     emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
@@ -50,7 +42,57 @@ def _mode_theme(mode: str) -> str:
     }
     return f"{emoji} {names.get(mode, mode)}"
 
+def _extract_smart_evidence(signal: SignalCandidate) -> dict:
+    try:
+        meta = getattr(signal, "meta", {}) or {}
+        evidence = meta.get("smart_evidence") or {}
+        return evidence if isinstance(evidence, dict) else {}
+    except Exception:
+        return {}
 
+def _format_smart_evidence_block(signal: SignalCandidate) -> str:
+    """Telegram-only Smart Evidence display.
+
+    Display-only:
+    - Does not affect score.
+    - Does not affect modes.
+    - Does not affect Nour filters.
+    - Does not affect execution decisions.
+    """
+    evidence = _extract_smart_evidence(signal)
+
+    if not evidence:
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            "• بيانات القراءة غير موجودة",
+        ])
+
+    if not evidence.get("available"):
+        reason = str(evidence.get("reason") or "بيانات الشموع غير كافية")
+        return "\n".join([
+            "",
+            "🧠 قراءة السوق",
+            f"• {reason}",
+        ])
+
+    yes = lambda value: "✅" if bool(value) else "❌"
+
+    lines = [
+        "",
+        "🧠 قراءة السوق",
+        f"• تمدد قوي: {yes(evidence.get('displacement_hint'))}",
+        f"• قبول سعري: {yes(evidence.get('auction_acceptance_hint'))}",
+        f"• اختراق ضعيف {''❌' if evidence.get('failed_breakout_risk') else '✅'}",
+    ]
+
+    if evidence.get("sweep_reclaim_hint"):
+        lines.append("• سحب سيولة ✅")
+
+    if evidence.get("compression_release_hint"):
+        lines.append("• فك ضغط ✅")
+
+    return "\n".join(lines)
 
 def _compact_market_label(mode: str) -> str:
     names = {
@@ -67,7 +109,6 @@ def _compact_market_label(mode: str) -> str:
     }
     return f"{icons.get(mode, '⚪')} {names.get(mode, str(mode or '-'))}"
 
-
 def _execution_header(mode: str) -> str:
     emoji = MODE_COLOR_EMOJI.get(mode, "⚪")
     if mode == MODE_STRONG_LONG_ONLY:
@@ -78,11 +119,9 @@ def _execution_header(mode: str) -> str:
         return f"🔥{emoji} BLOCK EXCEPTION"
     return f"🔥{emoji} EXECUTION"
 
-
 def _normal_header(mode: str) -> str:
     # Calm normal alert. Mode color appears in the Market section, not in the header.
     return "📈 LONG SIGNAL"
-
 
 def _execution_path(signal: SignalCandidate, execution_result: dict | None) -> str:
     if execution_result and execution_result.get("path"):
@@ -98,12 +137,10 @@ def _execution_path(signal: SignalCandidate, execution_result: dict | None) -> s
         return "whitelist"
     return "normal_check"
 
-
 def _managed_split_for_path(path: str) -> tuple[int, int, int]:
     if str(path or "").lower() == "recovery":
         return 50, 25, 25
     return 40, 40, 20
-
 
 def _tradingview_symbol(symbol: str) -> str:
     """Convert OKX instrument id to a TradingView-friendly symbol.
@@ -117,11 +154,9 @@ def _tradingview_symbol(symbol: str) -> str:
     compact = raw.replace("-", "")
     return f"OKX:{compact}"
 
-
 def build_tradingview_url(symbol: str) -> str:
     """بيبني الـ URL الكامل — نفس الـ URL المستخدم في الـ button."""
     return f"https://www.tradingview.com/chart/?symbol={_tradingview_symbol(symbol)}"
-
 
 def build_tradingview_html_link(symbol: str) -> str:
     """HTML clickable link — يُستخدم في الـ track messages مع parse_mode=HTML.
@@ -132,7 +167,6 @@ def build_tradingview_html_link(symbol: str) -> str:
     url = f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
     return f'<a href="{url}">🔗 TradingView — {tv_symbol}</a>'
 
-
 def build_tradingview_plain_link(symbol: str) -> str:
     """Plain text link للـ reports اللي مش HTML — يظهر كـ URL قابل للنقر في Telegram.
 
@@ -141,7 +175,6 @@ def build_tradingview_plain_link(symbol: str) -> str:
     tv_symbol = _tradingview_symbol(symbol)
     url = f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
     return f"🔗 TradingView ({tv_symbol})\n{url}"
-
 
 def build_signal_buttons(signal: SignalCandidate) -> dict:
     """Unified inline buttons under every trade message.
@@ -156,20 +189,17 @@ def build_signal_buttons(signal: SignalCandidate) -> dict:
         ]]
     }
 
-
 def _slot_status_snapshot(trade) -> tuple[bool, bool, bool]:
     counted_open = bool(getattr(trade, "counts_as_active_slot", False))
     daily_open = bool(getattr(trade, "counts_as_daily_open_risk", False))
     same_symbol_blocks = bool(getattr(trade, "blocks_same_symbol_reentry", counted_open))
     return counted_open, daily_open, same_symbol_blocks
 
-
 def _preview_status_label(status: str) -> str:
     status = str(status or "").lower()
     if status == "pending_pullback_preview":
         return "🟡 Status: PULLBACK WAITING"
     return "🟢 Status: OPEN / ACTIVE"
-
 
 def _profit_state(total_usd: float, protected: bool = False) -> str:
     if total_usd > 0.01:
@@ -178,15 +208,12 @@ def _profit_state(total_usd: float, protected: bool = False) -> str:
         return "🔴 خاسرة"
     return "⚪ تعادل / Protected" if protected else "⚪ تعادل"
 
-
 def _leveraged_pct(raw_pct: float) -> float:
     return float(raw_pct or 0.0) * float(DEFAULT_LEVERAGE or 1)
-
 
 def _money_from_pct(pct: float, margin: float = 35.0) -> float:
     """USD impact from a displayed leveraged performance percentage."""
     return (float(pct or 0.0) / 100.0) * margin
-
 
 def _trade_raw_effective_pnl_pct(trade) -> float:
     if getattr(trade, "tp2_hit", False):
@@ -196,10 +223,8 @@ def _trade_raw_effective_pnl_pct(trade) -> float:
         return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + max(0.0, float(getattr(trade, "pnl_pct", 0.0) or 0.0)) * (remaining_pct / 100.0)
     return float(getattr(trade, "pnl_pct", 0.0) or 0.0)
 
-
 def _trade_effective_pnl_pct(trade) -> float:
     return _leveraged_pct(_trade_raw_effective_pnl_pct(trade))
-
 
 def _managed_plan_from_sources(signal: SignalCandidate, execution_result: dict | None = None, trade=None, order_result: dict | None = None) -> dict:
     execution_result = execution_result or {}
@@ -284,7 +309,6 @@ def _managed_plan_from_sources(signal: SignalCandidate, execution_result: dict |
         "runner_requires_trailing_after_tp2": runner_requires_trailing,
     }
 
-
 def build_execution_confirmation_message(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -336,7 +360,6 @@ def build_execution_confirmation_message(
     ]
     return "\n".join(lines)
 
-
 def build_execution_failure_message(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -375,7 +398,6 @@ def build_execution_failure_message(
         f"🔗 {build_tradingview_html_link(signal.symbol)}",
     ]
     return "\n".join(lines)
-
 
 def build_trade_track_message(trade) -> str:
     path = getattr(trade, "execution_path", "") or ("Execution" if getattr(trade, "execution_trade", False) else "Normal")
@@ -475,7 +497,6 @@ def build_trade_track_message(trade) -> str:
     ])
     return "\n".join(lines)
 
-
 def build_rejected_track_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     execution_result = execution_result or {}
     reason = execution_result.get("reason") or "unknown"
@@ -500,7 +521,6 @@ def build_rejected_track_message(signal: SignalCandidate, execution_result: dict
         "",
         f"🔗 {build_tradingview_html_link(signal.symbol)}",
     ])
-
 
 def build_track_message(signal: SignalCandidate, execution_result: dict | None = None, trade=None) -> str:
     if trade is not None:
@@ -578,13 +598,13 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
     return "\n".join(lines)
 
-
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build the official compact Telegram signal message.
 
-    Preserved:
-    - Top header identity for normal vs execution messages.
-    - Inline buttons remain handled by main.py via build_signal_buttons().
+    Separation preserved:
+    - Normal signals stay calm and do not show execution rejection blocks.
+    - Execution candidates keep the premium execution header and execution-only details.
+    - Track/TradingView buttons are attached by main.py via build_signal_buttons().
     """
     status = (execution_result or {}).get("status")
     reason = (execution_result or {}).get("reason")
@@ -593,8 +613,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     entry_label = "Market Entry" if signal.entry_timing == "market" else "Pullback Entry"
     setup_clean = _clean_name(signal.setup_type)
     tags_clean = " | ".join(_clean_name(t) for t in (signal.execution_setup_tags or [])[:4]) or setup_clean
-    evidence = extract_smart_evidence_from_signal(signal)
-    evidence_block = format_smart_evidence_block(evidence)
+    evidence_block = _format_smart_evidence_block(signal)
 
     is_pullback_preview = status == "pending_pullback_preview"
     path = _execution_path(signal, execution_result)
@@ -605,95 +624,73 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             _execution_header(signal.market_mode),
             EXEC_LINE,
             "🔥 مرشحة للتنفيذ التجريبي",
-            "🧠 Quality Filters: PASS",
+            "🟢 Quality Filters: PASS",
             "⏳ Waiting Pullback Confirmation" if is_pullback_preview else "⚡ Preview Ready",
             "",
-            f"💎 {signal.symbol}",
-            "━━━━━━━━━━━━",
+                        f"━━━ 🚦 {signal.symbol} 🚦 ━━━",
             f"⭐ Score: {signal.score:.2f} | TF: 15m",
             "",
             f"📍 {entry_label}",
             f"• Price: {_fmt_price(signal.entry)}",
-            f"• TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
-            f"• TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
-            f"• Runner: {runner_pct}% after TP2",
-            f"• SL: {_fmt_price(signal.sl)}",
-        ]
-
-        if evidence_block:
-            lines.append(evidence_block)
-
-        lines.extend([
-            "",
-            "┌─ 🏷 Tag Badge ─┐",
+            f"🎯 TP1: {_fmt_price(signal.tp1)} | Close {tp1_pct}%",
+            f"🏁 TP2: {_fmt_price(signal.tp2)} | Close {tp2_pct}%",
+            f"🏃 Runner: {runner_pct}% after TP2",
+            f"🛡 SL: {_fmt_price(signal.sl)}",
+            evidence_block,
+            "┌─ 🚀 Tag Badge ─┐",
             f"Setup: {setup_clean}",
-            f"Path: {path}",
             f"Context: {tags_clean}",
             "└──────────────┘",
-            "",
             _compact_market_label(signal.market_mode),
-            "",
-            "⚙️ Execution",
-            f"Status: {status}",
-            "🟡 Pending pullback does NOT place a market order yet" if is_pullback_preview else "🧪 OKX managed execution will confirm separately",
-            "📌 Separate confirmation message will be sent after actual OKX execution" if not is_pullback_preview else "📌 Preview only — waiting pullback trigger before any execution",
-        ])
-
-        if reason:
-            lines.append(f"• Reason: {reason}")
-
-        if signal.warnings:
-            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+        ]
 
         slots = (execution_result or {}).get("slots")
         if slots:
             lines.extend([
                 "",
-                f"📊 Slots: allowed {slots.get('allowed')} | open {slots.get('counted')} | remaining {slots.get('remaining')}",
+                f"📊 Slots: {slots.get('counted')} / {slots.get('allowed')} Open | {slots.get('remaining')} Remaining",
             ])
+
+        lines.extend([
+            "⚙️ Execution",
+            "• Pending Pullback" if is_pullback_preview else "• Execution Ready",
+            "• Preview only — waiting pullback trigger" if is_pullback_preview else "• Awaiting OKX confirmation",
+        ])
+
+        if reason:
+            lines.append(f"• Reason: {_clean_name(str(reason))}")
+
+        if signal.warnings:
+            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
 
         return "\n".join(lines)
 
+    # Normal scan signal: intentionally calm.
+    # Do NOT show execution rejection/slots/OKX details here.
     lines = [
         _normal_header(signal.market_mode),
         LIGHT_LINE,
         "📍 إشارة عادية — التنفيذ مسار منفصل",
         "",
-        f"💎 {signal.symbol}",
-        "━━━━━━━━━━━━",
+                f"━━━ 🚦 {signal.symbol} 🚦 ━━━",
         f"⭐ Score: {signal.score:.2f} | TF: 15m",
         "",
         f"📍 {entry_label}",
         f"• Price: {_fmt_price(signal.entry)}",
-        f"• TP1: {_fmt_price(signal.tp1)}",
-        f"• TP2: {_fmt_price(signal.tp2)}",
-        "• Runner: 20% after TP2",
-        f"• SL: {_fmt_price(signal.sl)}",
-    ]
-
-    if evidence_block:
-        lines.append(evidence_block)
-
-    lines.extend([
-        "",
+        f"🎯 TP1: {_fmt_price(signal.tp1)}",
+        f"🏁 TP2: {_fmt_price(signal.tp2)}",
+        "🏃 Runner: 20% after TP2",
+        f"🛡 SL: {_fmt_price(signal.sl)}",
+        evidence_block,
         "┌─ 🏷 Tag Badge ─┐",
         f"Setup: {setup_clean}",
         f"Context: {tags_clean}",
         "└──────────────┘",
-        "",
         _compact_market_label(signal.market_mode),
-    ])
+    ]
 
     if signal.warnings:
         lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
-
-    if execution_result:
-        lines.extend([
-            "",
-            "⚙️ Execution Check",
-            f"Status: {status or 'not_candidate'}",
-            f"Reason: {reason or 'normal_signal_only'}",
-        ])
 
     return "\n".join(lines)
 
