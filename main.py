@@ -1359,8 +1359,8 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
 def _build_managed_execution_lines(managed_order_result: dict | None) -> list[str]:
     """Compact OKX execution block inside the main signal card.
 
-    Keep only the essential confirmation details here.
-    Full OKX details stay in the separate OKX result message below.
+    Keeps the important details here, while the separate OKX result
+    message still carries the full failure/success information.
     """
     if not isinstance(managed_order_result, dict):
         return []
@@ -1394,13 +1394,10 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
         runner_pct = (plan.get("runner") or {}).get("close_pct", "-")
 
     if tp1_pct != "-" or tp2_pct != "-" or runner_pct != "-":
-        lines.extend([
-            "",
-            f"📌 <b>Plan</b>: TP1 {tp1_pct}% • TP2 {tp2_pct}% • Runner {runner_pct}%",
-        ])
+        lines.append(f"📌 <b>Plan</b>: TP1 {tp1_pct}% • TP2 {tp2_pct}% • Runner {runner_pct}%")
 
     if managed_order_result.get("requires_runner_trailing"):
-        lines.append("🏃 Trailing after TP2")
+        lines.append("🏃 Runner: trailing بعد TP2 / Block SL sync")
 
     if not ok:
         lines.append("📌 لم يتم فتح الصفقة على OKX")
