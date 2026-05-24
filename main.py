@@ -1174,20 +1174,25 @@ def _build_signal_fingerprint(signal, exec_result: dict) -> str:
 
 def _iter_signal_items_for_dispatch(result: dict) -> list[dict]:
     items = list(result.get("signal_items", []) or [])
-    execution_items = [
-        item for item in items
-        if str((item.get("execution") or {}).get("status") or "").strip().lower()
-        in {"accepted_preview", "pending_pullback_preview"}
-    ]
-    normal_items = [
-        item for item in items
-        if str((item.get("execution") or {}).get("status") or "").strip().lower()
-        not in {"accepted_preview", "pending_pullback_preview"}
-    ]
 
-    # Always send all execution-related alerts.
-    # Limit normal observations to the first 8 to avoid Telegram spam.
-    return [*execution_items, *normal_items[:8]]
+    actionable_items = []
+    normal_items = []
+
+    for item in items:
+        exec_status = str((item.get("execution") or {}).get("status") or "").strip().lower()
+
+        # Must always be eligible for dispatch before the normal observation limit:
+        # - accepted execution previews
+        # - pullback previews
+        # - any rejected_* status, including PA gate rejects
+        if _is_actionable_signal_status(exec_status):
+            actionable_items.append(item)
+        else:
+            normal_items.append(item)
+
+    # Always send all actionable trading-mode alerts.
+    # Limit only non-actionable normal observations to avoid Telegram spam.
+    return [*actionable_items, *normal_items[:8]]
 
 
 
