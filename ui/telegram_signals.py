@@ -559,30 +559,45 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
 
 def _format_pa_line_from_signal(signal) -> str:
-    """Fixed-slot PA line for consistent Telegram layout."""
+    """Fixed-slot PA line with PA score for consistent Telegram layout.
+
+    Display only:
+    - Shows PA score from signal.meta["pa_score"].
+    - Uses smart_evidence flags.
+    - Does not affect scoring, modes, Nour, or execution.
+    """
     meta = getattr(signal, "meta", {}) or {}
     evidence = meta.get("smart_evidence") or {}
 
+    try:
+        pa_score = float(meta.get("pa_score") or 0.0)
+    except Exception:
+        pa_score = 0.0
+
     expansion = bool(
-        evidence.get("displacement")
+        evidence.get("displacement_hint")
+        or evidence.get("displacement")
         or evidence.get("expansion")
         or evidence.get("momentum_expansion")
     )
 
     acceptance = bool(
-        evidence.get("acceptance")
+        evidence.get("auction_acceptance_hint")
+        or evidence.get("acceptance")
         or evidence.get("value_acceptance")
         or evidence.get("accepted")
     )
 
     compression = bool(
-        evidence.get("compression")
+        evidence.get("compression_release_hint")
+        or evidence.get("compression")
         or evidence.get("compression_release")
         or evidence.get("squeeze")
     )
 
     weak_breakout = bool(
-        evidence.get("weak_breakout")
+        evidence.get("failed_breakout_risk")
+        or evidence.get("weak_breakout")
         or evidence.get("failed_breakout")
         or evidence.get("fake_breakout")
     )
@@ -596,7 +611,11 @@ def _format_pa_line_from_signal(signal) -> str:
     if weak_breakout:
         parts.append("WeakBreakout⚠️")
 
-    return "🧠 PA: " + " | ".join(parts)
+    score_icon = "🟢" if pa_score > 0 else ("🔴" if pa_score < 0 else "⚪")
+    return "\n".join([
+        f"🧠 PA Score: {score_icon} {pa_score:+.2f}",
+        "PA: " + " | ".join(parts),
+    ])
 
 
 
