@@ -630,7 +630,8 @@ def _format_pa_line_from_signal(signal) -> str:
         return f"🧠 PA Score: {score_icon} {pa_score:+.2f}"
 
     return "\n".join([
-        f"🧠 PA Score: {score_icon} {pa_score:+.2f}",
+        f"🧠 PA: {score_icon} {pa_score:.2f}",
+        f"🟢 Accept | 🟡 Neutral | 🔴 Reject",
         "PA: " + " | ".join(parts),
     ])
 
