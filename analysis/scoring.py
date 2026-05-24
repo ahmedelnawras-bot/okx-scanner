@@ -1016,15 +1016,6 @@ def build_signal_candidate(
         )
     )
 
-    # Pre-Nour evidence injection only.
-    # This does NOT change scoring, thresholds, modes, or execution decisions.
-    smart_evidence = build_smart_evidence(
-        candles=[],
-        pair=pair,
-        signal_setup=setup_type,
-        market_mode=market_mode,
-    )
-
     return SignalCandidate(
 
         symbol=pair.symbol,
