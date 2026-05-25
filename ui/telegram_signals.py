@@ -637,6 +637,29 @@ def _format_pa_line_from_signal(signal) -> str:
 
 
 
+
+def _format_market_context_line(signal: SignalCandidate, execution_result: dict | None = None) -> str:
+    meta = getattr(signal, "meta", {}) or {}
+    context = (execution_result or {}).get("market_context") or meta.get("market_context") or {}
+    btc = meta.get("btc_control") or {}
+    resistance = meta.get("resistance_4h") or {}
+
+    status = str(context.get("status") or "PASS").upper()
+    icon = str(context.get("icon") or ("🔴" if status == "BLOCK" else "🟡" if status == "CAUTION" else "🟢"))
+
+    btc_label = context.get("btc_label") or btc.get("label") or "-"
+    resistance_status = context.get("resistance_status") or resistance.get("status") or "unknown"
+    distance = context.get("resistance_distance_pct")
+    distance_text = ""
+    try:
+        if distance is not None:
+            distance_text = f" {float(distance):+.2f}%"
+    except Exception:
+        distance_text = ""
+
+    return f"🌍 Context: {icon} {status} | ₿ {btc_label} | 4H {str(resistance_status).title()}{distance_text}"
+
+
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build Telegram signal message.
 
@@ -694,6 +717,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"• Current Wave: {signal.meta.get('wave', 'n/a')}",
             f"• Volume State: {signal.meta.get('volume_state', 'n/a')}",
             f"• 1H Confirmation: {signal.meta.get('htf_confirmation', 'n/a')}",
+            _format_market_context_line(signal, execution_result),
         ])
 
         slots = (execution_result or {}).get("slots")
