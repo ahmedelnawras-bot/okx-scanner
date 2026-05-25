@@ -1123,6 +1123,15 @@ def run_once(
                 max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
                 drawdown_status=drawdown_status,
             )
+            exec_result["decision_engine"] = "process_trade_candidate"
+            exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
+            print(
+                f"DECISION_ENGINE | {signal.symbol} | "
+                f"runtime={exec_result.get('runtime_mode')} | "
+                f"engine={exec_result.get('decision_engine')} | "
+                f"status={exec_result.get('status')} | reason={exec_result.get('reason')}",
+                flush=True,
+            )
 
         exec_status = str(exec_result.get("status") or "").strip().lower()
         consumes_live_slot = exec_status == "accepted_preview"
@@ -1252,12 +1261,31 @@ def run_once(
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
         "portfolio_state_inputs": portfolio_state_inputs,
-        "help": build_master_help(
-            mode=state.mode,
-            execution_enabled=settings.execution_enabled,
-            risk_enabled=True,
-            okx_orders=settings.okx_place_orders,
-        ),
+        "help": "\n".join([
+            build_master_help(
+                mode=state.mode,
+                execution_enabled=settings.execution_enabled,
+                risk_enabled=True,
+                okx_orders=settings.okx_place_orders,
+            ),
+            "",
+            "━━━━━━━━━━━━",
+            "📌 <b>الأوامر الرئيسية</b>",
+            "━━━━━━━━━━━━",
+            "/status — حالة البوت والتنفيذ",
+            "/mood — حالة السوق الحالية",
+            "/okx_control — لوحة أوضاع OKX",
+            "/help_execution — تقارير صفقات التنفيذ",
+            "/help_normal — تقارير الرسائل العادية",
+            "/help_simulation — تقارير وضع المحاكاة",
+            "/diagnostics_help — أوامر التشخيص",
+            "",
+            build_execution_help(),
+            "",
+            build_normal_help(),
+            "",
+            _build_simulation_help(),
+        ]),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
         "signals": [item["message"] for item in signal_items[:8]],
