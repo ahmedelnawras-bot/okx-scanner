@@ -408,6 +408,88 @@ def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "1
     return candles
 
 
+
+def _build_4h_resistance_context_for_pair(pair, settings: Settings, bar: str = "4H", limit: int = 30) -> dict:
+    """Build lightweight 4H resistance context for Market Context Layer.
+
+    Observational only:
+    - Adds context to the pair before scoring.
+    - Does not place orders.
+    - Does not mutate market mode.
+    """
+    symbol = str(getattr(pair, "symbol", "") or "")
+    last_price = _safe_float(getattr(pair, "last_price", 0.0), 0.0)
+
+    if not symbol or last_price <= 0:
+        return {
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "missing_symbol_or_price",
+        }
+
+    try:
+        rows = fetch_okx_candles(
+            settings.okx_base_url,
+            symbol,
+            bar=bar,
+            limit=limit,
+            timeout=settings.request_timeout,
+        )
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": f"fetch_failed:{exc}",
+        }
+
+    if not isinstance(rows, list) or len(rows) < 6:
+        return {
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "not_enough_4h_candles",
+        }
+
+    highs: list[float] = []
+    for row in rows[1:]:  # skip current forming candle
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        high = _safe_float(row[2], 0.0)
+        if high > 0:
+            highs.append(high)
+
+    if not highs:
+        return {
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "no_valid_highs",
+        }
+
+    resistance = max(highs)
+    distance_pct = ((resistance - last_price) / last_price) * 100.0
+
+    if distance_pct < 0:
+        status = "cleared"
+    elif distance_pct <= 0.75:
+        status = "very_near"
+    elif distance_pct <= 2.00:
+        status = "near"
+    elif distance_pct <= 4.00:
+        status = "watch"
+    else:
+        status = "clear"
+
+    return {
+        "status": status,
+        "distance_pct": round(distance_pct, 3),
+        "resistance": resistance,
+        "reason": f"nearest_4h_high_{status}",
+    }
+
+
 def _build_snapshot(ranked_pairs, settings: Settings) -> MarketSnapshot:
     return build_market_guard_snapshot(
         ranked_pairs,
@@ -796,6 +878,21 @@ def run_once(
         except Exception as exc:
             print(
                 f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
+                flush=True,
+            )
+
+        try:
+            resistance_4h_context = _build_4h_resistance_context_for_pair(pair, settings)
+            setattr(pair, "resistance_4h_context", resistance_4h_context)
+            print(
+                f"4H_RESISTANCE | {pair.symbol} | "
+                f"status={resistance_4h_context.get('status')} | "
+                f"distance={resistance_4h_context.get('distance_pct')}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"4H_RESISTANCE | {getattr(pair, 'symbol', '-')} | error={exc}",
                 flush=True,
             )
 
