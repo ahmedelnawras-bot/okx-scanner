@@ -2376,7 +2376,10 @@ def _build_unified_help_reply(result: dict, settings: Settings) -> str:
 
 
 def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Settings) -> None:
-    """Send restored dashboard /help with main keyboard."""
+    """Send restored dashboard /help with the original inline keyboard.
+
+    Uses _send_text so reply_markup handling is identical to the working menu callbacks.
+    """
     dashboard = build_master_help(
         mode=result.get("mode", "UNKNOWN"),
         execution_enabled=settings.execution_enabled,
@@ -2389,7 +2392,8 @@ def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Set
         reply_markup={"remove_keyboard": True},
     )
 
-    sender.send_message(
+    _send_text(
+        sender,
         dashboard,
         reply_markup=_build_main_inline_keyboard_with_bot_modes(),
     )
