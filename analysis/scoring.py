@@ -6,7 +6,7 @@ Execution-specific strictness stays downstream and never suppresses
 the normal signal itself.
 
 v129 FIXED execution intelligence update
-──────────────────────────────────────────────────────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 FIXES:
 
 1) Nour Filter V2 moved to execution layer philosophy
@@ -29,7 +29,7 @@ IMPORTANT:
 - display_score still UI-only
 - no future leakage
 - no mode architecture changes
-──────────────────────────────────────────────────────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 """
 
 from __future__ import annotations
@@ -247,6 +247,53 @@ def _heat_penalty(
 
 
 
+def _build_btc_control_context(pair: PairCandidate) -> dict:
+    """Lightweight BTC control context for alt execution.
+
+    Uses btc_bounce_pct attached in main.py from market snapshot.
+    Display + post-Nour execution context only.
+    """
+    try:
+        btc_15m = float(getattr(pair, "btc_bounce_pct", 0.0) or 0.0)
+    except Exception:
+        btc_15m = 0.0
+
+    abs_move = abs(btc_15m)
+
+    if abs_move >= 0.85:
+        status = "risk"
+        label = "Dominance Risk"
+        icon = "ðŸ”´"
+    elif abs_move >= 0.35:
+        status = "active"
+        label = "Active BTC"
+        icon = "ðŸŸ¡"
+    else:
+        status = "calm"
+        label = "Calm BTC"
+        icon = "ðŸŸ¢"
+
+    return {
+        "status": status,
+        "label": label,
+        "icon": icon,
+        "btc_15m_move": round(btc_15m, 3),
+    }
+
+
+def _build_4h_resistance_meta(pair: PairCandidate) -> dict:
+    ctx = getattr(pair, "resistance_4h_context", None)
+    if isinstance(ctx, dict):
+        return dict(ctx)
+    return {
+        "status": "unknown",
+        "distance_pct": None,
+        "resistance": None,
+        "reason": "not_attached",
+    }
+
+
+
 def _build_trade_context_meta(
     pair: PairCandidate,
     setup_type: str,
@@ -444,12 +491,12 @@ def _calculate_pa_score(
     }
 
 
-# ─────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Execution Stability Intelligence
 # IMPORTANT:
 # informational only
 # NOT hard rejection
-# ─────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _calculate_execution_stability(
     pair: PairCandidate,
     setup_type: str,
@@ -567,11 +614,11 @@ def _calculate_execution_stability(
     }
 
 
-# ─────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Adaptive Target Geometry
 # FIXED:
 # more realistic TP2
-# ─────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _calculate_adaptive_targets(
     pair: PairCandidate,
     setup_type: str,
@@ -767,7 +814,7 @@ def _infer_setup(
 
         if "near_resistance" in pair_tags:
             warnings.append(
-                "مقاومة قريبة قبل TP1"
+                "Ù…Ù‚Ø§ÙˆÙ…Ø© Ù‚Ø±ÙŠØ¨Ø© Ù‚Ø¨Ù„ TP1"
             )
 
         return (
@@ -783,7 +830,7 @@ def _infer_setup(
     if "rebound" in pair_tags:
 
         warnings.append(
-            "ارتداد مبكر يحتاج تأكيد"
+            "Ø§Ø±ØªØ¯Ø§Ø¯ Ù…Ø¨ÙƒØ± ÙŠØ­ØªØ§Ø¬ ØªØ£ÙƒÙŠØ¯"
         )
 
         return (
@@ -796,7 +843,7 @@ def _infer_setup(
         )
 
     warnings.append(
-        "حركة متابعة — ليست أفضل إعداد تنفيذ"
+        "Ø­Ø±ÙƒØ© Ù…ØªØ§Ø¨Ø¹Ø© â€” Ù„ÙŠØ³Øª Ø£ÙØ¶Ù„ Ø¥Ø¹Ø¯Ø§Ø¯ ØªÙ†ÙÙŠØ°"
     )
 
     return (
@@ -901,7 +948,7 @@ def _infer_quality_context(
     resistance_warning = (
         "near_resistance_before_tp1"
         if any(
-            "مقاومة" in str(w)
+            "Ù…Ù‚Ø§ÙˆÙ…Ø©" in str(w)
             for w in warnings
         )
         or "near_resistance" in tags
@@ -1073,6 +1120,9 @@ def build_signal_candidate(
         entry_timing=entry_timing,
         smart_evidence=smart_evidence,
     )
+
+    btc_control_context = _build_btc_control_context(pair)
+    resistance_4h_context = _build_4h_resistance_meta(pair)
 
     # PA sub-score is intentionally small and bounded.
     # It improves ranking/eligibility before Nour without becoming a hard filter.
@@ -1331,6 +1381,24 @@ def build_signal_candidate(
 
             "entry_context":
                 trade_context_meta.get("entry_context"),
+
+            "btc_control":
+                btc_control_context,
+
+            "btc_control_status":
+                btc_control_context.get("status"),
+
+            "btc_15m_move":
+                btc_control_context.get("btc_15m_move"),
+
+            "resistance_4h":
+                resistance_4h_context,
+
+            "resistance_4h_status":
+                resistance_4h_context.get("status"),
+
+            "resistance_4h_distance_pct":
+                resistance_4h_context.get("distance_pct"),
 
             "smart_evidence":
                 smart_evidence,
