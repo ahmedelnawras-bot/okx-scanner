@@ -1251,7 +1251,7 @@ def run_once(
         ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(),
+        "menu_keyboard": build_main_inline_keyboard(),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
@@ -1261,25 +1261,12 @@ def run_once(
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
         "portfolio_state_inputs": portfolio_state_inputs,
-        "help": "\n".join([
-            build_master_help(
-                mode=state.mode,
-                execution_enabled=settings.execution_enabled,
-                risk_enabled=True,
-                okx_orders=settings.okx_place_orders,
-            ),
-            "",
-            "━━━━━━━━━━━━",
-            "📌 <b>الأوامر</b>",
-            "━━━━━━━━━━━━",
-            "/status — حالة البوت",
-            "/mood — حالة السوق",
-            "/okx_control — لوحة OKX",
-            "/help_execution — تقارير التنفيذ",
-            "/help_normal — تقارير الرسائل العادية",
-            "/help_simulation — تقارير المحاكاة",
-            "/diagnostics_help — التشخيص",
-        ]),
+        "help": build_master_help(
+            mode=state.mode,
+            execution_enabled=settings.execution_enabled,
+            risk_enabled=True,
+            okx_orders=settings.okx_place_orders,
+        ),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
         "signals": [item["message"] for item in signal_items[:8]],
@@ -2376,10 +2363,7 @@ def _build_unified_help_reply(result: dict, settings: Settings) -> str:
 
 
 def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Settings) -> None:
-    """Send restored dashboard /help with the original inline keyboard.
-
-    Uses _send_text so reply_markup handling is identical to the working menu callbacks.
-    """
+    """Send restored dashboard /help with main keyboard."""
     dashboard = build_master_help(
         mode=result.get("mode", "UNKNOWN"),
         execution_enabled=settings.execution_enabled,
@@ -2392,8 +2376,7 @@ def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Set
         reply_markup={"remove_keyboard": True},
     )
 
-    _send_text(
-        sender,
+    sender.send_message(
         dashboard,
         reply_markup=_build_main_inline_keyboard_with_bot_modes(),
     )
@@ -2574,7 +2557,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command in ("/start", "/help"):
-                _send_full_help_messages(sender, result, settings)
+                reply = result.get("help") or "OKX Long Bot is running."
+                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
+                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
                 continue
             elif command == "/status":
                 reply = _build_fast_status(result, settings, trade_store)
