@@ -647,17 +647,33 @@ def _format_market_context_line(signal: SignalCandidate, execution_result: dict 
     status = str(context.get("status") or "PASS").upper()
     icon = str(context.get("icon") or ("🔴" if status == "BLOCK" else "🟡" if status == "CAUTION" else "🟢"))
 
-    btc_label = context.get("btc_label") or btc.get("label") or "-"
-    resistance_status = context.get("resistance_status") or resistance.get("status") or "unknown"
-    distance = context.get("resistance_distance_pct")
-    distance_text = ""
-    try:
-        if distance is not None:
-            distance_text = f" {float(distance):+.2f}%"
-    except Exception:
-        distance_text = ""
+    btc_status = str(context.get("btc_status") or btc.get("status") or "").lower()
+    if btc_status == "risk":
+        btc_text = "Dominating"
+    elif btc_status == "active":
+        btc_text = "Active"
+    elif btc_status == "calm":
+        btc_text = "Calm"
+    else:
+        btc_text = str(context.get("btc_label") or btc.get("label") or "-").replace(" BTC", "")
 
-    return f"🌍 Context: {icon} {status} | ₿ {btc_label} | 4H {str(resistance_status).title()}{distance_text}"
+    resistance_status = str(
+        context.get("resistance_status")
+        or resistance.get("status")
+        or "unknown"
+    ).lower()
+
+    if resistance_status in {"clear", "cleared"}:
+        resistance_text = "4H Clear ✅"
+    elif resistance_status == "watch":
+        resistance_text = "4H Watch ⚠️"
+    elif resistance_status in {"near", "very_near"}:
+        resistance_text = "4H Block ⛔"
+    else:
+        resistance_text = "4H Unknown"
+
+    return f"🌍 Context: {icon} {status} | ₿ {btc_text} | {resistance_text}"
+
 
 
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
