@@ -1251,7 +1251,7 @@ def run_once(
         ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "menu_keyboard": build_main_inline_keyboard(),
+        "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
