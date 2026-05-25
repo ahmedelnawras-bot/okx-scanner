@@ -2313,6 +2313,35 @@ def _build_unified_help_reply(result: dict, settings: Settings) -> str:
 
 
 
+def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Settings) -> None:
+    """Send complete help in separate Telegram messages.
+
+    This avoids Telegram length limits and prevents the short dashboard from
+    hiding the command lists.
+    """
+    dashboard = build_master_help(
+        mode=result.get("mode", "UNKNOWN"),
+        execution_enabled=settings.execution_enabled,
+        risk_enabled=True,
+        okx_orders=settings.okx_place_orders,
+    )
+
+    sender.send_message(
+        "⌨️ تم إغلاق لوحة /help القديمة.",
+        reply_markup={"remove_keyboard": True},
+    )
+
+    sender.send_message(
+        dashboard,
+        reply_markup=result.get("menu_keyboard"),
+    )
+
+    sender.send_message(build_execution_help())
+    sender.send_message(build_normal_help())
+    sender.send_message(_build_simulation_help())
+
+
+
 def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings, trade_store: RedisTradeStore | None = None) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
@@ -2485,9 +2514,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command in ("/start", "/help"):
-                reply = _build_unified_help_reply(result, settings)
-                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
-                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
+                _send_full_help_messages(sender, result, settings)
                 continue
             elif command == "/status":
                 reply = _build_fast_status(result, settings, trade_store)
