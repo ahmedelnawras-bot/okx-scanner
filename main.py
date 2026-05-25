@@ -2209,6 +2209,82 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         return
 
 
+def _build_simulation_help() -> str:
+    return "\n".join([
+        "🧪 <b>Simulation Trading Reports</b>",
+        "━━━━━━━━━━━━",
+        "📊 التقرير العام",
+        "/report_simulation",
+        "/report_simulation_7d",
+        "/report_simulation_today",
+        "/report_simulation_1h",
+        "",
+        "📂 الصفقات المفتوحة",
+        "/report_simulation_open",
+        "/report_simulation_open_7d",
+        "/report_simulation_open_today",
+        "/report_simulation_open_1h",
+        "",
+        "📈 تحليل أسباب الأرباح",
+        "/report_simulation_profit_analysis",
+        "/report_simulation_profit_analysis_7d",
+        "/report_simulation_profit_analysis_today",
+        "/report_simulation_profit_analysis_1h",
+        "",
+        "📉 تحليل أسباب الخسائر",
+        "/report_simulation_losses_analysis",
+        "/report_simulation_losses_analysis_7d",
+        "/report_simulation_losses_analysis_today",
+        "/report_simulation_losses_analysis_1h",
+        "",
+        "💼 Wallet Impact",
+        "/report_simulation_wallet",
+        "/simulation_wallet",
+        "",
+        "🧠 ذكاء التنفيذ",
+        "/report_simulation_intelligence",
+        "/report_simulation_intelligence_7d",
+        "/report_simulation_intelligence_today",
+        "/report_simulation_intelligence_1h",
+        "",
+        "⚙️ تشخيص التنفيذ",
+        "/report_simulation_diagnostics",
+        "/report_simulation_diagnostics_7d",
+        "/report_simulation_diagnostics_today",
+        "/report_simulation_diagnostics_1h",
+    ])
+
+
+def _build_unified_help_reply(result: dict, settings: Settings) -> str:
+    """Restore full /help command list while showing current runtime mode."""
+    base_help = str(result.get("help") or "OKX Long Bot Dashboard")
+    execution_help = str(result.get("help_execution") or build_execution_help())
+    normal_help = str(result.get("help_normal") or build_normal_help())
+
+    sections = [
+        base_help,
+        "",
+        "━━━━━━━━━━━━",
+        "📌 <b>الأوامر الرئيسية</b>",
+        "━━━━━━━━━━━━",
+        "/status — حالة البوت والتنفيذ",
+        "/mood — حالة السوق الحالية",
+        "/okx_control — لوحة أوضاع OKX",
+        "/help_execution — تقارير صفقات التنفيذ",
+        "/help_normal — تقارير الرسائل العادية",
+        "/diagnostics_help — أوامر التشخيص",
+        "",
+        execution_help,
+        "",
+        normal_help,
+        "",
+        _build_simulation_help(),
+    ]
+
+    return "\n".join(part for part in sections if str(part).strip())
+
+
+
 def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, settings: Settings, trade_store: RedisTradeStore | None = None) -> int | None:
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
@@ -2381,7 +2457,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
             if command in ("/start", "/help"):
-                reply = result.get("help") or "OKX Long Bot is running."
+                reply = _build_unified_help_reply(result, settings)
                 sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
                 sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
                 continue
@@ -2399,6 +2475,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/okx_orders_off":
                 applied = _set_runtime_okx_orders(settings, False)
                 reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
+            elif command in ("/help_simulation", "/simulation_help"):
+                reply = _build_simulation_help()
             elif command == "/okx_control":
                 reply = _build_okx_control_panel(settings)
                 _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
