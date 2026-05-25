@@ -894,6 +894,97 @@ def _pa_execution_gate(signal: SignalCandidate) -> dict:
         "block_reason": "pa_weak_breakout_danger" if hard_block else "ok",
     }
 
+
+def _market_context_layer(signal: SignalCandidate) -> dict:
+    """Post-Nour Market Context Layer.
+
+    Combines:
+    - BTC Control
+    - 4H Resistance Context
+
+    Output:
+    - PASS / CAUTION / BLOCK
+    """
+    meta = signal.meta or {}
+    btc = meta.get("btc_control") or {}
+    resistance = meta.get("resistance_4h") or {}
+
+    btc_status = str(btc.get("status") or meta.get("btc_control_status") or "unknown").lower()
+    resistance_status = str(resistance.get("status") or meta.get("resistance_4h_status") or "unknown").lower()
+
+    try:
+        pa_score = float(meta.get("pa_score") or 0.0)
+    except Exception:
+        pa_score = 0.0
+
+    status = "PASS"
+    icon = "🟢"
+    reasons: list[str] = []
+
+    if btc_status == "risk":
+        reasons.append("BTC Dominance Risk")
+    elif btc_status == "active":
+        reasons.append("BTC Active")
+
+    if resistance_status == "very_near":
+        reasons.append("4H Resistance Very Near")
+    elif resistance_status == "near":
+        reasons.append("4H Resistance Near")
+    elif resistance_status == "watch":
+        reasons.append("4H Resistance Watch")
+
+    # Mode-aware final context.
+    if signal.market_mode == MODE_NORMAL_LONG:
+        if resistance_status == "very_near":
+            status = "BLOCK"
+        elif btc_status == "risk" and resistance_status in {"near", "very_near"}:
+            status = "BLOCK"
+        elif btc_status == "risk" and pa_score < 0:
+            status = "BLOCK"
+        elif btc_status in {"risk", "active"} or resistance_status in {"near", "very_near", "watch"}:
+            status = "CAUTION"
+
+    elif signal.market_mode == MODE_STRONG_LONG_ONLY:
+        if btc_status == "risk" and resistance_status == "very_near" and pa_score <= -0.15:
+            status = "BLOCK"
+        elif btc_status == "risk" or resistance_status in {"near", "very_near"}:
+            status = "CAUTION"
+
+    elif signal.market_mode == MODE_RECOVERY_LONG:
+        if btc_status == "risk" and resistance_status in {"near", "very_near"} and pa_score < 0:
+            status = "BLOCK"
+        elif btc_status == "risk" or resistance_status in {"near", "very_near"}:
+            status = "CAUTION"
+
+    elif signal.market_mode == MODE_BLOCK_LONGS:
+        # Already defensive. Context is mostly advisory here.
+        if btc_status == "risk" or resistance_status in {"near", "very_near"}:
+            status = "CAUTION"
+
+    if status == "BLOCK":
+        icon = "🔴"
+    elif status == "CAUTION":
+        icon = "🟡"
+
+    if not reasons:
+        reasons.append("Context Clear")
+
+    label = f"{icon} {status}"
+
+    return {
+        "status": status,
+        "icon": icon,
+        "label": label,
+        "btc_status": btc_status,
+        "btc_label": btc.get("label") or btc_status,
+        "btc_15m_move": btc.get("btc_15m_move"),
+        "resistance_status": resistance_status,
+        "resistance_distance_pct": resistance.get("distance_pct"),
+        "reasons": reasons,
+        "reason": " | ".join(reasons),
+    }
+
+
 def decide_execution_candidate(
     signal: SignalCandidate,
     recovery_slots_remaining: int | None = None,
@@ -957,6 +1048,7 @@ def decide_execution_candidate(
     )
 
     pa_gate = _pa_execution_gate(signal)
+    market_context = _market_context_layer(signal)
 
     print(
         f"PA_GATE | {signal.symbol} | score={pa_gate.get('pa_score')} | "
@@ -994,6 +1086,9 @@ def decide_execution_candidate(
             "pa_gate": pa_gate,
             "pa_gate_passed": pa_gate.get("passed"),
             "pa_score": pa_gate.get("pa_score"),
+            "market_context": market_context,
+            "market_context_status": market_context.get("status"),
+            "market_context_reason": market_context.get("reason"),
             "weak_drift_passed": weak_drift_passed,
             "weak_drift": get_weak_trend_drift_status(signal),
             "recovery_quality_passed": recovery_quality_passed,
@@ -1015,6 +1110,9 @@ def decide_execution_candidate(
             "pa_gate": pa_gate,
             "pa_gate_passed": False,
             "pa_score": pa_gate.get("pa_score"),
+            "market_context": market_context,
+            "market_context_status": market_context.get("status"),
+            "market_context_reason": market_context.get("reason"),
             "weak_drift_passed": weak_drift_passed,
             "weak_drift": get_weak_trend_drift_status(signal),
             "recovery_quality_passed": recovery_quality_passed,
@@ -1169,6 +1267,9 @@ def decide_execution_candidate(
                 "pa_gate": pa_gate,
                 "pa_gate_passed": pa_gate.get("passed"),
                 "pa_score": pa_gate.get("pa_score"),
+                "market_context": market_context,
+                "market_context_status": market_context.get("status"),
+                "market_context_reason": market_context.get("reason"),
                 "weak_drift_passed": weak_drift_passed,
                 "weak_drift": get_weak_trend_drift_status(signal),
                 "recovery_quality_passed": recovery_quality_passed,
@@ -1225,6 +1326,15 @@ def decide_execution_candidate(
         path = "blocked"
 
         reason = "weak_drift_execution_block"
+
+    if allowed and market_context.get("status") == "BLOCK":
+        allowed = False
+        path = "precision_filter"
+        reason = "market_context_block"
+
+    elif allowed and market_context.get("status") == "CAUTION":
+        if not str(reason or "").endswith("_caution"):
+            reason = f"{reason}_context_caution"
 
     return {
         "allowed": allowed,
