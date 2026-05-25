@@ -1251,7 +1251,7 @@ def run_once(
         ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "menu_keyboard": build_main_inline_keyboard(),
+        "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
@@ -1270,21 +1270,15 @@ def run_once(
             ),
             "",
             "━━━━━━━━━━━━",
-            "📌 <b>الأوامر الرئيسية</b>",
+            "📌 <b>الأوامر</b>",
             "━━━━━━━━━━━━",
-            "/status — حالة البوت والتنفيذ",
-            "/mood — حالة السوق الحالية",
-            "/okx_control — لوحة أوضاع OKX",
-            "/help_execution — تقارير صفقات التنفيذ",
+            "/status — حالة البوت",
+            "/mood — حالة السوق",
+            "/okx_control — لوحة OKX",
+            "/help_execution — تقارير التنفيذ",
             "/help_normal — تقارير الرسائل العادية",
-            "/help_simulation — تقارير وضع المحاكاة",
-            "/diagnostics_help — أوامر التشخيص",
-            "",
-            build_execution_help(),
-            "",
-            build_normal_help(),
-            "",
-            _build_simulation_help(),
+            "/help_simulation — تقارير المحاكاة",
+            "/diagnostics_help — التشخيص",
         ]),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
@@ -1954,6 +1948,71 @@ def _should_dispatch_signal_item(item: dict, settings: Settings) -> bool:
     return _is_actionable_signal_status(exec_status)
 
 
+def _build_main_inline_keyboard_with_bot_modes() -> dict:
+    """Restore main /help keyboard and replace Wallet Impact with Bot Modes."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🚀 Execution", "callback_data": "menu:execution"},
+                {"text": "📊 Normal Trades", "callback_data": "menu:normal"},
+            ],
+            [
+                {"text": "🧠🚀 Execution Intelligence", "callback_data": "cmd:/report_execution_intelligence"},
+                {"text": "🧠📊 Market Intelligence", "callback_data": "cmd:/report_intelligence"},
+            ],
+            [
+                {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
+            ],
+            [
+                {"text": "🧠 Diagnostics", "callback_data": "menu:diagnostics"},
+                {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
+            ],
+        ]
+    }
+
+
+def _build_bot_modes_panel(settings: Settings) -> str:
+    mode = _get_signal_delivery_mode(settings)
+    mode_label = _signal_delivery_mode_label(settings)
+
+    def mark(name: str) -> str:
+        return "✅" if mode == name else "⬜"
+
+    return "\n".join([
+        "🧭 <b>أوضاع البوت</b>",
+        "━━━━━━━━━━━━",
+        f"الحالي: <b>{mode_label}</b>",
+        "",
+        f"{mark('scan')} 📡 <b>وضع الاسكان</b>",
+        "يعرض العادي + المرشح وينفذ حسب إعدادات OKX.",
+        "",
+        f"{mark('trading')} 🎯 <b>وضع التداول</b>",
+        "يعرض المرشح و rejected ورسائل OKX فقط.",
+        "",
+        f"{mark('simulation')} 🧪 <b>وضع المحاكاة</b>",
+        "نفس قرارات وضع التداول لكن تنفيذ داخلي فقط، و OKX live orders OFF.",
+    ])
+
+
+def _build_bot_modes_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📡 وضع الاسكان", "callback_data": "signal_mode:scan"},
+                {"text": "🎯 وضع التداول", "callback_data": "signal_mode:trading"},
+            ],
+            [
+                {"text": "🧪 وضع المحاكاة", "callback_data": "signal_mode:simulation"},
+            ],
+            [
+                {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
+                {"text": "🔄 تحديث", "callback_data": "menu:bot_modes"},
+            ],
+        ]
+    }
+
+
+
 def _build_okx_control_keyboard(settings: Settings) -> dict:
     orders_on = bool(getattr(settings, "okx_place_orders", False))
     toggle_text = "⏸ إيقاف تنفيذ OKX" if orders_on else "▶️ تشغيل تنفيذ OKX"
@@ -2182,13 +2241,13 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         _send_text(
             sender,
             "\n".join([
-                f"{prefix} Signal Mode Runtime Toggle",
+                f"{prefix} Bot Mode Runtime Toggle",
                 "┄┄┄┄┄┄┄┄",
                 f"Requested Mode: {desired_mode.upper() if desired_mode else '-'}",
                 f"Applied: {'YES' if applied else 'NO'}",
                 f"Current Mode: {mode_text}",
             ]),
-            reply_markup=_build_okx_control_keyboard(runtime_settings),
+            reply_markup=_build_bot_modes_keyboard(),
         )
         return
 
@@ -2219,6 +2278,9 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             _send_text(sender, result.get("help_normal", ""))
         elif key == "diagnostics":
             _send_text(sender, build_diagnostics_help())
+        elif key == "bot_modes":
+            runtime_settings = settings or get_settings()
+            _send_text(sender, _build_bot_modes_panel(runtime_settings), reply_markup=_build_bot_modes_keyboard())
         elif key == "okx_control":
             runtime_settings = settings or get_settings()
             _send_text(sender, _build_okx_control_panel(runtime_settings), reply_markup=_build_okx_control_keyboard(runtime_settings))
@@ -2314,11 +2376,7 @@ def _build_unified_help_reply(result: dict, settings: Settings) -> str:
 
 
 def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Settings) -> None:
-    """Send complete help in separate Telegram messages.
-
-    This avoids Telegram length limits and prevents the short dashboard from
-    hiding the command lists.
-    """
+    """Send restored dashboard /help with main keyboard."""
     dashboard = build_master_help(
         mode=result.get("mode", "UNKNOWN"),
         execution_enabled=settings.execution_enabled,
@@ -2333,12 +2391,9 @@ def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Set
 
     sender.send_message(
         dashboard,
-        reply_markup=result.get("menu_keyboard"),
+        reply_markup=_build_main_inline_keyboard_with_bot_modes(),
     )
 
-    sender.send_message(build_execution_help())
-    sender.send_message(build_normal_help())
-    sender.send_message(_build_simulation_help())
 
 
 
@@ -2370,8 +2425,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 "Exec Intelligence": "/report_execution_intelligence",
                 "🧠📊 Market Intelligence": "/report_intelligence",
                 "Market Intelligence": "/report_intelligence",
-                "💼 Wallet Impact": "/report_execution_wallet",
-                "Wallet Impact": "/report_execution_wallet",
+                "🧭 أوضاع البوت": "/bot_modes",
+                "Bot Modes": "/bot_modes",
+                "اوضاع البوت": "/bot_modes",
                 "🧠 Diagnostics": "/report_diagnostics",
                 "Diagnostics": "/report_diagnostics",
                 "🤖 OKX Control": "/okx_control",
@@ -2532,6 +2588,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
             elif command in ("/help_simulation", "/simulation_help"):
                 reply = _build_simulation_help()
+            elif command in ("/bot_modes", "/modes", "/mode"):
+                reply = _build_bot_modes_panel(settings)
+                _send_text(sender, reply, reply_markup=_build_bot_modes_keyboard())
+                continue
             elif command == "/okx_control":
                 reply = _build_okx_control_panel(settings)
                 _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
