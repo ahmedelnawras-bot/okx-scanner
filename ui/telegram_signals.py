@@ -558,6 +558,46 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
 
 
 
+
+def _fix_mojibake_text(value) -> str:
+    """Repair Arabic mojibake before Telegram display."""
+    s = str(value or "")
+    if not any(ch in s for ch in ("Ø", "Ù", "Â", "Ã", "Ð", "Ñ")):
+        return s
+
+    candidates = [s]
+    for enc in ("latin1", "cp1252"):
+        try:
+            candidates.append(s.encode(enc, errors="ignore").decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+
+    def badness(x: str) -> int:
+        return (
+            x.count("Ø") * 3
+            + x.count("Ù") * 3
+            + x.count("Â") * 2
+            + x.count("Ã") * 2
+            + x.count("Ð") * 2
+            + x.count("Ñ") * 2
+            + x.count("�") * 5
+        )
+
+    return min(candidates, key=badness) or s
+
+
+def _clean_display_text(value) -> str:
+    fixed = _fix_mojibake_text(value).strip()
+
+    # If it is still unreadable mojibake, do not show it in Notes.
+    bad_chars = sum(fixed.count(ch) for ch in ("Ø", "Ù", "Â", "Ã", "Ð", "Ñ", "�"))
+    if bad_chars >= 3:
+        return ""
+
+    return fixed
+
+
+
 def _format_pa_line_from_signal(signal) -> str:
     """Compact PA display line.
 
@@ -747,10 +787,16 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
         ])
 
         if reason:
-            lines.append(f"• Reason: {_clean_name(str(reason))}")
+            lines.append(f"• Reason: {_clean_display_text(_clean_name(str(reason)))}")
 
         if signal.warnings:
-            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+            cleaned_warnings = [
+                _clean_display_text(w)
+                for w in signal.warnings[:3]
+                if _clean_display_text(w)
+            ]
+            if cleaned_warnings:
+                lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in cleaned_warnings]])
 
         return "\n".join(lines)
 
@@ -793,7 +839,13 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     ])
 
     if signal.warnings:
-        lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in signal.warnings[:3]]])
+        cleaned_warnings = [
+            _clean_display_text(w)
+            for w in signal.warnings[:3]
+            if _clean_display_text(w)
+        ]
+        if cleaned_warnings:
+            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in cleaned_warnings]])
 
     if execution_result:
         lines.extend([
