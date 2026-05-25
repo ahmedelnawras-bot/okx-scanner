@@ -10,7 +10,7 @@ def build_main_menu_layout() -> list[list[str]]:
     return [
         ["🚀 Execution", "📊 Normal Trades"],
         ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence"],
-        ["💼 Wallet Impact"],
+        ["🧭 أوضاع البوت"],
         ["🧠 Diagnostics", "🤖 OKX Control"],
         ["⚙️ Admin", "📘 System Info"],
     ]
@@ -38,7 +38,7 @@ def build_main_inline_keyboard() -> dict:
                 {"text": "🧠📊 Market Intelligence", "callback_data": "cmd:/report_intelligence"},
             ],
             [
-                {"text": "💼 Wallet Impact", "callback_data": "cmd:/report_execution_wallet"},
+                {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
             ],
             [
                 {"text": "🧠 Diagnostics", "callback_data": "menu:diagnostics"},
