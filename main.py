@@ -946,11 +946,27 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         commands = {}
 
     out = {}
+    reserved_commands = {
+        "/help",
+        "/start",
+        "/status",
+        "/mood",
+        "/okx_control",
+        "/help_execution",
+        "/help_normal",
+        "/diagnostics_help",
+        "/help_diagnostics",
+        "/bot_modes",
+        "/modes",
+        "/mode",
+    }
     for key, value in {**reports, **commands}.items():
         if isinstance(value, str) and value.strip():
             command_key = str(key)
             if not command_key.startswith("/"):
                 command_key = "/" + command_key
+            if command_key in reserved_commands:
+                continue
             out[command_key.replace("/report_", "/report_simulation_")] = _simulation_header(value)
             out[command_key.replace("/", "/simulation_", 1)] = _simulation_header(value)
 
@@ -1835,6 +1851,15 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     if drawdown is not None:
         drawdown_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}% | level={int(getattr(drawdown, 'level', 0) or 0)} | {'ALLOWED' if getattr(drawdown, 'allowed', True) else 'HALTED'}"
 
+    loss_guard = result.get("loss_streak_guard") or {}
+    if loss_guard.get("active"):
+        loss_guard_line = (
+            f"ACTIVE | streak={int(loss_guard.get('streak', 0) or 0)} | "
+            f"remaining={int(loss_guard.get('remaining_minutes', 0) or 0)}m"
+        )
+    else:
+        loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
+
     return "\n".join([
         "🟢 Bot Status",
         "━━━━━━━━━━━━",
@@ -2437,6 +2462,15 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, clean_reply)
                 continue
 
+            # /help must always use the original dashboard + main keyboard.
+            # Simulation reports are handled only by /help_simulation or /report_simulation*
+            # and must never shadow /help.
+            if command in ("/start", "/help"):
+                reply = result.get("help") or "OKX Long Bot is running."
+                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
+                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
+                continue
+
             simulation_outputs = _build_simulation_command_outputs(result)
             if command in simulation_outputs:
                 _send_text(sender, simulation_outputs[command])
@@ -2556,12 +2590,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             if command == "/compare_live_vs_replay":
                 _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
                 continue
-            if command in ("/start", "/help"):
-                reply = result.get("help") or "OKX Long Bot is running."
-                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
-                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
-                continue
-            elif command == "/status":
+            if command == "/status":
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
                 reply = result.get("mode_message", "No mode yet")
