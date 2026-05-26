@@ -827,8 +827,10 @@ def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
                 trade = None
             if trade:
                 setattr(trade, "trade_source", "simulation")
-                setattr(trade, "tracking_bucket", "simulation")
+                setattr(trade, "tracking_bucket", "execution")
                 setattr(trade, "execution_trade", True)
+                if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+                    setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
                 trades.append(trade)
     except Exception as exc:
         print(f"⚠️ Simulation load failed: {exc}", flush=True)
@@ -847,7 +849,7 @@ def _save_simulation_trades(trades: list, trade_store: RedisTradeStore | None = 
                 continue
 
             setattr(trade, "trade_source", "simulation")
-            setattr(trade, "tracking_bucket", "simulation")
+            setattr(trade, "tracking_bucket", "execution")
             setattr(trade, "execution_trade", True)
             payload = json.dumps(trade_to_dict(trade), ensure_ascii=False, default=str)
             key = _simulation_trade_key(trade_id)
@@ -903,14 +905,22 @@ def _load_simulation_execution_checks(trade_store: RedisTradeStore | None = None
 
 
 def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = SIMULATION_START_BALANCE_USDT) -> dict:
+    """Build a simple virtual wallet snapshot from simulation trades.
+
+    This uses the same lifecycle PnL fields produced by update_open_trades.
+    Each trade is assumed to use the configured paper margin if available,
+    falling back to 35 USDT. The wallet itself starts at 1000 USDT.
+    """
     open_trades = [t for t in sim_trades or [] if not _is_trade_closed(t)]
     closed_trades = [t for t in sim_trades or [] if _is_trade_closed(t)]
 
     realized = 0.0
     floating = 0.0
+    margin = 35.0
+
     for trade in sim_trades or []:
         pct = _trade_effective_pnl_pct(trade)
-        usd = _money_from_pct(pct, margin=35.0)
+        usd = _money_from_pct(pct, margin=margin)
         if _is_trade_closed(trade):
             realized += usd
         else:
@@ -926,6 +936,7 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
         "closed_count": len(closed_trades),
         "total_count": len(sim_trades or []),
     }
+
 
 
 def _simulation_header(text: str) -> str:
@@ -1034,6 +1045,8 @@ def _build_simulation_command_outputs(result: dict) -> dict:
 
     # Wallet aliases.
     out["/simulation_wallet"] = wallet_text
+    if "/report_simulation_open" in out:
+        out["/simulation_open"] = out["/report_simulation_open"]
     out["/report_simulation_wallet"] = wallet_text
     out["/report_simulation_wallet_7d"] = wallet_text
     out["/report_simulation_wallet_today"] = wallet_text
@@ -1256,6 +1269,12 @@ def run_once(
                 elif not candidate_id:
                     simulation_trades.append(candidate_trade)
                 local_gate_trades[-1] = candidate_trade
+                print(
+                    f"SIM_TRADE_OPEN | {candidate_trade.symbol} | "
+                    f"id={candidate_id or '-'} | entry={getattr(candidate_trade, 'entry', '-')} | "
+                    f"path={getattr(candidate_trade, 'execution_path', '-')}",
+                    flush=True,
+                )
 
         signal_items.append({
             "signal": signal,
@@ -1472,23 +1491,44 @@ def _activate_announced_trade(
 
 
 def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None):
-    """Mark a candidate trade as an opened virtual simulation trade."""
+    """Mark a candidate trade as an opened virtual simulation trade.
+
+    Important:
+    - trade_source stays "simulation" so it never mixes with live trades.
+    - tracking_bucket is "execution" so existing execution reports/open-trade
+      reports can read it exactly like real execution trades.
+    - No OKX metadata is required; lifecycle is price-driven.
+    """
     exec_result = exec_result or {}
     opened_at = datetime.now(timezone.utc)
 
     setattr(candidate_trade, "trade_source", "simulation")
-    setattr(candidate_trade, "tracking_bucket", "simulation")
+    setattr(candidate_trade, "tracking_bucket", "execution")
     setattr(candidate_trade, "execution_trade", True)
-    setattr(candidate_trade, "execution_status", "simulated_open")
+    setattr(candidate_trade, "execution_checked", True)
+    setattr(candidate_trade, "execution_status", "accepted_preview")
     setattr(candidate_trade, "execution_reason", str(exec_result.get("reason") or "simulation"))
-    setattr(candidate_trade, "exchange_sync_state", "simulation")
+    setattr(candidate_trade, "execution_path", str(exec_result.get("path") or getattr(candidate_trade, "execution_path", "") or "general"))
+    setattr(candidate_trade, "exchange_sync_state", "simulation_virtual_fill")
     setattr(candidate_trade, "exchange_order_ok", True)
     setattr(candidate_trade, "exchange_order_reason", "simulation_virtual_fill")
     setattr(candidate_trade, "telegram_announced", True)
     setattr(candidate_trade, "announced_to_telegram", True)
     setattr(candidate_trade, "telegram_announced_at", opened_at)
     setattr(candidate_trade, "opened_at", getattr(candidate_trade, "opened_at", None) or opened_at)
-    setattr(candidate_trade, "status", str(getattr(candidate_trade, "status", "") or "open"))
+    setattr(candidate_trade, "updated_at", opened_at)
+    setattr(candidate_trade, "closed_at", None)
+    setattr(candidate_trade, "status", "open")
+    setattr(candidate_trade, "slot_exempt", False)
+    setattr(candidate_trade, "slot_exempt_reason", "")
+    setattr(candidate_trade, "daily_open_risk_exempt", False)
+    setattr(candidate_trade, "same_symbol_block_exempt", False)
+
+    entry = float(getattr(candidate_trade, "entry", 0.0) or 0.0)
+    if entry > 0:
+        setattr(candidate_trade, "current_price", entry)
+        setattr(candidate_trade, "highest_price", max(float(getattr(candidate_trade, "highest_price", 0.0) or 0.0), entry))
+
     return candidate_trade
 
 
