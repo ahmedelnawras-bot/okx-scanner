@@ -1169,6 +1169,7 @@ def _simulation_protection_label(result: dict | None = None) -> str:
 
 
 def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | None = None, limit: int = 5) -> list[str]:
+    """Compact Simulation equity rows using the same simple style as execution reports."""
     merged: list[dict] = []
 
     for item in rows or []:
@@ -1203,63 +1204,55 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
         end_eq = _safe_float(item.get("end_balance") or item.get("current_balance"), start_eq)
         pnl = end_eq - start_eq
         icon = "🟢" if pnl >= 0 else "🔴"
-
-        out.extend([
-            f"• <b>{date}</b>",
-            f"Start → End: {_sim_code(f'{start_eq:,.2f} → {end_eq:,.2f} USDT')}",
-            f"{icon} Change: {_sim_code(f'{pnl:+,.2f} USDT')}",
-        ])
+        out.append(f"• {date} | {start_eq:,.2f} → {end_eq:,.2f} USDT | {icon} {pnl:+,.2f} USDT")
 
     return out
 
 def _build_simulation_account_summary(result: dict | None = None) -> str:
-    """Small paper-account block for Simulation reports only.
+    """Small Simulation account block.
 
-    Keep formatting Telegram-friendly:
-    - section titles use <b>
-    - important numbers use <code>
-    - avoid mixing long Arabic/English/numeric text in one line
+    Same style as execution reports:
+    - short English/LTR metric lines
+    - no split Arabic labels vs numbers
+    - no extra blank lines
     """
     result = result or {}
     sim_trades = list(result.get("simulation_trades", []) or [])
     wallet = result.get("simulation_wallet") or _build_simulation_wallet_snapshot(sim_trades)
     daily_row = result.get("simulation_daily_balance") or {}
 
-    start_balance = _safe_float(daily_row.get("start_balance"), _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT))
+    start_balance = _safe_float(
+        daily_row.get("start_balance"),
+        _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT),
+    )
     current_balance = _safe_float(
         daily_row.get("current_balance") or daily_row.get("end_balance"),
         _safe_float(wallet.get("equity"), start_balance),
     )
-    growth_pct = ((current_balance - start_balance) / start_balance * 100.0) if start_balance else 0.0
     delta = current_balance - start_balance
-    risk_mode = _simulation_protection_label(result)
+    growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
     realized = _safe_float(wallet.get("realized"), 0.0)
     floating = _safe_float(wallet.get("floating"), 0.0)
+    risk_mode = _simulation_protection_label(result)
+    icon = "🟢" if delta >= 0 else "🔴"
 
     rows = list(result.get("simulation_daily_log", []) or [])
     equity_rows = _format_simulation_equity_curve_rows(rows, daily_row, limit=5)
 
-    daily_lines = [
+    return "\n".join([
         "💰 <b>Simulation Daily Balance</b>",
         "━━━━━━━━━━━━",
-        "📍 بداية اليوم",
-        _sim_money(start_balance),
-        "💼 الرصيد الحالي",
-        _sim_money(current_balance),
-        f"{'🟢' if delta >= 0 else '🔴'} صافي اليوم",
-        f"{_sim_money(delta, signed=True)} | {_sim_pct(growth_pct, signed=True)}",
-        "✅ المحقق",
-        _sim_money(realized, signed=True),
-        "📊 العائم",
-        _sim_money(floating, signed=True),
-        "🛡 وضع الحماية",
-        _sim_code(risk_mode),
+        f"📍 Start Balance: {start_balance:,.2f} USDT",
+        f"💼 Current Balance: {current_balance:,.2f} USDT",
+        f"{icon} Daily Net: {delta:+,.2f} USDT | {growth_pct:+.2f}%",
+        f"✅ Realized: {realized:+,.2f} USDT",
+        f"📊 Floating: {floating:+,.2f} USDT",
+        f"🛡 Protection: {risk_mode}",
         "",
         "📈 <b>Simulation Equity Curve</b>",
         *equity_rows,
         "",
-    ]
-    return "\n".join(daily_lines)
+    ])
 
 def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
     """Remove orphan wallet emoji line that old reports may leave before Daily Balance.
@@ -1279,14 +1272,14 @@ def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
         stripped = line.strip()
         is_orphan_icon = stripped in {"💰", "💼"}
         next_few = "\n".join(lines[idx + 1: idx + 5])
-        if is_orphan_icon and "💰 Daily Balance" in next_few:
+        if is_orphan_icon and ("💰 Daily Balance" in next_few or "💰 <b>Simulation Daily Balance</b>" in next_few or "Simulation Daily Balance" in next_few):
             continue
         cleaned.append(line)
 
     value = "\n".join(cleaned)
 
     # Collapse excessive blank lines around the injected block.
-    value = re.sub(r"\n{3,}(💰 Daily Balance)", r"\n\n\1", value)
+    value = re.sub(r"\n{3,}(💰 (?:<b>)?Simulation Daily Balance(?:</b>)?|💰 Daily Balance)", r"\n\n\1", value)
     value = re.sub(r"(━━━━━━━━━━━━)\n{2,}(📍 بداية اليوم)", r"\1\n\2", value)
     return value.strip()
 
