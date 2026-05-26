@@ -1267,7 +1267,7 @@ def run_once(
         ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
-        "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(),
+        "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(settings),
         "mode_context": mode_context,
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
@@ -2035,17 +2035,32 @@ def _should_dispatch_signal_item(item: dict, settings: Settings) -> bool:
     return _is_actionable_signal_status(exec_status)
 
 
-def _build_main_inline_keyboard_with_bot_modes() -> dict:
-    """Restore main /help keyboard and replace Wallet Impact with Bot Modes."""
+def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None) -> dict:
+    """Main /help keyboard with active runtime mode marker.
+
+    Telegram does not support custom button background colors, so the active mode
+    is marked with 🟢 while preserving the original visual logos.
+    """
+    try:
+        runtime_settings = settings or get_settings()
+        mode = _get_signal_delivery_mode(runtime_settings)
+    except Exception:
+        mode = "scan"
+
+    def active(name: str, label: str) -> str:
+        return f"🟢{label}" if mode == name else label
+
     return {
         "inline_keyboard": [
             [
-                {"text": "🚀 Execution", "callback_data": "menu:execution"},
-                {"text": "📊 Normal Trades", "callback_data": "menu:normal"},
+                {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
+                {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
+                {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
             ],
             [
-                {"text": "🧠🚀 Execution Intelligence", "callback_data": "cmd:/report_execution_intelligence"},
-                {"text": "🧠📊 Market Intelligence", "callback_data": "cmd:/report_intelligence"},
+                {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "cmd:/report_execution_intelligence"},
+                {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
+                {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "cmd:/report_simulation_intelligence"},
             ],
             [
                 {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
@@ -2056,6 +2071,7 @@ def _build_main_inline_keyboard_with_bot_modes() -> dict:
             ],
         ]
     }
+
 
 
 def _build_bot_modes_panel(settings: Settings) -> str:
@@ -2081,15 +2097,24 @@ def _build_bot_modes_panel(settings: Settings) -> str:
     ])
 
 
-def _build_bot_modes_keyboard() -> dict:
+def _build_bot_modes_keyboard(settings: Settings | None = None) -> dict:
+    try:
+        runtime_settings = settings or get_settings()
+        mode = _get_signal_delivery_mode(runtime_settings)
+    except Exception:
+        mode = "scan"
+
+    def mark(name: str, label: str) -> str:
+        return f"🟢{label}" if mode == name else f"⚪{label}"
+
     return {
         "inline_keyboard": [
             [
-                {"text": "📡 وضع الاسكان", "callback_data": "signal_mode:scan"},
-                {"text": "🎯 وضع التداول", "callback_data": "signal_mode:trading"},
+                {"text": mark("scan", "📡 وضع الاسكان"), "callback_data": "signal_mode:scan"},
+                {"text": mark("trading", "🎯 وضع التداول"), "callback_data": "signal_mode:trading"},
             ],
             [
-                {"text": "🧪 وضع المحاكاة", "callback_data": "signal_mode:simulation"},
+                {"text": mark("simulation", "🧪 وضع المحاكاة"), "callback_data": "signal_mode:simulation"},
             ],
             [
                 {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
@@ -2097,6 +2122,7 @@ def _build_bot_modes_keyboard() -> dict:
             ],
         ]
     }
+
 
 
 
@@ -2334,7 +2360,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
                 f"Applied: {'YES' if applied else 'NO'}",
                 f"Current Mode: {mode_text}",
             ]),
-            reply_markup=_build_bot_modes_keyboard(),
+            reply_markup=_build_bot_modes_keyboard(runtime_settings),
         )
         return
 
@@ -2363,6 +2389,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             _send_text(sender, result.get("help_execution", ""))
         elif key == "normal":
             _send_text(sender, result.get("help_normal", ""))
+        elif key == "simulation":
+            _send_text(sender, _build_simulation_help())
         elif key == "diagnostics":
             _send_text(sender, build_diagnostics_help())
         elif key == "bot_modes":
@@ -2381,7 +2409,12 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
-        reply = result.get("command_outputs", {}).get(command) or "الأمر غير متاح في هذه النسخة."
+        simulation_outputs = _build_simulation_command_outputs(result)
+        reply = (
+            simulation_outputs.get(command)
+            or result.get("command_outputs", {}).get(command)
+            or "الأمر غير متاح في هذه النسخة."
+        )
         _send_text(sender, reply)
         return
 
@@ -2505,13 +2538,24 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         if not commands and plain_text:
             button_map = {
                 "🚀 Execution": "/help_execution",
+                "🟢🚀 Execution": "/help_execution",
                 "Execution": "/help_execution",
                 "📊 Normal Trades": "/help_normal",
+                "🟢📊 Normal Trades": "/help_normal",
                 "Normal Trades": "/help_normal",
+                "🧪 Simulation": "/help_simulation",
+                "🟢🧪 Simulation": "/help_simulation",
+                "Simulation": "/help_simulation",
                 "🧠🚀 Execution Intelligence": "/report_execution_intelligence",
+                "🟢🧠🚀 Exec Intel": "/report_execution_intelligence",
+                "🧠🚀 Exec Intel": "/report_execution_intelligence",
                 "Exec Intelligence": "/report_execution_intelligence",
                 "🧠📊 Market Intelligence": "/report_intelligence",
+                "🟢🧠📊 Market Intel": "/report_intelligence",
+                "🧠📊 Market Intel": "/report_intelligence",
                 "Market Intelligence": "/report_intelligence",
+                "🧠🧪 Sim Intel": "/report_simulation_intelligence",
+                "🟢🧠🧪 Sim Intel": "/report_simulation_intelligence",
                 "🧭 أوضاع البوت": "/bot_modes",
                 "Bot Modes": "/bot_modes",
                 "اوضاع البوت": "/bot_modes",
@@ -2543,7 +2587,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             if command in ("/start", "/help"):
                 reply = result.get("help") or "OKX Long Bot is running."
                 sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
-                sender.send_message(reply, reply_markup=result.get("menu_keyboard"))
+                sender.send_message(reply, reply_markup=_build_main_inline_keyboard_with_bot_modes(settings))
                 continue
 
             simulation_outputs = _build_simulation_command_outputs(result)
