@@ -1231,16 +1231,49 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
     return "\n".join(daily_lines)
 
 
+
+def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
+    """Remove orphan wallet emoji line that old reports may leave before Daily Balance.
+
+    Some report bundles render Wallet Impact as:
+        💰
+        Wallet Impact
+
+    When the Daily Balance block is injected before "Wallet Impact", the standalone
+    emoji can remain above Daily Balance. This cleanup removes only that orphan
+    wallet/briefcase line when it directly precedes the Daily Balance block.
+    """
+    lines = str(text or "").splitlines()
+    cleaned: list[str] = []
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        is_orphan_icon = stripped in {"💰", "💼"}
+        next_few = "\n".join(lines[idx + 1: idx + 5])
+        if is_orphan_icon and "💰 Daily Balance" in next_few:
+            continue
+        cleaned.append(line)
+
+    value = "\n".join(cleaned)
+
+    # Collapse excessive blank lines around the injected block.
+    value = re.sub(r"\n{3,}(💰 Daily Balance)", r"\n\n\1", value)
+    value = re.sub(r"(━━━━━━━━━━━━)\n{2,}(📍 بداية اليوم)", r"\1\n\2", value)
+    return value.strip()
+
+
 def _inject_simulation_account_summary(text: str, result: dict | None = None) -> str:
-    value = str(text or "")
-    if "💰 Daily Balance" in value and "📈 Equity Curve" in value:
-        return value
+    value = _clean_orphan_wallet_icon_before_daily_balance(str(text or ""))
+
+    # If the block is already present, do not inject again; just cleanup old orphan icon.
+    if "💰 Daily Balance" in value and ("📊 Equity Curve" in value or "📈 Equity Curve" in value):
+        return _clean_orphan_wallet_icon_before_daily_balance(value)
 
     block = _build_simulation_account_summary(result)
 
     # Match the full title first. If we only match "Wallet Impact",
-    # an original "💰 Wallet Impact" title leaves a useless standalone 💰
-    # before the Daily Balance block.
+    # an original "💰 Wallet Impact" title or split "💰\\nWallet Impact"
+    # can leave a useless standalone icon before Daily Balance.
     wallet_markers = ["💰 Wallet Impact", "💼 Wallet Impact", "Wallet Impact"]
     for marker in wallet_markers:
         idx = value.find(marker)
@@ -1248,15 +1281,22 @@ def _inject_simulation_account_summary(text: str, result: dict | None = None) ->
             before = value[:idx].rstrip()
             after = value[idx:].lstrip()
 
-            # Defensive cleanup for older report formats that had the icon
-            # on its own line immediately before "Wallet Impact".
+            # Defensive cleanup for split-title formats:
+            #   💰
+            #   Wallet Impact
             before_lines = before.splitlines()
-            if before_lines and before_lines[-1].strip() in {"💰", "💼"}:
-                before = "\n".join(before_lines[:-1]).rstrip()
+            while before_lines and before_lines[-1].strip() in {"💰", "💼", ""}:
+                last = before_lines[-1].strip()
+                before_lines.pop()
+                if last in {"💰", "💼"}:
+                    break
+            before = "\n".join(before_lines).rstrip()
 
-            return before + "\n\n" + block + "\n" + after
+            return _clean_orphan_wallet_icon_before_daily_balance(
+                before + "\n\n" + block + "\n" + after
+            )
 
-    return block + "\n" + value
+    return _clean_orphan_wallet_icon_before_daily_balance(block + "\n" + value)
 
 def _simulation_header(text: str) -> str:
     return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
@@ -1396,12 +1436,15 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     ])
 
     for _cmd, _value in list(out.items()):
-        if (
-            isinstance(_value, str)
-            and (_cmd.startswith("/report_simulation") or _cmd.startswith("/simulation"))
-            and not _value.lstrip().startswith("🧪 Simulation Mode")
-        ):
-            out[_cmd] = _simulation_header(_value)
+        if not isinstance(_value, str):
+            continue
+        if not (_cmd.startswith("/report_simulation") or _cmd.startswith("/simulation")):
+            continue
+
+        _value = _clean_orphan_wallet_icon_before_daily_balance(_value)
+        if not _value.lstrip().startswith("🧪 Simulation Mode"):
+            _value = _simulation_header(_value)
+        out[_cmd] = _value
 
     return out
 
@@ -2547,12 +2590,14 @@ def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
 
 
 def _get_signal_delivery_mode(settings: Settings) -> str:
-    mode = str(getattr(settings, "signal_delivery_mode", "scan") or "scan").strip().lower()
-    return mode if mode in {"scan", "trading", "simulation"} else "scan"
+    # Default after restart/deploy: Simulation.
+    # Explicit Railway/config value still wins if set to scan/trading/simulation.
+    mode = str(getattr(settings, "signal_delivery_mode", "simulation") or "simulation").strip().lower()
+    return mode if mode in {"scan", "trading", "simulation"} else "simulation"
 
 
 def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
-    normalized = str(mode or "scan").strip().lower()
+    normalized = str(mode or "simulation").strip().lower()
     if normalized not in {"scan", "trading", "simulation"}:
         return False
     try:
