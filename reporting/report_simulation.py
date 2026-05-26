@@ -3,86 +3,99 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from reporting.report_router import build_report_bundle, build_command_outputs
 from reporting.report_execution import build_execution_report
+from reporting.report_open_trades import build_open_trades_report
+from reporting.report_wallet import build_wallet_report
+from reporting.report_profit_analysis import build_profit_analysis_report
+from reporting.report_losses_analysis import build_losses_analysis_report
+from reporting.report_intelligence import build_execution_intelligence_report
+from reporting.report_diagnostics import build_diagnostics_report
+from reporting.report_format import filter_checks_by_period, filter_trades_by_period
 
 
-_RESERVED_COMMANDS = {
-    "/help",
-    "/start",
-    "/status",
-    "/mood",
-    "/okx_control",
-    "/help_execution",
-    "/help_normal",
-    "/diagnostics_help",
-    "/help_diagnostics",
-    "/bot_modes",
-    "/modes",
-    "/mode",
-}
+PERIODS = [
+    ("", "since_start"),
+    ("_month", "month"),
+    ("_7d", "last_7d"),
+    ("_today", "today"),
+    ("_1h", "last_1h"),
+]
 
 
 def _simulation_header(text: str) -> str:
-    return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
-
-
-def _simulation_aliases_for_execution_command(command_key: str) -> list[str]:
-    command_key = str(command_key or "").strip()
-    if not command_key.startswith("/"):
-        command_key = "/" + command_key
-
-    aliases: list[str] = []
-    if command_key == "/report_execution":
-        aliases.append("/report_simulation")
-    elif command_key.startswith("/report_execution_"):
-        suffix = command_key[len("/report_execution_"):]
-        aliases.append("/report_simulation_" + suffix)
-
-    if command_key.startswith("/report_"):
-        aliases.append(command_key.replace("/report_", "/report_simulation_", 1))
-
-    return list(dict.fromkeys(a for a in aliases if a and a not in {"/report_simulation_execution"}))
+    return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "").strip()
 
 
 def _compact_tradingview_links(text: str) -> str:
-    """Compact TradingView display only in Simulation reports.
+    """Compact TradingView links only inside Simulation reports.
 
-    Keeps shared report_format.py unchanged so Execution/Normal reports are not affected.
+    We keep the actual URL in an HTML anchor so Telegram shows only TV.
+    This module must not touch shared report_format.py.
     """
     value = str(text or "")
+    url = r"https://www\.tradingview\.com/chart/\?symbol=[^\s<]+"
 
-    # Existing format from report_format.trade_card_lines:
-    # 🔗 TradingView: https://www.tradingview.com/chart/?symbol=OKX:BTCUSDT.P
-    pattern = re.compile(r"🔗 TradingView:\s*(https://www\.tradingview\.com/chart/\?symbol=[^\s<]+)")
-    value = pattern.sub(r'🔗 <a href="\1">TV</a>', value)
+    # Original shared formatter:
+    # 🔗 TradingView: https://...
+    value = re.sub(rf"🔗\s*TradingView:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
+
+    # Some previous versions already changed label to TV but left the URL visible:
+    # 🔗 TV: https://...
+    value = re.sub(rf"🔗\s*TV:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
+
+    # Fallback if the icon is missing.
+    value = re.sub(rf"(?m)^TV:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
 
     return value
 
 
-def _inject_account_summary(text: str, account_summary: str | None = None) -> str:
-    value = str(text or "").strip()
-    block = str(account_summary or "").strip()
-    if not block:
-        return value
+def _inject_top_block(execution_style_report: str, account_summary: str | None = None) -> str:
+    """Add the Simulation-only top block, then leave the execution-style report intact.
 
-    if "Simulation Daily Balance" in value and "Simulation Equity Curve" in value:
-        return value
+    The user requirement is: Simulation report = Execution report style/order/terms,
+    with only the upper Simulation balance/equity block added.
+    """
+    report = str(execution_style_report or "").strip()
+    top = str(account_summary or "").strip()
+    if not top:
+        return report
 
-    # Put the Simulation-only top block immediately before Wallet Impact,
-    # leaving the execution report sections identical afterwards.
-    for marker in ("💰 Wallet Impact", "💼 Wallet Impact", "Wallet Impact"):
-        idx = value.find(marker)
-        if idx >= 0:
-            before = value[:idx].rstrip()
-            after = value[idx:].lstrip()
-            return (before + "\n\n" + block + "\n" + after).strip()
+    if "Simulation Daily Balance" in report and "Simulation Equity Curve" in report:
+        return report
 
-    return (block + "\n" + value).strip()
+    # Keep the execution report header and Quick Stats order exactly as generated.
+    return (top + "\n" + report).strip()
 
 
 def _decorate(text: str, account_summary: str | None = None) -> str:
-    return _simulation_header(_compact_tradingview_links(_inject_account_summary(text, account_summary)))
+    return _simulation_header(_compact_tradingview_links(_inject_top_block(text, account_summary)))
+
+
+def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, account_summary: str | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for suffix, period in PERIODS:
+        checks = filter_checks_by_period(sim_checks, period)
+        trades = filter_trades_by_period(sim_trades, period)
+        out[f"/report_simulation{suffix}"] = _decorate(
+            build_execution_report(
+                checks,
+                trades,
+                title="🚀 تقرير أداء التنفيذ",
+                period=period,
+                table=False,
+            ),
+            account_summary,
+        )
+        out[f"/report_simulation_open{suffix}"] = _decorate(
+            build_open_trades_report(
+                trades,
+                title="🚀📂 صفقات التنفيذ المفتوحة",
+                execution_only=True,
+                period=period,
+            ),
+            account_summary,
+        )
+    return out
 
 
 def build_simulation_command_outputs(
@@ -92,74 +105,69 @@ def build_simulation_command_outputs(
     wallet_text: str | None = None,
     daily_balance_text: str | None = None,
 ) -> dict[str, str]:
-    """Build Simulation report command outputs in an isolated report module.
+    """Build Simulation reports in an isolated module.
 
-    This intentionally mirrors Execution report formatting by feeding only
-    simulation data into the existing report builders:
-    - simulation_trades
-    - simulation_execution_results
-    - simulation_signal_items
+    Uses only:
+    - result["simulation_trades"]
+    - result["simulation_execution_results"]
+    - result["simulation_signal_items"]
 
-    Execution and Normal reports are not modified.
+    It deliberately mirrors execution report builders/terms/order without
+    modifying execution, normal reports, or shared report_format.py.
     """
     sim_trades = list((result or {}).get("simulation_trades", []) or [])
     sim_checks = list((result or {}).get("simulation_execution_results", []) or [])
     sim_items = list((result or {}).get("simulation_signal_items", []) or [])
 
-    try:
-        reports = build_report_bundle(sim_trades, sim_checks, sim_items)
-        commands = build_command_outputs(sim_trades, sim_checks, sim_items)
-    except Exception as exc:
-        print(f"⚠️ Simulation reports build failed: {exc}", flush=True)
-        reports = {}
-        commands = {}
+    out = _periodic_execution_style_reports(sim_checks, sim_trades, account_summary)
 
-    out: dict[str, str] = {}
-    merged = {**reports, **commands}
+    # Same report families as execution, but under /report_simulation_*.
+    out["/report_simulation_wallet"] = _decorate(
+        build_wallet_report(sim_trades, title="💼 Wallet Impact — Execution"),
+        account_summary,
+    )
+    out["/report_simulation_profit_analysis"] = _decorate(
+        build_profit_analysis_report(sim_trades, title="📈 تحليل أسباب أرباح التنفيذ"),
+        account_summary,
+    )
+    out["/report_simulation_losses_analysis"] = _decorate(
+        build_losses_analysis_report(sim_trades, title="📉 تحليل أسباب خسائر التنفيذ"),
+        account_summary,
+    )
+    out["/report_simulation_intelligence"] = _decorate(
+        build_execution_intelligence_report(sim_trades, sim_checks, "🧠🚀 ذكاء صفقات التنفيذ"),
+        account_summary,
+    )
+    out["/report_simulation_diagnostics"] = _decorate(
+        build_diagnostics_report(sim_items, sim_checks),
+        account_summary,
+    )
 
-    for key, value in merged.items():
-        if not isinstance(value, str) or not value.strip():
-            continue
+    # Period aliases for analysis reports. These builders filter by trade period only.
+    for suffix, period in PERIODS[1:]:
+        trades = filter_trades_by_period(sim_trades, period)
+        checks = filter_checks_by_period(sim_checks, period)
+        out[f"/report_simulation_profit_analysis{suffix}"] = _decorate(
+            build_profit_analysis_report(trades, title="📈 تحليل أسباب أرباح التنفيذ"),
+            account_summary,
+        )
+        out[f"/report_simulation_losses_analysis{suffix}"] = _decorate(
+            build_losses_analysis_report(trades, title="📉 تحليل أسباب خسائر التنفيذ"),
+            account_summary,
+        )
+        out[f"/report_simulation_intelligence{suffix}"] = _decorate(
+            build_execution_intelligence_report(trades, checks, "🧠🚀 ذكاء صفقات التنفيذ"),
+            account_summary,
+        )
+        out[f"/report_simulation_diagnostics{suffix}"] = _decorate(
+            build_diagnostics_report(sim_items, checks),
+            account_summary,
+        )
 
-        command_key = str(key)
-        if not command_key.startswith("/"):
-            command_key = "/" + command_key
-        if command_key in _RESERVED_COMMANDS:
-            continue
-
-        for alias in _simulation_aliases_for_execution_command(command_key):
-            if alias not in _RESERVED_COMMANDS:
-                out[alias] = _decorate(value, account_summary)
-
-        if command_key.startswith("/simulation_"):
-            out[command_key] = _decorate(value, account_summary)
-
-    if "/report_simulation" not in out:
-        try:
-            fallback_report = build_execution_report(
-                sim_checks,
-                sim_trades,
-                title="🧪 تقرير أداء المحاكاة",
-                period="since_start",
-                table=False,
-            )
-        except Exception:
-            fallback_report = (
-                merged.get("/report_execution")
-                or merged.get("report_execution")
-                or merged.get("/report_all")
-                or merged.get("report_all")
-                or ""
-            )
-        if isinstance(fallback_report, str) and fallback_report.strip():
-            out["/report_simulation"] = _decorate(fallback_report, account_summary)
-
+    # Dedicated wallet/daily commands can keep their compact Simulation-only wallet panel.
     if wallet_text:
         out["/simulation_wallet"] = str(wallet_text)
-        out["/report_simulation_wallet"] = str(wallet_text)
-        out["/report_simulation_wallet_7d"] = str(wallet_text)
-        out["/report_simulation_wallet_today"] = str(wallet_text)
-
+        out["/report_simulation_wallet_panel"] = str(wallet_text)
     if daily_balance_text:
         out["/report_simulation_daily_balance"] = str(daily_balance_text)
         out["/simulation_daily_balance"] = str(daily_balance_text)
