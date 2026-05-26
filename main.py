@@ -45,6 +45,7 @@ from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
 from tracking.persistence import RedisTradeStore, trade_to_dict, trade_from_dict
 from reporting.report_router import build_report_bundle, build_command_outputs
+from reporting.report_simulation import build_simulation_command_outputs as build_simulation_report_command_outputs
 from reporting.help_menus import (
     build_main_menu_layout,
     build_main_inline_keyboard,
@@ -1352,66 +1353,14 @@ def _simulation_command_aliases_for_execution_command(command_key: str) -> list[
 
 
 def _build_simulation_command_outputs(result: dict) -> dict:
-    sim_trades = list(result.get("simulation_trades", []) or [])
-    sim_checks = result.get("simulation_execution_results", []) or []
-    sim_items = result.get("simulation_signal_items", []) or []
-    wallet = _build_simulation_wallet_snapshot(sim_trades)
+    """Build Simulation reports through reporting/report_simulation.py only.
 
-    try:
-        reports = build_report_bundle(sim_trades, sim_checks, sim_items)
-        commands = build_command_outputs(sim_trades, sim_checks, sim_items)
-    except Exception as exc:
-        print(f"⚠️ Simulation reports build failed: {exc}", flush=True)
-        reports = {}
-        commands = {}
-
-    out: dict[str, str] = {}
-    reserved_commands = {
-        "/help",
-        "/start",
-        "/status",
-        "/mood",
-        "/okx_control",
-        "/help_execution",
-        "/help_normal",
-        "/diagnostics_help",
-        "/help_diagnostics",
-        "/bot_modes",
-        "/modes",
-        "/mode",
-    }
-
-    merged = {**reports, **commands}
-    for key, value in merged.items():
-        if not isinstance(value, str) or not value.strip():
-            continue
-
-        command_key = str(key)
-        if not command_key.startswith("/"):
-            command_key = "/" + command_key
-        if command_key in reserved_commands:
-            continue
-
-        # Main supported mapping: execution reports -> simulation reports.
-        for alias in _simulation_command_aliases_for_execution_command(command_key):
-            if alias not in reserved_commands:
-                out[alias] = _simulation_header(_inject_simulation_account_summary(value, result))
-
-        # Backward-compatible aliases for any existing simulation_* keys.
-        if command_key.startswith("/simulation_"):
-            out[command_key] = _simulation_header(_inject_simulation_account_summary(value, result))
-
-    # Hard fallbacks: if report bundle returns a plain execution report but no command alias,
-    # expose a useful /report_simulation instead of letting the router fall through.
-    if "/report_simulation" not in out:
-        fallback_report = (
-            merged.get("/report_execution")
-            or merged.get("report_execution")
-            or merged.get("/report_all")
-            or merged.get("report_all")
-        )
-        if isinstance(fallback_report, str) and fallback_report.strip():
-            out["/report_simulation"] = _simulation_header(_inject_simulation_account_summary(fallback_report, result))
+    Important:
+    - Uses simulation_trades / simulation_execution_results only.
+    - Does not touch execution reports.
+    - Keeps shared report_format.py unchanged.
+    """
+    wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
 
     wallet_text = "\n".join([
         _build_simulation_account_summary(result),
@@ -1431,13 +1380,6 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     ])
     wallet_text = _simulation_header(wallet_text)
 
-    # Wallet aliases.
-    out["/simulation_wallet"] = wallet_text
-    if "/report_simulation_open" in out:
-        out["/simulation_open"] = out["/report_simulation_open"]
-    out["/report_simulation_wallet"] = wallet_text
-    out["/report_simulation_wallet_7d"] = wallet_text
-    out["/report_simulation_wallet_today"] = wallet_text
     daily_balance_text = _simulation_header("\n".join([
         "📅 <b>رصيد المحاكاة اليومي</b>",
         "━━━━━━━━━━━━",
@@ -1447,34 +1389,13 @@ def _build_simulation_command_outputs(result: dict) -> dict:
             limit=10,
         ),
     ]))
-    out["/report_simulation_daily_balance"] = daily_balance_text
-    out["/simulation_daily_balance"] = daily_balance_text
 
-    # Mode overview.
-    out["/simulation"] = "\n".join([
-        "🧪 Simulation Mode",
-        "━━━━━━━━━━━━",
-        "Mirror كامل لوضع التداول.",
-        "• نفس شروط الترشيح والتنفيذ",
-        "• لا يرسل أوامر OKX Live",
-        "• يفتح صفقات داخلية بمحفظة محاكاة",
-        "",
-        wallet_text,
-    ])
-
-    for _cmd, _value in list(out.items()):
-        if not isinstance(_value, str):
-            continue
-        if not (_cmd.startswith("/report_simulation") or _cmd.startswith("/simulation")):
-            continue
-
-        _value = _clean_orphan_wallet_icon_before_daily_balance(_value)
-        if not _value.lstrip().startswith("🧪 Simulation Mode"):
-            _value = _simulation_header(_value)
-        out[_cmd] = _value
-
-    return out
-
+    return build_simulation_report_command_outputs(
+        result,
+        account_summary=_build_simulation_account_summary(result),
+        wallet_text=wallet_text,
+        daily_balance_text=daily_balance_text,
+    )
 
 def run_once(
     previous_state: MarketModeState | None = None,
