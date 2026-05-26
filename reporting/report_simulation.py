@@ -49,6 +49,39 @@ def _compact_tradingview_links(text: str) -> str:
     return value
 
 
+def _strip_inherited_execution_title(text: str) -> str:
+    """Remove only the inherited execution title from Simulation reports.
+
+    The report keeps the same execution section order and labels, but the visible
+    title must not say "execution" after the Simulation header/top block.
+    """
+    lines = str(text or "").splitlines()
+    cleaned: list[str] = []
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if not removed and stripped in {"🚀 تقرير أداء التنفيذ", "🚀 تقرير الصفقات المرشحة — Execution"}:
+            removed = True
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def _polish_wallet_impact_rtl(text: str) -> str:
+    """Simulation-only RTL polish for Wallet Impact.
+
+    Avoid changing shared report_format.py. This only rewrites the capital line
+    that Telegram Android renders badly when Arabic and USD are mixed together.
+    """
+    value = str(text or "")
+    value = re.sub(
+        r"(?m)^📌\s*رأس المال:\s*([^\n]+)$",
+        r"📌 رأس المال\n<b>\1</b>",
+        value,
+    )
+    return value
+
+
 def _inject_top_block(execution_style_report: str, account_summary: str | None = None) -> str:
     """Add the Simulation-only top block, then leave the execution-style report intact.
 
@@ -68,7 +101,11 @@ def _inject_top_block(execution_style_report: str, account_summary: str | None =
 
 
 def _decorate(text: str, account_summary: str | None = None) -> str:
-    return _simulation_header(_compact_tradingview_links(_inject_top_block(text, account_summary)))
+    value = _inject_top_block(text, account_summary)
+    value = _strip_inherited_execution_title(value)
+    value = _polish_wallet_impact_rtl(value)
+    value = _compact_tradingview_links(value)
+    return _simulation_header(value)
 
 
 def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, account_summary: str | None) -> dict[str, str]:
