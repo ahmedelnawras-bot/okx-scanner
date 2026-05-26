@@ -1233,108 +1233,34 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
 
 
 def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
-    """Remove orphan wallet emoji lines before Daily Balance.
+    """Remove orphan wallet emoji line that old reports may leave before Daily Balance.
 
     Some report bundles render Wallet Impact as:
         💰
         Wallet Impact
 
-    When Daily Balance is injected before Wallet Impact, that standalone emoji
-    can remain above the block. This removes only standalone wallet icons that
-    appear before the Daily Balance block and before Wallet Impact.
+    When the Daily Balance block is injected before "Wallet Impact", the standalone
+    emoji can remain above Daily Balance. This cleanup removes only that orphan
+    wallet/briefcase line when it directly precedes the Daily Balance block.
     """
     lines = str(text or "").splitlines()
     cleaned: list[str] = []
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        if stripped in {"💰", "💼"}:
-            lookahead_lines = lines[idx + 1: idx + 12]
-            lookahead = "\n".join(lookahead_lines)
-            next_section = next((x.strip() for x in lookahead_lines if x.strip()), "")
-            if (
-                "Daily Balance" in lookahead
-                or next_section in {"💰 Daily Balance", "Daily Balance"}
-            ):
-                continue
+        is_orphan_icon = stripped in {"💰", "💼"}
+        next_few = "\n".join(lines[idx + 1: idx + 5])
+        if is_orphan_icon and "💰 Daily Balance" in next_few:
+            continue
         cleaned.append(line)
 
     value = "\n".join(cleaned)
-
-    # Also catch the exact pattern after previous formatting passes.
-    value = re.sub(
-        r"(?m)^[ \t]*[💰💼][ \t]*\n+(?=[💰💼]?\s*Daily Balance)",
-        "",
-        value,
-    )
 
     # Collapse excessive blank lines around the injected block.
     value = re.sub(r"\n{3,}(💰 Daily Balance)", r"\n\n\1", value)
     value = re.sub(r"(━━━━━━━━━━━━)\n{2,}(📍 بداية اليوم)", r"\1\n\2", value)
     return value.strip()
 
-
-def _bold_simulation_wallet_kpis(text: str) -> str:
-    """Bold the important Simulation wallet KPI numbers.
-
-    Targets:
-    - net realized line after الصافي
-    - net floating line after Total Floating PnL / العائم الصافي
-    - final current portfolio impact line after التأثير الحالي على المحفظة
-    """
-    value = str(text or "")
-    if "<b>" in value:
-        return value
-
-    lines = value.splitlines()
-    out: list[str] = []
-    pending = ""
-
-    def bold_money_line(line: str) -> str:
-        # Bold the leading signed money amount and optional percentage after |
-        return re.sub(
-            r"^([🟢🔴]?\s*)([+-]\d+(?:\.\d+)?\$)(\s*\|\s*)([+-]\d+(?:\.\d+)?%)(.*)$",
-            r"\1<b>\2</b>\3<b>\4</b>\5",
-            line,
-        )
-
-    def bold_single_money_line(line: str) -> str:
-        return re.sub(
-            r"^([🟢🔴]?\s*)([+-]\d+(?:\.\d+)?\$)(.*)$",
-            r"\1<b>\2</b>\3",
-            line,
-        )
-
-    for line in lines:
-        stripped = line.strip()
-
-        if pending == "net_realized":
-            line = bold_money_line(line)
-            pending = ""
-        elif pending == "net_floating":
-            line = bold_money_line(line)
-            pending = ""
-        elif pending == "final_impact":
-            line = bold_single_money_line(line)
-            pending = ""
-
-        if stripped in {"الصافي ⚖️", "⚖️ الصافي", "الصافي"}:
-            pending = "net_realized"
-        elif "Total Floating PnL" in stripped or stripped in {"⚖️ العائم الصافي", "العائم الصافي ⚖️"}:
-            pending = "net_floating"
-        elif "التأثير الحالي على المحفظة" in stripped:
-            pending = "final_impact"
-
-        out.append(line)
-
-    return "\n".join(out)
-
-
-def _format_simulation_report_text_for_telegram(text: str) -> str:
-    value = _clean_orphan_wallet_icon_before_daily_balance(str(text or ""))
-    if "Daily Balance" in value or "Wallet Impact" in value or "Simulation Mode" in value:
-        value = _bold_simulation_wallet_kpis(value)
-    return value
 
 def _inject_simulation_account_summary(text: str, result: dict | None = None) -> str:
     value = _clean_orphan_wallet_icon_before_daily_balance(str(text or ""))
@@ -1515,7 +1441,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         if not (_cmd.startswith("/report_simulation") or _cmd.startswith("/simulation")):
             continue
 
-        _value = _format_simulation_report_text_for_telegram(_value)
+        _value = _clean_orphan_wallet_icon_before_daily_balance(_value)
         if not _value.lstrip().startswith("🧪 Simulation Mode"):
             _value = _simulation_header(_value)
         out[_cmd] = _value
@@ -2606,7 +2532,7 @@ def _chunk_text_for_telegram(text: str, max_len: int = 3600) -> list[str]:
 
 
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None):
-    raw_text = _format_simulation_report_text_for_telegram(str(text or ""))
+    raw_text = str(text or "")
 
     # Telegram hard-limits message size. Long reports are split safely.
     if len(raw_text) > 3800:
