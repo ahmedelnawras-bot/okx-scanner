@@ -716,6 +716,43 @@ def _format_market_context_line(signal: SignalCandidate, execution_result: dict 
 
 
 
+
+
+def _localized_warning_notes(warnings, limit: int = 3) -> list[str]:
+    """Return clean Arabic notes for Telegram signal messages.
+
+    Keeps the signal card readable by translating known technical warnings
+    and hiding broken/mojibake text.
+    """
+    warning_rules = [
+        (("weak breakout", "weak_breakout", "failed breakout", "fake breakout", "pa_weak_breakout"), "ضعف تأكيد الاختراق"),
+        (("volume not supportive", "low volume", "weak volume", "volume_state", "exhaustion"), "حجم التداول غير داعم"),
+        (("near resistance", "resistance rejection", "4h block", "resistance", "rejection"), "ارتداد قريب من المقاومة"),
+    ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for raw in list(warnings or [])[: max(1, int(limit or 3))]:
+        cleaned = _clean_display_text(raw)
+        if not cleaned:
+            continue
+
+        key = cleaned.lower().strip()
+        translated = ""
+        for patterns, label in warning_rules:
+            if any(pattern in key for pattern in patterns):
+                translated = label
+                break
+
+        value = translated or cleaned
+        if value and value not in seen:
+            out.append(value)
+            seen.add(value)
+
+    return out
+
+
 def build_signal_message(signal: SignalCandidate, execution_result: dict | None = None) -> str:
     """Build Telegram signal message.
 
@@ -790,13 +827,9 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             lines.append(f"• Reason: {_clean_display_text(_clean_name(str(reason)))}")
 
         if signal.warnings:
-            cleaned_warnings = [
-                _clean_display_text(w)
-                for w in signal.warnings[:3]
-                if _clean_display_text(w)
-            ]
+            cleaned_warnings = _localized_warning_notes(signal.warnings, limit=3)
             if cleaned_warnings:
-                lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in cleaned_warnings]])
+                lines.extend(["", "⚠️ ملاحظات", *[f"• {w}" for w in cleaned_warnings]])
 
         return "\n".join(lines)
 
@@ -839,13 +872,9 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
     ])
 
     if signal.warnings:
-        cleaned_warnings = [
-            _clean_display_text(w)
-            for w in signal.warnings[:3]
-            if _clean_display_text(w)
-        ]
+        cleaned_warnings = _localized_warning_notes(signal.warnings, limit=3)
         if cleaned_warnings:
-            lines.extend(["", "⚠️ Notes", *[f"• {w}" for w in cleaned_warnings]])
+            lines.extend(["", "⚠️ ملاحظات", *[f"• {w}" for w in cleaned_warnings]])
 
     if execution_result:
         lines.extend([
