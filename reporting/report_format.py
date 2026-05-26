@@ -328,7 +328,7 @@ def trade_card_lines(
 
         f"🧠 {clean_setup(t)}",
 
-        f"🔗 TradingView: {tradingview_url(t.symbol)}",
+        f'🔗 <a href="{tradingview_url(t.symbol)}">TradingView</a>',
     ]
 
 
@@ -464,55 +464,43 @@ def wallet_impact_lines(
 
     total = closed_net + floating_net
 
+    def _code(value: str) -> str:
+        return f"<code>{value}</code>"
+
+    def _money_pct_line(pct: float, label: str = "") -> str:
+        usd = money_from_exposure_pct(pct)
+        icon = "🟢" if usd >= 0 else "🔴"
+        suffix = f" {label}" if label else ""
+        return f"{icon} {_code(f'{usd:+.2f}$ | {pct:+.2f}%{suffix}')}"
+
+    def _money_only_line(value: float) -> str:
+        icon = "🟢" if value >= 0 else "🔴"
+        return f"{icon} {_code(f'{value:+.2f}$')}"
+
     return [
         f"💰 <b>{title}</b>",
-        f"📌 رأس المال: {starting_balance:.0f}$",
-
-        "",
+        "📌 رأس المال",
+        _code(f"{starting_balance:.0f}$"),
 
         "✅ <b>الصفقات المغلقة</b>",
-
         "📈 الأرباح",
-
-        f"{money_from_exposure_pct(closed_profit):+.2f}$ | "
-        f"{closed_profit:+.2f}% Realized PnL",
-
+        _money_pct_line(closed_profit, "Realized PnL"),
         "📉 الخسائر",
-
-        f"{money_from_exposure_pct(closed_loss):+.2f}$ | "
-        f"{closed_loss:+.2f}% Realized PnL",
-
+        _money_pct_line(closed_loss, "Realized PnL"),
         "⚖️ الصافي",
-
-        f"<b>{money_line(money_from_exposure_pct(closed_net))} | "
-        f"{closed_net:+.2f}% Realized PnL</b>",
-
-        "",
+        _money_pct_line(closed_net, "Realized PnL"),
 
         "🔄 <b>الصفقات المفتوحة</b>",
-
         "📈 الأرباح العائمة",
-
-        f"{money_from_exposure_pct(floating_profit):+.2f}$ | "
-        f"{floating_profit:+.2f}% Total Floating PnL",
-
+        _money_pct_line(floating_profit, "Floating PnL"),
         "📉 الخسائر العائمة",
-
-        f"{money_from_exposure_pct(floating_loss):+.2f}$ | "
-        f"{floating_loss:+.2f}% Total Floating PnL",
-
-        "⚖️ Total Floating PnL",
-
-        f"<b>{money_line(money_from_exposure_pct(floating_net))} | "
-        f"{floating_net:+.2f}% Total Floating PnL</b>",
-
-        "",
+        _money_pct_line(floating_loss, "Floating PnL"),
+        "⚖️ صافي العائم",
+        _money_pct_line(floating_net, "Floating PnL"),
 
         "💼 <b>التأثير الحالي على المحفظة</b>",
-
-        f"<b>{money_line(money_from_exposure_pct(total))}</b>",
+        _money_only_line(money_from_exposure_pct(total)),
     ]
-
 
 def quick_stats_lines(
     trades: list[TrackedTrade],
