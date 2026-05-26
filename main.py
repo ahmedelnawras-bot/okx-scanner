@@ -2202,6 +2202,10 @@ def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None)
                 {"text": "🧠 Diagnostics", "callback_data": "menu:diagnostics"},
                 {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
             ],
+            [
+                {"text": "⚙️ Admin", "callback_data": "menu:admin"},
+                {"text": "📘 System Info", "callback_data": "menu:system_info"},
+            ],
         ]
     }
 
@@ -2412,11 +2416,260 @@ def _reset_runtime_state_after_clean(result: dict, *, keep_mode_state: bool = Tr
         result["mode"] = MODE_NORMAL_LONG
 
 
+
+def _build_admin_panel() -> str:
+    base = build_admin_help()
+    reset_lines = [
+        "",
+        "━━━━━━━━━━━━",
+        "🧹 <b>Reset Reports</b>",
+        "━━━━━━━━━━━━",
+        "الأوامر التالية تعمل Preview أولًا ثم تحتاج Confirm.",
+        "",
+        "🚀 <b>Execution</b>",
+        "/reset_reports_execution",
+        "/confirm_reset_reports_execution",
+        "",
+        "📊 <b>Normal</b>",
+        "/reset_reports_normal",
+        "/confirm_reset_reports_normal",
+        "",
+        "🧪 <b>Simulation</b>",
+        "/reset_reports_simulation",
+        "/confirm_reset_reports_simulation",
+        "",
+        "🧹 <b>All Reports</b>",
+        "/reset_reports_all",
+        "/confirm_reset_reports_all",
+        "",
+        "⚠️ لا تمسح هذه الأوامر: whitelist/config/replay/snapshots/mode state.",
+    ]
+    return "\n".join([str(base or "").rstrip(), *reset_lines])
+
+
+def _is_simulation_trade_record(trade) -> bool:
+    return str(getattr(trade, "trade_source", "") or "").strip().lower() == "simulation"
+
+
+def _is_execution_report_trade_record(trade) -> bool:
+    if _is_simulation_trade_record(trade):
+        return False
+    return bool(
+        getattr(trade, "execution_trade", False)
+        or str(getattr(trade, "tracking_bucket", "") or "").strip().lower() == "execution"
+    )
+
+
+def _is_normal_report_trade_record(trade) -> bool:
+    return not _is_simulation_trade_record(trade) and not _is_execution_report_trade_record(trade)
+
+
+def _delete_redis_keys_by_patterns(trade_store: RedisTradeStore | None, patterns: list[str]) -> int:
+    if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
+        return 0
+    client = trade_store.client
+    keys: set[str] = set()
+    try:
+        for pattern in patterns:
+            for key in client.scan_iter(pattern):
+                keys.add(str(key))
+        if keys:
+            return int(client.delete(*sorted(keys)) or 0)
+    except Exception as exc:
+        print(f"⚠️ reset redis delete failed: {exc}", flush=True)
+    return 0
+
+
+def _reset_reports_preview(kind: str, trade_store: RedisTradeStore | None, result: dict | None = None) -> dict:
+    live_trades = []
+    if trade_store:
+        try:
+            live_trades = trade_store.load_trades() or []
+        except Exception:
+            live_trades = []
+    if not live_trades and result is not None:
+        live_trades = list(result.get("trades", []) or [])
+
+    sim_trades = _load_simulation_trades(trade_store)
+    if not sim_trades and result is not None:
+        sim_trades = list(result.get("simulation_trades", []) or [])
+
+    execution_count = sum(1 for t in live_trades if _is_execution_report_trade_record(t))
+    normal_count = sum(1 for t in live_trades if _is_normal_report_trade_record(t))
+    simulation_count = len(sim_trades)
+
+    return {
+        "enabled": bool(trade_store and getattr(trade_store, "enabled", False)),
+        "kind": kind,
+        "execution": execution_count,
+        "normal": normal_count,
+        "simulation": simulation_count,
+        "total_live": len(live_trades),
+    }
+
+
+def _format_reset_reports_preview(stats: dict, confirm_command: str, title: str) -> str:
+    lines = [
+        title,
+        "━━━━━━━━━━━━",
+        f"Redis: {'ON' if stats.get('enabled') else 'OFF / runtime only'}",
+        f"Execution report trades: {int(stats.get('execution', 0) or 0)}",
+        f"Normal report trades: {int(stats.get('normal', 0) or 0)}",
+        f"Simulation report trades: {int(stats.get('simulation', 0) or 0)}",
+        "",
+        "⚠️ هذا Preview فقط.",
+        f"للتنفيذ أرسل: {confirm_command}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_reset_reports_done(stats: dict, title: str) -> str:
+    lines = [
+        title,
+        "━━━━━━━━━━━━",
+        f"Kept live trades: {int(stats.get('kept_live', 0) or 0)}",
+        f"Removed execution: {int(stats.get('removed_execution', 0) or 0)}",
+        f"Removed normal: {int(stats.get('removed_normal', 0) or 0)}",
+        f"Removed simulation: {int(stats.get('removed_simulation', 0) or 0)}",
+        f"Deleted simulation Redis keys: {int(stats.get('deleted_sim_keys', 0) or 0)}",
+        "",
+        "✅ تم تصفير التقارير المطلوبة بدون لمس الإعدادات أو whitelist أو replay/snapshots.",
+    ]
+    return "\n".join(lines)
+
+
+def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None) -> None:
+    if not isinstance(result, dict):
+        return
+
+    refreshed_trades = trade_store.load_trades() if trade_store else list(result.get("trades", []) or [])
+    refreshed_checks = trade_store.load_execution_checks(limit=500) if trade_store else list(result.get("execution_results", []) or [])
+    refreshed_sim_trades = _load_simulation_trades(trade_store)
+
+    result["trades"] = refreshed_trades
+    result["simulation_trades"] = refreshed_sim_trades
+    result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
+    result["simulation_execution_results"] = _load_simulation_execution_checks(trade_store, limit=500) if trade_store else []
+    result["simulation_signal_items"] = []
+    result["signal_items"] = []
+    result["signals"] = []
+    result["execution_results"] = refreshed_checks
+    result["current_execution_results"] = []
+
+    reports = build_report_bundle(refreshed_trades, refreshed_checks, [])
+    result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [])
+    result.update(reports)
+
+    portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
+    portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **portfolio_state_inputs)
+    result["portfolio_state"] = portfolio_state
+    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+    result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    result["loss_streak_guard"] = _build_loss_streak_guard(refreshed_trades)
+
+
+def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, result: dict | None = None) -> dict:
+    stats = _reset_reports_preview(kind, trade_store, result)
+    live_trades = []
+    if trade_store:
+        try:
+            live_trades = trade_store.load_trades() or []
+        except Exception:
+            live_trades = []
+    if not live_trades and result is not None:
+        live_trades = list(result.get("trades", []) or [])
+
+    kept_live = []
+    removed_execution = 0
+    removed_normal = 0
+
+    for trade in live_trades:
+        is_exec = _is_execution_report_trade_record(trade)
+        is_norm = _is_normal_report_trade_record(trade)
+
+        remove = False
+        if kind in {"execution", "all"} and is_exec:
+            remove = True
+            removed_execution += 1
+        elif kind in {"normal", "all"} and is_norm:
+            remove = True
+            removed_normal += 1
+
+        if not remove:
+            kept_live.append(trade)
+
+    if trade_store and getattr(trade_store, "enabled", False):
+        try:
+            trade_store.save_trades(kept_live)
+        except Exception as exc:
+            print(f"⚠️ save after report reset failed: {exc}", flush=True)
+
+    if result is not None:
+        result["trades"] = kept_live
+
+    removed_simulation = 0
+    deleted_sim_keys = 0
+    if kind in {"simulation", "all"}:
+        sim_trades = _load_simulation_trades(trade_store)
+        if not sim_trades and result is not None:
+            sim_trades = list(result.get("simulation_trades", []) or [])
+        removed_simulation = len(sim_trades)
+        deleted_sim_keys = _delete_redis_keys_by_patterns(
+            trade_store,
+            [
+                f"{SIMULATION_REDIS_PREFIX}:*",
+            ],
+        )
+        if result is not None:
+            result["simulation_trades"] = []
+            result["simulation_execution_results"] = []
+            result["simulation_signal_items"] = []
+            result["simulation_wallet"] = _build_simulation_wallet_snapshot([])
+
+    _refresh_runtime_after_report_reset(result, trade_store=trade_store)
+
+    stats.update({
+        "kept_live": len(kept_live),
+        "removed_execution": removed_execution,
+        "removed_normal": removed_normal,
+        "removed_simulation": removed_simulation,
+        "deleted_sim_keys": deleted_sim_keys,
+    })
+    return stats
+
+
 def _handle_admin_clean_command(
     command: str,
     trade_store: RedisTradeStore | None,
     result: dict | None = None,
 ) -> str | None:
+    reset_preview_commands = {
+        "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
+        "/reset_reports_normal": ("normal", "/confirm_reset_reports_normal", "📊 Reset Normal Reports Preview"),
+        "/reset_reports_simulation": ("simulation", "/confirm_reset_reports_simulation", "🧪 Reset Simulation Reports Preview"),
+        "/reset_reports_all": ("all", "/confirm_reset_reports_all", "🧹 Reset All Reports Preview"),
+    }
+    if command in reset_preview_commands:
+        kind, confirm_command, title = reset_preview_commands[command]
+        return _format_reset_reports_preview(
+            _reset_reports_preview(kind, trade_store, result),
+            confirm_command,
+            title,
+        )
+
+    reset_confirm_commands = {
+        "/confirm_reset_reports_execution": ("execution", "🚀 Reset Execution Reports Done"),
+        "/confirm_reset_reports_normal": ("normal", "📊 Reset Normal Reports Done"),
+        "/confirm_reset_reports_simulation": ("simulation", "🧪 Reset Simulation Reports Done"),
+        "/confirm_reset_reports_all": ("all", "🧹 Reset All Reports Done"),
+    }
+    if command in reset_confirm_commands:
+        kind, title = reset_confirm_commands[command]
+        return _format_reset_reports_done(
+            _reset_reports_confirm(kind, trade_store, result),
+            title,
+        )
+
     if command in {"/soft_clean", "/soft_clean_preview"}:
         stats = trade_store.clean_preview("soft") if trade_store else {"enabled": False}
         return _format_clean_preview(stats, "🧹 Soft Clean Preview", "/soft_clean_confirm")
@@ -2533,7 +2786,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             runtime_settings = settings or get_settings()
             _send_text(sender, _build_okx_control_panel(runtime_settings), reply_markup=_build_okx_control_keyboard(runtime_settings))
         elif key == "admin":
-            _send_text(sender, build_admin_help())
+            _send_text(sender, _build_admin_panel())
         elif key == "system_info":
             _send_text(sender, _build_fast_status(result, settings or get_settings()))
         else:
@@ -2644,7 +2897,7 @@ def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Set
 
     sender.send_message(
         dashboard,
-        reply_markup=_build_main_inline_keyboard_with_bot_modes(),
+        reply_markup=_build_main_inline_keyboard_with_bot_modes(settings),
     )
 
 
@@ -2696,10 +2949,10 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 "Diagnostics": "/report_diagnostics",
                 "🤖 OKX Control": "/okx_control",
                 "OKX Control": "/okx_control",
-                "⚙️ Admin": "/status",
-                "Admin": "/status",
-                "📘 System Info": "/help",
-                "System Info": "/help",
+                "⚙️ Admin": "/admin",
+                "Admin": "/admin",
+                "📘 System Info": "/status",
+                "System Info": "/status",
             }
             mapped = button_map.get(plain_text)
             if mapped:
@@ -2858,6 +3111,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
             elif command in ("/help_simulation", "/simulation_help"):
                 reply = _build_simulation_help()
+            elif command in ("/admin", "/help_admin"):
+                reply = _build_admin_panel()
             elif command in ("/bot_modes", "/modes", "/mode"):
                 reply = _build_bot_modes_panel(settings)
                 _send_text(sender, reply, reply_markup=_build_bot_modes_keyboard())
