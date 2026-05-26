@@ -366,6 +366,27 @@ def _resolve_portfolio_state_inputs(
 def _fmt_money(value: object) -> str:
     number = _safe_float(value, 0.0)
     return f"{number:.2f}" if abs(number) >= 1 else f"{number:.4f}"
+
+
+def _sim_code(value: object) -> str:
+    return f"<code>{value}</code>"
+
+
+def _sim_money(value: object, suffix: str = "USDT", signed: bool = False) -> str:
+    number = _safe_float(value, 0.0)
+    sign = "+" if signed and number >= 0 else ""
+    return _sim_code(f"{sign}{number:,.2f} {suffix}".strip())
+
+
+def _sim_pct(value: object, signed: bool = False) -> str:
+    number = _safe_float(value, 0.0)
+    sign = "+" if signed and number >= 0 else ""
+    return _sim_code(f"{sign}{number:.2f}%")
+
+
+def _sim_metric(label: str, value: object, icon: str = "•") -> str:
+    return f"{icon} {label}\n{_sim_code(value)}"
+
 def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[str, float]:
     price_map: dict[str, float] = {}
     for raw in raw_tickers or []:
@@ -1184,21 +1205,20 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
         icon = "🟢" if pnl >= 0 else "🔴"
 
         out.extend([
-            f"• {date} → {start_eq:,.0f}$ ⟶ {end_eq:,.0f}$",
-            f"{icon} {pnl:+,.2f}$",
+            f"• <b>{date}</b>",
+            f"Start → End: {_sim_code(f'{start_eq:,.2f} → {end_eq:,.2f} USDT')}",
+            f"{icon} Change: {_sim_code(f'{pnl:+,.2f} USDT')}",
         ])
 
     return out
 
-
 def _build_simulation_account_summary(result: dict | None = None) -> str:
-    """Small paper-account block for Simulation reports.
+    """Small paper-account block for Simulation reports only.
 
-    It shows:
-    - start-of-day balance
-    - current virtual balance
-    - current risk/protection status
-    - a compact daily equity curve
+    Keep formatting Telegram-friendly:
+    - section titles use <b>
+    - important numbers use <code>
+    - avoid mixing long Arabic/English/numeric text in one line
     """
     result = result or {}
     sim_trades = list(result.get("simulation_trades", []) or [])
@@ -1211,26 +1231,35 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
         _safe_float(wallet.get("equity"), start_balance),
     )
     growth_pct = ((current_balance - start_balance) / start_balance * 100.0) if start_balance else 0.0
+    delta = current_balance - start_balance
     risk_mode = _simulation_protection_label(result)
+    realized = _safe_float(wallet.get("realized"), 0.0)
+    floating = _safe_float(wallet.get("floating"), 0.0)
 
     rows = list(result.get("simulation_daily_log", []) or [])
     equity_rows = _format_simulation_equity_curve_rows(rows, daily_row, limit=5)
 
     daily_lines = [
-        "💰 Daily Balance",
+        "💰 <b>Simulation Daily Balance</b>",
         "━━━━━━━━━━━━",
-        f"📍 بداية اليوم: {start_balance:,.2f}$",
-        f"💼 الحالي: {current_balance:,.2f}$",
-        f"{'📈' if growth_pct >= 0 else '📉'} نمو اليوم: {growth_pct:+.2f}%",
-        f"🛡 الحماية: {risk_mode}",
+        "📍 بداية اليوم",
+        _sim_money(start_balance),
+        "💼 الرصيد الحالي",
+        _sim_money(current_balance),
+        f"{'🟢' if delta >= 0 else '🔴'} صافي اليوم",
+        f"{_sim_money(delta, signed=True)} | {_sim_pct(growth_pct, signed=True)}",
+        "✅ المحقق",
+        _sim_money(realized, signed=True),
+        "📊 العائم",
+        _sim_money(floating, signed=True),
+        "🛡 وضع الحماية",
+        _sim_code(risk_mode),
         "",
-        "📊 Equity Curve",
+        "📈 <b>Simulation Equity Curve</b>",
         *equity_rows,
         "",
     ]
     return "\n".join(daily_lines)
-
-
 
 def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
     """Remove orphan wallet emoji line that old reports may leave before Daily Balance.
@@ -1394,13 +1423,18 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     wallet_text = "\n".join([
         _build_simulation_account_summary(result),
         "",
-        "🧪 Simulation Wallet",
+        "🧪 <b>Simulation Wallet</b>",
         "━━━━━━━━━━━━",
-        f"Start Balance: {wallet['start_balance']:.2f} USDT",
-        f"Equity: {wallet['equity']:.2f} USDT",
-        f"Realized: {wallet['realized']:+.2f} USDT",
-        f"Floating: {wallet['floating']:+.2f} USDT",
-        f"Open: {wallet['open_count']} | Closed: {wallet['closed_count']} | Total: {wallet['total_count']}",
+        "Start Balance",
+        _sim_money(wallet['start_balance']),
+        "Equity",
+        _sim_money(wallet['equity']),
+        "Realized",
+        _sim_money(wallet['realized'], signed=True),
+        "Floating",
+        _sim_money(wallet['floating'], signed=True),
+        "Trades",
+        _sim_code(f"Open {wallet['open_count']} | Closed {wallet['closed_count']} | Total {wallet['total_count']}"),
     ])
     wallet_text = _simulation_header(wallet_text)
 
@@ -1412,7 +1446,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     out["/report_simulation_wallet_7d"] = wallet_text
     out["/report_simulation_wallet_today"] = wallet_text
     daily_balance_text = _simulation_header("\n".join([
-        "📅 رصيد المحاكاة اليومي",
+        "📅 <b>رصيد المحاكاة اليومي</b>",
         "━━━━━━━━━━━━",
         *_format_simulation_equity_curve_rows(
             list(result.get("simulation_daily_log", []) or []),
@@ -2549,7 +2583,7 @@ def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = No
             _telegram_send_pause(0.45)
         return last_result
 
-    parse_mode = "HTML" if ("<b>" in raw_text or "<a " in raw_text) else None
+    parse_mode = "HTML" if ("<b>" in raw_text or "<code>" in raw_text or "<a " in raw_text) else None
     result = sender.send_message(raw_text, parse_mode=parse_mode, reply_markup=reply_markup)
 
     # If Telegram rejects HTML formatting, retry as plain text once.
