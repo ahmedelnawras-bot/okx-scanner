@@ -831,13 +831,27 @@ def _simulation_today_key(now: datetime | None = None) -> str:
 
 
 def _simulation_margin_usdt(balance: float, settings: Settings | None = None) -> float:
-    try:
-        slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
-    except Exception:
+    """Simulation sizing must mirror execution sizing exactly.
+
+    The only intended difference:
+    - Execution reference balance comes from OKX.
+    - Simulation reference balance comes from the virtual simulation wallet.
+
+    Therefore we reuse _risk_sizing_constants() so any future change in
+    execution allocation/slot rules automatically affects simulation too.
+    """
+    if settings is not None:
+        allocation_pct, slot_count = _risk_sizing_constants(settings)
+    else:
+        allocation_pct = SIMULATION_ALLOCATION_PCT
         slot_count = 7
-    allocation_pct = SIMULATION_ALLOCATION_PCT
-    if risk_manager_module is not None:
-        allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
+        if risk_manager_module is not None:
+            allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
+            slot_count = max(1, int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count))
+
+    if float(balance or 0.0) <= 0 or int(slot_count or 0) <= 0:
+        return 0.0
+
     return max(0.0, float(balance or 0.0) * (float(allocation_pct or 0.0) / 100.0) / float(slot_count))
 
 
@@ -1170,7 +1184,7 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
         icon = "🟢" if pnl >= 0 else "🔴"
 
         out.extend([
-            f"• {date} → ${start_eq:,.0f} ⟶ ${end_eq:,.0f}",
+            f"• {date} → {start_eq:,.0f}$ ⟶ {end_eq:,.0f}$",
             f"{icon} {pnl:+,.2f}$",
         ])
 
@@ -1205,12 +1219,10 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
     daily_lines = [
         "💰 Daily Balance",
         "━━━━━━━━━━━━",
-        "",
-        f"📍 بداية اليوم: ${start_balance:,.2f}",
-        f"💼 الرصيد الحالي: ${current_balance:,.2f}",
+        f"📍 بداية اليوم: {start_balance:,.2f}$",
+        f"💼 الحالي: {current_balance:,.2f}$",
         f"{'📈' if growth_pct >= 0 else '📉'} نمو اليوم: {growth_pct:+.2f}%",
-        "",
-        f"🛡 وضع الحماية: {risk_mode}",
+        f"🛡 الحماية: {risk_mode}",
         "",
         "📊 Equity Curve",
         *equity_rows,
@@ -1225,13 +1237,26 @@ def _inject_simulation_account_summary(text: str, result: dict | None = None) ->
         return value
 
     block = _build_simulation_account_summary(result)
-    wallet_markers = ["💼 Wallet Impact", "Wallet Impact"]
+
+    # Match the full title first. If we only match "Wallet Impact",
+    # an original "💰 Wallet Impact" title leaves a useless standalone 💰
+    # before the Daily Balance block.
+    wallet_markers = ["💰 Wallet Impact", "💼 Wallet Impact", "Wallet Impact"]
     for marker in wallet_markers:
         idx = value.find(marker)
         if idx >= 0:
-            return value[:idx].rstrip() + "\n\n" + block + "\n\n" + value[idx:].lstrip()
+            before = value[:idx].rstrip()
+            after = value[idx:].lstrip()
 
-    return block + "\n\n" + value
+            # Defensive cleanup for older report formats that had the icon
+            # on its own line immediately before "Wallet Impact".
+            before_lines = before.splitlines()
+            if before_lines and before_lines[-1].strip() in {"💰", "💼"}:
+                before = "\n".join(before_lines[:-1]).rstrip()
+
+            return before + "\n\n" + block + "\n" + after
+
+    return block + "\n" + value
 
 def _simulation_header(text: str) -> str:
     return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
