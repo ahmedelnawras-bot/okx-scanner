@@ -1120,6 +1120,113 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
 
 
 
+
+def _simulation_protection_label(result: dict | None = None) -> str:
+    result = result or {}
+    mode = str(result.get("mode") or "").strip()
+    if mode == MODE_BLOCK_LONGS:
+        return "BLOCKED"
+    if mode == MODE_RECOVERY_LONG:
+        return "RECOVERY"
+    if mode == MODE_STRONG_LONG_ONLY:
+        return "STRONG"
+    return "NORMAL"
+
+
+def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | None = None, limit: int = 5) -> list[str]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        day = str(item.get("date") or "").strip()
+        if not day:
+            continue
+        merged.append(item)
+        seen.add(day)
+
+    if isinstance(current_row, dict):
+        day = str(current_row.get("date") or "").strip()
+        if day:
+            merged = [item for item in merged if str(item.get("date") or "") != day]
+            merged.append(current_row)
+
+    if not merged:
+        merged = [{
+            "date": _simulation_today_key(),
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "open_trades": 0,
+        }]
+
+    merged = sorted(merged, key=lambda item: str(item.get("date") or ""))
+    selected = merged[-max(1, int(limit or 5)):]
+
+    out: list[str] = []
+    for item in selected:
+        day = str(item.get("date") or "-")
+        start = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+        current = _safe_float(item.get("current_balance") or item.get("end_balance"), start)
+        delta = current - start
+        icon = "🟢" if delta >= 0 else "🔴"
+        out.append(f"• {icon} {day}: ${start:,.2f} → ${current:,.2f} ({delta:+.2f}$)")
+    return out
+
+
+def _build_simulation_account_summary(result: dict | None = None) -> str:
+    """Small paper-account block for Simulation reports.
+
+    It shows:
+    - start-of-day balance
+    - current virtual balance
+    - current risk/protection status
+    - a compact daily equity curve
+    """
+    result = result or {}
+    sim_trades = list(result.get("simulation_trades", []) or [])
+    wallet = result.get("simulation_wallet") or _build_simulation_wallet_snapshot(sim_trades)
+    daily_row = result.get("simulation_daily_balance") or {}
+
+    start_balance = _safe_float(daily_row.get("start_balance"), _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT))
+    current_balance = _safe_float(
+        daily_row.get("current_balance") or daily_row.get("end_balance"),
+        _safe_float(wallet.get("equity"), start_balance),
+    )
+    daily_growth_pct = ((current_balance - start_balance) / start_balance * 100.0) if start_balance else 0.0
+
+    rows = list(result.get("simulation_daily_log", []) or [])
+    equity_rows = _format_simulation_equity_curve_rows(rows, daily_row, limit=5)
+
+    lines = [
+        "💰 Daily Balance",
+        f"• Start Of Day: ${start_balance:,.2f}",
+        f"• Current Balance: ${current_balance:,.2f}",
+        f"• Daily Growth: {daily_growth_pct:+.2f}%",
+        "",
+        "🛡 Risk Status",
+        f"• Protection Mode: {_simulation_protection_label(result)}",
+        "",
+        "📈 Equity Curve",
+        *equity_rows,
+    ]
+    return "\n".join(lines)
+
+
+def _inject_simulation_account_summary(text: str, result: dict | None = None) -> str:
+    value = str(text or "")
+    if "💰 Daily Balance" in value and "📈 Equity Curve" in value:
+        return value
+
+    block = _build_simulation_account_summary(result)
+    wallet_markers = ["💼 Wallet Impact", "Wallet Impact"]
+    for marker in wallet_markers:
+        idx = value.find(marker)
+        if idx >= 0:
+            return value[:idx].rstrip() + "\n\n" + block + "\n\n" + value[idx:].lstrip()
+
+    return block + "\n\n" + value
+
 def _simulation_header(text: str) -> str:
     return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
 
@@ -1195,11 +1302,11 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         # Main supported mapping: execution reports -> simulation reports.
         for alias in _simulation_command_aliases_for_execution_command(command_key):
             if alias not in reserved_commands:
-                out[alias] = _simulation_header(value)
+                out[alias] = _simulation_header(_inject_simulation_account_summary(value, result))
 
         # Backward-compatible aliases for any existing simulation_* keys.
         if command_key.startswith("/simulation_"):
-            out[command_key] = _simulation_header(value)
+            out[command_key] = _simulation_header(_inject_simulation_account_summary(value, result))
 
     # Hard fallbacks: if report bundle returns a plain execution report but no command alias,
     # expose a useful /report_simulation instead of letting the router fall through.
@@ -1211,9 +1318,11 @@ def _build_simulation_command_outputs(result: dict) -> dict:
             or merged.get("report_all")
         )
         if isinstance(fallback_report, str) and fallback_report.strip():
-            out["/report_simulation"] = _simulation_header(fallback_report)
+            out["/report_simulation"] = _simulation_header(_inject_simulation_account_summary(fallback_report, result))
 
     wallet_text = "\n".join([
+        _build_simulation_account_summary(result),
+        "",
         "🧪 Simulation Wallet",
         "━━━━━━━━━━━━",
         f"Start Balance: {wallet['start_balance']:.2f} USDT",
@@ -1231,7 +1340,15 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     out["/report_simulation_wallet"] = wallet_text
     out["/report_simulation_wallet_7d"] = wallet_text
     out["/report_simulation_wallet_today"] = wallet_text
-    daily_balance_text = _simulation_header(_build_simulation_daily_balance_text())
+    daily_balance_text = _simulation_header("\n".join([
+        "📅 Simulation Daily Balance",
+        "━━━━━━━━━━━━",
+        *_format_simulation_equity_curve_rows(
+            list(result.get("simulation_daily_log", []) or []),
+            result.get("simulation_daily_balance") or {},
+            limit=10,
+        ),
+    ]))
     out["/report_simulation_daily_balance"] = daily_balance_text
     out["/simulation_daily_balance"] = daily_balance_text
 
@@ -1577,6 +1694,7 @@ def run_once(
         "simulation_signal_items": signal_items if simulation_mode_active else [],
         "simulation_wallet": _build_simulation_wallet_snapshot(simulation_trades),
         "simulation_daily_balance": _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings),
+        "simulation_daily_log": _load_simulation_daily_log(trade_store),
         "trades": trades,
         "command_outputs": command_outputs,
         "simulation_command_outputs": {},
@@ -2825,6 +2943,8 @@ def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisT
     result["trades"] = refreshed_trades
     result["simulation_trades"] = refreshed_sim_trades
     result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
+    result["simulation_daily_balance"] = _ensure_simulation_daily_log(refreshed_sim_trades, trade_store=trade_store) if trade_store else _ensure_simulation_daily_log(refreshed_sim_trades)
+    result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
     result["simulation_execution_results"] = _load_simulation_execution_checks(trade_store, limit=500) if trade_store else []
     result["simulation_signal_items"] = []
     result["signal_items"] = []
@@ -2901,6 +3021,8 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
             result["simulation_execution_results"] = []
             result["simulation_signal_items"] = []
             result["simulation_wallet"] = _build_simulation_wallet_snapshot([])
+            result["simulation_daily_balance"] = _ensure_simulation_daily_log([], trade_store=trade_store)
+            result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
 
     _refresh_runtime_after_report_reset(result, trade_store=trade_store)
 
@@ -3112,6 +3234,10 @@ def _build_simulation_help() -> str:
         "💼 Wallet Impact",
         "/report_simulation_wallet",
         "/simulation_wallet",
+        "",
+        "📅 رصيد بداية اليوم",
+        "/report_simulation_daily_balance",
+        "/simulation_daily_balance",
         "",
         "🧠 ذكاء التنفيذ",
         "/report_simulation_intelligence",
