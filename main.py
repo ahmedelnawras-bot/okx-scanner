@@ -96,6 +96,15 @@ SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS = 45 * 60
 SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
 
+# Telegram send pacing.
+# This only spaces Telegram messages after decisions are already made.
+# It does not delay process_trade_candidate, OKX execution, slots, or simulation tracking.
+TELEGRAM_SEND_GAP_SECONDS = 0.65
+TELEGRAM_EXECUTION_SEND_GAP_SECONDS = 0.35
+TELEGRAM_NORMAL_SEND_GAP_SECONDS = 0.85
+TELEGRAM_COMMAND_POLL_SLEEP_SECONDS = 1.0
+
+
 # Simulation Trading Mode
 # Mirror of trading mode execution decisions, but with internal virtual execution.
 SIMULATION_START_BALANCE_USDT = 1000.0
@@ -2046,6 +2055,9 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
 
         send_result = _send_text(sender, text, reply_markup=build_signal_buttons(signal))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
+        _telegram_send_pause(
+            TELEGRAM_EXECUTION_SEND_GAP_SECONDS if is_execution else TELEGRAM_NORMAL_SEND_GAP_SECONDS
+        )
 
         if exchange_required:
             try:
@@ -2058,6 +2070,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                     ),
                     reply_markup=build_signal_buttons(signal),
                 )
+                _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
             except Exception:
                 pass
 
@@ -2137,6 +2150,23 @@ def _extract_commands(text: str) -> list[str]:
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None):
     parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
     return sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+def _telegram_send_pause(seconds: float | None = None) -> None:
+    """Small Telegram-only pacing pause to prevent bursty messages.
+
+    Safe by design:
+    - Called only after Telegram send calls.
+    - Not used inside the decision engine.
+    - Not used before OKX order submission.
+    """
+    try:
+        delay = float(TELEGRAM_SEND_GAP_SECONDS if seconds is None else seconds)
+    except Exception:
+        delay = TELEGRAM_SEND_GAP_SECONDS
+    if delay <= 0:
+        return
+    time.sleep(min(delay, 2.0))
 
 
 def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
@@ -3282,6 +3312,29 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
         _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
 
 
+
+def _poll_telegram_commands_safe(
+    sender: TelegramSender,
+    result: dict | None,
+    offset: int | None,
+    settings: Settings,
+    trade_store: RedisTradeStore | None,
+) -> int | None:
+    """Poll Telegram commands without waiting for the next full scan.
+
+    This keeps /status, /help, Admin, reset, and report commands responsive.
+    It intentionally does not run trading decisions; it only answers commands
+    using the latest completed result.
+    """
+    if result is None:
+        return offset
+    try:
+        return _answer_commands(sender, result, offset, settings, trade_store)
+    except Exception as exc:
+        print(f"telegram command polling error: {exc}", flush=True)
+        return offset
+
+
 def live_worker() -> None:
     settings = get_settings()
     sender = TelegramSender(settings.bot_token, settings.chat_id, timeout=settings.request_timeout)
@@ -3318,10 +3371,29 @@ def live_worker() -> None:
 
     while True:
         try:
+            # Answer pending Telegram commands before starting a potentially long scan.
+            if sender.enabled and settings.telegram_enabled and last_result is not None:
+                telegram_offset = _poll_telegram_commands_safe(
+                    sender,
+                    last_result,
+                    telegram_offset,
+                    settings,
+                    trade_store,
+                )
+
             previous_scan_mode = state.mode if state is not None else None
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
             state = result["state"]
             if sender.enabled and settings.telegram_enabled:
+                # Commands get priority over scan message bursts.
+                telegram_offset = _poll_telegram_commands_safe(
+                    sender,
+                    result,
+                    telegram_offset,
+                    settings,
+                    trade_store,
+                )
+
                 if settings.send_mode_status_each_scan:
                     # ✅ FIX: _send_text بدل send_message لدعم HTML tags
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
@@ -3332,7 +3404,13 @@ def live_worker() -> None:
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
-                telegram_offset = _answer_commands(sender, result, telegram_offset, settings, trade_store)
+                telegram_offset = _poll_telegram_commands_safe(
+                    sender,
+                    result,
+                    telegram_offset,
+                    settings,
+                    trade_store,
+                )
 
             last_result = result
             if settings.verbose_logs:
@@ -3355,10 +3433,16 @@ def live_worker() -> None:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
                         _maybe_send_mode_reminder(sender, last_result, reminder_tracker)
-                        telegram_offset = _answer_commands(sender, last_result, telegram_offset, settings, trade_store)
+                        telegram_offset = _poll_telegram_commands_safe(
+                            sender,
+                            last_result,
+                            telegram_offset,
+                            settings,
+                            trade_store,
+                        )
                 except Exception as exc:
                     print(f"telegram command polling error: {exc}", flush=True)
-            time.sleep(3)
+            time.sleep(max(0.5, float(TELEGRAM_COMMAND_POLL_SLEEP_SECONDS)))
 
 
 if __name__ == "__main__":
