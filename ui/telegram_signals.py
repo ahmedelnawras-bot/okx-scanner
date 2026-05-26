@@ -483,9 +483,14 @@ def build_rejected_track_message(signal: SignalCandidate, execution_result: dict
 def build_track_message(signal: SignalCandidate, execution_result: dict | None = None, trade=None) -> str:
     if trade is not None:
         return build_trade_track_message(trade)
-    status = (execution_result or {}).get("status") or "normal_signal_only"
-    if status not in {"accepted_preview", "pending_pullback_preview", "executed", "open", "tp1", "tp2", "trailing"}:
-        return build_rejected_track_message(signal, execution_result)
+
+    # Track button is a market-follow-up view for the coin, not an execution
+    # rejection card. Rejected / limit / same-symbol candidates still get the
+    # normal tracking layout; rejection details remain only in the original
+    # signal message under Execution Check.
+    raw_status = (execution_result or {}).get("status") or "normal_signal_only"
+    accepted_statuses = {"accepted_preview", "pending_pullback_preview", "executed", "open", "tp1", "tp2", "trailing"}
+    status = raw_status if raw_status in accepted_statuses else "normal_signal_only"
 
     reason = (execution_result or {}).get("reason") or "-"
     setup_clean = _clean_name(signal.setup_type)
@@ -497,10 +502,18 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
     current_price_line = (
         f"• Current Price: {_fmt_price(entry_price)} (waiting pullback trigger)"
         if status == "pending_pullback_preview"
+        else f"• Current Price: {_fmt_price(entry_price)} (tracking from signal entry)"
+        if status == "normal_signal_only"
         else f"• Current Price: {_fmt_price(entry_price)} (just opened)"
     )
 
-    quality_label = "PREVIEW / WAITING PULLBACK" if status == "pending_pullback_preview" else "PASS"
+    quality_label = (
+        "PREVIEW / WAITING PULLBACK"
+        if status == "pending_pullback_preview"
+        else "Normal Tracking"
+        if status == "normal_signal_only"
+        else "PASS"
+    )
 
     lines = [
         f"📊 Track — {signal.symbol}",
@@ -537,11 +550,18 @@ def build_track_message(signal: SignalCandidate, execution_result: dict | None =
         "🧠 Setup",
         f"• {setup_clean}",
         f"• Quality: {quality_label}",
-        f"• Execution: {status}",
-        f"• Reason: {reason}",
+    ]
+
+    if status != "normal_signal_only":
+        lines.extend([
+            f"• Execution: {status}",
+            f"• Reason: {reason}",
+        ])
+
+    lines.extend([
         "",
         f"🔗 {build_tradingview_html_link(signal.symbol)}",
-    ]
+    ])
 
     entry_order_id = (execution_result or {}).get("entry_order_id")
     if entry_order_id:
