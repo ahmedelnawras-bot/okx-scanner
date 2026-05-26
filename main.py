@@ -1232,9 +1232,21 @@ def run_once(
             else:
                 slot_counts["general"] = slot_counts.get("general", 0) + 1
 
-            # Reserve this trade only for same-scan gating.
-            # It must NOT become an open tracked trade before Telegram alert succeeds.
+            # Reserve this trade for same-scan gating.
             local_gate_trades.append(candidate_trade)
+
+            # Simulation mode must mirror the trading decision immediately:
+            # if process_trade_candidate accepts it and the slot/same-symbol gate allows it,
+            # open a virtual tracked trade regardless of Telegram delivery/dedup.
+            if simulation_mode_active and consumes_live_slot:
+                candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result)
+                existing_ids = {str(getattr(t, "trade_id", "") or "") for t in simulation_trades}
+                candidate_id = str(getattr(candidate_trade, "trade_id", "") or "")
+                if candidate_id and candidate_id not in existing_ids:
+                    simulation_trades.append(candidate_trade)
+                elif not candidate_id:
+                    simulation_trades.append(candidate_trade)
+                local_gate_trades[-1] = candidate_trade
 
         signal_items.append({
             "signal": signal,
@@ -1449,6 +1461,28 @@ def _activate_announced_trade(
     return True
 
 
+
+def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None):
+    """Mark a candidate trade as an opened virtual simulation trade."""
+    exec_result = exec_result or {}
+    opened_at = datetime.now(timezone.utc)
+
+    setattr(candidate_trade, "trade_source", "simulation")
+    setattr(candidate_trade, "tracking_bucket", "simulation")
+    setattr(candidate_trade, "execution_trade", True)
+    setattr(candidate_trade, "execution_status", "simulated_open")
+    setattr(candidate_trade, "execution_reason", str(exec_result.get("reason") or "simulation"))
+    setattr(candidate_trade, "exchange_sync_state", "simulation")
+    setattr(candidate_trade, "exchange_order_ok", True)
+    setattr(candidate_trade, "exchange_order_reason", "simulation_virtual_fill")
+    setattr(candidate_trade, "telegram_announced", True)
+    setattr(candidate_trade, "announced_to_telegram", True)
+    setattr(candidate_trade, "telegram_announced_at", opened_at)
+    setattr(candidate_trade, "opened_at", getattr(candidate_trade, "opened_at", None) or opened_at)
+    setattr(candidate_trade, "status", str(getattr(candidate_trade, "status", "") or "open"))
+    return candidate_trade
+
+
 def _activate_simulated_trade(
     result: dict,
     item: dict,
@@ -1479,19 +1513,7 @@ def _activate_simulated_trade(
         item["announcement_status"] = "simulation_not_eligible"
         return True
 
-    announced_at = datetime.now(timezone.utc)
-
-    setattr(candidate_trade, "trade_source", "simulation")
-    setattr(candidate_trade, "tracking_bucket", "simulation")
-    setattr(candidate_trade, "execution_trade", True)
-    setattr(candidate_trade, "execution_status", "simulated_open")
-    setattr(candidate_trade, "execution_reason", str(exec_result.get("reason") or "simulation"))
-    setattr(candidate_trade, "exchange_sync_state", "simulation")
-    setattr(candidate_trade, "exchange_order_ok", True)
-    setattr(candidate_trade, "exchange_order_reason", "simulation_virtual_fill")
-    setattr(candidate_trade, "telegram_announced", True)
-    setattr(candidate_trade, "announced_to_telegram", True)
-    setattr(candidate_trade, "telegram_announced_at", announced_at)
+    candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result)
 
     item["telegram_announced"] = True
     item["announcement_status"] = "simulation_sent"
@@ -1577,9 +1599,12 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
         ]),
         flush=True,
     )
+    sim_trades = result.get("simulation_trades", []) or []
+    sim_open = sum(1 for t in sim_trades if _is_counted_open_trade(t))
     print(
         " | ".join([
             f"📂 Open trades={open_trades}",
+            f"simulation_open={sim_open}",
             f"protected runners={protected}",
             f"Redis={'ON' if trade_store and trade_store.enabled else 'OFF'}",
         ]),
