@@ -932,6 +932,33 @@ def _simulation_header(text: str) -> str:
     return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
 
 
+def _simulation_command_aliases_for_execution_command(command_key: str) -> list[str]:
+    """Map execution report command names to simulation report command names.
+
+    Examples:
+    /report_execution -> /report_simulation
+    /report_execution_open_7d -> /report_simulation_open_7d
+    /report_execution_profit_analysis_today -> /report_simulation_profit_analysis_today
+    """
+    command_key = str(command_key or "").strip()
+    if not command_key.startswith("/"):
+        command_key = "/" + command_key
+
+    aliases: list[str] = []
+
+    if command_key == "/report_execution":
+        aliases.append("/report_simulation")
+    elif command_key.startswith("/report_execution_"):
+        suffix = command_key[len("/report_execution_"):]
+        aliases.append("/report_simulation_" + suffix)
+
+    # Also support old generated names just in case.
+    if command_key.startswith("/report_"):
+        aliases.append(command_key.replace("/report_", "/report_simulation_", 1))
+
+    return list(dict.fromkeys(a for a in aliases if a and a not in {"/report_simulation_execution"}))
+
+
 def _build_simulation_command_outputs(result: dict) -> dict:
     sim_trades = list(result.get("simulation_trades", []) or [])
     sim_checks = result.get("simulation_execution_results", []) or []
@@ -941,11 +968,12 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     try:
         reports = build_report_bundle(sim_trades, sim_checks, sim_items)
         commands = build_command_outputs(sim_trades, sim_checks, sim_items)
-    except Exception:
+    except Exception as exc:
+        print(f"⚠️ Simulation reports build failed: {exc}", flush=True)
         reports = {}
         commands = {}
 
-    out = {}
+    out: dict[str, str] = {}
     reserved_commands = {
         "/help",
         "/start",
@@ -960,15 +988,38 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         "/modes",
         "/mode",
     }
-    for key, value in {**reports, **commands}.items():
-        if isinstance(value, str) and value.strip():
-            command_key = str(key)
-            if not command_key.startswith("/"):
-                command_key = "/" + command_key
-            if command_key in reserved_commands:
-                continue
-            out[command_key.replace("/report_", "/report_simulation_")] = _simulation_header(value)
-            out[command_key.replace("/", "/simulation_", 1)] = _simulation_header(value)
+
+    merged = {**reports, **commands}
+    for key, value in merged.items():
+        if not isinstance(value, str) or not value.strip():
+            continue
+
+        command_key = str(key)
+        if not command_key.startswith("/"):
+            command_key = "/" + command_key
+        if command_key in reserved_commands:
+            continue
+
+        # Main supported mapping: execution reports -> simulation reports.
+        for alias in _simulation_command_aliases_for_execution_command(command_key):
+            if alias not in reserved_commands:
+                out[alias] = _simulation_header(value)
+
+        # Backward-compatible aliases for any existing simulation_* keys.
+        if command_key.startswith("/simulation_"):
+            out[command_key] = _simulation_header(value)
+
+    # Hard fallbacks: if report bundle returns a plain execution report but no command alias,
+    # expose a useful /report_simulation instead of letting the router fall through.
+    if "/report_simulation" not in out:
+        fallback_report = (
+            merged.get("/report_execution")
+            or merged.get("report_execution")
+            or merged.get("/report_all")
+            or merged.get("report_all")
+        )
+        if isinstance(fallback_report, str) and fallback_report.strip():
+            out["/report_simulation"] = _simulation_header(fallback_report)
 
     wallet_text = "\n".join([
         "🧪 Simulation Wallet",
@@ -979,8 +1030,15 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         f"Floating: {wallet['floating']:+.2f} USDT",
         f"Open: {wallet['open_count']} | Closed: {wallet['closed_count']} | Total: {wallet['total_count']}",
     ])
+
+    # Wallet aliases.
     out["/simulation_wallet"] = wallet_text
     out["/report_simulation_wallet"] = wallet_text
+    out["/report_simulation_wallet_7d"] = wallet_text
+    out["/report_simulation_wallet_today"] = wallet_text
+    out["/report_simulation_wallet_1h"] = wallet_text
+
+    # Mode overview.
     out["/simulation"] = "\n".join([
         "🧪 Simulation Mode",
         "━━━━━━━━━━━━",
@@ -991,6 +1049,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         "",
         wallet_text,
     ])
+
     return out
 
 
@@ -2734,7 +2793,13 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
                 continue
             else:
-                reply = command_outputs.get(command) or command_outputs.get(command.lstrip("/")) or "الأمر غير متاح في نسخة v123 بعد."
+                simulation_outputs = _build_simulation_command_outputs(result)
+                reply = (
+                    simulation_outputs.get(command)
+                    or command_outputs.get(command)
+                    or command_outputs.get(command.lstrip("/"))
+                    or "الأمر غير متاح في نسخة v123 بعد."
+                )
             _send_text(sender, reply)
     return offset
 
