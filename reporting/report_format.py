@@ -328,7 +328,7 @@ def trade_card_lines(
 
         f"🧠 {clean_setup(t)}",
 
-        f'🔗 <a href="{tradingview_url(t.symbol)}">TradingView</a>',
+        f"🔗 TradingView: {tradingview_url(t.symbol)}",
     ]
 
 
