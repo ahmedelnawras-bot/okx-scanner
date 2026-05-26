@@ -8,8 +8,8 @@ def build_main_menu_layout() -> list[list[str]]:
     so it does not open the big persistent Telegram keyboard.
     """
     return [
-        ["🚀 Execution", "📊 Normal Trades"],
-        ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence"],
+        ["🚀 Execution", "📊 Normal Trades", "🧪 Simulation"],
+        ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence", "🧠🧪 Simulation Intelligence"],
         ["🧭 أوضاع البوت"],
         ["🧠 Diagnostics", "🤖 OKX Control"],
         ["⚙️ Admin", "📘 System Info"],
@@ -25,17 +25,27 @@ def build_main_reply_keyboard() -> dict:
     return {"remove_keyboard": True}
 
 
-def build_main_inline_keyboard() -> dict:
-    """Inline buttons under /help dashboard, matching the old approved style."""
+def build_main_inline_keyboard(mode: str | None = None) -> dict:
+    """Inline buttons under /help dashboard, matching the approved style.
+
+    Optional mode adds 🟢 beside the active runtime path while preserving the icons.
+    """
+    runtime_mode = str(mode or "").strip().lower()
+
+    def active(name: str, label: str) -> str:
+        return f"🟢{label}" if runtime_mode == name else label
+
     return {
         "inline_keyboard": [
             [
-                {"text": "🚀 Execution", "callback_data": "menu:execution"},
-                {"text": "📊 Normal Trades", "callback_data": "menu:normal"},
+                {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
+                {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
+                {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
             ],
             [
-                {"text": "🧠🚀 Execution Intelligence", "callback_data": "cmd:/report_execution_intelligence"},
-                {"text": "🧠📊 Market Intelligence", "callback_data": "cmd:/report_intelligence"},
+                {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "cmd:/report_execution_intelligence"},
+                {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
+                {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "cmd:/report_simulation_intelligence"},
             ],
             [
                 {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
@@ -50,6 +60,7 @@ def build_main_inline_keyboard() -> dict:
             ],
         ]
     }
+
 
 
 def _mode_line(mode: str | None = None) -> str:
@@ -126,6 +137,57 @@ def build_execution_help() -> str:
         "/report_execution_diagnostics_7d",
         "/report_execution_diagnostics_today",
         "/report_execution_diagnostics_1h",
+    ]
+    return "\n".join(lines)
+
+
+
+def build_simulation_help() -> str:
+    lines = [
+        "🧪 صفقات المحاكاة",
+        "📘 /help_simulation",
+        "┄┄┄┄┄┄┄┄",
+        "📊 التقرير العام",
+        "/report_simulation",
+        "/report_simulation_7d",
+        "/report_simulation_today",
+        "/report_simulation_1h",
+        "",
+        "📂 الصفقات المفتوحة",
+        "/report_simulation_open",
+        "/report_simulation_open_7d",
+        "/report_simulation_open_today",
+        "/report_simulation_open_1h",
+        "",
+        "📈 تحليل أسباب الأرباح",
+        "/report_simulation_profit_analysis",
+        "/report_simulation_profit_analysis_7d",
+        "/report_simulation_profit_analysis_today",
+        "/report_simulation_profit_analysis_1h",
+        "",
+        "📉 تحليل أسباب الخسائر",
+        "/report_simulation_losses_analysis",
+        "/report_simulation_losses_analysis_7d",
+        "/report_simulation_losses_analysis_today",
+        "/report_simulation_losses_analysis_1h",
+        "",
+        "💼 Wallet Impact",
+        "/report_simulation_wallet",
+        "/report_simulation_wallet_7d",
+        "/report_simulation_wallet_today",
+        "/report_simulation_wallet_1h",
+        "",
+        "🧠 ذكاء المحاكاة",
+        "/report_simulation_intelligence",
+        "/report_simulation_intelligence_7d",
+        "/report_simulation_intelligence_today",
+        "/report_simulation_intelligence_1h",
+        "",
+        "⚙️ تشخيص المحاكاة",
+        "/report_simulation_diagnostics",
+        "/report_simulation_diagnostics_7d",
+        "/report_simulation_diagnostics_today",
+        "/report_simulation_diagnostics_1h",
     ]
     return "\n".join(lines)
 
