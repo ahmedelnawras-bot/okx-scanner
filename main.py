@@ -1135,7 +1135,6 @@ def _simulation_protection_label(result: dict | None = None) -> str:
 
 def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | None = None, limit: int = 5) -> list[str]:
     merged: list[dict] = []
-    seen: set[str] = set()
 
     for item in rows or []:
         if not isinstance(item, dict):
@@ -1144,7 +1143,6 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
         if not day:
             continue
         merged.append(item)
-        seen.add(day)
 
     if isinstance(current_row, dict):
         day = str(current_row.get("date") or "").strip()
@@ -1157,7 +1155,7 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
             "date": _simulation_today_key(),
             "start_balance": SIMULATION_START_BALANCE_USDT,
             "current_balance": SIMULATION_START_BALANCE_USDT,
-            "open_trades": 0,
+            "end_balance": SIMULATION_START_BALANCE_USDT,
         }]
 
     merged = sorted(merged, key=lambda item: str(item.get("date") or ""))
@@ -1165,12 +1163,17 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
 
     out: list[str] = []
     for item in selected:
-        day = str(item.get("date") or "-")
-        start = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
-        current = _safe_float(item.get("current_balance") or item.get("end_balance"), start)
-        delta = current - start
-        icon = "🟢" if delta >= 0 else "🔴"
-        out.append(f"• {icon} {day}: ${start:,.2f} → ${current:,.2f} ({delta:+.2f}$)")
+        date = str(item.get("date") or "-")
+        start_eq = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+        end_eq = _safe_float(item.get("end_balance") or item.get("current_balance"), start_eq)
+        pnl = end_eq - start_eq
+        icon = "🟢" if pnl >= 0 else "🔴"
+
+        out.extend([
+            f"• {date} → ${start_eq:,.0f} ⟶ ${end_eq:,.0f}",
+            f"{icon} {pnl:+,.2f}$",
+        ])
+
     return out
 
 
@@ -1193,24 +1196,27 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
         daily_row.get("current_balance") or daily_row.get("end_balance"),
         _safe_float(wallet.get("equity"), start_balance),
     )
-    daily_growth_pct = ((current_balance - start_balance) / start_balance * 100.0) if start_balance else 0.0
+    growth_pct = ((current_balance - start_balance) / start_balance * 100.0) if start_balance else 0.0
+    risk_mode = _simulation_protection_label(result)
 
     rows = list(result.get("simulation_daily_log", []) or [])
     equity_rows = _format_simulation_equity_curve_rows(rows, daily_row, limit=5)
 
-    lines = [
+    daily_lines = [
         "💰 Daily Balance",
-        f"• Start Of Day: ${start_balance:,.2f}",
-        f"• Current Balance: ${current_balance:,.2f}",
-        f"• Daily Growth: {daily_growth_pct:+.2f}%",
+        "━━━━━━━━━━━━",
         "",
-        "🛡 Risk Status",
-        f"• Protection Mode: {_simulation_protection_label(result)}",
+        f"📍 بداية اليوم: ${start_balance:,.2f}",
+        f"💼 الرصيد الحالي: ${current_balance:,.2f}",
+        f"{'📈' if growth_pct >= 0 else '📉'} نمو اليوم: {growth_pct:+.2f}%",
         "",
-        "📈 Equity Curve",
+        f"🛡 وضع الحماية: {risk_mode}",
+        "",
+        "📊 Equity Curve",
         *equity_rows,
+        "",
     ]
-    return "\n".join(lines)
+    return "\n".join(daily_lines)
 
 
 def _inject_simulation_account_summary(text: str, result: dict | None = None) -> str:
@@ -1341,7 +1347,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     out["/report_simulation_wallet_7d"] = wallet_text
     out["/report_simulation_wallet_today"] = wallet_text
     daily_balance_text = _simulation_header("\n".join([
-        "📅 Simulation Daily Balance",
+        "📅 رصيد المحاكاة اليومي",
         "━━━━━━━━━━━━",
         *_format_simulation_equity_curve_rows(
             list(result.get("simulation_daily_log", []) or []),
