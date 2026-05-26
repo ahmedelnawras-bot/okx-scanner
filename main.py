@@ -404,6 +404,154 @@ def _execution_report_balance_kwargs(portfolio_state_inputs: dict | None = None)
     }
 
 
+
+def _is_live_okx_execution_mode(settings: Settings, okx_client: OKXTradeClient | None) -> bool:
+    return bool(
+        okx_client is not None
+        and getattr(okx_client, "configured", False)
+        and not bool(getattr(settings, "okx_simulated", True))
+        and not bool(getattr(settings, "offline_test_mode", False))
+    )
+
+
+def _trade_symbol_inst_id(trade) -> str:
+    return str(getattr(trade, "symbol", "") or "").strip().upper()
+
+
+def _row_inst_id(row: dict) -> str:
+    return str((row or {}).get("instId") or "").strip().upper()
+
+
+def _row_float(row: dict, *keys: str) -> float:
+    for key in keys:
+        value = _safe_float((row or {}).get(key), 0.0)
+        if abs(value) > 0:
+            return value
+    return 0.0
+
+
+def _extract_live_okx_position_inst_ids(positions_result: dict | None) -> set[str]:
+    if not isinstance(positions_result, dict) or not positions_result.get("ok"):
+        return set()
+    live: set[str] = set()
+    for row in positions_result.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        inst_id = _row_inst_id(row)
+        if not inst_id:
+            continue
+        pos_size = _row_float(row, "pos", "availPos", "notionalUsd", "imr", "margin")
+        if abs(pos_size) > 0:
+            live.add(inst_id)
+    return live
+
+
+def _extract_pending_okx_order_inst_ids(pending_result: dict | None) -> set[str]:
+    if not isinstance(pending_result, dict) or not pending_result.get("ok"):
+        return set()
+    pending: set[str] = set()
+    for row in pending_result.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        inst_id = _row_inst_id(row)
+        state = str(row.get("state") or row.get("ordState") or "").lower()
+        if inst_id and state not in {"filled", "canceled", "mmp_canceled"}:
+            pending.add(inst_id)
+    return pending
+
+
+def _is_open_execution_trade_for_reconcile(trade) -> bool:
+    return bool(
+        _is_execution_report_trade_record(trade)
+        and not bool(getattr(trade, "is_closed", False))
+    )
+
+
+def _reconcile_execution_trades_with_okx(
+    trades: list,
+    okx_client: OKXTradeClient | None,
+    settings: Settings,
+) -> tuple[list, dict]:
+    """Remove ghost execution tracked trades when OKX has no live position/order.
+
+    In live mode, OKX is the source of truth. Redis may still contain execution
+    tracked trades from old paper/simulation runs or from report resets. Those
+    trades must not occupy slots or appear in /report_execution when the exchange
+    has no matching live position or pending order.
+    """
+    stats = {
+        "enabled": False,
+        "changed": False,
+        "removed": 0,
+        "kept": len(trades or []),
+        "reason": "not_live_okx_mode",
+    }
+    if not trades or not _is_live_okx_execution_mode(settings, okx_client):
+        return list(trades or []), stats
+
+    try:
+        positions_result = okx_client.get_positions(inst_type="SWAP") if hasattr(okx_client, "get_positions") else None
+    except Exception as exc:
+        stats["reason"] = f"positions_fetch_failed:{exc}"
+        return list(trades or []), stats
+
+    if not isinstance(positions_result, dict) or not positions_result.get("ok"):
+        stats["reason"] = str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")
+        return list(trades or []), stats
+
+    try:
+        pending_result = okx_client.list_pending_orders(inst_type="SWAP", limit=100)
+    except Exception:
+        pending_result = None
+
+    live_inst_ids = _extract_live_okx_position_inst_ids(positions_result)
+    pending_inst_ids = _extract_pending_okx_order_inst_ids(pending_result)
+    protected_inst_ids = live_inst_ids | pending_inst_ids
+
+    kept = []
+    removed = 0
+    removed_symbols = []
+    for trade in list(trades or []):
+        if _is_open_execution_trade_for_reconcile(trade):
+            inst_id = _trade_symbol_inst_id(trade)
+            if inst_id and inst_id not in protected_inst_ids:
+                removed += 1
+                removed_symbols.append(inst_id)
+                continue
+        kept.append(trade)
+
+    stats.update({
+        "enabled": True,
+        "changed": removed > 0,
+        "removed": removed,
+        "kept": len(kept),
+        "live_positions": len(live_inst_ids),
+        "pending_orders": len(pending_inst_ids),
+        "removed_symbols": removed_symbols[:20],
+        "reason": "ok",
+    })
+    return kept, stats
+
+
+def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_store: RedisTradeStore | None, settings: Settings, okx_client: OKXTradeClient | None, stats: dict | None = None) -> None:
+    if not isinstance(result, dict):
+        return
+    refreshed_checks = trade_store.load_execution_checks(limit=500) if trade_store else list(result.get("execution_results", []) or [])
+    result["trades"] = list(trades or [])
+    if stats:
+        result["exchange_reconcile_stats"] = stats
+    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
+    result["portfolio_state_inputs"] = portfolio_state_inputs
+    execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
+    reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
+    result["command_outputs"] = build_command_outputs(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
+    result.update(reports)
+    portfolio_state = build_portfolio_state_from_trades(result["trades"], **portfolio_state_inputs)
+    result["portfolio_state"] = portfolio_state
+    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+    result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    result["loss_streak_guard"] = _build_loss_streak_guard(result["trades"])
+
 def _fmt_money(value: object) -> str:
     number = _safe_float(value, 0.0)
     return f"{number:.2f}" if abs(number) >= 1 else f"{number:.4f}"
@@ -1469,6 +1617,16 @@ def run_once(
         and int(initial_protection.get("level", 0) or 0) >= 2
     )
     if persisted_trades:
+        persisted_trades, exchange_reconcile_stats = _reconcile_execution_trades_with_okx(
+            persisted_trades,
+            okx_client,
+            settings,
+        )
+        if exchange_reconcile_stats.get("changed") and trade_store:
+            trade_store.save_trades(persisted_trades)
+    else:
+        exchange_reconcile_stats = {"enabled": False, "changed": False, "removed": 0, "reason": "no_trades"}
+    if persisted_trades:
         persisted_trades = update_open_trades(
             persisted_trades,
             initial_price_map,
@@ -1763,6 +1921,7 @@ def run_once(
         "simulation_daily_log": _load_simulation_daily_log(trade_store),
         "trades": trades,
         "command_outputs": command_outputs,
+        "exchange_reconcile_stats": exchange_reconcile_stats,
         "simulation_command_outputs": {},
         **reports,
     }
@@ -3506,6 +3665,16 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
     updates = sender.get_updates(offset=offset, timeout_seconds=0)
     if not updates.get("ok"):
         return offset
+
+    if trade_store and _is_live_okx_execution_mode(settings, okx_client):
+        try:
+            live_trades = trade_store.load_trades() or []
+            reconciled_trades, reconcile_stats = _reconcile_execution_trades_with_okx(live_trades, okx_client, settings)
+            if reconcile_stats.get("changed"):
+                trade_store.save_trades(reconciled_trades)
+                _rebuild_runtime_reports_after_reconcile(result, reconciled_trades, trade_store, settings, okx_client, reconcile_stats)
+        except Exception as exc:
+            print(f"⚠️ command exchange reconcile failed: {exc}", flush=True)
 
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
