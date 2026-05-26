@@ -112,6 +112,10 @@ SIMULATION_REDIS_PREFIX = "okx:longbot:simulation:v1"
 SIMULATION_OPEN_SET = f"{SIMULATION_REDIS_PREFIX}:trades:open"
 SIMULATION_HISTORY_SET = f"{SIMULATION_REDIS_PREFIX}:trades:history"
 SIMULATION_EXEC_CHECKS_LIST = f"{SIMULATION_REDIS_PREFIX}:execution:checks"
+SIMULATION_DAILY_BALANCE_HASH = f"{SIMULATION_REDIS_PREFIX}:daily_balance"
+SIMULATION_BALANCE_STATE_KEY = f"{SIMULATION_REDIS_PREFIX}:wallet:state"
+SIMULATION_ALLOCATION_PCT = 24.0
+
 
 # Loss Streak Guard: pause new execution after repeated SL hits before TP1.
 LOSS_STREAK_NO_TP1_LIMIT = 5
@@ -819,6 +823,142 @@ def _simulation_trade_key(trade_id: str) -> str:
     return f"{SIMULATION_REDIS_PREFIX}:trade:{trade_id}"
 
 
+
+def _simulation_today_key(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return now.date().isoformat()
+
+
+def _simulation_margin_usdt(balance: float, settings: Settings | None = None) -> float:
+    try:
+        slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
+    except Exception:
+        slot_count = 7
+    allocation_pct = SIMULATION_ALLOCATION_PCT
+    if risk_manager_module is not None:
+        allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
+    return max(0.0, float(balance or 0.0) * (float(allocation_pct or 0.0) / 100.0) / float(slot_count))
+
+
+def _simulation_equity_from_trades(
+    sim_trades: list,
+    start_balance: float = SIMULATION_START_BALANCE_USDT,
+) -> float:
+    equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
+    for trade in sim_trades or []:
+        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
+        if margin <= 0:
+            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+        equity += _money_from_pct(_trade_effective_pnl_pct(trade), margin=margin)
+    return equity
+
+
+def _load_simulation_daily_log(trade_store: RedisTradeStore | None = None) -> list[dict]:
+    if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
+        return []
+    try:
+        raw = trade_store.client.hgetall(SIMULATION_DAILY_BALANCE_HASH) or {}
+        rows = []
+        for day, payload in raw.items():
+            try:
+                item = json.loads(payload)
+            except Exception:
+                continue
+            item.setdefault("date", str(day))
+            rows.append(item)
+        return sorted(rows, key=lambda x: str(x.get("date", "")))
+    except Exception as exc:
+        print(f"⚠️ Simulation daily log load failed: {exc}", flush=True)
+        return []
+
+
+def _ensure_simulation_daily_log(
+    sim_trades: list,
+    trade_store: RedisTradeStore | None = None,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Persist a daily virtual balance row for Simulation only.
+
+    It behaves like a paper account:
+    - First day starts from 1000 USDT.
+    - Next day starts from previous day's ending/current equity.
+    - No reset means the sequence continues across deploys/restarts.
+    """
+    now = now or datetime.now(timezone.utc)
+    today = _simulation_today_key(now)
+
+    wallet = _build_simulation_wallet_snapshot(sim_trades)
+    current_equity = float(wallet.get("equity", SIMULATION_START_BALANCE_USDT) or SIMULATION_START_BALANCE_USDT)
+
+    rows = _load_simulation_daily_log(trade_store)
+    previous_rows = [r for r in rows if str(r.get("date", "")) < today]
+    previous_equity = None
+    if previous_rows:
+        last = previous_rows[-1]
+        previous_equity = _safe_float(last.get("end_balance") or last.get("current_balance") or last.get("equity"), 0.0)
+
+    if previous_equity and previous_equity > 0:
+        start_balance = previous_equity
+    elif rows and str(rows[-1].get("date", "")) == today:
+        start_balance = _safe_float(rows[-1].get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    else:
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    realized = _safe_float(wallet.get("realized"), 0.0)
+    floating = _safe_float(wallet.get("floating"), 0.0)
+    row = {
+        "date": today,
+        "start_balance": start_balance,
+        "current_balance": current_equity,
+        "end_balance": current_equity,
+        "realized": realized,
+        "floating": floating,
+        "open_trades": int(wallet.get("open_count", 0) or 0),
+        "closed_trades": int(wallet.get("closed_count", 0) or 0),
+        "margin_per_trade": _simulation_margin_usdt(start_balance, settings),
+        "updated_at": now.isoformat(),
+    }
+
+    if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
+        try:
+            trade_store.client.hset(SIMULATION_DAILY_BALANCE_HASH, today, json.dumps(row, ensure_ascii=False, default=str))
+            trade_store.client.expire(SIMULATION_DAILY_BALANCE_HASH, 180 * 24 * 60 * 60)
+            trade_store.client.setex(SIMULATION_BALANCE_STATE_KEY, 180 * 24 * 60 * 60, json.dumps(row, ensure_ascii=False, default=str))
+        except Exception as exc:
+            print(f"⚠️ Simulation daily log save failed: {exc}", flush=True)
+
+    return row
+
+
+def _build_simulation_daily_balance_text(trade_store: RedisTradeStore | None = None, limit: int = 10) -> str:
+    rows = _load_simulation_daily_log(trade_store)
+    if not rows:
+        rows = [{
+            "date": _simulation_today_key(),
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "realized": 0.0,
+            "floating": 0.0,
+            "open_trades": 0,
+        }]
+
+    selected = rows[-max(1, int(limit or 10)):]
+    lines = [
+        "📅 Simulation Daily Balance",
+        "━━━━━━━━━━━━",
+    ]
+    for item in selected:
+        start = _safe_float(item.get("start_balance"), 0.0)
+        current = _safe_float(item.get("current_balance") or item.get("end_balance"), 0.0)
+        delta = current - start
+        icon = "🟢" if delta >= 0 else "🔴"
+        lines.append(
+            f"{icon} {item.get('date')} | Start {start:.2f} → {current:.2f} | Δ {delta:+.2f} | Open {int(item.get('open_trades', 0) or 0)}"
+        )
+    return "\n".join(lines)
+
+
 def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
     if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
         return []
@@ -955,9 +1095,10 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
 
     realized = 0.0
     floating = 0.0
-    margin = 35.0
-
     for trade in sim_trades or []:
+        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
+        if margin <= 0:
+            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
         pct = _trade_effective_pnl_pct(trade)
         usd = _money_from_pct(pct, margin=margin)
         if _is_trade_closed(trade):
@@ -1089,7 +1230,9 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     out["/report_simulation_wallet"] = wallet_text
     out["/report_simulation_wallet_7d"] = wallet_text
     out["/report_simulation_wallet_today"] = wallet_text
-    out["/report_simulation_wallet_1h"] = wallet_text
+    daily_balance_text = _simulation_header(_build_simulation_daily_balance_text())
+    out["/report_simulation_daily_balance"] = daily_balance_text
+    out["/simulation_daily_balance"] = daily_balance_text
 
     # Mode overview.
     out["/simulation"] = "\n".join([
@@ -1300,7 +1443,7 @@ def run_once(
             # if process_trade_candidate accepts it and the slot/same-symbol gate allows it,
             # open a virtual tracked trade regardless of Telegram delivery/dedup.
             if simulation_mode_active and consumes_live_slot:
-                candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result)
+                candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result, settings=settings, balance=_build_simulation_wallet_snapshot(simulation_trades).get('equity', SIMULATION_START_BALANCE_USDT))
                 existing_ids = {str(getattr(t, "trade_id", "") or "") for t in simulation_trades}
                 candidate_id = str(getattr(candidate_trade, "trade_id", "") or "")
                 if candidate_id and candidate_id not in existing_ids:
@@ -1367,6 +1510,7 @@ def run_once(
     if trade_store:
         trade_store.save_trades(trades)
         _save_simulation_trades(simulation_trades, trade_store)
+        _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings)
         if simulation_mode_active:
             _append_simulation_execution_checks(current_execution_results, trade_store)
         else:
@@ -1431,6 +1575,7 @@ def run_once(
         "simulation_execution_results": simulation_execution_results_for_reports,
         "simulation_signal_items": signal_items if simulation_mode_active else [],
         "simulation_wallet": _build_simulation_wallet_snapshot(simulation_trades),
+        "simulation_daily_balance": _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings),
         "trades": trades,
         "command_outputs": command_outputs,
         "simulation_command_outputs": {},
@@ -1529,7 +1674,7 @@ def _activate_announced_trade(
 
 
 
-def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None):
+def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None, settings: Settings | None = None, balance: float = SIMULATION_START_BALANCE_USDT):
     """Mark a candidate trade as an opened virtual simulation trade.
 
     Important:
@@ -1561,7 +1706,10 @@ def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None):
     setattr(candidate_trade, "slot_exempt", False)
     setattr(candidate_trade, "slot_exempt_reason", "")
     setattr(candidate_trade, "daily_open_risk_exempt", False)
-    setattr(candidate_trade, "same_symbol_block_exempt", False)
+    margin_usdt = _simulation_margin_usdt(balance, settings)
+    setattr(candidate_trade, "simulation_balance_reference", float(balance or SIMULATION_START_BALANCE_USDT))
+    setattr(candidate_trade, "simulation_margin_usdt", margin_usdt)
+    setattr(candidate_trade, "used_margin_usdt", margin_usdt)
 
     entry = float(getattr(candidate_trade, "entry", 0.0) or 0.0)
     if entry > 0:
@@ -1601,7 +1749,7 @@ def _activate_simulated_trade(
         item["announcement_status"] = "simulation_not_eligible"
         return True
 
-    candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result)
+    candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result, balance=_build_simulation_wallet_snapshot(result.get('simulation_trades', []) or []).get('equity', SIMULATION_START_BALANCE_USDT))
 
     item["telegram_announced"] = True
     item["announcement_status"] = "simulation_sent"
