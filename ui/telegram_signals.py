@@ -725,9 +725,45 @@ def _localized_warning_notes(warnings, limit: int = 3) -> list[str]:
     and hiding broken/mojibake text.
     """
     warning_rules = [
-        (("weak breakout", "weak_breakout", "failed breakout", "fake breakout", "pa_weak_breakout"), "ضعف تأكيد الاختراق"),
-        (("volume not supportive", "low volume", "weak volume", "volume_state", "exhaustion"), "حجم التداول غير داعم"),
-        (("near resistance", "resistance rejection", "4h block", "resistance", "rejection"), "ارتداد قريب من المقاومة"),
+        (
+            (
+                "weak breakout",
+                "weak_breakout",
+                "failed breakout",
+                "fake breakout",
+                "pa_weak_breakout",
+                "اختراق",
+                "ضعف",
+            ),
+            "ضعف تأكيد الاختراق",
+        ),
+        (
+            (
+                "volume not supportive",
+                "low volume",
+                "weak volume",
+                "volume_state",
+                "exhaustion",
+                "حجم",
+                "سيولة",
+                "تداول",
+            ),
+            "حجم التداول غير داعم",
+        ),
+        (
+            (
+                "near resistance",
+                "resistance rejection",
+                "4h block",
+                "resistance",
+                "rejection",
+                "ارتداد",
+                "مقاومة",
+                "بره",
+                "نحت",
+            ),
+            "ارتداد قريب من المقاومة",
+        ),
     ]
 
     out: list[str] = []
