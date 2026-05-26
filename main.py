@@ -2437,17 +2437,22 @@ def _extract_commands(text: str) -> list[str]:
 
 
 def _strip_basic_html(text: str) -> str:
-    """Fallback renderer for long Telegram messages.
+    """Fallback renderer when Telegram rejects HTML.
 
-    Telegram rejects messages above ~4096 chars. Splitting HTML can break tags,
-    so long chunks are sent as plain text with only basic tags removed.
+    Keep anchor labels compact. This prevents long TradingView URLs from
+    reappearing when a formatted report needs a plain-text fallback.
     """
     value = str(text or "")
     value = value.replace("<b>", "").replace("</b>", "")
     value = value.replace("<i>", "").replace("</i>", "")
-    value = re.sub(r'<a\s+href="([^"]+)">([^<]+)</a>', r'\2: \1', value)
+    value = re.sub(r'<a\s+href="([^"]+)">([^<]+)</a>', r'\2', value)
     value = value.replace("<code>", "").replace("</code>", "")
     return value
+
+
+def _has_basic_html(text: str) -> bool:
+    value = str(text or "")
+    return bool("<b>" in value or "<code>" in value or "<a " in value or "<i>" in value)
 
 
 def _chunk_text_for_telegram(text: str, max_len: int = 3600) -> list[str]:
@@ -2481,23 +2486,31 @@ def _chunk_text_for_telegram(text: str, max_len: int = 3600) -> list[str]:
 
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None):
     raw_text = str(text or "")
+    parse_mode = "HTML" if _has_basic_html(raw_text) else None
 
-    # Telegram hard-limits message size. Long reports are split safely.
+    # Telegram hard-limits message size. Long reports are split by lines.
+    # We keep HTML parse mode for chunks so compact <a href=...>TV</a> links
+    # stay embedded instead of expanding back to full URLs.
     if len(raw_text) > 3800:
-        plain = _strip_basic_html(raw_text)
-        chunks = _chunk_text_for_telegram(plain, max_len=3600)
+        chunks = _chunk_text_for_telegram(raw_text, max_len=3600)
         last_result = None
         for idx, chunk in enumerate(chunks):
             suffix = f"\n\n({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            chunk_text = chunk + suffix
             last_result = sender.send_message(
-                chunk + suffix,
-                parse_mode=None,
+                chunk_text,
+                parse_mode=parse_mode,
                 reply_markup=reply_markup if idx == len(chunks) - 1 else None,
             )
+            if isinstance(last_result, dict) and not last_result.get("ok") and parse_mode:
+                last_result = sender.send_message(
+                    _strip_basic_html(chunk_text),
+                    parse_mode=None,
+                    reply_markup=reply_markup if idx == len(chunks) - 1 else None,
+                )
             _telegram_send_pause(0.45)
         return last_result
 
-    parse_mode = "HTML" if ("<b>" in raw_text or "<code>" in raw_text or "<a " in raw_text) else None
     result = sender.send_message(raw_text, parse_mode=parse_mode, reply_markup=reply_markup)
 
     # If Telegram rejects HTML formatting, retry as plain text once.
