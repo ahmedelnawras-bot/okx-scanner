@@ -904,6 +904,36 @@ def _load_simulation_execution_checks(trade_store: RedisTradeStore | None = None
         return []
 
 
+
+def _trade_effective_pnl_pct(trade) -> float:
+    """Safe effective PnL% helper for simulation wallet."""
+    try:
+        realized = _safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)
+        floating = _safe_float(getattr(trade, "floating_pnl_pct", 0.0), 0.0)
+        pnl_pct = _safe_float(getattr(trade, "pnl_pct", 0.0), 0.0)
+
+        if abs(realized) > 0 or abs(floating) > 0:
+            return realized + floating
+        if abs(pnl_pct) > 0:
+            return pnl_pct
+
+        entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+        current = _safe_float(getattr(trade, "current_price", 0.0), 0.0)
+        if entry > 0 and current > 0:
+            return ((current - entry) / entry) * 100.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _money_from_pct(pct: float, margin: float = 35.0) -> float:
+    """Convert PnL% to rough USDT impact."""
+    try:
+        return float(margin or 0.0) * (float(pct or 0.0) / 100.0)
+    except Exception:
+        return 0.0
+
+
 def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = SIMULATION_START_BALANCE_USDT) -> dict:
     """Build a simple virtual wallet snapshot from simulation trades.
 
