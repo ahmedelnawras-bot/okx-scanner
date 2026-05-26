@@ -13,6 +13,7 @@ Phase 1 fixes applied:
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import traceback
@@ -102,7 +103,7 @@ SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
 TELEGRAM_SEND_GAP_SECONDS = 0.65
 TELEGRAM_EXECUTION_SEND_GAP_SECONDS = 0.35
 TELEGRAM_NORMAL_SEND_GAP_SECONDS = 0.85
-TELEGRAM_COMMAND_POLL_SLEEP_SECONDS = 1.0
+TELEGRAM_COMMAND_POLL_SLEEP_SECONDS = 2.0
 
 
 # Simulation Trading Mode
@@ -2295,9 +2296,76 @@ def _extract_commands(text: str) -> list[str]:
     return commands
 
 
+def _strip_basic_html(text: str) -> str:
+    """Fallback renderer for long Telegram messages.
+
+    Telegram rejects messages above ~4096 chars. Splitting HTML can break tags,
+    so long chunks are sent as plain text with only basic tags removed.
+    """
+    value = str(text or "")
+    value = value.replace("<b>", "").replace("</b>", "")
+    value = value.replace("<i>", "").replace("</i>", "")
+    value = re.sub(r'<a\s+href="([^"]+)">([^<]+)</a>', r'\2: \1', value)
+    value = value.replace("<code>", "").replace("</code>", "")
+    return value
+
+
+def _chunk_text_for_telegram(text: str, max_len: int = 3600) -> list[str]:
+    value = str(text or "")
+    if len(value) <= max_len:
+        return [value]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in value.splitlines():
+        add_len = len(line) + 1
+        if current and current_len + add_len > max_len:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = add_len
+        elif add_len > max_len:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i:i + max_len])
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
 def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = None):
-    parse_mode = "HTML" if ("<b>" in str(text or "") or "<a " in str(text or "")) else None
-    return sender.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    raw_text = str(text or "")
+
+    # Telegram hard-limits message size. Long reports are split safely.
+    if len(raw_text) > 3800:
+        plain = _strip_basic_html(raw_text)
+        chunks = _chunk_text_for_telegram(plain, max_len=3600)
+        last_result = None
+        for idx, chunk in enumerate(chunks):
+            suffix = f"\n\n({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            last_result = sender.send_message(
+                chunk + suffix,
+                parse_mode=None,
+                reply_markup=reply_markup if idx == len(chunks) - 1 else None,
+            )
+            _telegram_send_pause(0.45)
+        return last_result
+
+    parse_mode = "HTML" if ("<b>" in raw_text or "<a " in raw_text) else None
+    result = sender.send_message(raw_text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+    # If Telegram rejects HTML formatting, retry as plain text once.
+    if isinstance(result, dict) and not result.get("ok") and parse_mode:
+        plain = _strip_basic_html(raw_text)
+        result = sender.send_message(plain, parse_mode=None, reply_markup=reply_markup)
+
+    return result
 
 
 def _telegram_send_pause(seconds: float | None = None) -> None:
