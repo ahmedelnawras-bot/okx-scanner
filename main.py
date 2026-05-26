@@ -1030,6 +1030,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         f"Floating: {wallet['floating']:+.2f} USDT",
         f"Open: {wallet['open_count']} | Closed: {wallet['closed_count']} | Total: {wallet['total_count']}",
     ])
+    wallet_text = _simulation_header(wallet_text)
 
     # Wallet aliases.
     out["/simulation_wallet"] = wallet_text
@@ -1049,6 +1050,14 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         "",
         wallet_text,
     ])
+
+    for _cmd, _value in list(out.items()):
+        if (
+            isinstance(_value, str)
+            and (_cmd.startswith("/report_simulation") or _cmd.startswith("/simulation"))
+            and not _value.lstrip().startswith("🧪 Simulation Mode")
+        ):
+            out[_cmd] = _simulation_header(_value)
 
     return out
 
