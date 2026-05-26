@@ -1390,6 +1390,81 @@ def _activate_announced_trade(
     return True
 
 
+def _activate_simulated_trade(
+    result: dict,
+    item: dict,
+    trade_store: RedisTradeStore | None = None,
+) -> bool:
+    """Activate accepted_preview as a virtual simulation trade only.
+
+    This is intentionally the same decision path as trading:
+    process_trade_candidate decides; this function only replaces the final OKX fill
+    with an internal simulated fill.
+    """
+    if not isinstance(item, dict):
+        return False
+
+    exec_result = item.get("execution") or {}
+    exec_status = str(exec_result.get("status") or "").strip().lower()
+    if exec_status != "accepted_preview":
+        return False
+
+    if bool(item.get("telegram_announced")):
+        return False
+
+    candidate_trade = item.get("candidate_trade")
+    if candidate_trade is None:
+        return False
+
+    if not bool(item.get("eligible_for_activation")):
+        item["announcement_status"] = "simulation_not_eligible"
+        return True
+
+    announced_at = datetime.now(timezone.utc)
+
+    setattr(candidate_trade, "trade_source", "simulation")
+    setattr(candidate_trade, "tracking_bucket", "simulation")
+    setattr(candidate_trade, "execution_trade", True)
+    setattr(candidate_trade, "execution_status", "simulated_open")
+    setattr(candidate_trade, "execution_reason", str(exec_result.get("reason") or "simulation"))
+    setattr(candidate_trade, "exchange_sync_state", "simulation")
+    setattr(candidate_trade, "exchange_order_ok", True)
+    setattr(candidate_trade, "exchange_order_reason", "simulation_virtual_fill")
+    setattr(candidate_trade, "telegram_announced", True)
+    setattr(candidate_trade, "announced_to_telegram", True)
+    setattr(candidate_trade, "telegram_announced_at", announced_at)
+
+    item["telegram_announced"] = True
+    item["announcement_status"] = "simulation_sent"
+    item["decision_engine"] = "process_trade_candidate"
+    item["execution_source"] = "same_trading_decision_virtual_fill"
+
+    sim_trades = list(result.get("simulation_trades", []) or [])
+    trade_id = getattr(candidate_trade, "trade_id", None)
+    updated_existing = False
+
+    for idx, trade in enumerate(sim_trades):
+        if trade_id and getattr(trade, "trade_id", None) == trade_id:
+            sim_trades[idx] = candidate_trade
+            updated_existing = True
+            break
+
+    if not updated_existing:
+        sim_trades.append(candidate_trade)
+
+    result["simulation_trades"] = sim_trades
+    result["simulation_wallet"] = _build_simulation_wallet_snapshot(sim_trades)
+
+    _save_simulation_trades(sim_trades, trade_store=trade_store)
+
+    try:
+        result["simulation_command_outputs"] = _build_simulation_command_outputs(result)
+    except Exception as exc:
+        print(f"⚠️ Simulation command output refresh failed: {exc}", flush=True)
+
+    return True
+
+
 def _plain_result(result: dict) -> dict:
     return {k: v for k, v in result.items() if k not in {"state", "signal_items", "trades", "simulation_trades"}}
 
