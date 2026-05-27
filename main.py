@@ -3080,6 +3080,48 @@ def _simulation_signal_badge(text: str) -> str:
     return "🧪 <b>Simulation Mode</b>\n" + value
 
 
+
+def _build_runtime_track_buttons(signal, source: str | None = None) -> dict:
+    """Build Track button with explicit source to avoid Simulation/Execution mixups."""
+    buttons = build_signal_buttons(signal)
+    symbol = str(getattr(signal, "symbol", "") or "")
+    src = str(source or "auto").strip().lower()
+    if src not in {"simulation", "execution", "auto"}:
+        src = "auto"
+    try:
+        buttons = dict(buttons or {})
+        rows = [list(row) for row in buttons.get("inline_keyboard", [])]
+        if rows and rows[0] and symbol:
+            rows[0][0] = dict(rows[0][0])
+            rows[0][0]["callback_data"] = f"track:{src}:{symbol}"[:64]
+            buttons["inline_keyboard"] = rows
+    except Exception:
+        return build_signal_buttons(signal)
+    return buttons
+
+
+def _track_candidates_for_source(result: dict, source: str, settings: Settings) -> list:
+    """Return track candidates from the correct runtime bucket.
+
+    Explicit source comes from new buttons. Old buttons use current runtime mode.
+    This prevents a Simulation trade and an Execution trade with the same symbol
+    from shadowing each other.
+    """
+    source = str(source or "auto").strip().lower()
+    runtime_mode = _get_signal_delivery_mode(settings)
+    execution_trades = list((result or {}).get("trades", []) or [])
+    simulation_trades = list((result or {}).get("simulation_trades", []) or [])
+
+    if source in {"sim", "simulation"}:
+        return simulation_trades
+    if source in {"exec", "execution", "trading"}:
+        return execution_trades
+    if runtime_mode == "simulation":
+        return simulation_trades
+    if runtime_mode == "trading":
+        return execution_trades
+    return [*execution_trades, *simulation_trades]
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in _iter_signal_items_for_dispatch(result):
         signal = item["signal"]
@@ -3135,7 +3177,8 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         if exchange_required:
             _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
 
-        send_result = _send_text(sender, text, reply_markup=build_signal_buttons(signal))
+        track_source = "simulation" if simulation_mode_active else ("execution" if exchange_required else "auto")
+        send_result = _send_text(sender, text, reply_markup=_build_runtime_track_buttons(signal, track_source))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
         _telegram_send_pause(
             TELEGRAM_EXECUTION_SEND_GAP_SECONDS if is_execution else TELEGRAM_NORMAL_SEND_GAP_SECONDS
@@ -3150,7 +3193,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                         managed_order_result,
                         ok=exchange_order_ok,
                     ),
-                    reply_markup=build_signal_buttons(signal),
+                    reply_markup=_build_runtime_track_buttons(signal, "execution"),
                 )
                 _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
             except Exception:
@@ -4122,7 +4165,82 @@ def _handle_admin_clean_command(
     return None
 
 
-def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None) -> None:
+
+
+def _refresh_track_trades_before_reply(
+    result: dict,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> None:
+    """Refresh tracked trade prices immediately when the Track button is pressed.
+
+    Previously Track used the last completed scan snapshot only, so the button
+    could show stale current_price/PnL/TP stage until the next full scan.
+    This refresh is read-only for OKX orders: it pulls fresh tickers, updates the
+    in-memory lifecycle state, and persists Redis snapshots when available.
+    """
+    if not isinstance(result, dict):
+        return
+
+    trades = list(result.get("trades", []) or [])
+    simulation_trades = list(result.get("simulation_trades", []) or [])
+    if not trades and not simulation_trades:
+        return
+
+    try:
+        tickers = fetch_okx_tickers(
+            settings.okx_base_url,
+            settings.request_timeout,
+            settings.offline_test_mode,
+        )
+        price_map = _build_live_price_map(tickers)
+    except Exception as exc:
+        print(f"⚠️ track refresh tickers failed: {exc}", flush=True)
+        price_map = {}
+
+    if not price_map:
+        return
+
+    try:
+        protection_level = int(block_protection_status(result.get("state")).get("level", 0) or 0) if result.get("state") else 0
+    except Exception:
+        protection_level = 0
+
+    if trades:
+        try:
+            refreshed_trades = update_open_trades(
+                trades,
+                price_map,
+                protection_level=protection_level,
+                okx_client=None,
+                sync_exchange=False,
+                sync_exchange_stop=False,
+            )
+            result["trades"] = refreshed_trades
+            if trade_store:
+                trade_store.save_trades(refreshed_trades)
+        except Exception as exc:
+            print(f"⚠️ track execution refresh failed: {exc}", flush=True)
+
+    if simulation_trades:
+        try:
+            refreshed_sim_trades = update_open_trades(
+                simulation_trades,
+                price_map,
+                protection_level=protection_level,
+                okx_client=None,
+                sync_exchange=False,
+                sync_exchange_stop=False,
+            )
+            result["simulation_trades"] = refreshed_sim_trades
+            result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
+            _save_simulation_trades(refreshed_sim_trades, trade_store=trade_store)
+        except Exception as exc:
+            print(f"⚠️ track simulation refresh failed: {exc}", flush=True)
+
+
+def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     callback_id = str(callback_query.get("id") or "")
     data = str(callback_query.get("data") or "")
     if callback_id:
@@ -4169,15 +4287,22 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         return
 
     if data.startswith("track:"):
-        symbol = data.split(":", 1)[1]
+        runtime_settings = settings or get_settings()
+        _refresh_track_trades_before_reply(result, runtime_settings, trade_store=trade_store, okx_client=okx_client)
+        parts = data.split(":", 2)
+        if len(parts) >= 3:
+            track_source = parts[1].strip().lower() or "auto"
+            symbol = parts[2]
+        else:
+            track_source = "auto"
+            symbol = data.split(":", 1)[1]
         matching_trade = None
-        # Track must read from the live lifecycle objects. In Simulation mode,
-        # those live objects are in result["simulation_trades"], not result["trades"].
-        track_candidates = [
-            *(result.get("trades", []) or []),
-            *(result.get("simulation_trades", []) or []),
-        ]
+        track_candidates = _track_candidates_for_source(result, track_source, runtime_settings)
         symbol_trades = [trade for trade in track_candidates if getattr(trade, "symbol", "") == symbol]
+        if not symbol_trades and track_source != "auto":
+            # Fallback for old messages or after mode switches: search both, but only
+            # after the requested bucket fails.
+            symbol_trades = [trade for trade in _track_candidates_for_source(result, "auto", runtime_settings) if getattr(trade, "symbol", "") == symbol]
         if symbol_trades:
             def _track_sort_key(trade):
                 return (
@@ -4362,7 +4487,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         offset = int(update.get("update_id", 0)) + 1
         callback_query = update.get("callback_query")
         if callback_query:
-            _handle_callback_query(sender, result, callback_query, settings, okx_client=okx_client)
+            _handle_callback_query(sender, result, callback_query, settings, okx_client=okx_client, trade_store=trade_store)
             continue
 
         message = update.get("message") or update.get("channel_post") or {}
@@ -4637,12 +4762,35 @@ def _block_protection_alert_for_level(level: int, affected: int = 0, protected: 
     ])
 
 
-def _enrich_reminder_context(result: dict, base_context: dict) -> dict:
+
+def _reminder_trades_for_runtime(result: dict | None, settings: Settings | None = None) -> list:
+    """Return the trade list that mode reminders should display.
+
+    Simulation reminders must count simulation_trades, while live/trading
+    reminders must count real execution trades. This keeps BLOCK reminders
+    from showing zero open positions during Simulation.
+    """
+    result = result or {}
+    runtime_settings = settings or get_settings()
+    if _is_simulation_mode(runtime_settings):
+        return list(result.get("simulation_trades", []) or [])
+    return list(result.get("trades", []) or [])
+
+
+def _reminder_execution_results_for_runtime(result: dict | None, settings: Settings | None = None) -> list:
+    """Return execution-check rows matching the active runtime mode."""
+    result = result or {}
+    runtime_settings = settings or get_settings()
+    if _is_simulation_mode(runtime_settings):
+        return list(result.get("simulation_execution_results", []) or result.get("current_execution_results", []) or [])
+    return list(result.get("current_execution_results") or result.get("execution_results") or [])
+
+def _enrich_reminder_context(result: dict, base_context: dict, settings: Settings | None = None) -> dict:
     from collections import Counter
     ctx = dict(base_context or {})
-    trades = result.get("trades", []) or []
+    trades = _reminder_trades_for_runtime(result, settings)
     signal_items = result.get("signal_items", []) or []
-    execution_results = result.get("current_execution_results") or result.get("execution_results") or []
+    execution_results = _reminder_execution_results_for_runtime(result, settings)
     scan = result.get("scan_stats", {}) or {}
 
     counted_open_items = [t for t in trades if _is_counted_open_trade(t)]
@@ -4673,7 +4821,7 @@ def _enrich_reminder_context(result: dict, base_context: dict) -> dict:
     return ctx
 
 
-def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict) -> None:
+def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict, settings: Settings | None = None) -> None:
     state = result.get("state")
     if not state:
         return
@@ -4692,7 +4840,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
         for threshold, level in BLOCK_REMINDER_THRESHOLDS:
             if minutes_in_mode >= threshold and level not in tracker["block_levels_sent"]:
                 tracker["block_levels_sent"].add(level)
-                context = _enrich_reminder_context(result, result.get("mode_context", {}))
+                context = _enrich_reminder_context(result, result.get("mode_context", {}), settings=settings)
                 context.update({
                     "reminder_count": level,
                     "minutes_in_mode": minutes_in_mode,
@@ -4702,7 +4850,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
                 })
                 # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
                 _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
-                trades = result.get("trades", [])
+                trades = _reminder_trades_for_runtime(result, settings)
                 _send_text(sender, _block_protection_alert_for_level(
                     level,
                     affected=len(trades),
@@ -4715,7 +4863,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
     expected_count = minutes_in_mode // GENERAL_MODE_REMINDER_MINUTES
     if expected_count > tracker.get("general_sent", 0):
         tracker["general_sent"] = expected_count
-        context = _enrich_reminder_context(result, result.get("mode_context", {}))
+        context = _enrich_reminder_context(result, result.get("mode_context", {}), settings=settings)
         context.update({"reminder_count": expected_count, "minutes_in_mode": minutes_in_mode})
         # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
         _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
@@ -4816,7 +4964,7 @@ def live_worker() -> None:
                     else:
                         _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
-                _maybe_send_mode_reminder(sender, result, reminder_tracker)
+                _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
                 telegram_offset = _poll_telegram_commands_safe(
                     sender,
@@ -4847,7 +4995,7 @@ def live_worker() -> None:
                         if now_ts >= next_mode_guard_ts:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
-                        _maybe_send_mode_reminder(sender, last_result, reminder_tracker)
+                        _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
                         telegram_offset = _poll_telegram_commands_safe(
                             sender,
                             last_result,
