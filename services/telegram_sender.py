@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Queue
 from threading import Thread
 from typing import Any
@@ -205,10 +206,10 @@ class TelegramSender:
             }
 
         try:
-            with open(file_path, "rb") as fh:
-                files = {
-                    "document": fh.read(),
-                }
+            path = Path(file_path)
+            filename = path.name or "report_export.dat"
+            with open(path, "rb") as fh:
+                content = fh.read()
 
             data: dict[str, Any] = {
                 "chat_id": self.chat_id,
@@ -217,12 +218,14 @@ class TelegramSender:
             if caption:
                 data["caption"] = caption[:1024]
 
+            # Telegram uses the multipart filename. Sending raw bytes without a
+            # filename makes clients download it as document.json/document.csv.
             return self._enqueue(
                 method="POST",
                 endpoint="sendDocument",
                 data=data,
                 files={
-                    "document": files["document"],
+                    "document": (filename, content),
                 },
                 timeout=max(self.timeout, 60),
             )
