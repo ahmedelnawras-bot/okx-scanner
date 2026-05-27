@@ -3327,6 +3327,7 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
         live_trades = list(result.get("trades", []) or [])
 
     kept_live = []
+    removed_trade_ids: list[str] = []
     removed_execution = 0
     removed_normal = 0
 
@@ -3342,17 +3343,30 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
             remove = True
             removed_normal += 1
 
-        if not remove:
+        if remove:
+            trade_id = str(getattr(trade, "trade_id", "") or "").strip()
+            if trade_id:
+                removed_trade_ids.append(trade_id)
+        else:
             kept_live.append(trade)
 
+    deleted_live_trade_keys = 0
+    deleted_execution_checks = 0
     if trade_store and getattr(trade_store, "enabled", False):
         try:
+            if removed_trade_ids and hasattr(trade_store, "delete_trade_records"):
+                deleted_live_trade_keys = trade_store.delete_trade_records(removed_trade_ids)
+            if kind in {"execution", "all"} and hasattr(trade_store, "clear_execution_checks"):
+                deleted_execution_checks = trade_store.clear_execution_checks()
             trade_store.save_trades(kept_live)
         except Exception as exc:
             print(f"⚠️ save after report reset failed: {exc}", flush=True)
 
     if result is not None:
         result["trades"] = kept_live
+        if kind in {"execution", "all"}:
+            result["execution_results"] = []
+            result["current_execution_results"] = []
 
     removed_simulation = 0
     deleted_sim_keys = 0
@@ -3383,6 +3397,8 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
         "removed_normal": removed_normal,
         "removed_simulation": removed_simulation,
         "deleted_sim_keys": deleted_sim_keys,
+        "deleted_live_trade_keys": deleted_live_trade_keys,
+        "deleted_execution_checks": deleted_execution_checks,
     })
     return stats
 
