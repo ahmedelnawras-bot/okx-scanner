@@ -2319,7 +2319,7 @@ def run_once(
             )
 
         exec_status = str(exec_result.get("status") or "").strip().lower()
-        consumes_live_slot = exec_status == "accepted_preview"
+        consumes_live_slot = exec_status in {"accepted_preview", "pending_pullback_preview"}
 
         candidate_trade = register_trade(signal, exec_result)
         setattr(candidate_trade, "telegram_announced", False)
@@ -4171,11 +4171,20 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
     if data.startswith("track:"):
         symbol = data.split(":", 1)[1]
         matching_trade = None
-        for trade in result.get("trades", []):
-            if getattr(trade, "symbol", "") == symbol:
-                matching_trade = trade
-                if not getattr(trade, "is_closed", False):
-                    break
+        # Track must read from the live lifecycle objects. In Simulation mode,
+        # those live objects are in result["simulation_trades"], not result["trades"].
+        track_candidates = [
+            *(result.get("trades", []) or []),
+            *(result.get("simulation_trades", []) or []),
+        ]
+        symbol_trades = [trade for trade in track_candidates if getattr(trade, "symbol", "") == symbol]
+        if symbol_trades:
+            def _track_sort_key(trade):
+                return (
+                    1 if not getattr(trade, "is_closed", False) else 0,
+                    getattr(trade, "updated_at", None) or getattr(trade, "opened_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                )
+            matching_trade = sorted(symbol_trades, key=_track_sort_key, reverse=True)[0]
         for item in result.get("signal_items", []):
             signal = item.get("signal")
             if signal and signal.symbol == symbol:
