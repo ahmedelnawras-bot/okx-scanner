@@ -3324,26 +3324,46 @@ def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
             return False
 
 
+RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE: str | None = None
+
+
 def _get_signal_delivery_mode(settings: Settings) -> str:
+    """Single runtime source of truth for Scan/Trading/Simulation.
+
+    Runtime button clicks may use a fresh Settings instance while the scan loop
+    keeps an older Settings object. A module-level override prevents split-brain
+    states where /bot_modes says Trading but mode messages still render Simulation.
+    """
+    global RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE
+    override = str(RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE or "").strip().lower()
+    if override in {"scan", "trading", "simulation"}:
+        return override
+
     # Default after restart/deploy: Simulation.
-    # Explicit Railway/config value still wins if set to scan/trading/simulation.
     mode = str(getattr(settings, "signal_delivery_mode", "simulation") or "simulation").strip().lower()
     return mode if mode in {"scan", "trading", "simulation"} else "simulation"
 
 
 def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
+    global RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE
     normalized = str(mode or "simulation").strip().lower()
     if normalized not in {"scan", "trading", "simulation"}:
         return False
+
+    # First update the process-wide runtime override. This is the real active
+    # mode used by /bot_modes, /help, mode messages, and risk display.
+    RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE = normalized
+
+    # Best effort: also update the passed Settings object for compatibility.
     try:
         setattr(settings, "signal_delivery_mode", normalized)
-        return _get_signal_delivery_mode(settings) == normalized
     except Exception:
         try:
             object.__setattr__(settings, "signal_delivery_mode", normalized)
-            return _get_signal_delivery_mode(settings) == normalized
         except Exception:
-            return False
+            pass
+
+    return _get_signal_delivery_mode(settings) == normalized
 
 
 def _signal_delivery_mode_label(settings: Settings) -> str:
