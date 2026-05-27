@@ -29,7 +29,8 @@ _EXECUTION_OPEN_STATUSES = {
 }
 
 _NON_FILLED_PREVIEW_STATUSES = {
-    "pending_pullback_preview",
+    # pending_pullback_preview is an execution-intent trade waiting for entry,
+    # so it must stay in the execution lifecycle / slot / same-symbol guards.
     "candidate_only",
     "normal_signal_only",
     "rejected_quality",
