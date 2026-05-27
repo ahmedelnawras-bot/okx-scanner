@@ -685,7 +685,9 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    result["loss_streak_guard"] = _build_loss_streak_guard(result["trades"])
+    result["loss_streak_guard"] = _build_loss_streak_guard(
+        _loss_streak_base_trades_for_runtime(settings, result, execution_trades=result["trades"])
+    )
 
 def _fmt_money(value: object) -> str:
     number = _safe_float(value, 0.0)
@@ -1143,6 +1145,30 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
         "symbols": streak_symbols[-LOSS_STREAK_NO_TP1_LIMIT:],
         "reason": "loss_streak_no_tp1_guard",
     }
+
+
+
+
+def _loss_streak_base_trades_for_runtime(
+    settings: Settings,
+    result: dict | None = None,
+    execution_trades: list | None = None,
+    simulation_trades: list | None = None,
+) -> list:
+    """Return the correct loss-streak source for the active runtime mode.
+
+    Simulation counts simulation trades only. Execution/trading counts real
+    execution trades only. This prevents report refresh/reset/reconcile paths
+    from overwriting the guard with the wrong trade source.
+    """
+    result = result or {}
+    if _is_simulation_mode(settings):
+        if simulation_trades is not None:
+            return list(simulation_trades or [])
+        return list(result.get("simulation_trades", []) or [])
+    if execution_trades is not None:
+        return list(execution_trades or [])
+    return list(result.get("trades", []) or [])
 
 
 def _loss_streak_rejection(guard: dict) -> dict:
@@ -2469,7 +2495,7 @@ def run_once(
     }
 
 
-def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore | None = None) -> None:
+def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
     trades = list(result.get("trades", []) or [])
     execution_results = result.get("execution_results", []) or []
     signal_items = result.get("signal_items", []) or []
@@ -2488,7 +2514,10 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    result["loss_streak_guard"] = _build_loss_streak_guard(trades)
+    runtime_settings = settings or get_settings()
+    result["loss_streak_guard"] = _build_loss_streak_guard(
+        _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades)
+    )
 
     if trade_store:
         trade_store.save_trades(trades)
@@ -3902,7 +3931,7 @@ def _format_reset_reports_done(stats: dict, title: str) -> str:
     return "\n".join(lines)
 
 
-def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None) -> None:
+def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
     if not isinstance(result, dict):
         return
 
@@ -3933,7 +3962,15 @@ def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisT
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    result["loss_streak_guard"] = _build_loss_streak_guard(refreshed_trades)
+    runtime_settings = settings or get_settings()
+    result["loss_streak_guard"] = _build_loss_streak_guard(
+        _loss_streak_base_trades_for_runtime(
+            runtime_settings,
+            result,
+            execution_trades=refreshed_trades,
+            simulation_trades=refreshed_sim_trades,
+        )
+    )
 
 
 def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, result: dict | None = None) -> dict:
@@ -3996,7 +4033,7 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
             result["simulation_daily_balance"] = _ensure_simulation_daily_log([], trade_store=trade_store)
             result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
 
-    _refresh_runtime_after_report_reset(result, trade_store=trade_store)
+    _refresh_runtime_after_report_reset(result, trade_store=trade_store, settings=get_settings())
 
     stats.update({
         "kept_live": len(kept_live),
@@ -4063,7 +4100,16 @@ def _handle_admin_clean_command(
             result["portfolio_state"] = portfolio_state
             result["drawdown_status"] = evaluate_drawdown(portfolio_state)
             result["drawdown_report"] = build_drawdown_report(portfolio_state)
-            result["loss_streak_guard"] = _build_loss_streak_guard(refreshed_trades)
+            runtime_settings = settings or get_settings()
+            refreshed_sim_trades = _load_simulation_trades(trade_store) if trade_store else list(result.get("simulation_trades", []) or [])
+            result["loss_streak_guard"] = _build_loss_streak_guard(
+                _loss_streak_base_trades_for_runtime(
+                    runtime_settings,
+                    result,
+                    execution_trades=refreshed_trades,
+                    simulation_trades=refreshed_sim_trades,
+                )
+            )
         return _format_clean_result(stats, "🧹 Soft Clean Done")
     if command in {"/deep_clean", "/deep_clean_preview"}:
         stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
@@ -4517,8 +4563,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/help_normal":
                 reply = result.get("help_normal", "")
             elif command == "/okx_orders_on":
-                applied = _set_runtime_okx_orders(settings, True)
-                reply = "✅ تم تشغيل تنفيذ OKX." if applied else "⚠️ تعذر تشغيل تنفيذ OKX."
+                mode_applied = _set_runtime_signal_delivery_mode(settings, "trading")
+                applied = bool(mode_applied and _set_runtime_okx_orders(settings, True) and _runtime_mode_snapshot(settings).get("active_mode") == "trading")
+                reply = "✅ تم تشغيل وضع التداول وتنفيذ OKX." if applied else "⚠️ تعذر تشغيل تنفيذ OKX لأن Runtime Mode لم يصبح Trading."
             elif command == "/okx_orders_off":
                 applied = _set_runtime_okx_orders(settings, False)
                 reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
