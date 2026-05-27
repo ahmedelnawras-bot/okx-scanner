@@ -269,6 +269,50 @@ class RedisTradeStore:
             print(f"⚠️ Redis load_execution_checks failed: {exc}", flush=True)
             return []
 
+    def delete_trade_records(self, trade_ids: list[str] | set[str] | tuple[str, ...]) -> int:
+        """Delete specific live trade records from Redis without touching simulation keys.
+
+        Used by scoped report reset commands. This only touches the current live
+        namespace trade keys and their open/history set memberships. Simulation
+        has its own namespace and is intentionally untouched here.
+        """
+        if not self.enabled or not self.client or not trade_ids:
+            return 0
+        ids = [str(tid) for tid in trade_ids if str(tid or "").strip()]
+        if not ids:
+            return 0
+        try:
+            pipe = self.client.pipeline()
+            for trade_id in ids:
+                pipe.delete(self._trade_key(trade_id))
+                pipe.srem(OPEN_SET, trade_id)
+                pipe.srem(HISTORY_SET, trade_id)
+            result = pipe.execute() or []
+            deleted = 0
+            for idx in range(0, len(result), 3):
+                try:
+                    deleted += int(result[idx] or 0)
+                except Exception:
+                    continue
+            return deleted
+        except Exception as exc:
+            print(f"⚠️ Redis delete_trade_records failed: {exc}", flush=True)
+            return 0
+
+    def clear_execution_checks(self) -> int:
+        """Clear live execution check history only.
+
+        Simulation execution checks are stored under SIMULATION_REDIS_PREFIX in
+        main.py, so this does not affect simulation reports.
+        """
+        if not self.enabled or not self.client:
+            return 0
+        try:
+            return int(self.client.delete(EXEC_CHECKS_LIST) or 0)
+        except Exception as exc:
+            print(f"⚠️ Redis clear_execution_checks failed: {exc}", flush=True)
+            return 0
+
     def _parse_execution_check_ts(self, item: dict[str, Any]) -> datetime | None:
         return _parse_dt(item.get("ts") or item.get("created_at") or item.get("time"))
 
