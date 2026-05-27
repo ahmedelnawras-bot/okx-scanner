@@ -221,7 +221,16 @@ def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
     )
     # Do not treat a plain healthy/strong snapshot as Recovery. Recovery is a
     # fast post-crash rebound path, not a replacement for NORMAL/STRONG.
-    return bool(old_core_recovery and (snapshot.fast_rebound or controlled_rebound_edge) or fast_recovery_edge)
+    return bool(
+        (
+            old_core_recovery
+            and snapshot.fast_rebound
+            and snapshot.breadth_improving
+            and strong >= 5
+        )
+        or controlled_rebound_edge
+        or fast_recovery_edge
+    )
 
 def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
     return bool(getattr(snapshot, "hourly_ma5_pressure", False))
@@ -375,7 +384,7 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         elif minutes_in_mode < BLOCK_MIN_HOLD_MINUTES:
             candidate_mode = MODE_BLOCK_LONGS
         # Slow/safe exit path: crash stopped but market is still pressured -> STRONG.
-        elif flags["no_longer_crashing"] or flags["stabilizing"] or not flags["real_block"]:
+        elif flags["no_longer_crashing"] or flags["stabilizing"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
                 candidate_mode = MODE_STRONG_LONG_ONLY
             else:
