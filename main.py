@@ -2008,6 +2008,57 @@ def _simulation_header(text: str) -> str:
     return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "")
 
 
+def _normalize_wallet_impact_percentages_for_capital(text: str, capital_base: float) -> str:
+    """Normalize Wallet Impact percentages to full wallet capital.
+
+    Shared report builders express PnL% as exposure/trade PnL. For Wallet Impact,
+    the money value is the source of truth and the displayed percentage should be
+    wallet impact versus the simulation baseline capital.
+    """
+    value = str(text or "")
+    capital = _safe_float(capital_base, 0.0)
+    if capital <= 0:
+        return value
+
+    money_pattern = re.compile(
+        r"(?P<money>[+-]\s*\d[\d,]*(?:\.\d+)?)\$\s*\|\s*"
+        r"(?P<old>[+-]\s*\d[\d,]*(?:\.\d+)?)%\s*"
+        r"(?P<label>(?:Realized PnL|Total Floating PnL))"
+    )
+
+    def _replace(match: re.Match) -> str:
+        money_text = str(match.group("money") or "").replace(" ", "").replace(",", "")
+        money = _safe_float(money_text, 0.0)
+        wallet_pct = (money / capital) * 100.0 if capital else 0.0
+        sign_money = "+" if money >= 0 else ""
+        sign_pct = "+" if wallet_pct >= 0 else ""
+        return f"{sign_money}{money:.2f}$ | {sign_pct}{wallet_pct:.2f}% {match.group('label')}"
+
+    return money_pattern.sub(_replace, value)
+
+
+def _simulation_wallet_capital_base(result: dict | None = None) -> float:
+    """Simulation Wallet Impact baseline.
+
+    The baseline is the start of the current simulation experiment. It stays
+    1000 USDT after restart/deploy and changes only when simulation reset logic
+    creates a new baseline.
+    """
+    result = result or {}
+    wallet = result.get("simulation_wallet") or {}
+    daily = result.get("simulation_daily_balance") or {}
+    for value in (
+        wallet.get("start_balance") if isinstance(wallet, dict) else None,
+        daily.get("start_balance") if isinstance(daily, dict) else None,
+        SIMULATION_START_BALANCE_USDT,
+    ):
+        base = _safe_float(value, 0.0)
+        if base > 0:
+            return base
+    return SIMULATION_START_BALANCE_USDT
+
+
+
 def _simulation_command_aliases_for_execution_command(command_key: str) -> list[str]:
     """Map execution report command names to simulation report command names.
 
@@ -2063,6 +2114,11 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         wallet_text=wallet_text,
         daily_balance_text=daily_balance_text,
     )
+    capital_base = _simulation_wallet_capital_base(result)
+    outputs = {
+        key: _normalize_wallet_impact_percentages_for_capital(value, capital_base)
+        for key, value in (outputs or {}).items()
+    }
     for cmd, (_key, title, days) in _SIM_WALLET_PERIOD_COMMANDS.items():
         outputs[cmd] = _simulation_header(_build_simulation_wallet_period_report(result, title, days))
     outputs["/report_simulation_wallet"] = _simulation_header(_simulation_wallet_menu_text())
