@@ -929,6 +929,27 @@ def _build_mode_message(
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(runtime_settings, risk_profile))
     return message + "\n" + risk_block
 
+
+def _refresh_risk_block_in_mode_message(message: str, settings: Settings, result: dict | None = None) -> str:
+    """Refresh only the Risk Manager block using the current runtime snapshot.
+
+    /mood may use a cached scan result while the user just switched between
+    Simulation and Trading. The market analysis part can remain cached, but the
+    bottom Risk Manager block must always reflect the current runtime mode.
+    """
+    base = str(message or "").strip()
+    # Remove the old trailing risk block regardless of its previous context.
+    base = re.sub(
+        r"\n(?:🧪|🚀|🧮)\s*Risk Manager\s*(?:—\s*(?:Simulation|Execution))?.*\Z",
+        "",
+        base,
+        flags=re.DOTALL,
+    ).strip()
+    risk_profile = _risk_profile_snapshot(settings, result or {})
+    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
+    return (base + "\n" + risk_block).strip()
+
+
 def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot, settings: Settings | None = None) -> dict:
     protection = block_protection_status(state)
     result["state"] = state
@@ -4434,7 +4455,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/status":
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
-                reply = result.get("mode_message", "No mode yet")
+                reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
             elif command == "/help_execution":
                 reply = result.get("help_execution", "")
             elif command == "/help_normal":
@@ -4681,7 +4702,7 @@ def live_worker() -> None:
                     if mode_changed_in_scan and result.get("mode_transition_message"):
                         _send_text(sender, result.get("mode_transition_message", ""))
                     else:
-                        _send_text(sender, result.get("mode_message", ""))
+                        _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
