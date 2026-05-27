@@ -79,14 +79,21 @@ def _system_status_block(
     execution_enabled: bool = True,
     risk_enabled: bool = True,
     okx_orders: bool = False,
+    runtime_snapshot: dict | None = None,
 ) -> list[str]:
+    runtime_snapshot = runtime_snapshot or {}
+    active_mode = str(runtime_snapshot.get("active_mode") or "-").upper()
+    risk_context = str(runtime_snapshot.get("risk_context") or "-")
+    effective_orders = bool(runtime_snapshot.get("orders_enabled", okx_orders))
+    raw_orders = bool(runtime_snapshot.get("raw_okx_orders", okx_orders))
     return [
         "🧭 System Status",
         "",
         _mode_line(mode),
+        f"🧭 Runtime Mode: {active_mode} | Risk: {risk_context}",
         f"⚡ Execution Engine: {'ACTIVE' if execution_enabled else 'PAUSED'}",
         f"🛡 Risk Protection: {'ENABLED' if risk_enabled else 'DISABLED'}",
-        f"🧪 OKX Orders: {'ON' if okx_orders else 'OFF'}",
+        f"🧪 OKX Orders: {'ON' if raw_orders else 'OFF'} | Effective: {'ON' if effective_orders else 'OFF'}",
         "",
     ]
 
@@ -330,6 +337,7 @@ def build_master_help(
     execution_enabled: bool = True,
     risk_enabled: bool = True,
     okx_orders: bool = False,
+    runtime_snapshot: dict | None = None,
 ) -> str:
     """Approved compact /help dashboard.
 
@@ -344,6 +352,7 @@ def build_master_help(
             execution_enabled=execution_enabled,
             risk_enabled=risk_enabled,
             okx_orders=okx_orders,
+            runtime_snapshot=runtime_snapshot,
         ),
         "📝 ملاحظات",
         "• الأزرار بالأسفل تفتح أقسام الأوامر مباشرة.",
