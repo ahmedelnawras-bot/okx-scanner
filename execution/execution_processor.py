@@ -95,6 +95,15 @@ def _trade_blocks_same_symbol_reentry(trade) -> bool:
         return False
 
     if _trade_reached_tp2(trade):
+        # TP2 releases the main slot, but if a runner/protected runner/trailing
+        # exposure is still alive, the same symbol should remain blocked until
+        # that exposure is closed by lifecycle.
+        if any([
+            bool(getattr(trade, "runner_active", False)),
+            bool(getattr(trade, "protected_runner", False)),
+            bool(getattr(trade, "trailing_active", False)),
+        ]):
+            return True
         return False
 
     trade_status = str(getattr(trade, "status", "")).lower()
