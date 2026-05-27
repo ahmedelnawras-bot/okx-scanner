@@ -271,17 +271,12 @@ def _compute_margin_from_reference(reference_balance_usdt: float, settings: Sett
 
 
 def _risk_profile_context(settings: Settings, result: dict | None = None) -> str:
-    """Return risk-display context from the same runtime mode used by bot modes panel.
-
-    Do NOT infer this from stale result/runtime fields. The previous build mixed
-    execution_enabled / simulation_wallet / runtime_mode and could display
-    Simulation while the bot modes panel was in Trading. The single source of
-    truth here is Settings.signal_delivery_mode, exactly like /bot_modes.
-    """
-    mode = _get_signal_delivery_mode(settings)
-    if mode == "trading":
+    """Return risk-display context from the centralized runtime snapshot."""
+    runtime = _runtime_mode_snapshot(settings)
+    context = str(runtime.get("risk_context") or "scanner").lower()
+    if context == "execution":
         return "execution"
-    if mode == "simulation":
+    if context == "simulation":
         return "simulation"
     return "scan"
 
@@ -352,8 +347,13 @@ def _risk_profile_snapshot(
     if isinstance(loss_guard, dict) and loss_guard.get("active"):
         reason_bits.append(f"loss_streak={int(loss_guard.get('streak', 0) or 0)}")
 
+    runtime_snapshot = _runtime_mode_snapshot(settings)
+
     return {
         "context": risk_context,
+        "runtime_mode": runtime_snapshot.get("active_mode"),
+        "orders_enabled": runtime_snapshot.get("orders_enabled"),
+        "balance_source": runtime_snapshot.get("balance_source"),
         "source": resolved_source,
         "reference_balance_usdt": reference_balance,
         "allocation_pct": float(allocation_pct or 0.0),
@@ -392,8 +392,11 @@ def _compact_mode_message_text(message: str) -> str:
 
 def _format_risk_profile_block(profile: dict | None, title: str = "🧮 Risk Profile") -> str:
     profile = profile or {}
+    runtime_label = str(profile.get("runtime_mode") or profile.get("context") or "-").upper()
+    orders_label = "ON" if bool(profile.get("orders_enabled")) else "OFF"
     return "\n".join([
         f"{title}",
+        f"Runtime: <b>{runtime_label}</b> | Orders: <b>{orders_label}</b>",
         f"Slots: <b>{int(profile.get('slot_count', 0) or 0)}</b>",
         f"Allocation: <b>{_safe_float(profile.get('allocation_pct'), 0.0):.2f}%</b>",
         f"Reference Balance: <b>{_safe_float(profile.get('reference_balance_usdt'), 0.0):,.2f} USDT</b>",
@@ -2054,7 +2057,8 @@ def run_once(
     settings = settings or get_settings()
     persisted_trades = trade_store.load_trades() if trade_store else []
     simulation_trades = _load_simulation_trades(trade_store)
-    simulation_mode_active = _is_simulation_mode(settings)
+    runtime_snapshot = _runtime_mode_snapshot(settings)
+    simulation_mode_active = runtime_snapshot.get("active_mode") == "simulation"
 
     tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout, settings.offline_test_mode)
     ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
@@ -2367,6 +2371,7 @@ def run_once(
             execution_enabled=settings.execution_enabled,
             risk_enabled=True,
             okx_orders=settings.okx_place_orders,
+            runtime_snapshot=_runtime_mode_snapshot(settings),
         ),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
@@ -2992,12 +2997,14 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
 
         text = item["message"]
         managed_order_result = None
-        simulation_mode_active = _is_simulation_mode(settings)
+        runtime_snapshot = _runtime_mode_snapshot(settings)
+        simulation_mode_active = runtime_snapshot.get("active_mode") == "simulation"
+        execution_mode_active = runtime_snapshot.get("active_mode") == "trading"
         exchange_required = bool(
             can_place_order
+            and execution_mode_active
             and not simulation_mode_active
-            and settings.execution_enabled
-            and settings.okx_place_orders
+            and bool(runtime_snapshot.get("orders_enabled"))
             and okx_client
         )
         exchange_order_ok = True
@@ -3094,7 +3101,8 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
-        f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
+        f"🧭 Runtime: {_runtime_mode_snapshot(settings).get('active_mode', '-').upper()} | Risk={_runtime_mode_snapshot(settings).get('risk_context', '-')}",
+        f"🧪 Simulation: {'ON' if _runtime_mode_snapshot(settings).get('active_mode') == 'simulation' else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
         "",
         risk_block,
         "",
@@ -3147,7 +3155,9 @@ def _build_okx_status_panel(
 
     configured = bool(getattr(client, "configured", False))
     paper_mode = bool(getattr(getattr(client, "credentials", None), "simulated", getattr(settings, "okx_simulated", True)))
+    runtime_snapshot = _runtime_mode_snapshot(settings)
     orders_on = bool(getattr(settings, "okx_place_orders", False))
+    effective_orders = bool(runtime_snapshot.get("orders_enabled"))
     live_guard = bool(getattr(settings, "allow_live_trading", False))
 
     lines = [
@@ -3155,7 +3165,9 @@ def _build_okx_status_panel(
         "━━━━━━━━━━━━",
         f"• Credentials: <b>{'CONFIGURED' if configured else 'MISSING'}</b>",
         f"• Account Mode: <b>{'PAPER / DEMO' if paper_mode else 'LIVE'}</b>",
-        f"• OKX Orders: <b>{'ON' if orders_on else 'OFF'}</b>",
+        f"• Runtime Mode: <b>{str(runtime_snapshot.get('active_mode') or '-').upper()}</b>",
+        f"• Risk Context: <b>{runtime_snapshot.get('risk_context')}</b>",
+        f"• OKX Orders: <b>{'ON' if orders_on else 'OFF'}</b> | Effective: <b>{'ON' if effective_orders else 'OFF'}</b>",
         f"• Live Trading Guard: <b>{'ALLOWED' if live_guard else 'BLOCKED'}</b>",
         f"• Base URL: {getattr(settings, 'okx_base_url', '-')}",
     ]
@@ -3344,6 +3356,46 @@ def _get_signal_delivery_mode(settings: Settings) -> str:
     return mode if mode in {"scan", "trading", "simulation"} else "simulation"
 
 
+def _runtime_mode_snapshot(settings: Settings | None = None) -> dict:
+    """Single source of truth for runtime mode and execution/simulation context.
+
+    This is UI + safety state only. It does not change market-mode logic, scoring,
+    slots, allocation, TP/SL, or strategy thresholds.
+    """
+    settings = settings or get_settings()
+    active_mode = _get_signal_delivery_mode(settings)
+    if active_mode not in {"scan", "trading", "simulation"}:
+        active_mode = "simulation"
+
+    raw_orders_enabled = bool(getattr(settings, "okx_place_orders", False))
+    execution_enabled = bool(getattr(settings, "execution_enabled", False))
+    simulated_okx = bool(getattr(settings, "okx_simulated", True))
+
+    # Effective live-order permission is intentionally strict.
+    # Simulation can never place OKX orders, and Scan is not treated as live execution.
+    orders_enabled = bool(active_mode == "trading" and raw_orders_enabled and execution_enabled)
+
+    if active_mode == "simulation":
+        risk_context = "simulation"
+        balance_source = "simulation_wallet"
+    elif active_mode == "trading":
+        risk_context = "execution"
+        balance_source = "okx_balance"
+    else:
+        risk_context = "scanner"
+        balance_source = "none"
+
+    return {
+        "active_mode": active_mode,
+        "risk_context": risk_context,
+        "orders_enabled": orders_enabled,
+        "raw_okx_orders": raw_orders_enabled,
+        "execution_enabled": execution_enabled,
+        "simulated_okx": simulated_okx,
+        "balance_source": balance_source,
+    }
+
+
 def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
     global RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE
     normalized = str(mode or "simulation").strip().lower()
@@ -3362,6 +3414,11 @@ def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
             object.__setattr__(settings, "signal_delivery_mode", normalized)
         except Exception:
             pass
+
+    # Hard safety invariant: simulation mode never leaves OKX live orders enabled.
+    # Trading does not auto-enable live orders; OKX Control/Railway still owns that.
+    if normalized == "simulation":
+        _set_runtime_okx_orders(settings, False)
 
     return _get_signal_delivery_mode(settings) == normalized
 
@@ -3437,7 +3494,8 @@ def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None)
 
 
 def _build_bot_modes_panel(settings: Settings) -> str:
-    mode = _get_signal_delivery_mode(settings)
+    snapshot = _runtime_mode_snapshot(settings)
+    mode = str(snapshot.get("active_mode") or _get_signal_delivery_mode(settings))
     mode_label = _signal_delivery_mode_label(settings)
 
     def mark(name: str) -> str:
@@ -3447,12 +3505,14 @@ def _build_bot_modes_panel(settings: Settings) -> str:
         "🧭 <b>أوضاع البوت</b>",
         "━━━━━━━━━━━━",
         f"الحالي: <b>{mode_label}</b>",
+        f"Risk Context: <b>{snapshot.get('risk_context')}</b>",
+        f"OKX Orders Effective: <b>{'ON' if snapshot.get('orders_enabled') else 'OFF'}</b>",
         "",
         f"{mark('scan')} 📡 <b>وضع الاسكان</b>",
-        "يعرض العادي + المرشح وينفذ حسب إعدادات OKX.",
+        "يعرض العادي + المرشح فقط، ولا يفتح محاكاة أو تنفيذ حي.",
         "",
         f"{mark('trading')} 🎯 <b>وضع التداول</b>",
-        "يعرض المرشح و rejected ورسائل OKX فقط.",
+        "يعرض المرشح و rejected ورسائل OKX، والتنفيذ الحي يتبع OKX Orders.",
         "",
         f"{mark('simulation')} 🧪 <b>وضع المحاكاة</b>",
         "نفس قرارات وضع التداول لكن تنفيذ داخلي فقط، و OKX live orders OFF.",
@@ -3970,9 +4030,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         desired_mode = data.split(":", 1)[1].strip().lower()
         runtime_settings = settings or get_settings()
         applied = _set_runtime_signal_delivery_mode(runtime_settings, desired_mode)
-        if desired_mode == "simulation":
-            _set_runtime_okx_orders(runtime_settings, False)
         mode_text = _signal_delivery_mode_label(runtime_settings)
+        runtime_snapshot = _runtime_mode_snapshot(runtime_settings)
         prefix = "✅" if applied else "⚠️"
         _send_text(
             sender,
@@ -3982,6 +4041,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
                 f"Requested Mode: {desired_mode.upper() if desired_mode else '-'}",
                 f"Applied: {'YES' if applied else 'NO'}",
                 f"Current Mode: {mode_text}",
+                f"Risk Context: {runtime_snapshot.get('risk_context')}",
+                f"OKX Orders Effective: {'ON' if runtime_snapshot.get('orders_enabled') else 'OFF'}",
             ]),
             reply_markup=_build_bot_modes_keyboard(runtime_settings),
         )
@@ -4136,6 +4197,7 @@ def _send_full_help_messages(sender: TelegramSender, result: dict, settings: Set
         execution_enabled=settings.execution_enabled,
         risk_enabled=True,
         okx_orders=settings.okx_place_orders,
+        runtime_snapshot=_runtime_mode_snapshot(settings),
     )
 
     sender.send_message(
