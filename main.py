@@ -681,13 +681,15 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result["command_outputs"] = build_command_outputs(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result.update(reports)
-    portfolio_state = build_portfolio_state_from_trades(result["trades"], **portfolio_state_inputs)
-    result["portfolio_state"] = portfolio_state
-    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
-    result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    result["loss_streak_guard"] = _build_loss_streak_guard(
-        _loss_streak_base_trades_for_runtime(settings, result, execution_trades=result["trades"])
+    risk_guards = _runtime_guard_bundle(
+        settings=settings,
+        execution_trades=result["trades"],
+        simulation_trades=list(result.get("simulation_trades", []) or []),
+        execution_portfolio_inputs=portfolio_state_inputs,
+        trade_store=trade_store,
     )
+    result.update(risk_guards)
+    result["drawdown_report"] = build_drawdown_report(risk_guards["portfolio_state"])
 
 def _fmt_money(value: object) -> str:
     number = _safe_float(value, 0.0)
@@ -1183,6 +1185,89 @@ def _loss_streak_rejection(guard: dict) -> dict:
         "cooldown_remaining_minutes": int(guard.get("remaining_minutes", 0) or 0),
         "cooldown_until": guard.get("cooldown_until", ""),
         "message_ar": f"تم إيقاف التنفيذ مؤقتًا بعد {int(guard.get('streak', 0) or 0)} ضربات SL متتالية بدون TP1.",
+    }
+
+
+def _build_simulation_portfolio_state(
+    simulation_trades: list,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+):
+    """Build Simulation drawdown state independently from live execution.
+
+    Simulation uses the same drawdown evaluator as execution, but its own
+    virtual wallet baseline and simulated margin sizing. This keeps DD guards
+    active for Simulation even while the bot is in Trading mode, and vice versa.
+    """
+    start_balance = SIMULATION_START_BALANCE_USDT
+    try:
+        today = _simulation_today_key()
+        rows = _load_simulation_daily_log(trade_store)
+        today_rows = [row for row in rows if str((row or {}).get("date") or "") == today]
+        if today_rows:
+            start_balance = _safe_float(today_rows[-1].get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    except Exception:
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    if start_balance <= 0:
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    margin_per_trade = _simulation_margin_usdt(start_balance, settings)
+    leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
+    return build_portfolio_state_from_trades(
+        simulation_trades,
+        reference_portfolio=start_balance,
+        start_of_day_balance=start_balance,
+        margin_per_trade=margin_per_trade,
+        leverage=leverage,
+    )
+
+
+def _runtime_guard_bundle(
+    *,
+    settings: Settings,
+    execution_trades: list,
+    simulation_trades: list,
+    execution_portfolio_inputs: dict | None = None,
+    trade_store: RedisTradeStore | None = None,
+) -> dict:
+    """Return independent DD + loss-streak guards for execution and simulation.
+
+    Both guards are always computed. The legacy keys `drawdown_status` and
+    `loss_streak_guard` remain mapped to the currently active runtime mode so
+    existing reports/UI keep working.
+    """
+    execution_inputs = dict(execution_portfolio_inputs or {})
+    execution_portfolio_state = build_portfolio_state_from_trades(execution_trades, **execution_inputs)
+    simulation_portfolio_state = _build_simulation_portfolio_state(simulation_trades, settings, trade_store=trade_store)
+
+    execution_drawdown_status = evaluate_drawdown(execution_portfolio_state)
+    simulation_drawdown_status = evaluate_drawdown(simulation_portfolio_state)
+    execution_loss_streak_guard = _build_loss_streak_guard(execution_trades)
+    simulation_loss_streak_guard = _build_loss_streak_guard(simulation_trades)
+
+    if _is_simulation_mode(settings):
+        active_context = "simulation"
+        active_portfolio_state = simulation_portfolio_state
+        active_drawdown_status = simulation_drawdown_status
+        active_loss_streak_guard = simulation_loss_streak_guard
+    else:
+        active_context = "execution"
+        active_portfolio_state = execution_portfolio_state
+        active_drawdown_status = execution_drawdown_status
+        active_loss_streak_guard = execution_loss_streak_guard
+
+    return {
+        "active_guard_context": active_context,
+        "portfolio_state": active_portfolio_state,
+        "drawdown_status": active_drawdown_status,
+        "loss_streak_guard": active_loss_streak_guard,
+        "execution_portfolio_state": execution_portfolio_state,
+        "execution_drawdown_status": execution_drawdown_status,
+        "execution_loss_streak_guard": execution_loss_streak_guard,
+        "simulation_portfolio_state": simulation_portfolio_state,
+        "simulation_drawdown_status": simulation_drawdown_status,
+        "simulation_loss_streak_guard": simulation_loss_streak_guard,
     }
 
 
@@ -2213,10 +2298,16 @@ def run_once(
         )
 
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
-    portfolio_state = build_portfolio_state_from_trades(persisted_trades, **portfolio_state_inputs)
-    drawdown_status = evaluate_drawdown(portfolio_state)
-    loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
-    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades)
+    risk_guards = _runtime_guard_bundle(
+        settings=settings,
+        execution_trades=persisted_trades,
+        simulation_trades=simulation_trades,
+        execution_portfolio_inputs=portfolio_state_inputs,
+        trade_store=trade_store,
+    )
+    portfolio_state = risk_guards["portfolio_state"]
+    drawdown_status = risk_guards["drawdown_status"]
+    loss_streak_guard = risk_guards["loss_streak_guard"]
 
     signal_items = []
     current_execution_results = []
@@ -2434,11 +2525,17 @@ def run_once(
 
     mode_message = _build_mode_message(state, snapshot, protection, settings=settings)
     mode_context = _build_mode_context(state, snapshot, protection)
-    portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
-    drawdown_status = evaluate_drawdown(portfolio_state)
+    final_risk_guards = _runtime_guard_bundle(
+        settings=settings,
+        execution_trades=trades,
+        simulation_trades=simulation_trades,
+        execution_portfolio_inputs=portfolio_state_inputs,
+        trade_store=trade_store,
+    )
+    portfolio_state = final_risk_guards["portfolio_state"]
+    drawdown_status = final_risk_guards["drawdown_status"]
     drawdown_report = build_drawdown_report(portfolio_state)
-    loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
-    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades)
+    loss_streak_guard = final_risk_guards["loss_streak_guard"]
 
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
@@ -2467,6 +2564,13 @@ def run_once(
         "drawdown_status": drawdown_status,
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
+        "active_guard_context": final_risk_guards.get("active_guard_context"),
+        "execution_portfolio_state": final_risk_guards.get("execution_portfolio_state"),
+        "execution_drawdown_status": final_risk_guards.get("execution_drawdown_status"),
+        "execution_loss_streak_guard": final_risk_guards.get("execution_loss_streak_guard"),
+        "simulation_portfolio_state": final_risk_guards.get("simulation_portfolio_state"),
+        "simulation_drawdown_status": final_risk_guards.get("simulation_drawdown_status"),
+        "simulation_loss_streak_guard": final_risk_guards.get("simulation_loss_streak_guard"),
         "portfolio_state_inputs": portfolio_state_inputs,
         "help": build_master_help(
             mode=state.mode,
@@ -2510,14 +2614,17 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
     result.update(reports)
 
     portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
-    result["portfolio_state"] = portfolio_state
-    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
-    result["drawdown_report"] = build_drawdown_report(portfolio_state)
     runtime_settings = settings or get_settings()
-    result["loss_streak_guard"] = _build_loss_streak_guard(
-        _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades)
+    simulation_trades = list(result.get("simulation_trades", []) or [])
+    risk_guards = _runtime_guard_bundle(
+        settings=runtime_settings,
+        execution_trades=trades,
+        simulation_trades=simulation_trades,
+        execution_portfolio_inputs=portfolio_state_inputs,
+        trade_store=trade_store,
     )
+    result.update(risk_guards)
+    result["drawdown_report"] = build_drawdown_report(risk_guards["portfolio_state"])
 
     if trade_store:
         trade_store.save_trades(trades)
