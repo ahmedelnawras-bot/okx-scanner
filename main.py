@@ -270,52 +270,73 @@ def _compute_margin_from_reference(reference_balance_usdt: float, settings: Sett
 
 
 
+def _risk_profile_context(settings: Settings, result: dict | None = None) -> str:
+    """Return the effective context for risk display.
+
+    Important: execution_enabled only means the engine is allowed to evaluate
+    orders. The user-facing risk block must follow the active delivery mode:
+    - trading   -> Execution / OKX balance
+    - simulation -> Simulation wallet
+    - scan      -> Scan/Paper sizing
+    Runtime result mode wins when available because callbacks can change the
+    mode without rebuilding Settings from env.
+    """
+    result = result or {}
+    for key in ("runtime_mode", "signal_delivery_mode", "delivery_mode"):
+        value = str(result.get(key) or "").strip().lower()
+        if value in {"trading", "execution"}:
+            return "execution"
+        if value == "simulation":
+            return "simulation"
+        if value == "scan":
+            return "scan"
+
+    mode = _get_signal_delivery_mode(settings)
+    if mode == "trading":
+        return "execution"
+    if mode == "simulation":
+        return "simulation"
+    return "scan"
+
+
 def _risk_profile_snapshot(
     settings: Settings,
     result: dict | None = None,
     reference_balance: float | None = None,
     source: str | None = None,
 ) -> dict:
-    """Expose dynamic risk-manager sizing state for /status and mode messages.
-
-    Context aware:
-    - Simulation mode uses the virtual simulation wallet.
-    - Live execution mode uses OKX-derived portfolio_state_inputs.
-    - Scan/paper fallback uses existing portfolio inputs/settings.
-    """
+    """Expose dynamic risk-manager sizing state for /status and mode messages."""
     allocation_pct, slot_count = _risk_sizing_constants(settings)
     result = result or {}
     inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    signal_mode = _get_signal_delivery_mode(settings)
+    risk_context = _risk_profile_context(settings, result)
 
     resolved_source = source or str(inputs.get("source") or "dynamic_risk")
 
     if reference_balance is None:
-        if signal_mode == "simulation":
+        if risk_context == "simulation":
             wallet = result.get("simulation_wallet") if isinstance(result, dict) else None
             reference_balance = _safe_float((wallet or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
             resolved_source = "simulation_wallet_balance"
+        elif risk_context == "execution":
+            reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+            resolved_source = "okx_balance"
         else:
             reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
-            live_okx_mode = bool(
-                not bool(getattr(settings, "okx_simulated", True))
-                and bool(getattr(settings, "okx_api_key", ""))
-                and bool(getattr(settings, "okx_api_secret", ""))
-                and bool(getattr(settings, "okx_passphrase", ""))
-            )
-            resolved_source = "okx_balance" if live_okx_mode else resolved_source
 
     reference_balance = _safe_float(reference_balance, 0.0)
 
     margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
-    if signal_mode == "simulation" or margin_per_trade <= 0:
+    if risk_context == "simulation" or margin_per_trade <= 0:
         margin_per_trade = _compute_margin_from_reference(reference_balance, settings) if reference_balance > 0 else 0.0
 
     reason_bits: list[str] = []
-    if signal_mode == "simulation":
+    if risk_context == "simulation":
         reason_bits.append("simulation_wallet_balance")
-    elif resolved_source == "okx_balance":
+    elif risk_context == "execution":
         reason_bits.append("okx_live_balance")
+    else:
+        reason_bits.append("scan_or_paper_sizing")
 
     if risk_manager_module is not None:
         reason_bits.append("risk_manager_active")
@@ -327,9 +348,6 @@ def _risk_profile_snapshot(
 
     mode_context = result.get("mode_context") or {}
     if isinstance(mode_context, dict):
-        market_state = str(mode_context.get("market_state") or "").strip()
-        if market_state:
-            reason_bits.append(market_state)
         protection_current = str(mode_context.get("protection_current") or "").strip()
         if protection_current and protection_current != "inactive":
             reason_bits.append(f"protection={protection_current}")
@@ -348,6 +366,7 @@ def _risk_profile_snapshot(
         reason_bits.append(f"loss_streak={int(loss_guard.get('streak', 0) or 0)}")
 
     return {
+        "context": risk_context,
         "source": resolved_source,
         "reference_balance_usdt": reference_balance,
         "allocation_pct": float(allocation_pct or 0.0),
@@ -357,11 +376,11 @@ def _risk_profile_snapshot(
     }
 
 
-def _risk_profile_title(settings: Settings) -> str:
-    mode = _get_signal_delivery_mode(settings)
-    if mode == "simulation":
+def _risk_profile_title(settings: Settings, profile: dict | None = None) -> str:
+    context = str((profile or {}).get("context") or _risk_profile_context(settings, None)).strip().lower()
+    if context == "simulation":
         return "🧪 Risk Manager — Simulation"
-    if mode == "trading":
+    if context == "execution":
         return "🚀 Risk Manager — Execution"
     return "🧮 Risk Manager"
 
@@ -919,7 +938,7 @@ def _build_mode_message(
     risk_result = dict(result or {})
     risk_result.setdefault("mode_context", context)
     risk_profile = _risk_profile_snapshot(runtime_settings, risk_result)
-    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(runtime_settings))
+    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(runtime_settings, risk_profile))
     return message + "\n" + risk_block
 
 def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot) -> dict:
@@ -3077,7 +3096,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
 
     risk_profile = _risk_profile_snapshot(settings, result)
-    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings))
+    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
     return "\n".join([
         "🟢 Bot Status",
