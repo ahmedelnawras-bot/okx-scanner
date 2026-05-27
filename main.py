@@ -271,26 +271,13 @@ def _compute_margin_from_reference(reference_balance_usdt: float, settings: Sett
 
 
 def _risk_profile_context(settings: Settings, result: dict | None = None) -> str:
-    """Return the effective context for risk display.
+    """Return risk-display context from the same runtime mode used by bot modes panel.
 
-    Important: execution_enabled only means the engine is allowed to evaluate
-    orders. The user-facing risk block must follow the active delivery mode:
-    - trading   -> Execution / OKX balance
-    - simulation -> Simulation wallet
-    - scan      -> Scan/Paper sizing
-    Runtime result mode wins when available because callbacks can change the
-    mode without rebuilding Settings from env.
+    Do NOT infer this from stale result/runtime fields. The previous build mixed
+    execution_enabled / simulation_wallet / runtime_mode and could display
+    Simulation while the bot modes panel was in Trading. The single source of
+    truth here is Settings.signal_delivery_mode, exactly like /bot_modes.
     """
-    result = result or {}
-    for key in ("runtime_mode", "signal_delivery_mode", "delivery_mode"):
-        value = str(result.get(key) or "").strip().lower()
-        if value in {"trading", "execution"}:
-            return "execution"
-        if value == "simulation":
-            return "simulation"
-        if value == "scan":
-            return "scan"
-
     mode = _get_signal_delivery_mode(settings)
     if mode == "trading":
         return "execution"
@@ -941,12 +928,12 @@ def _build_mode_message(
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(runtime_settings, risk_profile))
     return message + "\n" + risk_block
 
-def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot) -> dict:
+def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot, settings: Settings | None = None) -> dict:
     protection = block_protection_status(state)
     result["state"] = state
     result["mode"] = state.mode
     result["mode_context"] = _build_mode_context(state, snapshot, protection)
-    result["mode_message"] = _build_mode_message(state, snapshot, protection, result=result)
+    result["mode_message"] = _build_mode_message(state, snapshot, protection, settings=settings, result=result)
     result["mode_transition_message"] = None
     result["block_alert_preview"] = (
         build_block_escalation_alert(
@@ -974,7 +961,7 @@ def _run_market_mode_guard(
     snapshot = _build_snapshot(ranked_pairs, settings)
     previous_mode = state.mode
     guarded_state = decide_market_mode(snapshot, previous=state)
-    _refresh_mode_outputs(result, guarded_state, snapshot)
+    _refresh_mode_outputs(result, guarded_state, snapshot, settings=settings)
     if guarded_state.mode != previous_mode:
         reminder_tracker.clear()
         transition_message = _build_mode_message(
