@@ -253,28 +253,29 @@ def build_market_mode_sections(mode: str, context: dict, variant: str) -> str:
         lines.append(f"⏱ {context.get('minutes_in_mode', 0)}m in {mode}")
         lines.append(LIGHT_LINE)
 
-    lines.append(MODE_TITLE_MAP.get(mode, f"{mode_emoji} Market Mode: {mode}"))
+    # Header: keep one current-mode line only. In transition messages the old→new
+    # line above already identifies the change, so avoid repeating the full title.
+    if variant == "transition":
+        lines.append(f"{mode_emoji} Current Mode: {mode}")
+        lines.append(f"🧩 Color: {_mode_color_identity(mode)}")
+    else:
+        lines.append(MODE_TITLE_MAP.get(mode, f"{mode_emoji} Market Mode: {mode}"))
+        lines.append(f"🧩 Color: {_mode_color_identity(mode)}")
     lines.append(TITLE_LINE if variant == "status" else LIGHT_LINE)
-    lines.append(f"🧩 Mode Color: {_mode_color_identity(mode)}")
 
     lines.extend([
-        "",
         "📌 الحالة العامة",
         _MODE_AR_STATUS.get(mode, "حالة السوق تحت المتابعة."),
         "",
-        "🌗 Market Mix",
+        "🌗 Market Summary",
         *_market_mix_lines(context),
-        "",
-        "🌐 Market State",
-        f"• Strong Coins: {context.get('strong_coins', 0)}",
-        f"• Avg 15m: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
-        f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
-        f"• BTC 1h MA5: {'pressure' if context.get('hourly_ma5_pressure') else 'clear'} ({_fmt_pct(context.get('btc_1h_ma5_gap_pct', 0.0), 2)})",
     ])
 
+    # Market State duplicated the same Strong/Avg/Red/BTC numbers from Market Mix.
+    # Keep the readable Market Summary only, and put Trigger directly under it.
     trigger = context.get("trigger")
     if trigger:
-        lines.extend(["", "⚡ Trigger", str(trigger)])
+        lines.extend([f"• Trigger: {trigger}"])
 
     lines.extend([
         "",
