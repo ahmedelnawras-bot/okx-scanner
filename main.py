@@ -12,7 +12,9 @@ Phase 1 fixes applied:
 """
 from __future__ import annotations
 
+import csv
 import json
+import os
 import re
 import threading
 import time
@@ -266,6 +268,78 @@ def _compute_margin_from_reference(reference_balance_usdt: float, settings: Sett
     total_allocation = float(reference_balance_usdt) * (allocation_pct / 100.0)
     return total_allocation / float(slot_count)
 
+
+
+def _risk_profile_snapshot(
+    settings: Settings,
+    result: dict | None = None,
+    reference_balance: float | None = None,
+    source: str | None = None,
+) -> dict:
+    """Expose dynamic risk-manager sizing state for /status and mode messages."""
+    allocation_pct, slot_count = _risk_sizing_constants(settings)
+    result = result or {}
+    inputs = dict(result.get("portfolio_state_inputs", {}) or {})
+
+    if reference_balance is None:
+        reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    reference_balance = _safe_float(reference_balance, 0.0)
+
+    margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
+    if margin_per_trade <= 0 and reference_balance > 0:
+        margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
+
+    reason_bits: list[str] = []
+    if risk_manager_module is not None:
+        reason_bits.append("risk_manager_active")
+        mode_value = getattr(risk_manager_module, "mode", None) or getattr(risk_manager_module, "current_mode", None)
+        if mode_value:
+            reason_bits.append(f"mode={mode_value}")
+    else:
+        reason_bits.append("settings_fallback")
+
+    mode_context = result.get("mode_context") or {}
+    if isinstance(mode_context, dict):
+        market_state = str(mode_context.get("market_state") or "").strip()
+        if market_state:
+            reason_bits.append(market_state)
+        protection_current = str(mode_context.get("protection_current") or "").strip()
+        if protection_current and protection_current != "inactive":
+            reason_bits.append(f"protection={protection_current}")
+
+    drawdown = result.get("drawdown_status")
+    if drawdown is not None:
+        try:
+            reason_bits.append(
+                f"drawdown={float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}%/level{int(getattr(drawdown, 'level', 0) or 0)}"
+            )
+        except Exception:
+            pass
+
+    loss_guard = result.get("loss_streak_guard") or {}
+    if isinstance(loss_guard, dict) and loss_guard.get("active"):
+        reason_bits.append(f"loss_streak={int(loss_guard.get('streak', 0) or 0)}")
+
+    return {
+        "source": source or str(inputs.get("source") or "dynamic_risk"),
+        "reference_balance_usdt": reference_balance,
+        "allocation_pct": float(allocation_pct or 0.0),
+        "slot_count": int(slot_count or 0),
+        "margin_per_trade": margin_per_trade,
+        "reason": " | ".join(reason_bits[:4]) if reason_bits else "dynamic risk sizing",
+    }
+
+
+def _format_risk_profile_block(profile: dict | None, title: str = "🧮 Risk Profile") -> str:
+    profile = profile or {}
+    return "\n".join([
+        f"{title}",
+        f"Slots: <b>{int(profile.get('slot_count', 0) or 0)}</b>",
+        f"Allocation: <b>{_safe_float(profile.get('allocation_pct'), 0.0):.2f}%</b>",
+        f"Reference Balance: <b>{_safe_float(profile.get('reference_balance_usdt'), 0.0):,.2f} USDT</b>",
+        f"Margin / Trade: <b>{_safe_float(profile.get('margin_per_trade'), 0.0):,.2f} USDT</b>",
+        f"Reason: <code>{str(profile.get('reason') or 'dynamic risk sizing')}</code>",
+    ])
 
 def _snapshot_risk_manager_state(settings: Settings) -> dict:
     if risk_manager_module is None:
@@ -782,7 +856,9 @@ def _build_mode_message(
         context.update({"reminder_count": reminder_count, "minutes_in_mode": minutes_in_mode})
     if old_mode:
         context["old_mode"] = old_mode
-    return build_market_mode_sections(state.mode, context, variant=variant)
+    message = build_market_mode_sections(state.mode, context, variant=variant)
+    risk_profile = _risk_profile_snapshot(get_settings(), reference_balance=_safe_float(getattr(risk_manager_module, "reference_portfolio", 0.0), 0.0) if risk_manager_module is not None else None)
+    return message + "\n\n" + _format_risk_profile_block(risk_profile, title="🧮 Risk Manager")
 
 
 def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot) -> dict:
@@ -1583,6 +1659,146 @@ def _build_simulation_wallet_journal_report(result: dict | None = None) -> str:
     ]
     return "\n".join(lines).strip()
 
+
+_SIM_WALLET_PERIOD_COMMANDS = {
+    "/report_simulation_wallet_since_start": ("since_start", "Since Start", None),
+    "/simulation_wallet_since_start": ("since_start", "Since Start", None),
+    "/report_simulation_wallet_30d": ("30d", "Last Month", 30),
+    "/simulation_wallet_30d": ("30d", "Last Month", 30),
+    "/report_simulation_wallet_7d": ("7d", "Last Week", 7),
+    "/simulation_wallet_7d": ("7d", "Last Week", 7),
+}
+
+
+def _simulation_wallet_period_payload(result: dict | None, title: str, days: int | None) -> dict:
+    result = result or {}
+    journal = _simulation_wallet_journal_rows(
+        list(result.get("simulation_daily_log", []) or []),
+        result.get("simulation_daily_balance") or {},
+    )
+    rows = _simulation_wallet_period_rows(journal, days)
+    start = _safe_float(rows[0].get("start") if rows else SIMULATION_START_BALANCE_USDT, SIMULATION_START_BALANCE_USDT)
+    close = _safe_float(rows[-1].get("close") if rows else start, start)
+    net = close - start
+    net_pct = (net / start * 100.0) if start else 0.0
+    best_row = max(rows, key=lambda r: _safe_float(r.get("pnl"), 0.0), default=None)
+    worst_row = min(rows, key=lambda r: _safe_float(r.get("pnl"), 0.0), default=None)
+    wins = sum(1 for row in rows if _safe_float(row.get("pnl"), 0.0) > 0)
+    losses = sum(1 for row in rows if _safe_float(row.get("pnl"), 0.0) < 0)
+    flats = sum(1 for row in rows if abs(_safe_float(row.get("pnl"), 0.0)) <= 1e-9)
+    return {
+        "title": title,
+        "from": _format_simulation_wallet_day(rows[0].get("date"), include_year=True) if rows else "-",
+        "to": _format_simulation_wallet_day(rows[-1].get("date"), include_year=True) if rows else "-",
+        "start_balance": start,
+        "close_balance": close,
+        "net_usdt": net,
+        "net_pct": net_pct,
+        "days": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "best_day": best_row,
+        "worst_day": worst_row,
+        "rows": rows,
+    }
+
+
+def _build_simulation_wallet_period_report(result: dict | None, title: str, days: int | None) -> str:
+    payload = _simulation_wallet_period_payload(result, title, days)
+    block = _build_simulation_wallet_period_block(title, payload.get("rows") or [])
+    return "\n".join([
+        "💼 <b>Simulation Wallet Impact</b>",
+        "━━━━━━━━━━━━",
+        f"Report: <b>{title}</b>",
+        f"From: <code>{payload.get('from')}</code> → <code>{payload.get('to')}</code>",
+        f"Days: <b>{int(payload.get('days', 0) or 0)}</b>",
+        f"Net: <b>{_safe_float(payload.get('net_usdt'), 0.0):+,.2f} USDT | {_safe_float(payload.get('net_pct'), 0.0):+.2f}%</b>",
+        f"Result Days: 🟢 {payload.get('wins', 0)} | 🔴 {payload.get('losses', 0)} | ⚪ {payload.get('flats', 0)}",
+        "",
+        block,
+        "",
+        "📎 CSV + JSON exports are sent with this report.",
+    ]).strip()
+
+
+def _wallet_export_safe_name(title: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(title or "wallet").strip().lower()).strip("_") or "wallet"
+
+
+def _build_simulation_wallet_export_files(result: dict | None, title: str, days: int | None) -> list[dict]:
+    payload = _simulation_wallet_period_payload(result, title, days)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe = _wallet_export_safe_name(title)
+    base = f"/tmp/simulation_wallet_{safe}_{stamp}"
+    csv_path = base + ".csv"
+    json_path = base + ".json"
+
+    rows = payload.get("rows") or []
+    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["date", "start_usdt", "pnl_usdt", "pnl_pct", "close_usdt", "result"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+                "start_usdt": round(_safe_float(row.get("start"), 0.0), 6),
+                "pnl_usdt": round(_safe_float(row.get("pnl"), 0.0), 6),
+                "pnl_pct": round(_safe_float(row.get("pnl_pct"), 0.0), 6),
+                "close_usdt": round(_safe_float(row.get("close"), 0.0), 6),
+                "result": str(row.get("result") or ""),
+            })
+
+    json_payload = dict(payload)
+    json_payload["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    json_payload["rows"] = [
+        {
+            "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+            "raw_date": str(row.get("date") or ""),
+            "start_usdt": _safe_float(row.get("start"), 0.0),
+            "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
+            "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
+            "close_usdt": _safe_float(row.get("close"), 0.0),
+            "result": str(row.get("result") or ""),
+        }
+        for row in rows
+    ]
+    for key in ("best_day", "worst_day"):
+        row = json_payload.get(key)
+        if isinstance(row, dict):
+            json_payload[key] = {
+                "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+                "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
+                "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
+                "close_usdt": _safe_float(row.get("close"), 0.0),
+                "result": str(row.get("result") or ""),
+            }
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(json_payload, fh, ensure_ascii=False, indent=2, default=str)
+
+    return [
+        {"path": csv_path, "caption": f"Simulation Wallet {title} CSV"},
+        {"path": json_path, "caption": f"Simulation Wallet {title} JSON"},
+    ]
+
+
+def _simulation_wallet_menu_text() -> str:
+    return "\n".join([
+        "💼 <b>Simulation Wallet Impact</b>",
+        "━━━━━━━━━━━━",
+        "اختار فترة التقرير:",
+        "",
+        "📊 Since Start",
+        "/report_simulation_wallet_since_start",
+        "",
+        "📆 Last Month",
+        "/report_simulation_wallet_30d",
+        "",
+        "🗓 Last Week",
+        "/report_simulation_wallet_7d",
+        "",
+        "كل أمر يرسل تقرير Telegram + ملف CSV + ملف JSON.",
+    ])
+
 def _build_simulation_account_summary(result: dict | None = None) -> str:
     """Small Simulation account block.
 
@@ -1736,7 +1952,7 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     """
     wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
 
-    wallet_text = _simulation_header(_build_simulation_wallet_journal_report(result))
+    wallet_text = _simulation_header(_simulation_wallet_menu_text())
 
     daily_balance_text = _simulation_header("\n".join([
         "📅 <b>Simulation Daily Balance</b>",
@@ -1748,12 +1964,17 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         ),
     ]))
 
-    return build_simulation_report_command_outputs(
+    outputs = build_simulation_report_command_outputs(
         result,
         account_summary=_build_simulation_account_summary(result),
         wallet_text=wallet_text,
         daily_balance_text=daily_balance_text,
     )
+    for cmd, (_key, title, days) in _SIM_WALLET_PERIOD_COMMANDS.items():
+        outputs[cmd] = _simulation_header(_build_simulation_wallet_period_report(result, title, days))
+    outputs["/report_simulation_wallet"] = _simulation_header(_simulation_wallet_menu_text())
+    outputs["/simulation_wallet"] = _simulation_header(_simulation_wallet_menu_text())
+    return outputs
 
 def run_once(
     previous_state: MarketModeState | None = None,
@@ -2791,6 +3012,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     else:
         loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
 
+    risk_profile = _risk_profile_snapshot(settings, result)
+    risk_block = _format_risk_profile_block(risk_profile, title="🧮 Risk Manager")
+
     return "\n".join([
         "🟢 Bot Status",
         "━━━━━━━━━━━━",
@@ -2801,6 +3025,8 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
         f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
+        "",
+        risk_block,
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
@@ -3758,8 +3984,12 @@ def _build_simulation_help() -> str:
         "/report_simulation_losses_analysis_1h",
         "",
         "💼 Wallet Impact",
-        "/report_simulation_wallet",
-        "/simulation_wallet",
+        "📊 Since Start",
+        "/report_simulation_wallet_since_start",
+        "📆 Last Month",
+        "/report_simulation_wallet_30d",
+        "🗓 Last Week",
+        "/report_simulation_wallet_7d",
         "",
         "📅 رصيد بداية اليوم",
         "/report_simulation_daily_balance",
@@ -3918,6 +4148,14 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 continue
 
             simulation_outputs = _build_simulation_command_outputs(result)
+            if command in _SIM_WALLET_PERIOD_COMMANDS:
+                _key, title, days = _SIM_WALLET_PERIOD_COMMANDS[command]
+                _send_text(sender, simulation_outputs.get(command) or _simulation_header(_build_simulation_wallet_period_report(result, title, days)))
+                for export in _build_simulation_wallet_export_files(result, title, days):
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Simulation Wallet Export"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال ملف Wallet export. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+                continue
             if command in simulation_outputs:
                 _send_text(sender, simulation_outputs[command])
                 continue
