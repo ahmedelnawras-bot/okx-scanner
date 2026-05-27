@@ -46,38 +46,41 @@ class MarketModeState:
 
 # Keep transitions stable without trapping the bot inside BLOCK.
 MODE_CHANGE_COOLDOWN_MINUTES = 10
-NORMAL_EXIT_COOLDOWN_MINUTES = 2
-RETURN_TO_NORMAL_COOLDOWN_MINUTES = 12
+# Defensive shift from NORMAL should be fast; return to NORMAL needs more proof.
+NORMAL_EXIT_COOLDOWN_MINUTES = 1
+RETURN_TO_NORMAL_COOLDOWN_MINUTES = 18
 
 # BLOCK should be defensive: fast in on real breakdown, slower out after pressure.
 # Recovery can still exit BLOCK immediately when a clear fast rebound appears.
 BLOCK_MIN_HOLD_MINUTES = 10
 BLOCK_EXIT_CONFIRM_SCANS = 3
 STRONG_TO_BLOCK_CONFIRM_SCANS = 1
+# Returning to NORMAL requires repeated healthy scans, not one green snapshot.
+NORMAL_RETURN_CONFIRM_SCANS = 2
 
 # Old-core style thresholds.
-BLOCK_RED_RATIO = 0.68
-BLOCK_AVG_CHANGE = -1.20
-BLOCK_BTC_CHANGE = -0.70
+BLOCK_RED_RATIO = 0.66
+BLOCK_AVG_CHANGE = -0.85
+BLOCK_BTC_CHANGE = -0.55
 BLOCK_BTC_RED_RATIO = 0.55
-ALT_WEAK_RED_RATIO = 0.60
+ALT_WEAK_RED_RATIO = 0.62
 
 # Fast emergency BLOCK path.
-FAST_BLOCK_BTC_15M = -1.10
-FAST_BLOCK_RED_RATIO = 0.80
-FAST_BLOCK_AVG = -1.80
+FAST_BLOCK_BTC_15M = -0.95
+FAST_BLOCK_RED_RATIO = 0.78
+FAST_BLOCK_AVG = -1.50
 
-NO_LONGER_CRASHING_RED_RATIO = 0.62
-NO_LONGER_CRASHING_AVG = -0.75
-NO_LONGER_CRASHING_BTC = -0.45
+NO_LONGER_CRASHING_RED_RATIO = 0.60
+NO_LONGER_CRASHING_AVG = -0.65
+NO_LONGER_CRASHING_BTC = -0.38
 
 RECOVERY_READY_RED_RATIO = 0.58
 RECOVERY_READY_AVG = -0.55
 RECOVERY_READY_BTC = -0.32
 
-NORMAL_READY_RED_RATIO = 0.52
-NORMAL_READY_AVG = -0.25
-NORMAL_READY_BTC = -0.15
+NORMAL_READY_RED_RATIO = 0.44
+NORMAL_READY_AVG = -0.05
+NORMAL_READY_BTC = -0.05
 
 RECOVERY_SOFT_FAIL_RED_RATIO = 0.62
 RECOVERY_SOFT_FAIL_AVG = -0.45
@@ -90,9 +93,9 @@ RECOVERY_HARD_FAIL_BTC = -0.75
 # NORMAL_LONG is the healthy/green market; STRONG_LONG_ONLY is the defensive
 # pressure mode. These thresholds only help Recovery leave quickly when the
 # rebound is no longer a fresh bounce but the market is still not green enough.
-RECOVERY_TO_STRONG_RED_RATIO = 0.58
-RECOVERY_TO_STRONG_AVG = -0.35
-RECOVERY_TO_STRONG_BTC = -0.30
+RECOVERY_TO_STRONG_RED_RATIO = 0.60
+RECOVERY_TO_STRONG_AVG = -0.45
+RECOVERY_TO_STRONG_BTC = -0.35
 RECOVERY_TO_STRONG_MIN_STRONG_COINS = 4
 
 
@@ -186,8 +189,8 @@ def _is_no_longer_crashing(snapshot: MarketSnapshot) -> bool:
     stabilization_safe = bool(
         snapshot.breadth_improving
         or snapshot.btc_reclaim
-        or (btc > -0.65 and avg > -1.05 and red_ratio < 0.68)
-        or (strong >= 5 and avg > -0.90 and btc > -0.65)
+        or (btc > -0.55 and avg > -0.85 and red_ratio < 0.62)
+        or (strong >= 5 and avg > -0.75 and btc > -0.55)
     )
     return bool(old_core_safe or stabilization_safe)
 
@@ -227,10 +230,10 @@ def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
 def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
     red_ratio, avg, btc, strong = _values(snapshot)
     return bool(
-        red_ratio < 0.48
-        and avg > -0.12
-        and btc > -0.08
-        and strong >= 7
+        red_ratio < NORMAL_READY_RED_RATIO
+        and avg > NORMAL_READY_AVG
+        and btc > NORMAL_READY_BTC
+        and strong >= 8
         and not _has_hourly_ma5_pressure(snapshot)
     )
 
@@ -258,7 +261,9 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     broad_market_crash = red_ratio >= BLOCK_RED_RATIO and avg <= BLOCK_AVG_CHANGE
     btc_breakdown = btc <= BLOCK_BTC_CHANGE and red_ratio >= BLOCK_BTC_RED_RATIO
-    alt_weak_pressure = red_ratio >= ALT_WEAK_RED_RATIO and avg <= -0.85 and btc <= -0.45
+    alt_weak_pressure = red_ratio >= ALT_WEAK_RED_RATIO and avg <= -0.65 and btc <= -0.30
+    severe_breadth_pressure = bool(red_ratio >= 0.75 and avg <= -0.45 and strong <= 3)
+    panic_breadth_pressure = bool(red_ratio >= 0.88 and avg <= -0.25 and strong <= 2)
 
     # Fast emergency panic path.
     fast_block_trigger = bool(
@@ -269,7 +274,7 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         or
         (
             avg <= FAST_BLOCK_AVG
-            and red_ratio >= 0.85
+            and red_ratio >= 0.82
         )
     )
 
@@ -281,7 +286,7 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     # Stabilization prevents breadth-only BLOCK and pushes the system toward STRONG.
     stabilizing = bool(no_longer_crashing or snapshot.breadth_improving or snapshot.btc_reclaim)
 
-    real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure) and not stabilizing)
+    real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
     # التعديل الوحيد هنا ────────────────────────────────
@@ -298,6 +303,8 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         "broad_market_crash": broad_market_crash,
         "btc_breakdown": btc_breakdown,
         "alt_weak_pressure": alt_weak_pressure,
+        "severe_breadth_pressure": severe_breadth_pressure,
+        "panic_breadth_pressure": panic_breadth_pressure,
         "fast_block_trigger": fast_block_trigger,
         "weak_breadth": weak_breadth,
         "stabilizing": stabilizing,
@@ -380,7 +387,7 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         # Enter BLOCK from STRONG immediately on confirmed real breakdown.
         if flags["real_block"] and next_state.consecutive_weak_scans >= STRONG_TO_BLOCK_CONFIRM_SCANS:
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"]:
+        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
             candidate_mode = MODE_NORMAL_LONG
         else:
             # STRONG is the pressure mode. Do not jump to RECOVERY unless a
@@ -390,7 +397,7 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     elif previous.mode == MODE_RECOVERY_LONG:
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"]:
+        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
             candidate_mode = MODE_NORMAL_LONG
         else:
             # Recovery may continue while the runner-style rebound remains active.
