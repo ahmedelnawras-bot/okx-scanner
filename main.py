@@ -1397,6 +1397,192 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
 
     return out
 
+
+def _parse_simulation_wallet_day(value: object):
+    """Parse a persisted simulation wallet day safely."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text[:10]).date()
+    except Exception:
+        return None
+
+
+def _format_simulation_wallet_day(value: object, include_year: bool = False) -> str:
+    day = _parse_simulation_wallet_day(value)
+    if not day:
+        return "-"
+    return day.strftime("%d-%m-%Y" if include_year else "%d-%m")
+
+
+def _simulation_wallet_journal_rows(
+    rows: list[dict],
+    current_row: dict | None = None,
+) -> list[dict]:
+    """Build daily journal rows where each day starts from previous close.
+
+    This is Simulation-only. Execution reports and live OKX state are untouched.
+    """
+    merged: dict[str, dict] = {}
+
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        day = str(item.get("date") or "").strip()
+        if day:
+            merged[day] = dict(item)
+
+    if isinstance(current_row, dict):
+        day = str(current_row.get("date") or "").strip()
+        if day:
+            merged[day] = dict(current_row)
+
+    if not merged:
+        today = _simulation_today_key()
+        merged[today] = {
+            "date": today,
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "end_balance": SIMULATION_START_BALANCE_USDT,
+        }
+
+    sorted_items = sorted(
+        merged.values(),
+        key=lambda item: str(item.get("date") or ""),
+    )
+
+    journal: list[dict] = []
+    previous_close: float | None = None
+
+    for item in sorted_items:
+        day_text = str(item.get("date") or "").strip()
+        if not day_text:
+            continue
+
+        stored_start = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+        start_balance = previous_close if previous_close is not None else stored_start
+        if start_balance <= 0:
+            start_balance = SIMULATION_START_BALANCE_USDT
+
+        close_balance = _safe_float(item.get("end_balance") or item.get("current_balance"), start_balance)
+        if close_balance <= 0:
+            close_balance = start_balance
+
+        pnl = close_balance - start_balance
+        pnl_pct = (pnl / start_balance * 100.0) if start_balance else 0.0
+        if pnl > 0:
+            result = "🟢 Profit"
+        elif pnl < 0:
+            result = "🔴 Loss"
+        else:
+            result = "⚪ Flat"
+
+        journal.append({
+            "date": day_text,
+            "day": _parse_simulation_wallet_day(day_text),
+            "start": start_balance,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "close": close_balance,
+            "result": result,
+        })
+        previous_close = close_balance
+
+    return journal
+
+
+def _simulation_wallet_period_rows(journal: list[dict], days: int | None = None) -> list[dict]:
+    if not journal:
+        return []
+    if days is None:
+        return list(journal)
+
+    valid_days = [row.get("day") for row in journal if row.get("day") is not None]
+    if not valid_days:
+        return list(journal[-max(1, int(days)):])
+
+    end_day = max(valid_days)
+    cutoff = end_day - timedelta(days=max(0, int(days) - 1))
+    return [row for row in journal if row.get("day") is None or row.get("day") >= cutoff]
+
+
+def _format_simulation_wallet_money(value: object, signed: bool = False) -> str:
+    number = _safe_float(value, 0.0)
+    if signed:
+        return f"{number:+,.2f}"
+    return f"{number:,.2f}"
+
+
+def _build_simulation_wallet_period_block(title: str, rows: list[dict]) -> str:
+    if not rows:
+        return "\n".join([
+            f"📊 <b>{title}</b>",
+            "From: - → -",
+            "",
+            "<code>No wallet rows yet.</code>",
+        ])
+
+    from_date = _format_simulation_wallet_day(rows[0].get("date"), include_year=True)
+    to_date = _format_simulation_wallet_day(rows[-1].get("date"), include_year=True)
+
+    table_lines = [
+        f"{'Date':<7} {'Start$':>10} {'PnL$':>10} {'PnL%':>8} {'Close$':>10} Result",
+    ]
+    for row in rows:
+        table_lines.append(
+            f"{_format_simulation_wallet_day(row.get('date')):<7} "
+            f"{_format_simulation_wallet_money(row.get('start')):>10} "
+            f"{_format_simulation_wallet_money(row.get('pnl'), signed=True):>10} "
+            f"{_safe_float(row.get('pnl_pct'), 0.0):+7.2f}% "
+            f"{_format_simulation_wallet_money(row.get('close')):>10} "
+            f"{row.get('result') or '-'}"
+        )
+
+    return "\n".join([
+        f"📊 <b>{title}</b>",
+        f"From: {from_date} → {to_date}",
+        "",
+        "<code>" + "\n".join(table_lines) + "</code>",
+    ])
+
+
+def _build_simulation_wallet_journal_report(result: dict | None = None) -> str:
+    """Detailed Simulation wallet journal for /report_simulation_wallet.
+
+    Sections:
+    - Since Start
+    - Last Month (30 days)
+    - Last Week (7 days)
+    """
+    result = result or {}
+    journal = _simulation_wallet_journal_rows(
+        list(result.get("simulation_daily_log", []) or []),
+        result.get("simulation_daily_balance") or {},
+    )
+
+    current = _safe_float(journal[-1].get("close") if journal else SIMULATION_START_BALANCE_USDT, SIMULATION_START_BALANCE_USDT)
+    start = _safe_float(journal[0].get("start") if journal else SIMULATION_START_BALANCE_USDT, SIMULATION_START_BALANCE_USDT)
+    net = current - start
+    net_pct = (net / start * 100.0) if start else 0.0
+    best = max((row.get("pnl", 0.0) for row in journal), default=0.0)
+    worst = min((row.get("pnl", 0.0) for row in journal), default=0.0)
+
+    lines = [
+        "💼 <b>Simulation Wallet Journal</b>",
+        "━━━━━━━━━━━━",
+        f"Current: <code>{current:,.2f} USDT</code>",
+        f"Net Since Start: <code>{net:+,.2f} USDT | {net_pct:+.2f}%</code>",
+        f"Best Day: <code>{best:+,.2f} USDT</code> | Worst Day: <code>{worst:+,.2f} USDT</code>",
+        "",
+        _build_simulation_wallet_period_block("Since Start", _simulation_wallet_period_rows(journal, None)),
+        "",
+        _build_simulation_wallet_period_block("Last Month", _simulation_wallet_period_rows(journal, 30)),
+        "",
+        _build_simulation_wallet_period_block("Last Week", _simulation_wallet_period_rows(journal, 7)),
+    ]
+    return "\n".join(lines).strip()
+
 def _build_simulation_account_summary(result: dict | None = None) -> str:
     """Small Simulation account block.
 
@@ -1550,26 +1736,10 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     """
     wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
 
-    wallet_text = "\n".join([
-        _build_simulation_account_summary(result),
-        "",
-        "🧪 <b>Simulation Wallet</b>",
-        "━━━━━━━━━━━━",
-        "Start Balance",
-        _sim_money(wallet['start_balance']),
-        "Equity",
-        _sim_money(wallet['equity']),
-        "Realized",
-        _sim_money(wallet['realized'], signed=True),
-        "Floating",
-        _sim_money(wallet['floating'], signed=True),
-        "Trades",
-        _sim_code(f"Open {wallet['open_count']} | Closed {wallet['closed_count']} | Total {wallet['total_count']}"),
-    ])
-    wallet_text = _simulation_header(wallet_text)
+    wallet_text = _simulation_header(_build_simulation_wallet_journal_report(result))
 
     daily_balance_text = _simulation_header("\n".join([
-        "📅 <b>رصيد المحاكاة اليومي</b>",
+        "📅 <b>Simulation Daily Balance</b>",
         "━━━━━━━━━━━━",
         *_format_simulation_equity_curve_rows(
             list(result.get("simulation_daily_log", []) or []),
@@ -3327,7 +3497,6 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
         live_trades = list(result.get("trades", []) or [])
 
     kept_live = []
-    removed_trade_ids: list[str] = []
     removed_execution = 0
     removed_normal = 0
 
@@ -3343,30 +3512,17 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
             remove = True
             removed_normal += 1
 
-        if remove:
-            trade_id = str(getattr(trade, "trade_id", "") or "").strip()
-            if trade_id:
-                removed_trade_ids.append(trade_id)
-        else:
+        if not remove:
             kept_live.append(trade)
 
-    deleted_live_trade_keys = 0
-    deleted_execution_checks = 0
     if trade_store and getattr(trade_store, "enabled", False):
         try:
-            if removed_trade_ids and hasattr(trade_store, "delete_trade_records"):
-                deleted_live_trade_keys = trade_store.delete_trade_records(removed_trade_ids)
-            if kind in {"execution", "all"} and hasattr(trade_store, "clear_execution_checks"):
-                deleted_execution_checks = trade_store.clear_execution_checks()
             trade_store.save_trades(kept_live)
         except Exception as exc:
             print(f"⚠️ save after report reset failed: {exc}", flush=True)
 
     if result is not None:
         result["trades"] = kept_live
-        if kind in {"execution", "all"}:
-            result["execution_results"] = []
-            result["current_execution_results"] = []
 
     removed_simulation = 0
     deleted_sim_keys = 0
@@ -3397,8 +3553,6 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
         "removed_normal": removed_normal,
         "removed_simulation": removed_simulation,
         "deleted_sim_keys": deleted_sim_keys,
-        "deleted_live_trade_keys": deleted_live_trade_keys,
-        "deleted_execution_checks": deleted_execution_checks,
     })
     return stats
 
