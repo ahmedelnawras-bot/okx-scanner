@@ -150,13 +150,28 @@ def _focus_lines(mode: str) -> list[str]:
 
 
 def _execution_status_lines(mode: str, context: dict) -> list[str]:
+    is_sim = bool(context.get("runtime_is_simulation")) or str(context.get("runtime_mode") or "").lower() == "simulation"
+    action_word = "simulation" if is_sim else "execution"
+    block_word = "simulated" if is_sim else "ON"
     if mode == MODE_BLOCK_LONGS:
-        return ["• Normal execution: OFF", "• Block exceptions: ON", "• Recovery: watching rebound"]
+        return [f"• Normal {action_word}: OFF", f"• Block exceptions: {block_word}", "• Recovery: watching rebound"]
     if mode == MODE_RECOVERY_LONG:
-        return ["• Recovery: ACTIVE", "• Normal execution: limited", "• Weak Drift: checked"]
+        return ["• Recovery: ACTIVE", f"• Normal {action_word}: limited", "• Weak Drift: checked"]
     if mode == MODE_STRONG_LONG_ONLY:
         return ["• Whitelist/Elite: ACTIVE", "• Weak Drift: ON"]
-    return ["• Whitelist: ACTIVE", "• Weak Drift: execution-only"]
+    return ["• Whitelist: ACTIVE", f"• Weak Drift: {action_word}-only"]
+
+
+def _runtime_protection_title(context: dict) -> str:
+    is_sim = bool(context.get("runtime_is_simulation")) or str(context.get("runtime_mode") or "").lower() == "simulation"
+    if is_sim:
+        return "🧪 <b>Simulation Protection</b>"
+    return "🚀 <b>Execution Protection</b>"
+
+
+def _accepted_label(context: dict) -> str:
+    is_sim = bool(context.get("runtime_is_simulation")) or str(context.get("runtime_mode") or "").lower() == "simulation"
+    return "Sim Accepted" if is_sim else "Exec Accepted"
 
 
 def _build_compact_market_reminder(mode: str, context: dict) -> str:
@@ -216,13 +231,13 @@ def _build_compact_market_reminder(mode: str, context: dict) -> str:
         "",
         "📈 <b>Scan Summary</b>",
         f"• Signals: {context.get('signals_count', 0)}",
-        f"• Exec Accepted: {context.get('exec_accepted', 0)}",
+        f"• {_accepted_label(context)}: {context.get('exec_accepted', 0)}",
         f"• Rejects: {context.get('rejects_count', 0)}",
         "",
         "⚠️ <b>Top Reject</b>",
         str(context.get("top_reject", "n/a")),
         "",
-        "🚀 <b>Execution</b>",
+        _runtime_protection_title(context),
         *_execution_status_lines(mode, context),
         "",
         "🛡 <b>Protection</b>",
