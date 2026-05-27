@@ -422,15 +422,15 @@ def build_trade_track_message(trade) -> str:
     symbol = getattr(trade, "symbol", "-")
     opened_at = getattr(trade, "opened_at", None)
     updated_at = getattr(trade, "updated_at", None)
-    age_label = _duration_label(opened_at, closed_at if getattr(trade, "is_closed", False) else None)
+    closed_at = getattr(trade, "closed_at", None)
+    is_closed = bool(getattr(trade, "is_closed", False))
+    age_label = _duration_label(opened_at, closed_at if is_closed else None)
     last_update_label = _time_label(updated_at)
     max_favorable_raw = float(getattr(trade, "max_favorable_pct", 0.0) or 0.0)
     max_adverse_raw = float(getattr(trade, "max_adverse_pct", 0.0) or 0.0)
 
     entry_price = float(getattr(trade, "entry", 0.0) or 0.0)
     current_price = float(getattr(trade, "current_price", 0.0) or entry_price)
-    closed_at = getattr(trade, "closed_at", None)
-    is_closed = bool(getattr(trade, "is_closed", False))
     counted_open, daily_open, same_symbol_blocks = _slot_status_snapshot(trade)
 
     price_change_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
