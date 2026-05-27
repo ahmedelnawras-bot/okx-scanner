@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from analysis.models import SignalCandidate
 from utils.constants import (
     DEFAULT_LEVERAGE,
@@ -164,6 +166,51 @@ def _leveraged_pct(raw_pct: float) -> float:
 def _money_from_pct(pct: float, margin: float = 35.0) -> float:
     """USD impact from a displayed leveraged performance percentage."""
     return (float(pct or 0.0) / 100.0) * margin
+
+
+def _ensure_datetime(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _duration_label(start, end=None) -> str:
+    start_dt = _ensure_datetime(start)
+    if start_dt is None:
+        return "unknown"
+    end_dt = _ensure_datetime(end) or datetime.now(timezone.utc)
+    seconds = max(0, int((end_dt - start_dt).total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _time_label(value) -> str:
+    dt = _ensure_datetime(value)
+    if dt is None:
+        return "-"
+    return dt.strftime("%H:%M:%S %d/%m")
+
+
+def _pct_pair_label(raw_pct: float) -> str:
+    leveraged = _leveraged_pct(raw_pct)
+    return f"{raw_pct:+.2f}% spot | {leveraged:+.2f}% {int(float(DEFAULT_LEVERAGE or 1))}x"
 
 
 def _trade_raw_effective_pnl_pct(trade) -> float:
@@ -373,6 +420,12 @@ def build_trade_track_message(trade) -> str:
     tp2_pct = float(getattr(trade, "tp2_close_pct", 40.0) or 40.0)
     runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
     symbol = getattr(trade, "symbol", "-")
+    opened_at = getattr(trade, "opened_at", None)
+    updated_at = getattr(trade, "updated_at", None)
+    age_label = _duration_label(opened_at, closed_at if getattr(trade, "is_closed", False) else None)
+    last_update_label = _time_label(updated_at)
+    max_favorable_raw = float(getattr(trade, "max_favorable_pct", 0.0) or 0.0)
+    max_adverse_raw = float(getattr(trade, "max_adverse_pct", 0.0) or 0.0)
 
     entry_price = float(getattr(trade, "entry", 0.0) or 0.0)
     current_price = float(getattr(trade, "current_price", 0.0) or entry_price)
@@ -391,10 +444,14 @@ def build_trade_track_message(trade) -> str:
         f"🚀 Path: {_clean_name(path)}",
         f"📈 Mode: {mode}",
         f"⏱ TF: 15m | ⭐ Score: {float(getattr(trade, 'score', 0.0) or 0.0):.2f}",
+        f"🕒 Open Duration: {age_label}",
+        f"🔄 Last Price Update: {last_update_label}",
         "",
         "📍 Position",
         f"• Entry Price: {_fmt_price(entry_price)}",
-        f"• Current Price: {_fmt_price(current_price)} {price_change_icon} {price_change_str}",
+        f"• Current Price: {_fmt_price(current_price)} {price_change_icon} {price_change_str} spot | {_leveraged_pct(price_change_pct):+.2f}% {int(float(DEFAULT_LEVERAGE or 1))}x",
+        f"• Max Rise: {_pct_pair_label(max_favorable_raw)}",
+        f"• Max Drop: {_pct_pair_label(max_adverse_raw)}",
         f"• Entry Type: {getattr(trade, 'entry_type', 'Market') if hasattr(trade, 'entry_type') else 'Market'}",
         *(
             [f"• Closed At: {closed_at.strftime('%H:%M %d/%m') if hasattr(closed_at, 'strftime') else str(closed_at)}"]
@@ -406,6 +463,7 @@ def build_trade_track_message(trade) -> str:
         f"• {floating_label}: {floating_usd:+.2f}$",
         f"• Total Impact Now: {total_usd:+.2f}$",
         f"• 15x Performance: {total_pct:+.2f}% | {total_usd:+.2f}$",
+        f"• ملاحظة: نسب PnL المعروضة محسوبة على الرافعة {int(float(DEFAULT_LEVERAGE or 1))}x",
         "",
         "🎯 Targets",
         f"• TP1: {_fmt_price(getattr(trade, 'tp1', 0.0))} | Close {tp1_pct:.0f}%",
