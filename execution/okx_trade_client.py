@@ -904,6 +904,140 @@ class OKXTradeClient:
         response = self._request("POST", path, payload=payload)
         return self._normalize_trade_response(response, payload, id_key="ordId", response_kind="amend_order")
 
+    def get_max_leverage(
+        self,
+        inst_id: str,
+        mgn_mode: str = "cross",
+    ) -> dict[str, Any]:
+        """اقرأ أقصى رافعة مسموح بها لعملة معينة.
+
+        بيستخدم instrument specs اللي بتتخزن في cache.
+        """
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+
+        # جرب account-level leverage info أولاً
+        path = "/api/v5/account/leverage-info"
+        params: dict[str, Any] = {"instId": inst_id, "mgnMode": mgn_mode}
+        response = self._request("GET", path, params=params)
+        ok = str(response.get("code", "")) == "0"
+        rows = response.get("data") or []
+        row = rows[0] if isinstance(rows, list) and rows else {}
+
+        if ok and row:
+            current_lever = int(self._safe_float(row.get("lever"), 0))
+            max_lever = current_lever  # OKX returns current set leverage
+            return {
+                "ok": True,
+                "simulated": self.credentials.simulated,
+                "current_leverage": current_lever,
+                "max_leverage": max_lever,
+                "source": "account_leverage_info",
+                "row": row,
+            }
+
+        # Fallback: instrument specs بتحتوي على lever field
+        specs = self.get_instrument_specs(inst_id)
+        if specs.get("ok"):
+            lever_val = int(self._safe_float(
+                (specs.get("row") or {}).get("lever") or 0, 0
+            ))
+            if lever_val > 0:
+                return {
+                    "ok": True,
+                    "simulated": self.credentials.simulated,
+                    "current_leverage": lever_val,
+                    "max_leverage": lever_val,
+                    "source": "instrument_specs",
+                    "row": specs.get("row") or {},
+                }
+
+        return {
+            "ok": False,
+            "simulated": self.credentials.simulated,
+            "reason": response.get("msg") or "max_leverage_unavailable",
+            "response": response,
+        }
+
+    def set_leverage(
+        self,
+        inst_id: str,
+        lever: int,
+        mgn_mode: str = "cross",
+        *,
+        pos_side: str | None = None,
+    ) -> dict[str, Any]:
+        """اضبط الرافعة لعملة معينة قبل الأوردر.
+
+        لو الرافعة المطلوبة أكبر من المسموح:
+        - بيجيب أقصى رافعة متاحة
+        - بيضبطها تلقائياً
+
+        دايماً cross margin.
+        """
+        guard = self._trade_guard_error()
+        if guard:
+            return guard
+
+        requested_lever = max(1, int(lever))
+        path = "/api/v5/account/set-leverage"
+
+        def _do_set(l: int) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "instId": inst_id,
+                "lever": str(l),
+                "mgnMode": mgn_mode,
+            }
+            if pos_side:
+                payload["posSide"] = pos_side
+            response = self._request("POST", path, payload=payload)
+            ok = str(response.get("code", "")) == "0"
+            rows = response.get("data") or []
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            return {
+                "ok": ok,
+                "simulated": self.credentials.simulated,
+                "lever_set": l,
+                "reason": (
+                    row.get("sMsg") or response.get("msg") or
+                    ("leverage_set" if ok else "set_leverage_failed")
+                ),
+                "payload": payload,
+                "response": response,
+            }
+
+        result = _do_set(requested_lever)
+
+        # لو فشل بسبب تجاوز الحد → اجلب الحد واعمل retry
+        if not result.get("ok"):
+            err_msg = str(result.get("reason") or "").lower()
+            leverage_exceeded = any(kw in err_msg for kw in (
+                "exceed", "max", "leverage", "51011", "51012", "51000"
+            ))
+            # كمان تحقق من كود OKX مباشرة
+            raw_code = str((result.get("response") or {}).get("code") or "")
+            if not leverage_exceeded:
+                leverage_exceeded = raw_code in {"51011", "51012", "51000", "51010"}
+
+            if leverage_exceeded:
+                max_info = self.get_max_leverage(inst_id, mgn_mode=mgn_mode)
+                max_lever = int(self._safe_float(max_info.get("max_leverage"), 0))
+                if max_lever > 0 and max_lever < requested_lever:
+                    print(
+                        f"⚠️ set_leverage: {inst_id} requested={requested_lever}x > max={max_lever}x "
+                        f"— retrying with max={max_lever}x",
+                        flush=True,
+                    )
+                    retry = _do_set(max_lever)
+                    retry["original_request"] = requested_lever
+                    retry["capped_to_max"] = max_lever
+                    retry["max_leverage_info"] = max_info
+                    return retry
+
+        result["original_request"] = requested_lever
+        return result
+
     def cancel_order(
         self,
         inst_id: str,
