@@ -2187,8 +2187,14 @@ def run_once(
     exchange_stop_sync_enabled = bool(
         exchange_reconcile_enabled
         and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
-        and state.mode == MODE_BLOCK_LONGS
-        and int(initial_protection.get("level", 0) or 0) >= 2
+        and (
+            # BLOCK mode protection — level 2+ كما كان
+            (state.mode == MODE_BLOCK_LONGS and int(initial_protection.get("level", 0) or 0) >= 2)
+            or
+            # Runner protection — أي صفقة وصلت TP2 في أي mode
+            # بيحافظ على الـ trailing SL على المنصة بعد ما TP2 يتنفذ
+            any(getattr(t, "tp2_hit", False) for t in persisted_trades)
+        )
     )
     if persisted_trades:
         persisted_trades, exchange_reconcile_stats = _reconcile_execution_trades_with_okx(
