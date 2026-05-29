@@ -3257,6 +3257,31 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         else:
             item["announcement_status"] = "sent" if send_ok else "send_failed"
 
+def _build_execution_balance_header(result: dict, settings: Settings) -> str:
+    """بلوك رصيد OKX يظهر في أعلى تقارير التنفيذ.
+
+    بيأخذ البيانات من portfolio_state_inputs اللي بتجي من OKX balance
+    أو fallback وبيظهرها بشكل واضح مع Low Balance Mode لو مفعل.
+    """
+    inputs = dict((result or {}).get("portfolio_state_inputs") or {})
+    reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
+    allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
+    low_balance = bool(0 < reference_balance < LOW_BALANCE_THRESHOLD_USDT)
+
+    lines = [
+        "💼 <b>OKX Account — Execution Sizing</b>",
+        "━━━━━━━━━━━━",
+        f"• Reference Balance: <b>{reference_balance:,.2f} USDT</b>",
+        f"• Allocation: <b>{allocation_pct:.2f}%</b> / <b>{slot_count} slots</b>",
+        f"• Planned Margin / Trade: <b>{margin_per_trade:,.2f} USDT</b>",
+    ]
+    if low_balance:
+        lines.append(f"⚠️ <b>Low Balance Mode</b> — balance &lt; {LOW_BALANCE_THRESHOLD_USDT:.0f} USDT")
+    lines.append("━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
@@ -4403,6 +4428,14 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             or result.get("command_outputs", {}).get(command)
             or "الأمر غير متاح في هذه النسخة."
         )
+        # أضف رصيد OKX في أعلى تقارير التنفيذ فقط
+        _cb_settings = settings or get_settings()
+        _is_exec_report_cb = (
+            command.startswith("/report_execution")
+            and command not in simulation_outputs
+        )
+        if _is_exec_report_cb and reply and not _is_simulation_mode(_cb_settings):
+            reply = _build_execution_balance_header(result, _cb_settings) + "\n" + reply
         _send_text(sender, reply)
         return
 
@@ -4770,6 +4803,15 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                     or command_outputs.get(command.lstrip("/"))
                     or "الأمر غير متاح في نسخة v123 بعد."
                 )
+                # أضف رصيد OKX في أعلى تقارير التنفيذ فقط
+                _is_exec_report = (
+                    command.startswith("/report_execution")
+                    and not command.startswith("/report_execution_intelligence")
+                    and command not in simulation_outputs
+                )
+                if _is_exec_report and reply and not _is_simulation_mode(settings):
+                    balance_header = _build_execution_balance_header(result, settings)
+                    reply = balance_header + "\n" + reply
             _send_text(sender, reply)
     return offset
 
