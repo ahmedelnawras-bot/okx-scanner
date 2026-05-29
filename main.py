@@ -47,6 +47,7 @@ from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
 from tracking.persistence import RedisTradeStore, trade_to_dict, trade_from_dict
 from reporting.report_router import build_report_bundle, build_command_outputs
+from reporting.report_format import trade_effective_pnl as _report_trade_effective_pnl
 from reporting.report_simulation import build_simulation_command_outputs as build_simulation_report_command_outputs
 from reporting.help_menus import (
     build_main_menu_layout,
@@ -1267,7 +1268,11 @@ def _simulation_equity_from_trades(
         margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
         if margin <= 0:
             margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
-        equity += _money_from_pct(_trade_effective_pnl_pct(trade), margin=margin)
+        try:
+            pct = _report_trade_effective_pnl(trade)
+        except Exception:
+            pct = _trade_effective_pnl_pct(trade)
+        equity += _money_from_pct(pct, margin=margin)
     return equity
 
 
@@ -1517,7 +1522,10 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
         margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
         if margin <= 0:
             margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
-        pct = _trade_effective_pnl_pct(trade)
+        try:
+            pct = _report_trade_effective_pnl(trade)
+        except Exception:
+            pct = _trade_effective_pnl_pct(trade)
         usd = _money_from_pct(pct, margin=margin)
         if _is_trade_closed(trade):
             realized += usd
