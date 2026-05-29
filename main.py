@@ -327,6 +327,13 @@ def _risk_profile_snapshot(
 
     reference_balance = _safe_float(reference_balance, 0.0)
 
+    # ✅ FIX: لو الرصيد 0 في execution mode، استخدم الـ cache
+    import time as _time
+    if reference_balance <= 0 and risk_context == "execution":
+        if _CACHED_OKX_BALANCE > 0 and (_time.time() - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+            reference_balance = _CACHED_OKX_BALANCE
+            resolved_source = "okx_balance_cached"
+
     # Low balance mode is applied here via reference_balance
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
 
@@ -450,6 +457,7 @@ def _resolve_entry_margin_plan(
     okx_client: OKXTradeClient,
     settings: Settings,
 ) -> dict:
+    global _CACHED_OKX_BALANCE, _CACHED_OKX_BALANCE_TS
     fallback_margin = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
     fallback_plan = {
         "source": "settings.paper_margin_usdt",
@@ -467,6 +475,18 @@ def _resolve_entry_margin_plan(
             balance_response = None
 
     okx_reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
+
+    # ✅ FIX: cache آخر رصيد صح من OKX — يُستخدم كـ fallback لو fetch فشل
+    import time as _time
+    now_ts = _time.time()
+    if okx_reference_balance > 0:
+        _CACHED_OKX_BALANCE = okx_reference_balance
+        _CACHED_OKX_BALANCE_TS = now_ts
+        print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
+    elif _CACHED_OKX_BALANCE > 0 and (now_ts - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+        okx_reference_balance = _CACHED_OKX_BALANCE
+        print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
+
     okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
         return {
@@ -2943,12 +2963,39 @@ def _execute_managed_okx_order(
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0) or max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
 
+    # ✅ FIX: إجبار cross margin دايماً — isolation مش مدعوم في هذا البوت
+    TD_MODE = "cross"
+
+    # ✅ FIX: set leverage على OKX قبل أي أمر عشان نضمن الرافعة الصح
+    # لو الـ method مش موجودة أو فشلت → نكمل بدون وقف
+    leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
+    leverage_set_result = None
+    try:
+        if hasattr(okx_client, "set_leverage"):
+            leverage_set_result = okx_client.set_leverage(
+                inst_id=signal.symbol,
+                lever=leverage,
+                mgn_mode=TD_MODE,
+            )
+            if isinstance(leverage_set_result, dict) and not leverage_set_result.get("ok", True):
+                print(
+                    f"⚠️ set_leverage failed for {signal.symbol}: {leverage_set_result.get('msg') or leverage_set_result}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"⚠️ set_leverage method not found on okx_client — skipping leverage pre-set for {signal.symbol}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"⚠️ set_leverage exception for {signal.symbol}: {exc}", flush=True)
+
     entry_result = okx_client.place_market_long(
         signal.symbol,
         entry_value,
         margin_usdt=margin_usdt,
-        leverage=settings.default_leverage,
-        td_mode=settings.okx_td_mode,
+        leverage=leverage,
+        td_mode=TD_MODE,
         sl_trigger_px=sl_value if sl_value > 0 else None,
         tag="entry",
     )
@@ -2959,7 +3006,7 @@ def _execute_managed_okx_order(
             signal.symbol,
             entry_value,
             margin_usdt,
-            settings.default_leverage,
+            leverage,
             sl_value,
             tp1_value,
             tp2_value,
@@ -2971,10 +3018,10 @@ def _execute_managed_okx_order(
             signal.symbol,
             entry_value,
             margin_usdt,
-            settings.default_leverage,
+            leverage,
             tp1_price=tp1_value,
             tp2_price=tp2_value,
-            td_mode=settings.okx_td_mode,
+            td_mode=TD_MODE,
             tag="tp",
         )
 
@@ -2985,6 +3032,8 @@ def _execute_managed_okx_order(
         "plan": plan,
         "sizing": sizing,
         "used_margin_usdt": margin_usdt,
+        "td_mode": TD_MODE,
+        "leverage_set_result": leverage_set_result,
         "sl_attached": bool(sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))),
         "tp_orders_ok": None if tp_split_result is None else bool(tp_split_result.get("ok")),
         "requires_runner_trailing": bool((plan.get("runner") or {}).get("requires_trailing_after_tp2")) if isinstance(plan, dict) else False,
@@ -3541,6 +3590,11 @@ def _telegram_send_pause(seconds: float | None = None) -> None:
 
 RUNTIME_OKX_ORDERS_OVERRIDE: bool | None = None
 RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE: str | None = None
+
+# Cache آخر رصيد OKX صحيح — يُستخدم كـ fallback لو fetch فشل
+_CACHED_OKX_BALANCE: float = 0.0
+_CACHED_OKX_BALANCE_TS: float = 0.0
+_CACHED_OKX_BALANCE_TTL_SECONDS: float = 300.0  # 5 دقايق
 
 
 def _get_runtime_okx_orders(settings: Settings) -> bool:
