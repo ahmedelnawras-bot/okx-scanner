@@ -101,6 +101,13 @@ SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS = 45 * 60
 SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
 
+# Low Balance Mode
+# لو الرصيد أقل من الحد → allocation أكبر وعدد slots أقل.
+# Block Exception و Recovery استثناء — بيفضلوا على حدودهم الأصلية.
+LOW_BALANCE_THRESHOLD_USDT: float = 109.0
+LOW_BALANCE_ALLOCATION_PCT: float = 40.0
+LOW_BALANCE_MAX_SLOTS: int = 3
+
 # Telegram send pacing.
 # This only spaces Telegram messages after decisions are already made.
 # It does not delay process_trade_candidate, OKX execution, slots, or simulation tracking.
@@ -248,7 +255,7 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     return total
 
 
-def _risk_sizing_constants(settings: Settings) -> tuple[float, int]:
+def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -> tuple[float, int]:
     allocation_pct = 24.0
     slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
 
@@ -259,11 +266,17 @@ def _risk_sizing_constants(settings: Settings) -> tuple[float, int]:
             int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
         )
 
+    # Low Balance Mode — رصيد أقل من الحد → allocation أعلى وعدد slots أقل.
+    # Block Exception و Recovery استثناء ومش بيتأثروا هنا.
+    if 0 < float(reference_balance or 0.0) < LOW_BALANCE_THRESHOLD_USDT:
+        allocation_pct = LOW_BALANCE_ALLOCATION_PCT
+        slot_count = LOW_BALANCE_MAX_SLOTS
+
     return allocation_pct, slot_count
 
 
 def _compute_margin_from_reference(reference_balance_usdt: float, settings: Settings) -> float:
-    allocation_pct, slot_count = _risk_sizing_constants(settings)
+    allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance_usdt)
     if reference_balance_usdt <= 0 or slot_count <= 0:
         return 0.0
     total_allocation = float(reference_balance_usdt) * (allocation_pct / 100.0)
@@ -295,7 +308,6 @@ def _risk_profile_snapshot(
     source: str | None = None,
 ) -> dict:
     """Expose dynamic risk-manager sizing state for /status and mode messages."""
-    allocation_pct, slot_count = _risk_sizing_constants(settings)
     result = result or {}
     inputs = dict(result.get("portfolio_state_inputs", {}) or {})
     risk_context = _risk_profile_context(settings, result)
@@ -314,6 +326,9 @@ def _risk_profile_snapshot(
             reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
 
     reference_balance = _safe_float(reference_balance, 0.0)
+
+    # Low balance mode is applied here via reference_balance
+    allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
 
     margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
     if risk_context == "simulation" or margin_per_trade <= 0:
@@ -1245,7 +1260,7 @@ def _simulation_margin_usdt(balance: float, settings: Settings | None = None) ->
     execution allocation/slot rules automatically affects simulation too.
     """
     if settings is not None:
-        allocation_pct, slot_count = _risk_sizing_constants(settings)
+        allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=float(balance or 0.0))
     else:
         allocation_pct = SIMULATION_ALLOCATION_PCT
         slot_count = 7
@@ -2187,14 +2202,8 @@ def run_once(
     exchange_stop_sync_enabled = bool(
         exchange_reconcile_enabled
         and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
-        and (
-            # BLOCK mode protection — level 2+ كما كان
-            (state.mode == MODE_BLOCK_LONGS and int(initial_protection.get("level", 0) or 0) >= 2)
-            or
-            # Runner protection — أي صفقة وصلت TP2 في أي mode
-            # بيحافظ على الـ trailing SL على المنصة بعد ما TP2 يتنفذ
-            any(getattr(t, "tp2_hit", False) for t in persisted_trades)
-        )
+        and state.mode == MODE_BLOCK_LONGS
+        and int(initial_protection.get("level", 0) or 0) >= 2
     )
     if persisted_trades:
         persisted_trades, exchange_reconcile_stats = _reconcile_execution_trades_with_okx(
@@ -2247,6 +2256,29 @@ def run_once(
     # ✅ FIX 2: snapshot الـ mode قبل اللوب — يمنع تأثير register_recovery_trade
     # على باقي الـ pairs في نفس الـ scan
     scan_mode = state.mode
+
+    # Low Balance Mode — لو الرصيد أقل من الحد، نغير الـ slots والـ margin.
+    # Block Exception و Recovery بيفضلوا على حدودهم الأصلية.
+    if simulation_mode_active:
+        _sim_wallet_balance = _safe_float(
+            _build_simulation_wallet_snapshot(simulation_trades).get("equity"),
+            SIMULATION_START_BALANCE_USDT,
+        )
+        _effective_reference_balance = _sim_wallet_balance
+    else:
+        _effective_reference_balance = _safe_float(
+            portfolio_state_inputs.get("reference_portfolio"), 0.0
+        )
+
+    _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
+    effective_max_positions = LOW_BALANCE_MAX_SLOTS if _low_balance_mode else settings.max_execution_positions
+
+    if _low_balance_mode:
+        print(
+            f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
+            f"slots={effective_max_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
+            flush=True,
+        )
 
     print(
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
@@ -2312,7 +2344,7 @@ def run_once(
                 signal,
                 open_trades=[*gate_base_trades, *local_gate_trades],
                 current_open_positions=slot_counts.get("general", 0),
-                max_open_positions=settings.max_execution_positions,
+                max_open_positions=effective_max_positions,  # low balance mode: 3 instead of 7
                 min_execution_score=settings.min_execution_score,
                 recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
                 block_open_positions=slot_counts.get("block_exception", 0),
@@ -3271,6 +3303,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
+        f"💰 Low Balance Mode: {'⚠️ ON — slots=3 alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF (balance≥{LOW_BALANCE_THRESHOLD_USDT:.0f}$)'}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
@@ -3346,7 +3379,7 @@ def _build_okx_status_panel(
     ok = _okx_response_ok(balance_response)
     reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
     sizing = _compute_margin_from_reference(reference_balance, settings) if reference_balance > 0 else 0.0
-    allocation_pct, slot_count = _risk_sizing_constants(settings)
+    allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
 
     lines.extend([
         "",
