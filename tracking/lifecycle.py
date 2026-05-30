@@ -104,14 +104,21 @@ def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
 
 
 def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
-    """After TP2, the remaining runner stays open for tracking only."""
+    """After TP2, the remaining runner stays open for tracking only.
+
+    SL بيتنقل لـ TP1 (مش entry) — هذا يضمن ربح محمي على الـ runner.
+    """
     if trade.tp2_hit and trade.sl_moved_to_entry:
         trade.protected_runner = True
         trade.slot_exempt = True
         trade.daily_open_risk_exempt = True
         trade.same_symbol_block_exempt = True
         trade.slot_exempt_reason = "tp2_protected_runner"
-        trade.protected_sl = max(float(trade.protected_sl or 0.0), float(trade.entry or 0.0))
+        # ✅ FIX: SL ينتقل لـ TP1 بعد TP2 — أعلى من entry = حماية أفضل للـ runner
+        tp1_price = float(getattr(trade, "tp1", 0.0) or 0.0)
+        fallback = float(trade.entry or 0.0)
+        sl_floor = tp1_price if tp1_price > fallback else fallback
+        trade.protected_sl = max(float(trade.protected_sl or 0.0), sl_floor)
     return trade
 
 
@@ -156,7 +163,8 @@ def _apply_tp2_partial(trade: TrackedTrade, tp1_close_pct: float, tp2_close_pct:
     trade.tp2_hit = True
     trade.trailing_active = True
     trade.runner_active = True
-    trade.sl_moved_to_entry = True
+    trade.sl_moved_to_entry = True   # backward compat — يفضل True عشان post_tp1_sl logic
+    trade.sl_moved_to_tp1 = True     # ✅ الـ flag الجديد — SL انتقل لـ TP1
     trade.closed_portion_pct = tp1_close_pct + tp2_close_pct
     trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp2) * (tp2_close_pct / 100.0)
     trade.status = "tp2_partial"
