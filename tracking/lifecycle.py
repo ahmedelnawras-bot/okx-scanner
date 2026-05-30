@@ -228,6 +228,12 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         trail_pct = max(0.9, TRAILING_STOP_AFTER_TP2_PCT - (0.6 if trade.trailing_tightened else 0.0))
         trail_anchor = max(trade.highest_price, trade.tp2)
         trailing_stop_price = max(trail_anchor * (1 - trail_pct / 100.0), trade.protected_sl or trade.entry)
+
+        # ✅ FIX: حدّث protected_sl بالـ trailing stop الحالي كل scan
+        # هذا يضمن إن _sync_stop_loss_to_exchange يبعت القيمة الصح للمنصة
+        # الـ trailing stop بيتحرك للأعلى مع السعر → SL على المنصة بيتحرك معاه
+        trade.protected_sl = max(float(trade.protected_sl or 0.0), trailing_stop_price)
+
         trade.runner_pnl_pct = _pnl_pct(trade.entry, current_price) * (runner_close_pct / 100.0)
         if current_price <= trailing_stop_price:
             trade.closed_portion_pct = 100.0
