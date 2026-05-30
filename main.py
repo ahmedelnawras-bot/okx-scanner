@@ -2267,7 +2267,6 @@ def run_once(
     local_gate_trades = []
     gate_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     slot_counts = _execution_slot_counts(gate_base_trades)
-    recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
 
     scan_pairs = ranked_pairs
     filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
@@ -2293,10 +2292,32 @@ def run_once(
     _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
     effective_max_positions = LOW_BALANCE_MAX_SLOTS if _low_balance_mode else settings.max_execution_positions
 
+    # Block Exception و Recovery slots — ديناميكية حسب الرصيد
+    # رصيد ≥ $109 → كل مود عنده 3 slots منفصلة
+    # رصيد < $109 → كل مود عنده slot واحد فقط
+    NORMAL_BLOCK_SLOTS = 3
+    NORMAL_RECOVERY_SLOTS = 3
+    LOW_BALANCE_BLOCK_SLOTS = 1
+    LOW_BALANCE_RECOVERY_SLOTS = 1
+
+    effective_max_block_positions = LOW_BALANCE_BLOCK_SLOTS if _low_balance_mode else NORMAL_BLOCK_SLOTS
+    effective_max_recovery_positions = LOW_BALANCE_RECOVERY_SLOTS if _low_balance_mode else NORMAL_RECOVERY_SLOTS
+
+    # إعادة حساب recovery_remaining بالحد الجديد
+    recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
+
     if _low_balance_mode:
         print(
             f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
-            f"slots={effective_max_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
+            f"general={effective_max_positions} | block={effective_max_block_positions} | "
+            f"recovery={effective_max_recovery_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
+            flush=True,
+        )
+    else:
+        print(
+            f"✅ NORMAL_MODE | balance={_effective_reference_balance:.2f} | "
+            f"general={effective_max_positions} | block={effective_max_block_positions} | "
+            f"recovery={effective_max_recovery_positions} | alloc=24%",
             flush=True,
         )
 
@@ -2364,13 +2385,13 @@ def run_once(
                 signal,
                 open_trades=[*gate_base_trades, *local_gate_trades],
                 current_open_positions=slot_counts.get("general", 0),
-                max_open_positions=effective_max_positions,  # low balance mode: 3 instead of 7
+                max_open_positions=effective_max_positions,
                 min_execution_score=settings.min_execution_score,
                 recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
                 block_open_positions=slot_counts.get("block_exception", 0),
-                max_block_positions=MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
+                max_block_positions=effective_max_block_positions,
                 recovery_open_positions=slot_counts.get("recovery", 0),
-                max_recovery_positions=MAX_RECOVERY_TRADES_PER_CYCLE,
+                max_recovery_positions=effective_max_recovery_positions,
                 drawdown_status=drawdown_status,
                 risk_mode=state.mode,
             )
@@ -2402,7 +2423,7 @@ def run_once(
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
             elif path == "recovery":
                 slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
-                recovery_remaining = max(0, MAX_RECOVERY_TRADES_PER_CYCLE - slot_counts.get("recovery", 0))
+                recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
                 if state.mode == MODE_RECOVERY_LONG:
                     state = register_recovery_trade(state)
             else:
@@ -3377,7 +3398,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
-        f"💰 Low Balance Mode: {'⚠️ ON — slots=3 alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF (balance≥{LOW_BALANCE_THRESHOLD_USDT:.0f}$)'}",
+        f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
