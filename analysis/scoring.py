@@ -1258,6 +1258,45 @@ def build_signal_candidate(
         risk_amount * rr2
     )
 
+    # ✅ Resistance-Aware TP1 Adjustment
+    # بيستخدم resistance_4h_context المحسوب مسبقاً في main.py
+    # لا يغير أي منطق تداول — فقط يعدل موقع TP1 بناءً على المقاومة
+    _r4h = getattr(pair, "resistance_4h_context", None) or {}
+    _r_status = str(_r4h.get("status") or "").strip().lower()
+    _r_distance = float(_r4h.get("distance_pct") or 0.0)
+    _r_price = float(_r4h.get("resistance") or 0.0)
+
+    if _r_status and _r_distance > 0 and _r_price > entry:
+
+        if _r_status == "very_near":
+            # مقاومة < 0.75% → TP1 مستحيل يعديها بأمان
+            # نضع TP1 تحت المقاومة مباشرة بـ 0.4%
+            _safe_tp1 = _r_price * 0.996
+            if _safe_tp1 > entry:
+                tp1 = min(tp1, _safe_tp1)
+
+        elif _r_status == "near":
+            # مقاومة 0.75% → 2% → TP1 يتوقف قبلها بـ 0.3%
+            _safe_tp1 = _r_price * 0.997
+            if _safe_tp1 > entry:
+                tp1 = min(tp1, _safe_tp1)
+
+        elif _r_status == "watch":
+            # مقاومة 2% → 4% → احترازي: قلل RR قليلاً
+            # لكن لو TP1 الحالي قبل المقاومة → لا تغيير
+            _tp1_beyond_resistance = tp1 > _r_price
+            if _tp1_beyond_resistance:
+                _safe_tp1 = _r_price * 0.997
+                if _safe_tp1 > entry:
+                    tp1 = min(tp1, _safe_tp1)
+
+        elif _r_status == "clear":
+            # طريق واضح > 4% → وسّع TP1 قليلاً
+            # فقط لو المقاومة بعيدة فعلاً ومش بين entry وTP2
+            if _r_price > tp2 or _r_distance >= 5.0:
+                _wider_tp1 = entry + (risk_amount * min(rr1 * 1.12, SMART_TP1_MAX_RR))
+                tp1 = max(tp1, _wider_tp1)
+
     if (
         tp1 <= entry
         or tp2 <= tp1
@@ -1417,6 +1456,16 @@ def build_signal_candidate(
 
             "pa_score_flags":
                 pa_score_context.get("pa_score_flags"),
+
+            # ✅ Resistance-Aware TP1 — للتتبع والـ AI export
+            "resistance_tp1_adjusted": bool(
+                _r_status in {"very_near", "near", "watch"}
+                and _r_price > entry
+                and _r_distance > 0
+            ),
+            "resistance_tp1_status": _r_status or None,
+            "resistance_tp1_distance_pct": _r_distance or None,
+            "resistance_tp1_price": _r_price or None,
 
             **quality_meta,
         },
