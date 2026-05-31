@@ -4500,6 +4500,7 @@ def _handle_admin_clean_command(
     command: str,
     trade_store: RedisTradeStore | None,
     result: dict | None = None,
+    settings: Settings | None = None,
 ) -> str | None:
     reset_preview_commands = {
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
@@ -4987,7 +4988,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
-            clean_reply = _handle_admin_clean_command(command, trade_store, result)
+            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
                 continue
