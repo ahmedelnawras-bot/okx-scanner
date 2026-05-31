@@ -133,6 +133,14 @@ SIMULATION_ALLOCATION_PCT = 24.0
 LOSS_STREAK_NO_TP1_LIMIT = 5
 LOSS_STREAK_COOLDOWN_MINUTES = 120
 
+try:
+    from reporting.ai_exporter import export_ai_snapshot
+    _AI_EXPORT_ENABLED = True
+except ImportError:
+    _AI_EXPORT_ENABLED = False
+    def export_ai_snapshot(*args, **kwargs) -> dict:
+        return {"ok": False, "error": "ai_exporter not found"}
+
 from services.telegram_sender import TelegramSender
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
@@ -2580,6 +2588,44 @@ def run_once(
         "simulation_command_outputs": {},
         **reports,
     }
+
+
+def _run_ai_export(result: dict, settings: Settings | None = None) -> None:
+    """تصدير AI snapshot في thread منفصل — لا يأثر على الـ scan loop."""
+    if not _AI_EXPORT_ENABLED:
+        return
+
+    def _do_export():
+        try:
+            # Simulation export
+            sim_stats = export_ai_snapshot(result, source="simulation")
+            if not sim_stats.get("ok"):
+                print(f"⚠️ AI export simulation failed: {sim_stats.get('error')}", flush=True)
+            else:
+                print(
+                    f"📊 AI export simulation | trades={sim_stats.get('trades_written')} | "
+                    f"rejections={sim_stats.get('rejections_written')} | "
+                    f"snapshot={'✅' if sim_stats.get('daily_snapshot_written') else '❌'}",
+                    flush=True,
+                )
+
+            # Execution export
+            exec_stats = export_ai_snapshot(result, source="execution")
+            if not exec_stats.get("ok"):
+                print(f"⚠️ AI export execution failed: {exec_stats.get('error')}", flush=True)
+            else:
+                print(
+                    f"📊 AI export execution | trades={exec_stats.get('trades_written')} | "
+                    f"rejections={exec_stats.get('rejections_written')} | "
+                    f"snapshot={'✅' if exec_stats.get('daily_snapshot_written') else '❌'}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"⚠️ AI export thread error: {exc}", flush=True)
+
+    import threading
+    t = threading.Thread(target=_do_export, daemon=True, name="ai_export")
+    t.start()
 
 
 def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
@@ -5140,6 +5186,7 @@ def live_worker() -> None:
                 )
 
             last_result = result
+            _run_ai_export(result, settings)
             if settings.verbose_logs:
                 print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
             else:
