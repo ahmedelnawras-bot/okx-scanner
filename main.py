@@ -2746,6 +2746,9 @@ def _activate_announced_trade(
         return True
 
     if not updated_existing:
+        # ✅ تأكد إن الـ flags صح قبل الحفظ في Redis
+        setattr(candidate_trade, "execution_trade", True)
+        setattr(candidate_trade, "tracking_bucket", "execution")
         trades.append(candidate_trade)
         result["trades"] = trades
 
