@@ -3398,7 +3398,83 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
     return "\n".join(lines)
 
 
-def _build_ai_report_panel(settings: Settings) -> str:
+def _build_exec_intel_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 تقرير التنفيذ", "callback_data": "cmd:/report_execution_intelligence"},
+            ],
+            [
+                {"text": "📋 Trades JSONL", "callback_data": "ai:exec_trades"},
+                {"text": "📋 Rejections JSONL", "callback_data": "ai:exec_rejections"},
+            ],
+            [
+                {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:exec_snapshot"},
+            ],
+            [
+                {"text": "🔙 رجوع", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+
+
+def _build_sim_intel_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 تقرير المحاكاة", "callback_data": "cmd:/report_simulation_intelligence"},
+            ],
+            [
+                {"text": "📋 Trades JSONL", "callback_data": "ai:sim_trades"},
+                {"text": "📋 Rejections JSONL", "callback_data": "ai:sim_rejections"},
+            ],
+            [
+                {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:sim_snapshot"},
+            ],
+            [
+                {"text": "🔙 رجوع", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+
+
+def _build_exec_intel_panel() -> str:
+    return "\n".join([
+        "🧠🚀 <b>Execution Intelligence</b>",
+        "━━━━━━━━━━━━",
+        "📊 تقرير ذكاء صفقات التنفيذ",
+        "اختار:",
+        "",
+        "📊 <b>التقرير العادي</b>",
+        "تقرير Telegram كامل بالـ setups والـ win rate والـ diagnostics",
+        "",
+        "🤖 <b>AI Research Export</b>",
+        "ملفات JSON/JSONL جاهزة للتحليل بـ GPT / Claude / Python",
+        "• Trades JSONL — كل صفقة مغلقة بيانات كاملة",
+        "• Rejections JSONL — كل رفض مع snapshot كامل",
+        "• Daily Snapshot — حالة يومية شاملة",
+    ])
+
+
+def _build_sim_intel_panel() -> str:
+    return "\n".join([
+        "🧠🧪 <b>Simulation Intelligence</b>",
+        "━━━━━━━━━━━━",
+        "📊 تقرير ذكاء صفقات المحاكاة",
+        "اختار:",
+        "",
+        "📊 <b>التقرير العادي</b>",
+        "تقرير Telegram كامل بالـ setups والـ win rate والـ diagnostics",
+        "",
+        "🤖 <b>AI Research Export</b>",
+        "ملفات JSON/JSONL جاهزة للتحليل بـ GPT / Claude / Python",
+        "• Trades JSONL — كل صفقة مغلقة بيانات كاملة",
+        "• Rejections JSONL — كل رفض مع snapshot كامل",
+        "• Daily Snapshot — حالة يومية شاملة",
+    ])
+
+
+def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     """ملخص حالة AI Export Layer."""
     from pathlib import Path
     import os
@@ -3914,9 +3990,9 @@ def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None)
                 {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
             ],
             [
-                {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "cmd:/report_execution_intelligence"},
+                {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "menu:exec_intel"},
                 {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
-                {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "cmd:/report_simulation_intelligence"},
+                {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "menu:sim_intel"},
             ],
             [
                 {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
@@ -4540,6 +4616,24 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
     if callback_id:
         sender.answer_callback_query(callback_id, "Opened")
 
+    if data.startswith("ai:"):
+        key = data.split(":", 1)[1]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cmd_map = {
+            "exec_trades":       "/ai_report_exec_trades",
+            "exec_rejections":   "/ai_report_exec_rejections",
+            "exec_snapshot":     "/ai_report_snapshot_exec",
+            "sim_trades":        "/ai_report_sim_trades",
+            "sim_rejections":    "/ai_report_sim_rejections",
+            "sim_snapshot":      "/ai_report_snapshot_sim",
+        }
+        cmd = cmd_map.get(key)
+        if cmd:
+            _send_ai_report_file(sender, cmd, today)
+        else:
+            _send_text(sender, "⚠️ أمر AI غير معروف.")
+        return
+
     if data.startswith("okx_orders:"):
         desired = data.split(":", 1)[1].strip().lower()
         desired_enabled = desired == "on"
@@ -4623,6 +4717,20 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             _send_text(sender, result.get("help_normal", ""))
         elif key == "simulation":
             _send_text(sender, _build_simulation_help())
+        elif key == "exec_intel":
+            _send_text(sender, _build_exec_intel_panel(), reply_markup=_build_exec_intel_keyboard())
+        elif key == "sim_intel":
+            _send_text(sender, _build_sim_intel_panel(), reply_markup=_build_sim_intel_keyboard())
+        elif key == "main":
+            runtime_settings = settings or get_settings()
+            dashboard = build_master_help(
+                mode=result.get("mode", "UNKNOWN"),
+                execution_enabled=runtime_settings.execution_enabled,
+                risk_enabled=True,
+                okx_orders=_runtime_mode_snapshot(runtime_settings).get("orders_enabled", False),
+                runtime_snapshot=_runtime_mode_snapshot(runtime_settings),
+            )
+            _send_text(sender, dashboard, reply_markup=_build_main_inline_keyboard_with_bot_modes(runtime_settings))
         elif key == "diagnostics":
             _send_text(sender, build_diagnostics_help())
         elif key == "bot_modes":
