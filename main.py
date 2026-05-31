@@ -2303,6 +2303,8 @@ def run_once(
         )
         # نحوّل الـ mode لـ scan فقط مؤقتاً
         _okx_orders_active = False
+        # ✅ FIX: أوقف الـ OKX orders على مستوى الـ runtime فعلياً
+        _set_runtime_okx_orders(settings, False)
 
     scan_pairs = ranked_pairs
     filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
