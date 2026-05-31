@@ -3398,6 +3398,107 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
     return "\n".join(lines)
 
 
+def _build_ai_report_panel(settings: Settings) -> str:
+    """ملخص حالة AI Export Layer."""
+    from pathlib import Path
+    import os
+
+    base = Path(os.environ.get("AI_REPORTS_DIR", "./data/ai_reports"))
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _count_lines(path: Path) -> int:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return sum(1 for _ in fh)
+        except Exception:
+            return 0
+
+    def _file_size_kb(path: Path) -> float:
+        try:
+            return round(path.stat().st_size / 1024, 1)
+        except Exception:
+            return 0.0
+
+    lines = [
+        "🤖 <b>AI Research Export Layer</b>",
+        "━━━━━━━━━━━━",
+        f"📅 Date: {today}",
+        f"📁 Base Dir: {base}",
+        "",
+        "🧪 <b>Simulation</b>",
+    ]
+
+    for label, key in [("Simulation", "simulation"), ("Execution", "execution")]:
+        src = base / key
+        trades_path = src / f"{today}_trades.jsonl"
+        rejections_path = src / f"{today}_rejections.jsonl"
+        snapshot_path = base / "daily_snapshots" / f"{today}_{key}.json"
+
+        t_count = _count_lines(trades_path)
+        r_count = _count_lines(rejections_path)
+        s_exists = snapshot_path.exists()
+
+        if label == "Execution":
+            lines.append("")
+            lines.append(f"🚀 <b>{label}</b>")
+
+        lines += [
+            f"• Trades JSONL: {t_count} records | {_file_size_kb(trades_path)} KB",
+            f"• Rejections JSONL: {r_count} records | {_file_size_kb(rejections_path)} KB",
+            f"• Daily Snapshot: {'✅' if s_exists else '❌ not yet'}",
+        ]
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━",
+        "📤 <b>Export Commands</b>",
+        "/ai_report_sim_trades — Simulation trades JSONL",
+        "/ai_report_sim_rejections — Simulation rejections JSONL",
+        "/ai_report_exec_trades — Execution trades JSONL",
+        "/ai_report_exec_rejections — Execution rejections JSONL",
+        "/ai_report_snapshot_sim — Simulation daily snapshot JSON",
+        "/ai_report_snapshot_exec — Execution daily snapshot JSON",
+    ]
+    return "\n".join(lines)
+
+
+def _send_ai_report_file(sender: TelegramSender, key: str, today: str) -> None:
+    """بعت ملف AI export للـ Telegram."""
+    from pathlib import Path
+    import os
+
+    base = Path(os.environ.get("AI_REPORTS_DIR", "./data/ai_reports"))
+
+    path_map = {
+        "/ai_report_sim_trades":        base / "simulation" / f"{today}_trades.jsonl",
+        "/ai_report_sim_rejections":    base / "simulation" / f"{today}_rejections.jsonl",
+        "/ai_report_exec_trades":       base / "execution" / f"{today}_trades.jsonl",
+        "/ai_report_exec_rejections":   base / "execution" / f"{today}_rejections.jsonl",
+        "/ai_report_snapshot_sim":      base / "daily_snapshots" / f"{today}_simulation.json",
+        "/ai_report_snapshot_exec":     base / "daily_snapshots" / f"{today}_execution.json",
+    }
+
+    caption_map = {
+        "/ai_report_sim_trades":        f"🧪 Simulation Trades {today}",
+        "/ai_report_sim_rejections":    f"🧪 Simulation Rejections {today}",
+        "/ai_report_exec_trades":       f"🚀 Execution Trades {today}",
+        "/ai_report_exec_rejections":   f"🚀 Execution Rejections {today}",
+        "/ai_report_snapshot_sim":      f"🧪 Simulation Daily Snapshot {today}",
+        "/ai_report_snapshot_exec":     f"🚀 Execution Daily Snapshot {today}",
+    }
+
+    path = path_map.get(key)
+    caption = caption_map.get(key, "AI Export")
+
+    if path is None or not path.exists():
+        _send_text(sender, f"⚠️ الملف غير موجود بعد:\n<code>{path}</code>")
+        return
+
+    doc_result = sender.send_document(str(path), caption=caption)
+    if not doc_result.get("ok"):
+        _send_text(sender, f"⚠️ فشل إرسال الملف:\n<code>{path}</code>\nError: {doc_result.get('error') or doc_result}")
+
+
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
@@ -4889,6 +4990,17 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 continue
             if command == "/okx_status":
                 reply = _build_okx_status_panel(settings, okx_client=okx_client)
+            elif command == "/ai_report":
+                _send_text(sender, _build_ai_report_panel(settings))
+                continue
+            elif command in {
+                "/ai_report_sim_trades", "/ai_report_sim_rejections",
+                "/ai_report_exec_trades", "/ai_report_exec_rejections",
+                "/ai_report_snapshot_sim", "/ai_report_snapshot_exec",
+            }:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                _send_ai_report_file(sender, command, today)
+                continue
             elif command == "/status":
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
