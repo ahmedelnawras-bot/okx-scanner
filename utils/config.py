@@ -63,4 +63,11 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    # ✅ DEBUG: اطبع الـ REDIS_URL عند الـ startup لتشخيص مشكلة الاتصال
+    import os as _os
+    _raw_url = _os.getenv("REDIS_URL", "NOT_SET")
+    _masked = _raw_url[:30] + "..." if len(_raw_url) > 30 else _raw_url
+    print(f"🔍 REDIS_URL from env: {_masked}", flush=True)
+    print(f"🔍 redis_url in settings: {str(settings.redis_url)[:30]}...", flush=True)
+    return settings
