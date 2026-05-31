@@ -335,12 +335,20 @@ def _risk_profile_snapshot(
 
     reference_balance = _safe_float(reference_balance, 0.0)
 
-    # ✅ FIX: لو الرصيد 0 في execution mode، استخدم الـ cache
+    # ✅ FIX: لو الرصيد 0 في execution mode
+    # ١. جرب الـ cache أولاً
+    # ٢. لو الـ cache فاضي، اجلب من OKX مباشرة وخزن في cache
     import time as _time
     if reference_balance <= 0 and risk_context == "execution":
         if _CACHED_OKX_BALANCE > 0 and (_time.time() - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
             reference_balance = _CACHED_OKX_BALANCE
             resolved_source = "okx_balance_cached"
+        else:
+            # جرب تجيب الرصيد مباشرة من الـ inputs الحالي
+            _direct_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+            if _direct_balance > 0:
+                reference_balance = _direct_balance
+                resolved_source = "okx_balance_inputs"
 
     # Low balance mode is applied here via reference_balance
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
@@ -535,6 +543,7 @@ def _resolve_portfolio_state_inputs(
     okx_client: OKXTradeClient | None,
     settings: Settings,
 ) -> dict:
+    import time as _time
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     reference_balance = _safe_float((sizing or {}).get("reference_balance_usdt"), 0.0)
     margin_per_trade = _safe_float((sizing or {}).get("margin_usdt"), 0.0)
@@ -545,8 +554,14 @@ def _resolve_portfolio_state_inputs(
         and not bool(getattr(settings, "okx_simulated", True))
     )
 
+    # ✅ FIX: لو live mode والـ balance = 0 → استخدم الـ cache
     if live_okx_mode and reference_balance <= 0:
-        margin_per_trade = 0.0
+        if _CACHED_OKX_BALANCE > 0 and (_time.time() - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+            reference_balance = _CACHED_OKX_BALANCE
+            margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
+            print(f"💰 portfolio_state_inputs using cached balance: {reference_balance:.2f} USDT", flush=True)
+        else:
+            margin_per_trade = 0.0
     elif margin_per_trade <= 0:
         margin_per_trade = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
 
