@@ -3512,7 +3512,7 @@ def _build_sim_intel_panel() -> str:
     ])
 
 
-def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
+def _build_ai_report_panel(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     """ملخص حالة AI Export Layer."""
     from pathlib import Path
     import os
@@ -4781,7 +4781,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         elif key == "admin":
             _send_text(sender, _build_admin_panel())
         elif key == "system_info":
-            _send_text(sender, _build_fast_status(result, settings or get_settings()))
+            _send_text(sender, _build_fast_status(result, settings or get_settings(), trade_store))
         else:
             sender.send_message("القسم غير متاح حاليًا.")
         return
