@@ -1405,7 +1405,7 @@ def _ensure_simulation_daily_log(
         try:
             trade_store.client.hset(SIMULATION_DAILY_BALANCE_HASH, today, json.dumps(row, ensure_ascii=False, default=str))
             trade_store.client.expire(SIMULATION_DAILY_BALANCE_HASH, 180 * 24 * 60 * 60)
-            trade_store.client.setex(SIMULATION_BALANCE_STATE_KEY, 180 * 24 * 60 * 60, json.dumps(row, ensure_ascii=False, default=str))
+            trade_store.client.set(SIMULATION_BALANCE_STATE_KEY, json.dumps(row, ensure_ascii=False, default=str), ex=180 * 24 * 60 * 60)
         except Exception as exc:
             print(f"⚠️ Simulation daily log save failed: {exc}", flush=True)
 
@@ -1485,12 +1485,12 @@ def _save_simulation_trades(trades: list, trade_store: RedisTradeStore | None = 
             key = _simulation_trade_key(trade_id)
 
             if _is_trade_closed(trade):
-                pipe.setex(key, 90 * 24 * 60 * 60, payload)
+                pipe.set(key, payload, ex=90 * 24 * 60 * 60)
                 pipe.srem(SIMULATION_OPEN_SET, trade_id)
                 pipe.sadd(SIMULATION_HISTORY_SET, trade_id)
                 pipe.expire(SIMULATION_HISTORY_SET, 90 * 24 * 60 * 60)
             else:
-                pipe.setex(key, 90 * 24 * 60 * 60, payload)
+                pipe.set(key, payload, ex=90 * 24 * 60 * 60)
                 pipe.sadd(SIMULATION_OPEN_SET, trade_id)
                 pipe.srem(SIMULATION_HISTORY_SET, trade_id)
 
@@ -2290,6 +2290,19 @@ def run_once(
     local_gate_trades = []
     gate_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     slot_counts = _execution_slot_counts(gate_base_trades)
+
+    # ✅ SAFETY GUARD: لو Redis OFF والـ OKX Orders ON → لا تفتح صفقات
+    # بدون Redis مفيش persistence → البوت هيفتح 3 صفقات كل scan بدون ما يعرف
+    _redis_enabled = bool(trade_store and getattr(trade_store, "enabled", False))
+    _okx_orders_active = bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
+    if not _redis_enabled and _okx_orders_active:
+        print(
+            "🚨 SAFETY GUARD: Redis is OFF but OKX orders are ON — "
+            "blocking all execution to prevent untracked positions.",
+            flush=True,
+        )
+        # نحوّل الـ mode لـ scan فقط مؤقتاً
+        _okx_orders_active = False
 
     scan_pairs = ranked_pairs
     filtered_pairs = [p for p in scan_pairs if prefilter_pair_before_candles(p, state.mode)]
@@ -3323,13 +3336,21 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         managed_order_result = None
         runtime = _runtime_mode_snapshot(settings)
         simulation_mode_active = str(runtime.get("active_mode")) == "simulation"
+        _redis_ok = bool(trade_store and getattr(trade_store, "enabled", False))
         exchange_required = bool(
             can_place_order
             and str(runtime.get("active_mode")) == "trading"
             and bool(runtime.get("effective_orders_enabled"))
             and settings.execution_enabled
             and okx_client
+            and _redis_ok  # ✅ SAFETY: لا تفتح صفقات بدون Redis
         )
+        if can_place_order and not _redis_ok and str(runtime.get("active_mode")) == "trading":
+            print(
+                f"🚨 SAFETY: Blocked OKX order for {getattr(item.get('signal'), 'symbol', '-')} "
+                f"— Redis is OFF, execution blocked to prevent untracked positions.",
+                flush=True,
+            )
         exchange_order_ok = True
 
         if simulation_mode_active:
@@ -3633,7 +3654,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         risk_block,
         "",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
-        f"🧠 Redis: {'ON' if redis_stats.get('enabled') else 'OFF'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
+        f"🧠 Redis: {'ON' if redis_stats.get('enabled') else '🚨 OFF — OKX execution BLOCKED for safety'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
         f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
