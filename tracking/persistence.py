@@ -211,13 +211,13 @@ class RedisTradeStore:
                 key = self._trade_key(trade.trade_id)
                 payload = json.dumps(trade_to_dict(trade), ensure_ascii=False)
                 if trade.is_closed:
-                    pipe.setex(key, RETENTION_SECONDS, payload)
+                    pipe.set(key, payload, ex=RETENTION_SECONDS)
                     pipe.srem(OPEN_SET, trade.trade_id)
                     pipe.sadd(HISTORY_SET, trade.trade_id)
                     pipe.expire(HISTORY_SET, RETENTION_SECONDS)
                 else:
                     # Open trades should survive redeploy/restart. Keep a long TTL as a safety net.
-                    pipe.setex(key, RETENTION_SECONDS * 3, payload)
+                    pipe.set(key, payload, ex=RETENTION_SECONDS * 3)
                     pipe.sadd(OPEN_SET, trade.trade_id)
                     pipe.srem(HISTORY_SET, trade.trade_id)
             pipe.execute()
