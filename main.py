@@ -2435,6 +2435,7 @@ def run_once(
             )
             exec_result["decision_engine"] = "process_trade_candidate"
             exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
+            exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
             print(
                 f"DECISION_ENGINE | {signal.symbol} | "
                 f"runtime={exec_result.get('runtime_mode')} | "
@@ -2994,14 +2995,22 @@ def _signal_fingerprint_ttl(exec_result: dict | None) -> int:
         return SYMBOL_EXECUTION_DEDUP_TTL_SECONDS
     if status == "pending_pullback_preview":
         return SYMBOL_PULLBACK_DEDUP_TTL_SECONDS
+    # ✅ FIX: Recovery mode signals → TTL أطول لمنع الـ spam
+    risk_mode = str((exec_result or {}).get("risk_mode") or "").strip().lower()
+    runtime_mode = str((exec_result or {}).get("runtime_mode") or "").strip().lower()
+    if risk_mode == "recovery_long" or runtime_mode == "recovery":
+        return SYMBOL_PULLBACK_DEDUP_TTL_SECONDS  # 60 دقيقة بدل 45
     return SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS
 
 
 def _build_signal_fingerprint(signal, exec_result: dict) -> str:
+    # ✅ FIX: Recovery mode له bucket منفصل عشان الـ dedup يكون أقوى
+    risk_mode = str((exec_result or {}).get("risk_mode") or "").strip().lower()
+    mode_suffix = ":recovery" if risk_mode == "recovery_long" else ""
     return "|".join([
         str(getattr(signal, "symbol", "")).upper(),
         "LONG",
-        _signal_status_bucket(exec_result.get("status") if isinstance(exec_result, dict) else None),
+        _signal_status_bucket(exec_result.get("status") if isinstance(exec_result, dict) else None) + mode_suffix,
     ])
 
 
