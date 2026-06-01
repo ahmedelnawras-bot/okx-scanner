@@ -2523,10 +2523,24 @@ def run_once(
 
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     protection = block_protection_status(state)
+
+    # ✅ FIX: احسب exchange_stop_sync للـ final update بعد ما الصفقات اتفتحت في اللوب
+    _final_exchange_stop_sync = bool(
+        exchange_reconcile_enabled
+        and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
+        and (
+            (state.mode == MODE_BLOCK_LONGS and int(protection.get("level", 0) or 0) >= 2)
+            or any(getattr(t, "tp2_hit", False) for t in persisted_trades)
+        )
+    )
+
     trades = update_open_trades(
         list(persisted_trades),
         price_map,
         protection_level=protection.get("level", 0),
+        okx_client=okx_client if exchange_reconcile_enabled else None,
+        sync_exchange=exchange_reconcile_enabled,
+        sync_exchange_stop=_final_exchange_stop_sync,
     )
 
     simulation_trades = update_open_trades(
