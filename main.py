@@ -5408,6 +5408,34 @@ def live_worker() -> None:
     next_mode_guard_ts: float = 0.0
     last_result: dict | None = None
 
+    # ✅ Priority Command Thread — يرد على الأوامر فوراً بدون انتظار الـ scan
+    _cmd_lock = threading.Lock()
+
+    def _command_thread_loop():
+        nonlocal telegram_offset
+        while True:
+            try:
+                if sender.enabled and settings.telegram_enabled and last_result is not None:
+                    with _cmd_lock:
+                        telegram_offset = _poll_telegram_commands_safe(
+                            sender,
+                            last_result,
+                            telegram_offset,
+                            settings,
+                            trade_store,
+                            okx_client=okx_client,
+                        )
+            except Exception as exc:
+                print(f"⚠️ command thread error: {exc}", flush=True)
+            time.sleep(0.5)
+
+    _cmd_thread = threading.Thread(
+        target=_command_thread_loop,
+        daemon=True,
+        name="telegram_commands",
+    )
+    _cmd_thread.start()
+
     startup_runtime = _runtime_mode_snapshot(settings)
     startup_lines = [
         "✅ OKX Long Bot v134 started",
