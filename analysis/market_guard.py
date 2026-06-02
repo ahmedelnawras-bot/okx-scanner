@@ -19,9 +19,8 @@ MARKET_GUARD_MIN_VALID = 20
 MARKET_GUARD_TIMEFRAME = "15m"
 STRONG_15M_THRESHOLD = 0.40
 HOURLY_MA_GUARD_SYMBOL = "BTC-USDT-SWAP"
-HOURLY_MA_GUARD_BAR = "1H"
-HOURLY_MA5_PRESSURE_GAP_PCT = -0.15  # ← أكثر حساسية: BTC تحت MA5 بـ 0.15% = pressure
-
+HOURLY_MA_GUARD_BAR = "30m"                      # ← تم التعديل من "1H" إلى "30m"
+HOURLY_MA5_PRESSURE_GAP_PCT = -0.25              # ← تم التعديل من -0.15 إلى -0.25
 
 
 @dataclass
@@ -251,7 +250,7 @@ def build_market_guard_snapshot(
         snap = _fallback_from_pair_change(ranked_pairs)
         if debug:
             print(
-                "ðŸ“Š MODE SNAPSHOT DEBUG | "
+                "📊 MODE SNAPSHOT DEBUG | "
                 f"Source={getattr(snap, 'market_guard_source', 'fallback')} | "
                 f"Sample={len(sample)} | Valid candles={len(changes)} < {min_valid} | "
                 f"Fallback avg={snap.avg_change_15m:.2f}% | Red={snap.red_ratio_15m*100:.0f}%",
@@ -290,7 +289,7 @@ def build_market_guard_snapshot(
         gainers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in gainers)
         losers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in losers)
         print(
-            "ðŸ“Š MODE SNAPSHOT DEBUG | "
+            "📊 MODE SNAPSHOT DEBUG | "
             f"Source=candles_{timeframe} | Sample={len(sample)} | Valid={len(changes)} | "
             f"Red={red_count}/{len(changes)} ({red_ratio*100:.0f}%) | "
             f"Avg15m={avg_change:+.2f}% | BTC15m={btc_change:+.2f}% | Strong={strong_count} | "
@@ -300,7 +299,7 @@ def build_market_guard_snapshot(
             flush=True,
         )
         if verbose:
-            print(f"ðŸ“ˆ Guard top gainers: {gainers_txt}", flush=True)
-            print(f"ðŸ“‰ Guard top losers: {losers_txt}", flush=True)
+            print(f"📈 Guard top gainers: {gainers_txt}", flush=True)
+            print(f"📉 Guard top losers: {losers_txt}", flush=True)
 
     return snap
