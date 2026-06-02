@@ -1,4 +1,5 @@
-"""Unified market mode engine with BTC dominance as a secondary filter.
+"""Unified market mode engine - BTC drop triggers STRONG even if alts are strong.
+Exit from BLOCK: weak rebound -> STRONG, strong rebound -> RECOVERY.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ class MarketSnapshot:
     btc_1h_close: float = 0.0
     btc_1h_ma5: float = 0.0
     btc_1h_ma5_gap_pct: float = 0.0
-    btc_dominance_change_1h: float = 0.0          # ← جديد
+    btc_dominance_change_1h: float = 0.0
 
 
 @dataclass
@@ -36,7 +37,7 @@ class MarketModeState:
     consecutive_weak_scans: int = 0
 
 
-# Keep transitions stable without trapping the bot inside BLOCK.
+# Keep transitions stable
 MODE_CHANGE_COOLDOWN_MINUTES = 10
 NORMAL_EXIT_COOLDOWN_MINUTES = 1
 RETURN_TO_NORMAL_COOLDOWN_MINUTES = 18
@@ -46,7 +47,7 @@ BLOCK_EXIT_CONFIRM_SCANS = 3
 STRONG_TO_BLOCK_CONFIRM_SCANS = 3
 NORMAL_RETURN_CONFIRM_SCANS = 2
 
-# Old-core style thresholds (modified to reduce BTC weight)
+# Old-core style thresholds
 BLOCK_RED_RATIO = 0.66
 BLOCK_AVG_CHANGE = -0.85
 BLOCK_BTC_CHANGE = -0.55
@@ -61,9 +62,9 @@ NO_LONGER_CRASHING_RED_RATIO = 0.60
 NO_LONGER_CRASHING_AVG = -0.65
 NO_LONGER_CRASHING_BTC = -0.38
 
-RECOVERY_READY_RED_RATIO = 0.58
-RECOVERY_READY_AVG = -0.55
-RECOVERY_READY_BTC = -0.32
+RECOVERY_READY_RED_RATIO = 0.55      # تم التخفيض من 0.58 ليكون أكثر انتقائية
+RECOVERY_READY_AVG = -0.30           # تم الرفع من -0.55
+RECOVERY_READY_BTC = -0.25           # تم الرفع من -0.32
 
 NORMAL_READY_RED_RATIO = 0.44
 NORMAL_READY_AVG = -0.05
@@ -180,39 +181,19 @@ def _is_no_longer_crashing(snapshot: MarketSnapshot) -> bool:
 
 
 def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
+    """Strong rebound condition for entering RECOVERY from BLOCK."""
     red_ratio, avg, btc, strong = _values(snapshot)
-    old_core_recovery = (
-        red_ratio < RECOVERY_READY_RED_RATIO
-        and avg > RECOVERY_READY_AVG
-        and btc > RECOVERY_READY_BTC
-    )
-    fast_recovery_edge = bool(
+    # تشديد الشروط: ارتداد قوي فقط
+    strong_rebound = bool(
         snapshot.fast_rebound
         and snapshot.btc_reclaim
         and snapshot.breadth_improving
-        and red_ratio <= 0.62
-        and avg > -0.55
-        and btc > -0.40
-        and strong >= 5
+        and red_ratio <= RECOVERY_READY_RED_RATIO   # 0.55
+        and avg > RECOVERY_READY_AVG               # -0.30
+        and btc > RECOVERY_READY_BTC               # -0.25
+        and strong >= 8
     )
-    controlled_rebound_edge = bool(
-        snapshot.btc_reclaim
-        and snapshot.breadth_improving
-        and red_ratio <= 0.58
-        and avg > -0.55
-        and btc > -0.35
-        and strong >= 5
-    )
-    return bool(
-        (
-            old_core_recovery
-            and snapshot.fast_rebound
-            and snapshot.breadth_improving
-            and strong >= 5
-        )
-        or controlled_rebound_edge
-        or fast_recovery_edge
-    )
+    return strong_rebound
 
 
 def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
@@ -277,26 +258,26 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
-    # Base weak_breadth from altcoins
-    weak_breadth = bool(
+    # ========== المنطق الجديد لـ weak_breadth ==========
+    alt_weak = (
         red_ratio >= 0.50
         or avg <= -0.20
         or strong <= 5
-        or (btc <= -0.25 and red_ratio >= 0.55)
-        or hourly_ma5_pressure
     )
+    btc_drop_alone = (btc <= -0.25)
+    ma5_pressure = hourly_ma5_pressure
+    weak_breadth = alt_weak or btc_drop_alone or ma5_pressure
+    # ==================================================
 
-    # 🔥 تعديل استخدام الهيمنة: إذا كانت الهيمنة تهبط بشدة (سلبي) والبدائل ضعيفة -> نخفف الضعف
-    # لأن السوق يتحول للبدائل فعلياً
-    if dom_change < -0.3 and weak_breadth:
-        # هبوط الهيمنة > 0.3% يعني البدائل أقوى مما يبدو، نلغي weak_breadth إذا كان مصدره BTC فقط
-        # لكن إذا كان الضعف حاداً (red_ratio > 0.7) نبقيه
-        if red_ratio < 0.7 and avg > -0.4:
-            weak_breadth = False
+    # تعديل الهيمنة (معطل مؤقتاً)
+    # if dom_change < -0.3 and weak_breadth:
+    #     if red_ratio < 0.7 and avg > -0.4:
+    #         weak_breadth = False
+    # if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.55 or avg <= -0.3):
+    #     weak_breadth = True
 
-    # إذا كانت الهيمنة ترتفع بشدة (إيجابي) والبدائل ضعيفة -> نؤكد الضعف
-    if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.55 or avg <= -0.3):
-        weak_breadth = True
+    # طباعة DEBUG
+    print(f"🔍 RISK_FLAGS: red={red_ratio:.2f} avg={avg:+.2f} strong={strong} btc={btc:+.2f} | alt_weak={alt_weak} btc_drop={btc_drop_alone} ma5_press={ma5_pressure} | weak_breadth={weak_breadth} dom_change={dom_change:+.2f}")
 
     return {
         "broad_market_crash": broad_market_crash,
@@ -364,10 +345,11 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     cooldown_applied = False
 
     if previous.mode == MODE_BLOCK_LONGS:
+        # منطق الخروج الجديد:
+        # 1. ارتداد قوي → RECOVERY
         if flags["recovery_ready"]:
             candidate_mode = MODE_RECOVERY_LONG
-        elif minutes_in_mode < BLOCK_MIN_HOLD_MINUTES:
-            candidate_mode = MODE_BLOCK_LONGS
+        # 2. تحسن بسيط (توقف الانهيار) → STRONG بعد التأكيدات
         elif flags["no_longer_crashing"] or flags["stabilizing"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
                 candidate_mode = MODE_STRONG_LONG_ONLY
