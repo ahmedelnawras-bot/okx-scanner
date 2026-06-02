@@ -298,10 +298,10 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
-    # التعديل لجعل المؤشر أكثر حساسية للانهيارات الحادة دون ضوضاء
+    # التعديل لجعل المؤشر أكثر حساسية للانهيارات الحادة دون ضوضاء (مع عتبة أعلى)
     btc_drop_15m = snapshot.btc_change_15m
     red = snapshot.red_ratio_15m
-    if btc_drop_15m <= -0.6 and red >= 0.60:
+    if btc_drop_15m <= -1.0 and red >= 0.65:   # ← تم التعديل من -0.6 و 0.60 إلى -1.0 و 0.65
         hourly_ma5_pressure = True
 
     # التعديل الوحيد هنا ────────────────────────────────
