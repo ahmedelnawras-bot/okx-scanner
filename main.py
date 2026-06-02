@@ -340,11 +340,13 @@ def _risk_profile_snapshot(
     # ٢. لو الـ cache فاضي، اجلب من OKX مباشرة وخزن في cache
     import time as _time
     if reference_balance <= 0 and risk_context == "execution":
-        if _CACHED_OKX_BALANCE > 0 and (_time.time() - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-            reference_balance = _CACHED_OKX_BALANCE
+        with _CACHED_OKX_BALANCE_LOCK:
+            _cached = _CACHED_OKX_BALANCE
+            _cached_ts = _CACHED_OKX_BALANCE_TS
+        if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+            reference_balance = _cached
             resolved_source = "okx_balance_cached"
         else:
-            # جرب تجيب الرصيد مباشرة من الـ inputs الحالي
             _direct_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
             if _direct_balance > 0:
                 reference_balance = _direct_balance
@@ -492,16 +494,17 @@ def _resolve_entry_margin_plan(
 
     okx_reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
 
-    # ✅ FIX: cache آخر رصيد صح من OKX — يُستخدم كـ fallback لو fetch فشل
+    # ✅ FIX: cache آخر رصيد صح من OKX — thread-safe
     import time as _time
     now_ts = _time.time()
-    if okx_reference_balance > 0:
-        _CACHED_OKX_BALANCE = okx_reference_balance
-        _CACHED_OKX_BALANCE_TS = now_ts
-        print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
-    elif _CACHED_OKX_BALANCE > 0 and (now_ts - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-        okx_reference_balance = _CACHED_OKX_BALANCE
-        print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
+    with _CACHED_OKX_BALANCE_LOCK:
+        if okx_reference_balance > 0:
+            _CACHED_OKX_BALANCE = okx_reference_balance
+            _CACHED_OKX_BALANCE_TS = now_ts
+            print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
+        elif _CACHED_OKX_BALANCE > 0 and (now_ts - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+            okx_reference_balance = _CACHED_OKX_BALANCE
+            print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
 
     okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
@@ -554,10 +557,13 @@ def _resolve_portfolio_state_inputs(
         and not bool(getattr(settings, "okx_simulated", True))
     )
 
-    # ✅ FIX: لو live mode والـ balance = 0 → استخدم الـ cache
+    # ✅ FIX: لو live mode والـ balance = 0 → استخدم الـ cache بـ lock
     if live_okx_mode and reference_balance <= 0:
-        if _CACHED_OKX_BALANCE > 0 and (_time.time() - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-            reference_balance = _CACHED_OKX_BALANCE
+        with _CACHED_OKX_BALANCE_LOCK:
+            _cached = _CACHED_OKX_BALANCE
+            _cached_ts = _CACHED_OKX_BALANCE_TS
+        if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
+            reference_balance = _cached
             margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
             print(f"💰 portfolio_state_inputs using cached balance: {reference_balance:.2f} USDT", flush=True)
         else:
@@ -1192,6 +1198,11 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
         active = now < cooldown_until
         if active:
             remaining_minutes = max(1, int((cooldown_until - now).total_seconds() // 60))
+        else:
+            # ✅ FIX: cooldown انتهى → صفّر الـ streak
+            # يمنع إيقاف التداول فوراً عند أول SL بعد انتهاء الـ cooldown
+            streak = 0
+            streak_symbols = []
 
     return {
         "active": active,
@@ -2237,6 +2248,16 @@ def run_once(
 
     initial_protection = block_protection_status(state)
     initial_price_map = _build_live_price_map(tickers, fallback_pairs=ranked_pairs)
+
+    # ✅ FIX: cache الـ price_map — fallback لو fetch فشل في scan تاني
+    global _CACHED_PRICE_MAP, _CACHED_PRICE_MAP_TS
+    import time as _ptime
+    if initial_price_map:
+        _CACHED_PRICE_MAP = dict(initial_price_map)
+        _CACHED_PRICE_MAP_TS = _ptime.time()
+    elif _CACHED_PRICE_MAP and (_ptime.time() - _CACHED_PRICE_MAP_TS) < _CACHED_PRICE_MAP_TTL_SECONDS:
+        print("⚠️ price_map empty — using cached fallback", flush=True)
+        initial_price_map = dict(_CACHED_PRICE_MAP)
     exchange_reconcile_enabled = bool(
         okx_client is not None
         and getattr(okx_client, "configured", False)
@@ -2460,13 +2481,26 @@ def run_once(
             path = str(exec_result.get("path") or "general")
             if path == "block_exception":
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["block_exception"] > effective_max_block_positions:
+                    slot_counts["block_exception"] -= 1
+                    eligible_for_activation = False
             elif path == "recovery":
                 slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
-                recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
-                if state.mode == MODE_RECOVERY_LONG:
-                    state = register_recovery_trade(state)
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["recovery"] > effective_max_recovery_positions:
+                    slot_counts["recovery"] -= 1
+                    eligible_for_activation = False
+                else:
+                    recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
+                    if state.mode == MODE_RECOVERY_LONG:
+                        state = register_recovery_trade(state)
             else:
                 slot_counts["general"] = slot_counts.get("general", 0) + 1
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["general"] > effective_max_positions:
+                    slot_counts["general"] -= 1
+                    eligible_for_activation = False
 
             # Reserve this trade for same-scan gating.
             local_gate_trades.append(candidate_trade)
@@ -2523,6 +2557,13 @@ def run_once(
             )
 
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
+    # ✅ FIX: fallback لو price_map فاضي
+    if price_map:
+        _CACHED_PRICE_MAP = dict(price_map)
+        _CACHED_PRICE_MAP_TS = _ptime.time()
+    elif _CACHED_PRICE_MAP and (_ptime.time() - _CACHED_PRICE_MAP_TS) < _CACHED_PRICE_MAP_TTL_SECONDS:
+        print("⚠️ final price_map empty — using cached fallback", flush=True)
+        price_map = dict(_CACHED_PRICE_MAP)
     protection = block_protection_status(state)
 
     # ✅ FIX: احسب exchange_stop_sync للـ final update بعد ما الصفقات اتفتحت في اللوب
@@ -2554,7 +2595,20 @@ def run_once(
     )
 
     if trade_store:
-        trade_store.save_trades(trades)
+        # ✅ FIX: Redis retry بـ exponential backoff
+        _redis_saved = False
+        for _attempt in range(3):
+            try:
+                trade_store.save_trades(trades)
+                _redis_saved = True
+                break
+            except Exception as _exc:
+                _wait = 0.5 * (2 ** _attempt)
+                print(f"⚠️ Redis save_trades attempt {_attempt+1}/3 failed: {_exc} — retry in {_wait}s", flush=True)
+                time.sleep(_wait)
+        if not _redis_saved:
+            print("🚨 Redis save_trades failed after 3 attempts — trades may be lost on restart", flush=True)
+
         _save_simulation_trades(simulation_trades, trade_store)
         _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings)
         if simulation_mode_active:
@@ -3090,8 +3144,9 @@ def _execute_managed_okx_order(
     TD_MODE = "cross"
 
     # ✅ FIX: set leverage على OKX قبل أي أمر عشان نضمن الرافعة الصح
-    # لو الـ method مش موجودة أو فشلت → نكمل بدون وقف
+    # لو العملة مش بتدعم 15x → يستخدم أقصى رافعة متاحة تلقائياً
     leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
+    effective_leverage = leverage  # هيتحدث لو OKX كابه
     leverage_set_result = None
     try:
         if hasattr(okx_client, "set_leverage"):
@@ -3100,14 +3155,32 @@ def _execute_managed_okx_order(
                 lever=leverage,
                 mgn_mode=TD_MODE,
             )
-            if isinstance(leverage_set_result, dict) and not leverage_set_result.get("ok", True):
-                print(
-                    f"⚠️ set_leverage failed for {signal.symbol}: {leverage_set_result.get('msg') or leverage_set_result}",
-                    flush=True,
-                )
+            if isinstance(leverage_set_result, dict):
+                if leverage_set_result.get("ok"):
+                    # استخدم الـ leverage الفعلي اللي اتضبط على OKX
+                    actual = int(_safe_float(
+                        leverage_set_result.get("lever_set") or
+                        leverage_set_result.get("capped_to_max") or
+                        leverage,
+                        leverage,
+                    ))
+                    if actual > 0 and actual != leverage:
+                        print(
+                            f"⚠️ Leverage capped for {signal.symbol}: "
+                            f"requested={leverage}x → actual={actual}x",
+                            flush=True,
+                        )
+                    effective_leverage = max(1, actual)
+                else:
+                    print(
+                        f"⚠️ set_leverage failed for {signal.symbol}: "
+                        f"{leverage_set_result.get('msg') or leverage_set_result}",
+                        flush=True,
+                    )
         else:
             print(
-                f"⚠️ set_leverage method not found on okx_client — skipping leverage pre-set for {signal.symbol}",
+                f"⚠️ set_leverage method not found on okx_client — "
+                f"skipping leverage pre-set for {signal.symbol}",
                 flush=True,
             )
     except Exception as exc:
@@ -3117,7 +3190,7 @@ def _execute_managed_okx_order(
         signal.symbol,
         entry_value,
         margin_usdt=margin_usdt,
-        leverage=leverage,
+        leverage=effective_leverage,  # ← الرافعة الفعلية
         td_mode=TD_MODE,
         sl_trigger_px=sl_value if sl_value > 0 else None,
         tag="entry",
@@ -3129,7 +3202,7 @@ def _execute_managed_okx_order(
             signal.symbol,
             entry_value,
             margin_usdt,
-            leverage,
+            effective_leverage,  # ← الرافعة الفعلية
             sl_value,
             tp1_value,
             tp2_value,
@@ -3141,8 +3214,7 @@ def _execute_managed_okx_order(
             signal.symbol,
             entry_value,
             margin_usdt,
-            leverage,
-            tp1_price=tp1_value,
+            effective_leverage,  # ← الرافعة الفعلية
             tp2_price=tp2_value,
             td_mode=TD_MODE,
             tag="tp",
@@ -3156,6 +3228,8 @@ def _execute_managed_okx_order(
         "sizing": sizing,
         "used_margin_usdt": margin_usdt,
         "td_mode": TD_MODE,
+        "requested_leverage": leverage,
+        "effective_leverage": effective_leverage,  # ← الرافعة الفعلية المستخدمة
         "leverage_set_result": leverage_set_result,
         "sl_attached": bool(sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))),
         "tp_orders_ok": None if tp_split_result is None else bool(tp_split_result.get("ok")),
@@ -3899,10 +3973,16 @@ def _telegram_send_pause(seconds: float | None = None) -> None:
 RUNTIME_OKX_ORDERS_OVERRIDE: bool | None = None
 RUNTIME_SIGNAL_DELIVERY_MODE_OVERRIDE: str | None = None
 
+# Cache آخر price_map صالح — fallback لو fetch فشل
+_CACHED_PRICE_MAP: dict[str, float] = {}
+_CACHED_PRICE_MAP_TS: float = 0.0
+_CACHED_PRICE_MAP_TTL_SECONDS: float = 60.0  # صالح دقيقة واحدة كـ fallback
+
 # Cache آخر رصيد OKX صحيح — يُستخدم كـ fallback لو fetch فشل
 _CACHED_OKX_BALANCE: float = 0.0
 _CACHED_OKX_BALANCE_TS: float = 0.0
 _CACHED_OKX_BALANCE_TTL_SECONDS: float = 300.0  # 5 دقايق
+_CACHED_OKX_BALANCE_LOCK = threading.Lock()  # ✅ thread-safe cache access
 
 
 def _get_runtime_okx_orders(settings: Settings) -> bool:
@@ -4608,12 +4688,14 @@ def _refresh_track_trades_before_reply(
     trade_store: RedisTradeStore | None = None,
     okx_client: OKXTradeClient | None = None,
 ) -> None:
-    """Refresh tracked trade prices immediately when the Track button is pressed.
+    """Read-only price refresh for Track button display.
 
-    Previously Track used the last completed scan snapshot only, so the button
-    could show stale current_price/PnL/TP stage until the next full scan.
-    This refresh is read-only for OKX orders: it pulls fresh tickers, updates the
-    in-memory lifecycle state, and persists Redis snapshots when available.
+    IMPORTANT: This function is a VIEWER only.
+    It must never:
+    - save trades to Redis
+    - modify trade state
+    - affect reports or portfolio
+    It only updates in-memory prices for display purposes.
     """
     if not isinstance(result, dict):
         return
@@ -4642,6 +4724,7 @@ def _refresh_track_trades_before_reply(
     except Exception:
         protection_level = 0
 
+    # ✅ READ-ONLY: update in-memory only, never save to Redis
     if trades:
         try:
             refreshed_trades = update_open_trades(
@@ -4653,8 +4736,7 @@ def _refresh_track_trades_before_reply(
                 sync_exchange_stop=False,
             )
             result["trades"] = refreshed_trades
-            if trade_store:
-                trade_store.save_trades(refreshed_trades)
+            # ✅ NO trade_store.save_trades() — read-only
         except Exception as exc:
             print(f"⚠️ track execution refresh failed: {exc}", flush=True)
 
@@ -4670,12 +4752,46 @@ def _refresh_track_trades_before_reply(
             )
             result["simulation_trades"] = refreshed_sim_trades
             result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
-            _save_simulation_trades(refreshed_sim_trades, trade_store=trade_store)
+            # ✅ NO _save_simulation_trades() — read-only
         except Exception as exc:
             print(f"⚠️ track simulation refresh failed: {exc}", flush=True)
 
 
-def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
+def _build_track_message_with_status(
+    signal,
+    exec_result: dict | None,
+    trade=None,
+) -> str:
+    """Wrap build_track_message with EXECUTED TRADE / TRACKING ONLY label.
+
+    This is display-only. It never modifies trades or affects reports.
+    """
+    base = build_track_message(signal, exec_result, trade=trade)
+
+    is_executed = bool(
+        trade is not None
+        and getattr(trade, "execution_trade", False)
+        and getattr(trade, "exchange_order_ok", False)
+    )
+
+    if is_executed:
+        label = "\n".join([
+            "🚀 <b>EXECUTED TRADE</b>",
+            "• Slot Reserved: <b>YES</b>",
+            "• Included In Live Reports: <b>YES</b>",
+            "• Protection System: <b>ACTIVE</b>",
+            "━━━━━━━━━━━━",
+        ])
+    else:
+        label = "\n".join([
+            "👁 <b>TRACKING ONLY</b>",
+            "• Slot Reserved: <b>NO</b>",
+            "• Included In Live Reports: <b>NO</b>",
+            "• Protection System: <b>INACTIVE</b>",
+            "━━━━━━━━━━━━",
+        ])
+
+    return label + "\n" + str(base or "")
     callback_id = str(callback_query.get("id") or "")
     data = str(callback_query.get("data") or "")
     if callback_id:
@@ -4766,10 +4882,10 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         for item in result.get("signal_items", []):
             signal = item.get("signal")
             if signal and signal.symbol == symbol:
-                _send_text(sender, build_track_message(signal, item.get("execution"), trade=matching_trade))
+                _send_text(sender, _build_track_message_with_status(signal, item.get("execution"), trade=matching_trade))
                 return
         if matching_trade is not None:
-            _send_text(sender, build_track_message(None, None, trade=matching_trade))
+            _send_text(sender, _build_track_message_with_status(None, None, trade=matching_trade))
             return
         sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan أو في سجل Redis.")
         return
@@ -5454,33 +5570,11 @@ def live_worker() -> None:
 
     while True:
         try:
-            # Answer pending Telegram commands before starting a potentially long scan.
-            if sender.enabled and settings.telegram_enabled and last_result is not None:
-                telegram_offset = _poll_telegram_commands_safe(
-                    sender,
-                    last_result,
-                    telegram_offset,
-                    settings,
-                    trade_store,
-                    okx_client=okx_client,
-                )
-
             previous_scan_mode = state.mode if state is not None else None
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
             state = result["state"]
             if sender.enabled and settings.telegram_enabled:
-                # Commands get priority over scan message bursts.
-                telegram_offset = _poll_telegram_commands_safe(
-                    sender,
-                    result,
-                    telegram_offset,
-                    settings,
-                    trade_store,
-                    okx_client=okx_client,
-                )
-
                 if settings.send_mode_status_each_scan:
-                    # ✅ FIX: _send_text بدل send_message لدعم HTML tags
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
                     if mode_changed_in_scan and result.get("mode_transition_message"):
                         _send_text(sender, result.get("mode_transition_message", ""))
@@ -5489,14 +5583,6 @@ def live_worker() -> None:
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
-                telegram_offset = _poll_telegram_commands_safe(
-                    sender,
-                    result,
-                    telegram_offset,
-                    settings,
-                    trade_store,
-                    okx_client=okx_client,
-                )
 
             last_result = result
             _run_ai_export(result, settings)
@@ -5520,16 +5606,8 @@ def live_worker() -> None:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
                         _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
-                        telegram_offset = _poll_telegram_commands_safe(
-                            sender,
-                            last_result,
-                            telegram_offset,
-                            settings,
-                            trade_store,
-                            okx_client=okx_client,
-                        )
                 except Exception as exc:
-                    print(f"telegram command polling error: {exc}", flush=True)
+                    print(f"mode reminder error: {exc}", flush=True)
             time.sleep(max(0.5, float(TELEGRAM_COMMAND_POLL_SLEEP_SECONDS)))
 
 
