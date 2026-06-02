@@ -54,7 +54,7 @@ RETURN_TO_NORMAL_COOLDOWN_MINUTES = 18
 # Recovery can still exit BLOCK immediately when a clear fast rebound appears.
 BLOCK_MIN_HOLD_MINUTES = 10
 BLOCK_EXIT_CONFIRM_SCANS = 3
-STRONG_TO_BLOCK_CONFIRM_SCANS = 1
+STRONG_TO_BLOCK_CONFIRM_SCANS = 3          # ← تم التعديل من 1 إلى 3
 # Returning to NORMAL requires repeated healthy scans, not one green snapshot.
 NORMAL_RETURN_CONFIRM_SCANS = 2
 
@@ -298,12 +298,6 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
-    # التعديل لجعل المؤشر أكثر حساسية للانهيارات الحادة دون ضوضاء (مع عتبة أعلى)
-    btc_drop_15m = snapshot.btc_change_15m
-    red = snapshot.red_ratio_15m
-    if btc_drop_15m <= -1.0 and red >= 0.65:   # ← تم التعديل من -0.6 و 0.60 إلى -1.0 و 0.65
-        hourly_ma5_pressure = True
-
     # التعديل الوحيد هنا ────────────────────────────────
     weak_breadth = bool(
         red_ratio >= 0.50
@@ -399,7 +393,7 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
             candidate_mode = MODE_BLOCK_LONGS
 
     elif previous.mode == MODE_STRONG_LONG_ONLY:
-        # Enter BLOCK from STRONG immediately on confirmed real breakdown.
+        # Enter BLOCK from STRONG only after repeated weakness (gradient)
         if flags["real_block"] and next_state.consecutive_weak_scans >= STRONG_TO_BLOCK_CONFIRM_SCANS:
             candidate_mode = MODE_BLOCK_LONGS
         elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
