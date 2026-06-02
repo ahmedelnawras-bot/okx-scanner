@@ -4792,6 +4792,9 @@ def _build_track_message_with_status(
         ])
 
     return label + "\n" + str(base or "")
+
+
+def _handle_callback_query(sender: TelegramSender, result: dict, callback_query: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     callback_id = str(callback_query.get("id") or "")
     data = str(callback_query.get("data") or "")
     if callback_id:
