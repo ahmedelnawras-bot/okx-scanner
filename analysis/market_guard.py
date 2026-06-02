@@ -20,7 +20,7 @@ MARKET_GUARD_TIMEFRAME = "15m"
 STRONG_15M_THRESHOLD = 0.40
 HOURLY_MA_GUARD_SYMBOL = "BTC-USDT-SWAP"
 HOURLY_MA_GUARD_BAR = "1H"
-HOURLY_MA5_PRESSURE_GAP_PCT = -0.05
+HOURLY_MA5_PRESSURE_GAP_PCT = -0.15  # ← أكثر حساسية: BTC تحت MA5 بـ 0.15% = pressure
 
 
 
@@ -130,7 +130,10 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
         }
 
     close = closes[0]
-    ma5 = sum(closes[:5]) / 5.0
+    # ✅ FIX: MA5 يتحسب من آخر 5 كاندل مغلقة (مش بتشمل الـ close الحالي)
+    # OKX بيحسب MA5 من 5 كاندل سابقة — لو اشملنا الـ close الحالي في الـ MA5
+    # الـ gap هيكون قريب من الصفر دايماً
+    ma5 = sum(closes[1:6]) / 5.0 if len(closes) >= 6 else sum(closes[:5]) / 5.0
     gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
 
     previous_below_ma5 = False
@@ -158,7 +161,7 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
 
 
 def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: int = 15) -> MarketSnapshot:
-    candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=12, timeout=timeout)
+    candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
     guard = _calc_hourly_ma5_guard(candles)
     for key, value in guard.items():
         setattr(snapshot, key, value)
