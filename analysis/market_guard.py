@@ -1,479 +1,310 @@
-"""Unified market mode engine - BTC drop triggers STRONG even if alts are strong.
+"""Candle-based Market Guard snapshot builder with BTC Dominance helper.
 """
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 from datetime import datetime, timezone
 
-from utils.constants import *
+from analysis.market_modes import MarketSnapshot
+
+
+MARKET_GUARD_SAMPLE_SIZE = 50
+MARKET_GUARD_MIN_VALID = 20
+MARKET_GUARD_TIMEFRAME = "15m"
+STRONG_15M_THRESHOLD = 0.40
+HOURLY_MA_GUARD_SYMBOL = "BTC-USDT-SWAP"
+HOURLY_MA_GUARD_BAR = "30m"
+HOURLY_MA5_PRESSURE_GAP_PCT = -0.25
+
+# CoinGecko endpoint for global data (no API key required, rate limited)
+COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+DOMINANCE_CACHE = {"timestamp": 0.0, "dominance_1h_ago": None}
 
 
 @dataclass
-class MarketSnapshot:
-    btc_change_15m: float = 0.0
-    red_ratio_15m: float = 0.5
-    avg_change_15m: float = 0.0
-    strong_coins_count: int = 0
-    fast_rebound: bool = False
-    btc_reclaim: bool = False
-    breadth_improving: bool = False
-    hourly_ma5_pressure: bool = False
-    btc_1h_close: float = 0.0
-    btc_1h_ma5: float = 0.0
-    btc_1h_ma5_gap_pct: float = 0.0
-    btc_dominance_change_1h: float = 0.0
+class GuardChange:
+    symbol: str
+    change_pct: float
+    turnover_usdt: float = 0.0
 
 
-@dataclass
-class MarketModeState:
-    mode: str = MODE_NORMAL_LONG
-    changed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    recovery_cycle_started_at: datetime | None = None
-    recovery_trade_count: int = 0
-    reminder_count: int = 0
-    consecutive_improvement_scans: int = 0
-    consecutive_weak_scans: int = 0
-
-
-# Keep transitions stable
-MODE_CHANGE_COOLDOWN_MINUTES = 10
-NORMAL_EXIT_COOLDOWN_MINUTES = 1
-RETURN_TO_NORMAL_COOLDOWN_MINUTES = 18
-
-BLOCK_MIN_HOLD_MINUTES = 10
-BLOCK_EXIT_CONFIRM_SCANS = 3
-STRONG_TO_BLOCK_CONFIRM_SCANS = 3
-NORMAL_RETURN_CONFIRM_SCANS = 2
-
-# Old-core style thresholds
-BLOCK_RED_RATIO = 0.66
-BLOCK_AVG_CHANGE = -0.85
-BLOCK_BTC_CHANGE = -0.55
-BLOCK_BTC_RED_RATIO = 0.66
-ALT_WEAK_RED_RATIO = 0.62
-
-FAST_BLOCK_BTC_15M = -0.95
-FAST_BLOCK_RED_RATIO = 0.80
-FAST_BLOCK_AVG = -1.50
-
-NO_LONGER_CRASHING_RED_RATIO = 0.60
-NO_LONGER_CRASHING_AVG = -0.65
-NO_LONGER_CRASHING_BTC = -0.38
-
-RECOVERY_READY_RED_RATIO = 0.58
-RECOVERY_READY_AVG = -0.55
-RECOVERY_READY_BTC = -0.32
-
-NORMAL_READY_RED_RATIO = 0.44
-NORMAL_READY_AVG = -0.05
-NORMAL_READY_BTC = -0.05
-
-RECOVERY_SOFT_FAIL_RED_RATIO = 0.62
-RECOVERY_SOFT_FAIL_AVG = -0.45
-RECOVERY_SOFT_FAIL_BTC = -0.45
-RECOVERY_HARD_FAIL_RED_RATIO = 0.70
-RECOVERY_HARD_FAIL_AVG = -0.75
-RECOVERY_HARD_FAIL_BTC = -0.75
-
-RECOVERY_TO_STRONG_RED_RATIO = 0.60
-RECOVERY_TO_STRONG_AVG = -0.45
-RECOVERY_TO_STRONG_BTC = -0.35
-RECOVERY_TO_STRONG_MIN_STRONG_COINS = 4
-
-
-MODE_DECISION_DEBUG = os.getenv("MODE_DECISION_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
-
-
-def _mode_debug_line(
-    snapshot: MarketSnapshot,
-    previous_mode: str,
-    raw_mode: str,
-    candidate_before_cooldown: str,
-    final_mode: str,
-    *,
-    minutes_in_mode: int,
-    flags: dict,
-    cooldown_applied: bool,
-    required_cooldown: int,
-) -> str:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    return (
-        "🧭 MODE DECISION"
-        f" | prev={previous_mode}"
-        f" | raw={raw_mode}"
-        f" | candidate={candidate_before_cooldown}"
-        f" | final={final_mode}"
-        f" | mins={minutes_in_mode}"
-        f" | need_cd={required_cooldown}"
-        f" | cd_blocked={cooldown_applied}"
-        f" | weak={int(bool(flags.get('weak_breadth')))}"
-        f" | block={int(bool(flags.get('real_block')))}"
-        f" | rec_ready={int(bool(flags.get('recovery_ready')))}"
-        f" | norm_ready={int(bool(flags.get('normal_ready')))}"
-        f" | stabilize={int(bool(flags.get('stabilizing')))}"
-        f" | hourly_p={int(bool(flags.get('hourly_ma5_pressure')))}"
-        f" | dom_ch={snapshot.btc_dominance_change_1h:+.2f}"
-        f" | red={red_ratio:.2f}"
-        f" | avg={avg:+.2f}"
-        f" | btc={btc:+.2f}"
-        f" | strong={strong}"
-    )
-
-
-def _print_mode_debug(
-    snapshot: MarketSnapshot,
-    previous_mode: str,
-    raw_mode: str,
-    candidate_before_cooldown: str,
-    final_mode: str,
-    *,
-    minutes_in_mode: int,
-    flags: dict,
-    cooldown_applied: bool,
-    required_cooldown: int,
-) -> None:
-    if not MODE_DECISION_DEBUG:
-        return
+def _safe_float(value, default: float = 0.0) -> float:
     try:
-        print(
-            _mode_debug_line(
-                snapshot,
-                previous_mode,
-                raw_mode,
-                candidate_before_cooldown,
-                final_mode,
-                minutes_in_mode=minutes_in_mode,
-                flags=flags,
-                cooldown_applied=cooldown_applied,
-                required_cooldown=required_cooldown,
-            ),
-            flush=True,
-        )
+        if value is None or value == "":
+            return default
+        return float(value)
     except Exception:
-        pass
+        return default
 
 
-def _values(snapshot: MarketSnapshot) -> tuple[float, float, float, int]:
-    return (
-        float(snapshot.red_ratio_15m or 0.0),
-        float(snapshot.avg_change_15m or 0.0),
-        float(snapshot.btc_change_15m or 0.0),
-        int(snapshot.strong_coins_count or 0),
-    )
+def _symbol_of(pair) -> str:
+    return str(getattr(pair, "symbol", "") or getattr(pair, "instId", "") or "")
 
 
-def _is_no_longer_crashing(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    old_core_safe = (
-        red_ratio < NO_LONGER_CRASHING_RED_RATIO
-        and avg > NO_LONGER_CRASHING_AVG
-        and btc > NO_LONGER_CRASHING_BTC
-    )
-    stabilization_safe = bool(
-        snapshot.breadth_improving
-        or snapshot.btc_reclaim
-        or (btc > -0.55 and avg > -0.85 and red_ratio < 0.62)
-        or (strong >= 5 and avg > -0.75 and btc > -0.55)
-    )
-    return bool(old_core_safe or stabilization_safe)
+def _turnover_of(pair) -> float:
+    return _safe_float(getattr(pair, "turnover_usdt", 0.0), 0.0)
 
 
-def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    old_core_recovery = (
-        red_ratio < RECOVERY_READY_RED_RATIO
-        and avg > RECOVERY_READY_AVG
-        and btc > RECOVERY_READY_BTC
-    )
-    fast_recovery_edge = bool(
-        snapshot.fast_rebound
-        and snapshot.btc_reclaim
-        and snapshot.breadth_improving
-        and red_ratio <= 0.62
-        and avg > -0.55
-        and btc > -0.40
-        and strong >= 5
-    )
-    controlled_rebound_edge = bool(
-        snapshot.btc_reclaim
-        and snapshot.breadth_improving
-        and red_ratio <= 0.58
-        and avg > -0.55
-        and btc > -0.35
-        and strong >= 5
-    )
-    return bool(
-        (
-            old_core_recovery
-            and snapshot.fast_rebound
-            and snapshot.breadth_improving
-            and strong >= 5
-        )
-        or controlled_rebound_edge
-        or fast_recovery_edge
-    )
+def select_market_guard_sample(ranked_pairs, limit: int = MARKET_GUARD_SAMPLE_SIZE) -> list:
+    pairs = [p for p in list(ranked_pairs or []) if _symbol_of(p).endswith("-USDT-SWAP")]
+    pairs = sorted(pairs, key=_turnover_of, reverse=True)
+    sample: list = []
+    seen: set[str] = set()
+    btc = next((p for p in pairs if _symbol_of(p).startswith("BTC-")), None)
+    if btc is not None:
+        sample.append(btc)
+        seen.add(_symbol_of(btc))
+    for pair in pairs:
+        if len(sample) >= max(1, int(limit)):
+            break
+        symbol = _symbol_of(pair)
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        sample.append(pair)
+    return sample
 
 
-def _has_hourly_ma5_pressure(snapshot: MarketSnapshot) -> bool:
-    return bool(getattr(snapshot, "hourly_ma5_pressure", False))
+def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFRAME, limit: int = 3, timeout: int = 15) -> list[list]:
+    url = f"{base_url}/api/v5/market/candles"
+    params = {"instId": symbol, "bar": bar, "limit": str(limit)}
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
-def _is_normal_ready(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    return bool(
-        red_ratio < NORMAL_READY_RED_RATIO
-        and avg > NORMAL_READY_AVG
-        and btc > NORMAL_READY_BTC
-        and strong >= 8
-        and not _has_hourly_ma5_pressure(snapshot)
-    )
+def get_last_closed_candle_change_pct(candles: list[list]) -> float | None:
+    if not candles:
+        return None
+    row = candles[1] if len(candles) > 1 else candles[0]
+    if not isinstance(row, (list, tuple)) or len(row) < 5:
+        return None
+    open_ = _safe_float(row[1])
+    close = _safe_float(row[4])
+    if open_ <= 0 or close <= 0:
+        return None
+    return ((close - open_) / open_) * 100.0
 
 
-def _is_recovery_to_strong_ready(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    pressure_but_stable = (
-        red_ratio <= RECOVERY_TO_STRONG_RED_RATIO
-        and avg >= RECOVERY_TO_STRONG_AVG
-        and btc >= RECOVERY_TO_STRONG_BTC
-        and strong >= RECOVERY_TO_STRONG_MIN_STRONG_COINS
-    )
-    recovery_edge_fading = bool(not snapshot.fast_rebound or snapshot.breadth_improving or snapshot.btc_reclaim)
-    return bool(pressure_but_stable and recovery_edge_fading)
+def fetch_btc_dominance_change_1h() -> float:
+    """Return percentage change of BTC dominance over last ~1 hour.
+    Falls back to 0.0 if API fails or data unavailable.
+    """
+    global DOMINANCE_CACHE
+    try:
+        now = datetime.now(timezone.utc).timestamp()
+        # Cache for 10 minutes to avoid hammering API
+        if now - DOMINANCE_CACHE["timestamp"] < 600 and DOMINANCE_CACHE["dominance_1h_ago"] is not None:
+            # We need fresh dominance now, but we can reuse old 1h_ago if still valid
+            pass
+        resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json()
+        if not isinstance(data, dict):
+            return 0.0
+        market_cap_percentage = data.get("data", {}).get("market_cap_percentage", {})
+        btc_dominance_now = _safe_float(market_cap_percentage.get("btc", 0.0), 0.0)
+        
+        # Fetch historical dominance from ~1 hour ago using CoinGecko's /global/history?date=
+        # Simpler: use a rolling cache. For demo, we'll just return 0.0 if no previous.
+        # Better: store last dominance and timestamp, compute change over 1 hour.
+        if DOMINANCE_CACHE["dominance_1h_ago"] is None:
+            DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
+            DOMINANCE_CACHE["timestamp"] = now
+            return 0.0
+        age_hours = (now - DOMINANCE_CACHE["timestamp"]) / 3600.0
+        if age_hours < 0.5:
+            # Not enough time difference, return 0
+            return 0.0
+        change_pct = btc_dominance_now - DOMINANCE_CACHE["dominance_1h_ago"]  # absolute percentage points
+        # Update cache for next call
+        DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
+        DOMINANCE_CACHE["timestamp"] = now
+        return change_pct
+    except Exception:
+        return 0.0
 
 
-def _risk_flags(snapshot: MarketSnapshot) -> dict:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    dom_change = snapshot.btc_dominance_change_1h
-
-    broad_market_crash = red_ratio >= BLOCK_RED_RATIO and avg <= BLOCK_AVG_CHANGE
-    btc_breakdown = btc <= BLOCK_BTC_CHANGE and red_ratio >= BLOCK_BTC_RED_RATIO
-    alt_weak_pressure = red_ratio >= ALT_WEAK_RED_RATIO and avg <= -0.65 and btc <= -0.30
-    severe_breadth_pressure = bool(red_ratio >= 0.75 and avg <= -0.45 and strong <= 3)
-    panic_breadth_pressure = bool(red_ratio >= 0.88 and avg <= -0.25 and strong <= 2)
-
-    fast_block_trigger = bool(
-        (
-            btc <= FAST_BLOCK_BTC_15M
-            and red_ratio >= FAST_BLOCK_RED_RATIO
-            and avg <= -0.70
-        )
-        or
-        (
-            avg <= FAST_BLOCK_AVG
-            and red_ratio >= 0.85
-        )
-    )
-
-    no_longer_crashing = _is_no_longer_crashing(snapshot)
-    recovery_ready = _is_recovery_ready(snapshot)
-    normal_ready = _is_normal_ready(snapshot)
-    recovery_to_strong_ready = _is_recovery_to_strong_ready(snapshot)
-
-    stabilizing = bool(no_longer_crashing or snapshot.breadth_improving or snapshot.btc_reclaim)
-
-    real_block_core = (broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure)
-    real_block = bool(real_block_core and not stabilizing and (red_ratio >= 0.60 or avg <= -0.50))
-
-    hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
-
-    # ========== المنطق الجديد لـ weak_breadth ==========
-    # 1. ضعف البدائل
-    alt_weak = (
-        red_ratio >= 0.50
-        or avg <= -0.20
-        or strong <= 5
-    )
-    # 2. هبوط البيتكوين وحده (حتى لو البدائل قوية) -> يرسل إلى STRONG
-    btc_drop_alone = (btc <= -0.25)   # يمكن تعديل العتبة حسب الحساسية
-    # 3. ضغط MA5 على الساعة
-    ma5_pressure = hourly_ma5_pressure
-
-    weak_breadth = alt_weak or btc_drop_alone or ma5_pressure
-    # ==================================================
-
-    # تعديل الهيمنة (ترجيح)
-    if dom_change < -0.3 and weak_breadth:
-        if red_ratio < 0.7 and avg > -0.4:
-            weak_breadth = False
-    if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.55 or avg <= -0.3):
-        weak_breadth = True
-
+def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
+    closed = [row for row in (candles or [])[1:] if isinstance(row, (list, tuple)) and len(row) >= 5]
+    closes = [_safe_float(row[4]) for row in closed]
+    closes = [x for x in closes if x > 0]
+    if len(closes) < 5:
+        return {
+            "hourly_ma5_pressure": False,
+            "btc_1h_close": 0.0,
+            "btc_1h_ma5": 0.0,
+            "btc_1h_ma5_gap_pct": 0.0,
+            "hourly_ma_guard_source": "unavailable",
+        }
+    close = closes[0]
+    ma5 = sum(closes[1:6]) / 5.0 if len(closes) >= 6 else sum(closes[:5]) / 5.0
+    gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
+    previous_below_ma5 = False
+    if len(closes) >= 6:
+        prev_close = closes[1]
+        prev_ma5 = sum(closes[1:6]) / 5.0
+        previous_below_ma5 = prev_ma5 > 0 and prev_close < prev_ma5
+    ma5_below_ma10 = False
+    if len(closes) >= 10:
+        ma10 = sum(closes[:10]) / 10.0
+        ma5_below_ma10 = ma5 < ma10
+    pressure = bool(gap_pct <= HOURLY_MA5_PRESSURE_GAP_PCT and (previous_below_ma5 or ma5_below_ma10))
     return {
-        "broad_market_crash": broad_market_crash,
-        "btc_breakdown": btc_breakdown,
-        "alt_weak_pressure": alt_weak_pressure,
-        "severe_breadth_pressure": severe_breadth_pressure,
-        "panic_breadth_pressure": panic_breadth_pressure,
-        "fast_block_trigger": fast_block_trigger,
-        "weak_breadth": weak_breadth,
-        "stabilizing": stabilizing,
-        "no_longer_crashing": no_longer_crashing,
-        "recovery_ready": recovery_ready,
-        "normal_ready": normal_ready,
-        "hourly_ma5_pressure": hourly_ma5_pressure,
-        "recovery_to_strong_ready": bool(recovery_to_strong_ready and not real_block),
-        "real_block": real_block,
+        "hourly_ma5_pressure": pressure,
+        "btc_1h_close": close,
+        "btc_1h_ma5": ma5,
+        "btc_1h_ma5_gap_pct": gap_pct,
+        "hourly_ma_guard_source": "btc_1h_ma5",
     }
 
 
-def _recovery_hard_fail(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    return bool(
-        red_ratio >= RECOVERY_HARD_FAIL_RED_RATIO
-        or avg <= RECOVERY_HARD_FAIL_AVG
-        or btc <= RECOVERY_HARD_FAIL_BTC
+def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: int = 15) -> MarketSnapshot:
+    candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
+    guard = _calc_hourly_ma5_guard(candles)
+    for key, value in guard.items():
+        setattr(snapshot, key, value)
+    try:
+        snapshot.hourly_ma5_pressure = bool(guard.get("hourly_ma5_pressure"))
+        snapshot.btc_1h_close = float(guard.get("btc_1h_close") or 0.0)
+        snapshot.btc_1h_ma5 = float(guard.get("btc_1h_ma5") or 0.0)
+        snapshot.btc_1h_ma5_gap_pct = float(guard.get("btc_1h_ma5_gap_pct") or 0.0)
+    except Exception:
+        pass
+    return snapshot
+
+
+def _fallback_from_pair_change(ranked_pairs) -> MarketSnapshot:
+    sample = select_market_guard_sample(ranked_pairs, limit=30)
+    if not sample:
+        snap = MarketSnapshot()
+        setattr(snap, "market_guard_source", "fallback_empty")
+        return snap
+    changes = [_safe_float(getattr(p, "change_pct", 0.0), 0.0) for p in sample]
+    red_count = sum(1 for x in changes if x < 0)
+    avg_change = sum(changes) / max(1, len(changes))
+    strong_count = sum(1 for x in changes if x >= 0.40)
+    btc_change = next((_safe_float(getattr(p, "change_pct", 0.0), avg_change) for p in sample if _symbol_of(p).startswith("BTC-")), avg_change)
+    snap = MarketSnapshot(
+        btc_change_15m=btc_change,
+        red_ratio_15m=red_count / max(1, len(changes)),
+        avg_change_15m=avg_change,
+        strong_coins_count=strong_count,
+        fast_rebound=bool(avg_change > 0.20 and strong_count >= 6 and (red_count / max(1, len(changes))) <= 0.58),
+        btc_reclaim=bool(btc_change > -0.15),
+        breadth_improving=bool((red_count / max(1, len(changes))) <= 0.62 and avg_change > -0.55),
     )
+    setattr(snap, "market_guard_source", "fallback_pair_change")
+    setattr(snap, "market_guard_valid_count", len(changes))
+    setattr(snap, "market_guard_red_count", red_count)
+    # Add dominance field with fallback
+    snap.btc_dominance_change_1h = 0.0
+    return snap
 
 
-def _recovery_soft_fail(snapshot: MarketSnapshot) -> bool:
-    red_ratio, avg, btc, strong = _values(snapshot)
-    return bool(
-        red_ratio >= RECOVERY_SOFT_FAIL_RED_RATIO
-        or avg <= RECOVERY_SOFT_FAIL_AVG
-        or btc <= RECOVERY_SOFT_FAIL_BTC
-        or strong <= 3
+def build_market_guard_snapshot(
+    ranked_pairs,
+    base_url: str,
+    timeout: int = 15,
+    sample_size: int = MARKET_GUARD_SAMPLE_SIZE,
+    min_valid: int = MARKET_GUARD_MIN_VALID,
+    timeframe: str = MARKET_GUARD_TIMEFRAME,
+    debug: bool = True,
+    verbose: bool = False,
+) -> MarketSnapshot:
+    """Build a MarketSnapshot from real candle changes."""
+    sample = select_market_guard_sample(ranked_pairs, limit=sample_size)
+    changes: list[GuardChange] = []
+
+    def _fetch_pair_change(pair):
+        symbol = _symbol_of(pair)
+        candles = fetch_okx_candles(base_url, symbol, bar=timeframe, limit=3, timeout=timeout)
+        change = get_last_closed_candle_change_pct(candles)
+        if change is None:
+            return None
+        return GuardChange(symbol=symbol, change_pct=change, turnover_usdt=_turnover_of(pair))
+
+    max_workers = min(12, max(4, len(sample)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_pair_change, pair) for pair in sample]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    changes.append(result)
+            except Exception:
+                continue
+
+    if len(changes) < max(1, int(min_valid)):
+        snap = _fallback_from_pair_change(ranked_pairs)
+        if debug:
+            print(
+                "📊 MODE SNAPSHOT DEBUG | "
+                f"Source={getattr(snap, 'market_guard_source', 'fallback')} | "
+                f"Sample={len(sample)} | Valid candles={len(changes)} < {min_valid} | "
+                f"Fallback avg={snap.avg_change_15m:.2f}% | Red={snap.red_ratio_15m*100:.0f}%",
+                flush=True,
+            )
+        return snap
+
+    red_count = sum(1 for item in changes if item.change_pct < 0)
+    avg_change = sum(item.change_pct for item in changes) / max(1, len(changes))
+    red_ratio = red_count / max(1, len(changes))
+    strong_count = sum(1 for item in changes if item.change_pct >= STRONG_15M_THRESHOLD)
+    btc_change = next((item.change_pct for item in changes if item.symbol.startswith("BTC-")), avg_change)
+
+    fast_rebound = bool(avg_change > 0.20 and strong_count >= 6 and red_ratio <= 0.58 and btc_change > -0.40)
+    btc_reclaim = bool(btc_change > -0.15)
+    breadth_improving = bool(red_ratio <= 0.62 and avg_change > -0.55)
+
+    # Fetch BTC dominance change over last hour
+    dominance_change = fetch_btc_dominance_change_1h()
+
+    snap = MarketSnapshot(
+        btc_change_15m=btc_change,
+        red_ratio_15m=red_ratio,
+        avg_change_15m=avg_change,
+        strong_coins_count=strong_count,
+        fast_rebound=fast_rebound,
+        btc_reclaim=btc_reclaim,
+        breadth_improving=breadth_improving,
+        btc_dominance_change_1h=dominance_change,
     )
+    setattr(snap, "market_guard_source", f"candles_{timeframe}")
+    setattr(snap, "market_guard_sample_size", len(sample))
+    setattr(snap, "market_guard_valid_count", len(changes))
+    setattr(snap, "market_guard_red_count", red_count)
+    attach_hourly_ma5_guard(snap, base_url=base_url, timeout=timeout)
+
+    if debug:
+        gainers = sorted(changes, key=lambda x: x.change_pct, reverse=True)[:5]
+        losers = sorted(changes, key=lambda x: x.change_pct)[:5]
+        gainers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in gainers)
+        losers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in losers)
+        print(
+            "📊 MODE SNAPSHOT DEBUG | "
+            f"Source=candles_{timeframe} | Sample={len(sample)} | Valid={len(changes)} | "
+            f"Red={red_count}/{len(changes)} ({red_ratio*100:.0f}%) | "
+            f"Avg15m={avg_change:+.2f}% | BTC15m={btc_change:+.2f}% | Strong={strong_count} | "
+            f"DomChange1h={dominance_change:+.2f}% | "
+            f"FastRebound={fast_rebound} | BTCReclaim={btc_reclaim} | BreadthImproving={breadth_improving} | "
+            f"1hMA5Pressure={getattr(snap, 'hourly_ma5_pressure', False)} (gap={getattr(snap, 'btc_1h_ma5_gap_pct', 0.0):+.2f}%)",
+            flush=True,
+        )
+        if verbose:
+            print(f"📈 Guard top gainers: {gainers_txt}", flush=True)
+            print(f"📉 Guard top losers: {losers_txt}", flush=True)
+
+    return snap
 
 
-def _base_mode(snapshot: MarketSnapshot) -> str:
-    flags = _risk_flags(snapshot)
-    if flags["fast_block_trigger"]:
-        return MODE_BLOCK_LONGS
-    if flags["real_block"]:
-        return MODE_BLOCK_LONGS
-    if flags["weak_breadth"]:
-        return MODE_STRONG_LONG_ONLY
-    return MODE_NORMAL_LONG
-
-
-def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | None = None, now: datetime | None = None) -> MarketModeState:
-    now = now or datetime.now(timezone.utc)
-    previous = previous or MarketModeState()
-    minutes_in_mode = int((now - previous.changed_at).total_seconds() // 60)
-    flags = _risk_flags(snapshot)
-    raw = _base_mode(snapshot)
-
-    next_state = replace(previous)
-    improving = flags["no_longer_crashing"] or flags["recovery_ready"] or flags["recovery_to_strong_ready"] or flags["stabilizing"]
-    weakening = flags["real_block"]
-    next_state.consecutive_improvement_scans = previous.consecutive_improvement_scans + 1 if improving else 0
-    next_state.consecutive_weak_scans = previous.consecutive_weak_scans + 1 if weakening else 0
-
-    candidate_mode = previous.mode
-    required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
-    cooldown_applied = False
-
-    if previous.mode == MODE_BLOCK_LONGS:
-        if flags["recovery_ready"]:
-            candidate_mode = MODE_RECOVERY_LONG
-        elif minutes_in_mode < BLOCK_MIN_HOLD_MINUTES:
-            candidate_mode = MODE_BLOCK_LONGS
-        elif flags["no_longer_crashing"] or flags["stabilizing"]:
-            if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
-                candidate_mode = MODE_STRONG_LONG_ONLY
-            else:
-                candidate_mode = MODE_BLOCK_LONGS
-        else:
-            candidate_mode = MODE_BLOCK_LONGS
-
-    elif previous.mode == MODE_STRONG_LONG_ONLY:
-        if flags["real_block"] and next_state.consecutive_weak_scans >= STRONG_TO_BLOCK_CONFIRM_SCANS:
-            candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
-            candidate_mode = MODE_NORMAL_LONG
-        else:
-            candidate_mode = MODE_STRONG_LONG_ONLY
-
-    elif previous.mode == MODE_RECOVERY_LONG:
-        if flags["real_block"] or _recovery_hard_fail(snapshot):
-            candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
-            candidate_mode = MODE_NORMAL_LONG
-        else:
-            candidate_mode = MODE_RECOVERY_LONG
-
-    else:  # NORMAL_LONG
-        if flags["real_block"]:
-            candidate_mode = MODE_BLOCK_LONGS
-        elif flags["weak_breadth"]:
-            candidate_mode = MODE_STRONG_LONG_ONLY
-        else:
-            candidate_mode = MODE_NORMAL_LONG
-
-    candidate_before_cooldown = candidate_mode
-
-    if candidate_mode != previous.mode:
-        required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
-        if previous.mode == MODE_NORMAL_LONG and candidate_mode == MODE_STRONG_LONG_ONLY:
-            required_cooldown = NORMAL_EXIT_COOLDOWN_MINUTES
-        elif previous.mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG) and candidate_mode == MODE_NORMAL_LONG:
-            required_cooldown = RETURN_TO_NORMAL_COOLDOWN_MINUTES
-
-        if minutes_in_mode < required_cooldown:
-            if previous.mode == MODE_BLOCK_LONGS and candidate_mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
-                pass
-            elif candidate_mode == MODE_BLOCK_LONGS and (flags["real_block"] or previous.mode == MODE_RECOVERY_LONG):
-                pass
-            elif candidate_mode != MODE_BLOCK_LONGS:
-                cooldown_applied = True
-                candidate_mode = previous.mode
-
-    changed = candidate_mode != previous.mode
-    next_state.mode = candidate_mode
-    next_state.changed_at = now if changed else previous.changed_at
-    next_state.reminder_count = 0 if changed else previous.reminder_count
-
-    if candidate_mode == MODE_RECOVERY_LONG:
-        if previous.mode != MODE_RECOVERY_LONG:
-            next_state.recovery_cycle_started_at = now
-            next_state.recovery_trade_count = 0
-        else:
-            next_state.recovery_cycle_started_at = previous.recovery_cycle_started_at
-            next_state.recovery_trade_count = previous.recovery_trade_count
-    else:
-        next_state.recovery_cycle_started_at = None
-        next_state.recovery_trade_count = 0
-
-    _print_mode_debug(
-        snapshot,
-        previous.mode,
-        raw,
-        candidate_before_cooldown,
-        next_state.mode,
-        minutes_in_mode=minutes_in_mode,
-        flags=flags,
-        cooldown_applied=cooldown_applied,
-        required_cooldown=required_cooldown,
-    )
-    return next_state
-
-
-def increment_reminder_count(state: MarketModeState) -> MarketModeState:
-    return replace(state, reminder_count=state.reminder_count + 1)
-
-
-def register_recovery_trade(state: MarketModeState) -> MarketModeState:
-    if state.mode != MODE_RECOVERY_LONG:
-        return state
-    return replace(state, recovery_trade_count=min(MAX_RECOVERY_TRADES_PER_CYCLE, state.recovery_trade_count + 1))
-
-
-def recovery_slots_remaining(state: MarketModeState) -> int:
-    if state.mode != MODE_RECOVERY_LONG:
-        return MAX_RECOVERY_TRADES_PER_CYCLE
-    return max(0, MAX_RECOVERY_TRADES_PER_CYCLE - state.recovery_trade_count)
-
-
-def block_protection_status(state: MarketModeState, now: datetime | None = None) -> dict:
-    now = now or datetime.now(timezone.utc)
-    if state.mode != MODE_BLOCK_LONGS:
-        return {"level": 0, "current": "inactive", "next": "inactive", "remaining_minutes": 0}
-    minutes_in_mode = int((now - state.changed_at).total_seconds() // 60)
-    if minutes_in_mode < 5:
-        return {"level": 1, "current": "LEVEL 1 — Monitor Only", "next": "Soft Protection", "remaining_minutes": 5 - minutes_in_mode}
-    if minutes_in_mode < 10:
-        return {"level": 2, "current": "LEVEL 2 — Soft Protection", "next": "Defensive Protection", "remaining_minutes": 10 - minutes_in_mode}
-    if minutes_in_mode < 15:
-        return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 15 - minutes_in_mode}
-    return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
+# ========== إضافة alias للتوافق مع main.py ==========
+build_market_guard = build_market_guard_snapshot
