@@ -116,7 +116,7 @@ def _mode_debug_line(
 ) -> str:
     red_ratio, avg, btc, strong = _values(snapshot)
     return (
-        "ðŸ§­ MODE DECISION"
+        "🧭 MODE DECISION"
         f" | prev={previous_mode}"
         f" | raw={raw_mode}"
         f" | candidate={candidate_before_cooldown}"
@@ -297,6 +297,12 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     real_block = bool((broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure) and not stabilizing)
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
+
+    # التعديل لجعل المؤشر أكثر حساسية للانهيارات الحادة دون ضوضاء
+    btc_drop_15m = snapshot.btc_change_15m
+    red = snapshot.red_ratio_15m
+    if btc_drop_15m <= -0.6 and red >= 0.60:
+        hourly_ma5_pressure = True
 
     # التعديل الوحيد هنا ────────────────────────────────
     weak_breadth = bool(
@@ -495,9 +501,9 @@ def block_protection_status(state: MarketModeState, now: datetime | None = None)
         return {"level": 0, "current": "inactive", "next": "inactive", "remaining_minutes": 0}
     minutes_in_mode = int((now - state.changed_at).total_seconds() // 60)
     if minutes_in_mode < 5:
-        return {"level": 1, "current": "LEVEL 1 â€” Monitor Only", "next": "Soft Protection", "remaining_minutes": 5 - minutes_in_mode}
+        return {"level": 1, "current": "LEVEL 1 — Monitor Only", "next": "Soft Protection", "remaining_minutes": 5 - minutes_in_mode}
     if minutes_in_mode < 10:
-        return {"level": 2, "current": "LEVEL 2 â€” Soft Protection", "next": "Defensive Protection", "remaining_minutes": 10 - minutes_in_mode}
+        return {"level": 2, "current": "LEVEL 2 — Soft Protection", "next": "Defensive Protection", "remaining_minutes": 10 - minutes_in_mode}
     if minutes_in_mode < 15:
-        return {"level": 3, "current": "LEVEL 3 â€” Defensive Protection", "next": "Max protection active", "remaining_minutes": 15 - minutes_in_mode}
-    return {"level": 3, "current": "LEVEL 3 â€” Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
+        return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 15 - minutes_in_mode}
+    return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
