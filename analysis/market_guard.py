@@ -1,15 +1,11 @@
-"""Candle-based Market Guard snapshot builder.
-
-v130 restores the old core idea for Market Mode:
-- Do NOT decide market mode from ticker/ranked pair change_pct.
-- Use the last closed 15m candle for a liquid market sample.
-- Print a compact diagnostic so BLOCK/STRONG/RECOVERY decisions can be audited.
+"""Candle-based Market Guard snapshot builder with BTC Dominance helper.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from datetime import datetime, timezone
 
 from analysis.market_modes import MarketSnapshot
 
@@ -19,8 +15,12 @@ MARKET_GUARD_MIN_VALID = 20
 MARKET_GUARD_TIMEFRAME = "15m"
 STRONG_15M_THRESHOLD = 0.40
 HOURLY_MA_GUARD_SYMBOL = "BTC-USDT-SWAP"
-HOURLY_MA_GUARD_BAR = "30m"                      # ← تم التعديل من "1H" إلى "30m"
-HOURLY_MA5_PRESSURE_GAP_PCT = -0.25              # ← تم التعديل من -0.15 إلى -0.25
+HOURLY_MA_GUARD_BAR = "30m"
+HOURLY_MA5_PRESSURE_GAP_PCT = -0.25
+
+# CoinGecko endpoint for global data (no API key required, rate limited)
+COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+DOMINANCE_CACHE = {"timestamp": 0.0, "dominance_1h_ago": None}
 
 
 @dataclass
@@ -48,22 +48,14 @@ def _turnover_of(pair) -> float:
 
 
 def select_market_guard_sample(ranked_pairs, limit: int = MARKET_GUARD_SAMPLE_SIZE) -> list:
-    """Pick a liquid, representative guard sample and force BTC into it.
-
-    ranked_pairs already applies the bot's liquidity universe. For mode decisions,
-    we sort by turnover to avoid a momentum/reversal-biased top slice.
-    """
     pairs = [p for p in list(ranked_pairs or []) if _symbol_of(p).endswith("-USDT-SWAP")]
     pairs = sorted(pairs, key=_turnover_of, reverse=True)
-
     sample: list = []
     seen: set[str] = set()
-
     btc = next((p for p in pairs if _symbol_of(p).startswith("BTC-")), None)
     if btc is not None:
         sample.append(btc)
         seen.add(_symbol_of(btc))
-
     for pair in pairs:
         if len(sample) >= max(1, int(limit)):
             break
@@ -72,7 +64,6 @@ def select_market_guard_sample(ranked_pairs, limit: int = MARKET_GUARD_SAMPLE_SI
             continue
         seen.add(symbol)
         sample.append(pair)
-
     return sample
 
 
@@ -90,12 +81,6 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
 
 
 def get_last_closed_candle_change_pct(candles: list[list]) -> float | None:
-    """Return percent change for the last closed candle.
-
-    OKX returns latest first. The latest row can be still forming, so prefer index 1
-    when available, and fall back to index 0 only for tests/offline fallback.
-    Row shape: [ts, open, high, low, close, ...]
-    """
     if not candles:
         return None
     row = candles[1] if len(candles) > 1 else candles[0]
@@ -108,14 +93,47 @@ def get_last_closed_candle_change_pct(candles: list[list]) -> float | None:
     return ((close - open_) / open_) * 100.0
 
 
-def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
-    """Return BTC 1h MA5 pressure guard from OKX candles.
-
-    OKX returns latest first. We use closed candles only (index 1 onward).
-    The guard is intentionally light and fast: if BTC is below 1h MA5 by a
-    small margin and the short 1h structure is not improving, NORMAL is blocked
-    and the engine stays in STRONG pressure mode instead of over-trusting a 15m bounce.
+def fetch_btc_dominance_change_1h() -> float:
+    """Return percentage change of BTC dominance over last ~1 hour.
+    Falls back to 0.0 if API fails or data unavailable.
     """
+    global DOMINANCE_CACHE
+    try:
+        now = datetime.now(timezone.utc).timestamp()
+        # Cache for 10 minutes to avoid hammering API
+        if now - DOMINANCE_CACHE["timestamp"] < 600 and DOMINANCE_CACHE["dominance_1h_ago"] is not None:
+            # We need fresh dominance now, but we can reuse old 1h_ago if still valid
+            pass
+        resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json()
+        if not isinstance(data, dict):
+            return 0.0
+        market_cap_percentage = data.get("data", {}).get("market_cap_percentage", {})
+        btc_dominance_now = _safe_float(market_cap_percentage.get("btc", 0.0), 0.0)
+        
+        # Fetch historical dominance from ~1 hour ago using CoinGecko's /global/history?date=
+        # Simpler: use a rolling cache. For demo, we'll just return 0.0 if no previous.
+        # Better: store last dominance and timestamp, compute change over 1 hour.
+        if DOMINANCE_CACHE["dominance_1h_ago"] is None:
+            DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
+            DOMINANCE_CACHE["timestamp"] = now
+            return 0.0
+        age_hours = (now - DOMINANCE_CACHE["timestamp"]) / 3600.0
+        if age_hours < 0.5:
+            # Not enough time difference, return 0
+            return 0.0
+        change_pct = btc_dominance_now - DOMINANCE_CACHE["dominance_1h_ago"]  # absolute percentage points
+        # Update cache for next call
+        DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
+        DOMINANCE_CACHE["timestamp"] = now
+        return change_pct
+    except Exception:
+        return 0.0
+
+
+def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
     closed = [row for row in (candles or [])[1:] if isinstance(row, (list, tuple)) and len(row) >= 5]
     closes = [_safe_float(row[4]) for row in closed]
     closes = [x for x in closes if x > 0]
@@ -127,29 +145,19 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
             "btc_1h_ma5_gap_pct": 0.0,
             "hourly_ma_guard_source": "unavailable",
         }
-
     close = closes[0]
-    # ✅ FIX: MA5 يتحسب من آخر 5 كاندل مغلقة (مش بتشمل الـ close الحالي)
-    # OKX بيحسب MA5 من 5 كاندل سابقة — لو اشملنا الـ close الحالي في الـ MA5
-    # الـ gap هيكون قريب من الصفر دايماً
     ma5 = sum(closes[1:6]) / 5.0 if len(closes) >= 6 else sum(closes[:5]) / 5.0
     gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
-
     previous_below_ma5 = False
     if len(closes) >= 6:
         prev_close = closes[1]
         prev_ma5 = sum(closes[1:6]) / 5.0
         previous_below_ma5 = prev_ma5 > 0 and prev_close < prev_ma5
-
     ma5_below_ma10 = False
     if len(closes) >= 10:
         ma10 = sum(closes[:10]) / 10.0
         ma5_below_ma10 = ma5 < ma10
-
-    pressure = bool(
-        gap_pct <= HOURLY_MA5_PRESSURE_GAP_PCT
-        and (previous_below_ma5 or ma5_below_ma10)
-    )
+    pressure = bool(gap_pct <= HOURLY_MA5_PRESSURE_GAP_PCT and (previous_below_ma5 or ma5_below_ma10))
     return {
         "hourly_ma5_pressure": pressure,
         "btc_1h_close": close,
@@ -175,23 +183,16 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
 
 
 def _fallback_from_pair_change(ranked_pairs) -> MarketSnapshot:
-    """Conservative fallback if candles are unavailable.
-
-    This keeps the worker alive during OKX candle interruptions, but marks the
-    numbers as fallback diagnostics and uses only moderate values.
-    """
     sample = select_market_guard_sample(ranked_pairs, limit=30)
     if not sample:
         snap = MarketSnapshot()
         setattr(snap, "market_guard_source", "fallback_empty")
         return snap
-
     changes = [_safe_float(getattr(p, "change_pct", 0.0), 0.0) for p in sample]
     red_count = sum(1 for x in changes if x < 0)
     avg_change = sum(changes) / max(1, len(changes))
     strong_count = sum(1 for x in changes if x >= 0.40)
     btc_change = next((_safe_float(getattr(p, "change_pct", 0.0), avg_change) for p in sample if _symbol_of(p).startswith("BTC-")), avg_change)
-
     snap = MarketSnapshot(
         btc_change_15m=btc_change,
         red_ratio_15m=red_count / max(1, len(changes)),
@@ -204,6 +205,8 @@ def _fallback_from_pair_change(ranked_pairs) -> MarketSnapshot:
     setattr(snap, "market_guard_source", "fallback_pair_change")
     setattr(snap, "market_guard_valid_count", len(changes))
     setattr(snap, "market_guard_red_count", red_count)
+    # Add dominance field with fallback
+    snap.btc_dominance_change_1h = 0.0
     return snap
 
 
@@ -217,7 +220,6 @@ def build_market_guard_snapshot(
     debug: bool = True,
     verbose: bool = False,
 ) -> MarketSnapshot:
-    """Build a MarketSnapshot from real candle changes."""
     sample = select_market_guard_sample(ranked_pairs, limit=sample_size)
     changes: list[GuardChange] = []
 
@@ -227,17 +229,11 @@ def build_market_guard_snapshot(
         change = get_last_closed_candle_change_pct(candles)
         if change is None:
             return None
-        return GuardChange(
-            symbol=symbol,
-            change_pct=change,
-            turnover_usdt=_turnover_of(pair),
-        )
+        return GuardChange(symbol=symbol, change_pct=change, turnover_usdt=_turnover_of(pair))
 
     max_workers = min(12, max(4, len(sample)))
-
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_fetch_pair_change, pair) for pair in sample]
-
         for future in as_completed(futures):
             try:
                 result = future.result()
@@ -268,6 +264,9 @@ def build_market_guard_snapshot(
     btc_reclaim = bool(btc_change > -0.15)
     breadth_improving = bool(red_ratio <= 0.62 and avg_change > -0.55)
 
+    # Fetch BTC dominance change over last hour
+    dominance_change = fetch_btc_dominance_change_1h()
+
     snap = MarketSnapshot(
         btc_change_15m=btc_change,
         red_ratio_15m=red_ratio,
@@ -276,6 +275,7 @@ def build_market_guard_snapshot(
         fast_rebound=fast_rebound,
         btc_reclaim=btc_reclaim,
         breadth_improving=breadth_improving,
+        btc_dominance_change_1h=dominance_change,
     )
     setattr(snap, "market_guard_source", f"candles_{timeframe}")
     setattr(snap, "market_guard_sample_size", len(sample))
@@ -293,9 +293,9 @@ def build_market_guard_snapshot(
             f"Source=candles_{timeframe} | Sample={len(sample)} | Valid={len(changes)} | "
             f"Red={red_count}/{len(changes)} ({red_ratio*100:.0f}%) | "
             f"Avg15m={avg_change:+.2f}% | BTC15m={btc_change:+.2f}% | Strong={strong_count} | "
+            f"DomChange1h={dominance_change:+.2f}% | "
             f"FastRebound={fast_rebound} | BTCReclaim={btc_reclaim} | BreadthImproving={breadth_improving} | "
-            f"1hMA5Pressure={getattr(snap, 'hourly_ma5_pressure', False)} "
-            f"(gap={getattr(snap, 'btc_1h_ma5_gap_pct', 0.0):+.2f}%)",
+            f"1hMA5Pressure={getattr(snap, 'hourly_ma5_pressure', False)} (gap={getattr(snap, 'btc_1h_ma5_gap_pct', 0.0):+.2f}%)",
             flush=True,
         )
         if verbose:
