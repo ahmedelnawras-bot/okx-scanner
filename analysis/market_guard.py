@@ -20,7 +20,11 @@ HOURLY_MA5_PRESSURE_GAP_PCT = -0.25
 
 # CoinGecko endpoint for global data (no API key required, rate limited)
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
-DOMINANCE_CACHE = {"timestamp": 0.0, "dominance_1h_ago": None}
+DOMINANCE_CACHE: dict = {
+    "current": None,
+    "current_ts": 0.0,
+    "history": [],  # [(timestamp, dominance)]
+}
 
 
 @dataclass
@@ -94,41 +98,57 @@ def get_last_closed_candle_change_pct(candles: list[list]) -> float | None:
 
 
 def fetch_btc_dominance_change_1h() -> float:
-    """Return percentage change of BTC dominance over last ~1 hour.
-    Falls back to 0.0 if API fails or data unavailable.
+    """Return BTC dominance change over last ~1 hour (percentage points).
+
+    يجيب BTC.D من CoinGecko ويحسب الفرق عن ساعة سابقة.
+    - Cache كل 10 دقايق لتجنب rate limits
+    - بيحتفظ بـ history لآخر ساعتين
+    - أول ساعة تشغيل → يرجع 0.0 لحد ما يتجمع بيانات كافية
     """
     global DOMINANCE_CACHE
     try:
-        now = datetime.now(timezone.utc).timestamp()
-        # Cache for 10 minutes to avoid hammering API
-        if now - DOMINANCE_CACHE["timestamp"] < 600 and DOMINANCE_CACHE["dominance_1h_ago"] is not None:
-            # We need fresh dominance now, but we can reuse old 1h_ago if still valid
-            pass
-        resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
-        if resp.status_code != 200:
+        import time as _time
+        now = _time.time()
+
+        # لو الـ cache حديث (أقل من 10 دقايق) → مش نجيب من API
+        if now - DOMINANCE_CACHE["current_ts"] >= 600 or DOMINANCE_CACHE["current"] is None:
+            resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
+            if resp.status_code != 200:
+                return 0.0
+            data = resp.json()
+            if not isinstance(data, dict):
+                return 0.0
+            market_cap_percentage = data.get("data", {}).get("market_cap_percentage", {})
+            btc_dom = _safe_float(market_cap_percentage.get("btc", 0.0), 0.0)
+            if btc_dom <= 0:
+                return 0.0
+
+            DOMINANCE_CACHE["current"] = btc_dom
+            DOMINANCE_CACHE["current_ts"] = now
+            DOMINANCE_CACHE["history"].append((now, btc_dom))
+
+            # احتفظ بآخر ساعتين فقط
+            cutoff = now - 7200
+            DOMINANCE_CACHE["history"] = [
+                (ts, d) for ts, d in DOMINANCE_CACHE["history"] if ts >= cutoff
+            ]
+
+        current = DOMINANCE_CACHE["current"]
+        if current is None:
             return 0.0
-        data = resp.json()
-        if not isinstance(data, dict):
+
+        # ابحث عن قيمة قبل ~1 ساعة (±30 دقيقة)
+        target_ts = now - 3600
+        candidates = [
+            (ts, d) for ts, d in DOMINANCE_CACHE["history"]
+            if abs(ts - target_ts) <= 1800
+        ]
+        if not candidates:
             return 0.0
-        market_cap_percentage = data.get("data", {}).get("market_cap_percentage", {})
-        btc_dominance_now = _safe_float(market_cap_percentage.get("btc", 0.0), 0.0)
-        
-        # Fetch historical dominance from ~1 hour ago using CoinGecko's /global/history?date=
-        # Simpler: use a rolling cache. For demo, we'll just return 0.0 if no previous.
-        # Better: store last dominance and timestamp, compute change over 1 hour.
-        if DOMINANCE_CACHE["dominance_1h_ago"] is None:
-            DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
-            DOMINANCE_CACHE["timestamp"] = now
-            return 0.0
-        age_hours = (now - DOMINANCE_CACHE["timestamp"]) / 3600.0
-        if age_hours < 0.5:
-            # Not enough time difference, return 0
-            return 0.0
-        change_pct = btc_dominance_now - DOMINANCE_CACHE["dominance_1h_ago"]  # absolute percentage points
-        # Update cache for next call
-        DOMINANCE_CACHE["dominance_1h_ago"] = btc_dominance_now
-        DOMINANCE_CACHE["timestamp"] = now
-        return change_pct
+
+        closest = min(candidates, key=lambda x: abs(x[0] - target_ts))
+        return round(current - closest[1], 3)
+
     except Exception:
         return 0.0
 
@@ -151,7 +171,7 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
     previous_below_ma5 = False
     if len(closes) >= 6:
         prev_close = closes[1]
-        prev_ma5 = sum(closes[1:6]) / 5.0
+        prev_ma5 = sum(closes[2:7]) / 5.0 if len(closes) >= 7 else sum(closes[1:6]) / 5.0  # ✅ FIX: previous window
         previous_below_ma5 = prev_ma5 > 0 and prev_close < prev_ma5
     ma5_below_ma10 = False
     if len(closes) >= 10:
