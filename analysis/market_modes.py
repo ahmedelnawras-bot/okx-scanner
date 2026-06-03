@@ -62,9 +62,9 @@ NO_LONGER_CRASHING_RED_RATIO = 0.60
 NO_LONGER_CRASHING_AVG = -0.65
 NO_LONGER_CRASHING_BTC = -0.38
 
-RECOVERY_READY_RED_RATIO = 0.55      # تم التخفيض من 0.58 ليكون أكثر انتقائية
-RECOVERY_READY_AVG = -0.30           # تم الرفع من -0.55
-RECOVERY_READY_BTC = -0.25           # تم الرفع من -0.32
+RECOVERY_READY_RED_RATIO = 0.55      # ╪к┘Е ╪з┘Д╪к╪о┘Б┘К╪╢ ┘Е┘Ж 0.58 ┘Д┘К┘Г┘И┘Ж ╪г┘Г╪л╪▒ ╪з┘Ж╪к┘В╪з╪ж┘К╪й
+RECOVERY_READY_AVG = -0.30           # ╪к┘Е ╪з┘Д╪▒┘Б╪╣ ┘Е┘Ж -0.55
+RECOVERY_READY_BTC = -0.25           # ╪к┘Е ╪з┘Д╪▒┘Б╪╣ ┘Е┘Ж -0.32
 
 NORMAL_READY_RED_RATIO = 0.44
 NORMAL_READY_AVG = -0.05
@@ -100,7 +100,7 @@ def _mode_debug_line(
 ) -> str:
     red_ratio, avg, btc, strong = _values(snapshot)
     return (
-        "🧭 MODE DECISION"
+        "ЁЯзн MODE DECISION"
         f" | prev={previous_mode}"
         f" | raw={raw_mode}"
         f" | candidate={candidate_before_cooldown}"
@@ -183,7 +183,7 @@ def _is_no_longer_crashing(snapshot: MarketSnapshot) -> bool:
 def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
     """Strong rebound condition for entering RECOVERY from BLOCK."""
     red_ratio, avg, btc, strong = _values(snapshot)
-    # تشديد الشروط: ارتداد قوي فقط
+    # ╪к╪┤╪п┘К╪п ╪з┘Д╪┤╪▒┘И╪╖: ╪з╪▒╪к╪п╪з╪п ┘В┘И┘К ┘Б┘В╪╖
     strong_rebound = bool(
         snapshot.fast_rebound
         and snapshot.btc_reclaim
@@ -258,7 +258,7 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
-    # ========== المنطق الجديد لـ weak_breadth ==========
+    # ========== ╪з┘Д┘Е┘Ж╪╖┘В ╪з┘Д╪м╪п┘К╪п ┘Д┘А weak_breadth ==========
     alt_weak = (
         red_ratio >= 0.50
         or avg <= -0.20
@@ -269,15 +269,18 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     weak_breadth = alt_weak or btc_drop_alone or ma5_pressure
     # ==================================================
 
-    # تعديل الهيمنة (معطل مؤقتاً)
-    # if dom_change < -0.3 and weak_breadth:
-    #     if red_ratio < 0.7 and avg > -0.4:
-    #         weak_breadth = False
-    # if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.55 or avg <= -0.3):
-    #     weak_breadth = True
+    # тЬЕ BTC Dominance ┘Г╪╣╪з┘Е┘Д ┘Е╪│╪з╪╣╪п
+    # dom_change > +0.3 тЖТ BTC.D ╪з╪▒╪к┘Б╪╣ тЖТ alts ╪╢╪╣┘К┘Б╪й тЖТ ┘К╪┤╪п╪п weak_breadth
+    # dom_change < -0.3 тЖТ BTC.D ┘Ж╪▓┘Д тЖТ alts ┘В┘И┘К╪й тЖТ ┘К╪о┘Б┘Б weak_breadth
+    if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.50 or avg <= -0.25):
+        weak_breadth = True
+        print(f"тЪая╕П DOM_PRESSURE: dom_change={dom_change:+.2f} тЖТ weak_breadth forced True", flush=True)
+    elif dom_change < -0.3 and weak_breadth and red_ratio < 0.55 and avg > -0.30:
+        weak_breadth = False
+        print(f"тЬЕ DOM_RELIEF: dom_change={dom_change:+.2f} тЖТ weak_breadth relieved", flush=True)
 
-    # طباعة DEBUG
-    print(f"🔍 RISK_FLAGS: red={red_ratio:.2f} avg={avg:+.2f} strong={strong} btc={btc:+.2f} | alt_weak={alt_weak} btc_drop={btc_drop_alone} ma5_press={ma5_pressure} | weak_breadth={weak_breadth} dom_change={dom_change:+.2f}")
+    # ╪╖╪и╪з╪╣╪й DEBUG
+    print(f"ЁЯФН RISK_FLAGS: red={red_ratio:.2f} avg={avg:+.2f} strong={strong} btc={btc:+.2f} | alt_weak={alt_weak} btc_drop={btc_drop_alone} ma5_press={ma5_pressure} | weak_breadth={weak_breadth} dom_change={dom_change:+.2f}")
 
     return {
         "broad_market_crash": broad_market_crash,
@@ -345,11 +348,11 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     cooldown_applied = False
 
     if previous.mode == MODE_BLOCK_LONGS:
-        # منطق الخروج الجديد:
-        # 1. ارتداد قوي → RECOVERY
+        # ┘Е┘Ж╪╖┘В ╪з┘Д╪о╪▒┘И╪м ╪з┘Д╪м╪п┘К╪п:
+        # 1. ╪з╪▒╪к╪п╪з╪п ┘В┘И┘К тЖТ RECOVERY
         if flags["recovery_ready"]:
             candidate_mode = MODE_RECOVERY_LONG
-        # 2. تحسن بسيط (توقف الانهيار) → STRONG بعد التأكيدات
+        # 2. ╪к╪н╪│┘Ж ╪и╪│┘К╪╖ (╪к┘И┘В┘Б ╪з┘Д╪з┘Ж┘З┘К╪з╪▒) тЖТ STRONG ╪и╪╣╪п ╪з┘Д╪к╪г┘Г┘К╪п╪з╪к
         elif flags["no_longer_crashing"] or flags["stabilizing"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
                 candidate_mode = MODE_STRONG_LONG_ONLY
@@ -452,9 +455,9 @@ def block_protection_status(state: MarketModeState, now: datetime | None = None)
         return {"level": 0, "current": "inactive", "next": "inactive", "remaining_minutes": 0}
     minutes_in_mode = int((now - state.changed_at).total_seconds() // 60)
     if minutes_in_mode < 5:
-        return {"level": 1, "current": "LEVEL 1 — Monitor Only", "next": "Soft Protection", "remaining_minutes": 5 - minutes_in_mode}
+        return {"level": 1, "current": "LEVEL 1 тАФ Monitor Only", "next": "Soft Protection", "remaining_minutes": 5 - minutes_in_mode}
     if minutes_in_mode < 10:
-        return {"level": 2, "current": "LEVEL 2 — Soft Protection", "next": "Defensive Protection", "remaining_minutes": 10 - minutes_in_mode}
+        return {"level": 2, "current": "LEVEL 2 тАФ Soft Protection", "next": "Defensive Protection", "remaining_minutes": 10 - minutes_in_mode}
     if minutes_in_mode < 15:
-        return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 15 - minutes_in_mode}
-    return {"level": 3, "current": "LEVEL 3 — Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
+        return {"level": 3, "current": "LEVEL 3 тАФ Defensive Protection", "next": "Max protection active", "remaining_minutes": 15 - minutes_in_mode}
+    return {"level": 3, "current": "LEVEL 3 тАФ Defensive Protection", "next": "Max protection active", "remaining_minutes": 0}
