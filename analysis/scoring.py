@@ -1467,6 +1467,10 @@ def build_signal_candidate(
             "resistance_tp1_distance_pct": _r_distance or None,
             "resistance_tp1_price": _r_price or None,
 
+            # ✅ Raw candles للـ candle reversal gate في execution layer فقط
+            # لا يأثر على الـ score أو الـ ranking أو أي منطق حالي
+            "raw_candles": list(getattr(pair, "recent_candles", []) or [])[:5],
+
             **quality_meta,
         },
     )
