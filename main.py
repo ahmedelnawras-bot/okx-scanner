@@ -9,6 +9,8 @@ Preserved design:
 Phase 1 fixes applied:
 - FIX 1: Variable shadowing (result → doc_result) في 4 أماكن
 - FIX 2: State mutation في run_once (scan_mode snapshot قبل اللوب)
+    except Exception as e:
+        logger.error(f"❌ TP placement failed: {e}")
 """
 from __future__ import annotations
 
@@ -3133,8 +3135,11 @@ def _execute_managed_okx_order(
     settings: Settings,
 ) -> dict:
     sl_value = float(getattr(signal, "sl", 0.0) or 0.0)
-    tp1_value = float(getattr(signal, "tp1", 0.0) or 0.0)
-    tp2_value = float(getattr(signal, "tp2", 0.0) or 0.0)
+    raw_tp1 = getattr(signal, "tp1", None)
+raw_tp2 = getattr(signal, "tp2", None)
+
+tp1_value = float(raw_tp1) if raw_tp1 not in (None, "", "-", 0) else None
+tp2_value = float(raw_tp2) if raw_tp2 not in (None, "", "-", 0) else None
     entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
 
     sizing = _resolve_entry_margin_plan(okx_client, settings)
@@ -3210,11 +3215,16 @@ def _execute_managed_okx_order(
 
     tp_split_result = None
     if entry_result.get("ok") and tp1_value > 0 and tp2_value > 0:
-        tp_split_result = okx_client.place_reduce_only_tp_split(
+        tp_split_result = if tp1_value is None or tp2_value is None:
+    logger.warning(f"⚠️ Skipping TP placement due to invalid TP values: tp1={tp1_value}, tp2={tp2_value}")
+else:
+    try:
+        okx_client.place_reduce_only_tp_split(
             signal.symbol,
             entry_value,
             margin_usdt,
             effective_leverage,  # ← الرافعة الفعلية
+            tp1_price=tp1_value,
             tp2_price=tp2_value,
             td_mode=TD_MODE,
             tag="tp",
@@ -3264,8 +3274,8 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
     path = str((getattr(signal, "meta", {}) or {}).get("execution_path") or "")
     entry_price = getattr(signal, "entry", "-")
     sl_price = getattr(signal, "sl", "-")
-    tp1_price = getattr(signal, "tp1", "-")
-    tp2_price = getattr(signal, "tp2", "-")
+    tp1_price = tp1_value if tp1_value is not None else "-"
+    tp2_price = tp2_value if tp2_value is not None else "-"
     mode_text = _mode_label(entry.get("simulated"))
     reason_text = _reason_label(
         entry.get("reason") or managed_order_result.get("reason") or ("submitted" if ok else "not_submitted")
