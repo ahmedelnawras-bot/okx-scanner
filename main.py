@@ -1,6 +1,3 @@
-import logging
-logger = logging.getLogger(__name__)
-
 """OKX Long Bot clean rebuild v125 mode-guard/report-style worker.
 
 Preserved design:
@@ -12,8 +9,6 @@ Preserved design:
 Phase 1 fixes applied:
 - FIX 1: Variable shadowing (result → doc_result) في 4 أماكن
 - FIX 2: State mutation في run_once (scan_mode snapshot قبل اللوب)
-    except Exception as e:
-        logger.error(f"❌ TP placement failed: {e}")
 """
 from __future__ import annotations
 
@@ -80,19 +75,19 @@ except ImportError:
         order_result = order_result or {}
         entry = (order_result or {}).get("entry") or {}
         return "\n".join([
-    "✅ OKX EXECUTION CONFIRMED",
-    f"💎 {getattr(signal, 'symbol', '-')}",
-    f"• Entry Order ID: {entry.get('order_id') or '-'}",
-    f"• SL Attached: {'YES' if (order_result or {}).get('sl_attached') else 'NO'}",
+            "✅ OKX EXECUTION CONFIRMED",
+            f"💎 {getattr(signal, 'symbol', '-')}",
+            f"• Entry Order ID: {entry.get('order_id') or '-'}",
+            f"• SL Attached: {'YES' if (order_result or {}).get('sl_attached') else 'NO'}",
         ])
 
     def build_execution_failure_message(signal, execution_result=None, order_result=None) -> str:
         order_result = order_result or {}
         entry = (order_result or {}).get("entry") or {}
         return "\n".join([
-    "⚠️ OKX EXECUTION FAILED",
-    f"💎 {getattr(signal, 'symbol', '-')}",
-    f"• Reason: {entry.get('reason') or order_result.get('reason') or 'okx_execution_failed'}",
+            "⚠️ OKX EXECUTION FAILED",
+            f"💎 {getattr(signal, 'symbol', '-')}",
+            f"• Reason: {entry.get('reason') or order_result.get('reason') or 'okx_execution_failed'}",
         ])
 from ui.market_mode_messages import build_market_mode_sections, build_block_escalation_alert
 
@@ -193,9 +188,9 @@ def _send_gate_sim_artifact(sender: TelegramSender, gate: str, settings: Setting
         artifact = build_gate_sim_artifact(gate, settings, redis_client=_snapshot_redis_client(trade_store))
         _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
         if artifact.get("ok") and artifact.get("path"):
-    doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-    if not doc_result.get("ok"):
-    _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+            doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+            if not doc_result.get("ok"):
+                _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
     finally:
         _GATE_SIM_LOCK.release()
 
@@ -209,17 +204,17 @@ def fetch_okx_tickers(base_url: str, timeout: int = 15, offline_test_mode: bool 
         return payload.get("data", [])
     except Exception as exc:
         if not offline_test_mode:
-    print(f"⚠️ OKX tickers fetch failed; live fake fallback disabled: {exc}", flush=True)
-    return []
+            print(f"⚠️ OKX tickers fetch failed; live fake fallback disabled: {exc}", flush=True)
+            return []
         return [
-    {"instId": "BTC-USDT-SWAP", "last": "103250", "volCcy24h": "250000000", "change_pct": 1.4},
-    {"instId": "ETH-USDT-SWAP", "last": "4980", "volCcy24h": "180000000", "change_pct": 2.2},
-    {"instId": "SOL-USDT-SWAP", "last": "212", "volCcy24h": "75000000", "change_pct": 3.8},
-    {"instId": "DOGE-USDT-SWAP", "last": "0.244", "volCcy24h": "42000000", "change_pct": -2.1},
-    {"instId": "XRP-USDT-SWAP", "last": "0.635", "volCcy24h": "36000000", "change_pct": -1.4},
-    {"instId": "APT-USDT-SWAP", "last": "11.2", "volCcy24h": "12000000", "change_pct": 1.1},
-    {"instId": "LINK-USDT-SWAP", "last": "18.45", "volCcy24h": "21000000", "change_pct": 0.4},
-    {"instId": "AVAX-USDT-SWAP", "last": "42.4", "volCcy24h": "42000000", "change_pct": 2.8},
+            {"instId": "BTC-USDT-SWAP", "last": "103250", "volCcy24h": "250000000", "change_pct": 1.4},
+            {"instId": "ETH-USDT-SWAP", "last": "4980", "volCcy24h": "180000000", "change_pct": 2.2},
+            {"instId": "SOL-USDT-SWAP", "last": "212", "volCcy24h": "75000000", "change_pct": 3.8},
+            {"instId": "DOGE-USDT-SWAP", "last": "0.244", "volCcy24h": "42000000", "change_pct": -2.1},
+            {"instId": "XRP-USDT-SWAP", "last": "0.635", "volCcy24h": "36000000", "change_pct": -1.4},
+            {"instId": "APT-USDT-SWAP", "last": "11.2", "volCcy24h": "12000000", "change_pct": 1.1},
+            {"instId": "LINK-USDT-SWAP", "last": "18.45", "volCcy24h": "21000000", "change_pct": 0.4},
+            {"instId": "AVAX-USDT-SWAP", "last": "42.4", "volCcy24h": "42000000", "change_pct": 2.8},
         ]
 
 
@@ -242,29 +237,29 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     # Prefer account-level totals when available.
     for account in data:
         if not isinstance(account, dict):
-    continue
+            continue
         for key in ("totalEq", "adjEq", "availEq"):
-    value = _safe_float(account.get(key), 0.0)
-    if value > 0:
-    return value
+            value = _safe_float(account.get(key), 0.0)
+            if value > 0:
+                return value
 
     # Fallback: sum stable-coin details when totals are unavailable.
     total = 0.0
     for account in data:
         if not isinstance(account, dict):
-    continue
+            continue
         for detail in account.get("details") or []:
-    if not isinstance(detail, dict):
-    continue
-    ccy = str(detail.get("ccy") or "").upper()
-    if ccy not in {"USDT", "USDC"}:
-    continue
-    value = 0.0
-    for key in ("eqUsd", "eq", "cashBal", "availEq"):
-    value = _safe_float(detail.get(key), 0.0)
-    if value > 0:
-    break
-    total += max(0.0, value)
+            if not isinstance(detail, dict):
+                continue
+            ccy = str(detail.get("ccy") or "").upper()
+            if ccy not in {"USDT", "USDC"}:
+                continue
+            value = 0.0
+            for key in ("eqUsd", "eq", "cashBal", "availEq"):
+                value = _safe_float(detail.get(key), 0.0)
+                if value > 0:
+                    break
+            total += max(0.0, value)
     return total
 
 
@@ -275,8 +270,8 @@ def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -
     if risk_manager_module is not None:
         allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
         slot_count = max(
-    1,
-    int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
+            1,
+            int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
         )
 
     # Low Balance Mode — رصيد أقل من الحد → allocation أعلى وعدد slots أقل.
@@ -329,14 +324,14 @@ def _risk_profile_snapshot(
 
     if reference_balance is None:
         if risk_context == "simulation":
-    wallet = result.get("simulation_wallet") if isinstance(result, dict) else None
-    reference_balance = _safe_float((wallet or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
-    resolved_source = "simulation_wallet_balance"
+            wallet = result.get("simulation_wallet") if isinstance(result, dict) else None
+            reference_balance = _safe_float((wallet or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
+            resolved_source = "simulation_wallet_balance"
         elif risk_context == "execution":
-    reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
-    resolved_source = "okx_balance"
+            reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+            resolved_source = "okx_balance"
         else:
-    reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+            reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
 
     reference_balance = _safe_float(reference_balance, 0.0)
 
@@ -346,16 +341,16 @@ def _risk_profile_snapshot(
     import time as _time
     if reference_balance <= 0 and risk_context == "execution":
         with _CACHED_OKX_BALANCE_LOCK:
-    _cached = _CACHED_OKX_BALANCE
-    _cached_ts = _CACHED_OKX_BALANCE_TS
+            _cached = _CACHED_OKX_BALANCE
+            _cached_ts = _CACHED_OKX_BALANCE_TS
         if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-    reference_balance = _cached
-    resolved_source = "okx_balance_cached"
+            reference_balance = _cached
+            resolved_source = "okx_balance_cached"
         else:
-    _direct_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
-    if _direct_balance > 0:
-    reference_balance = _direct_balance
-    resolved_source = "okx_balance_inputs"
+            _direct_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
+            if _direct_balance > 0:
+                reference_balance = _direct_balance
+                resolved_source = "okx_balance_inputs"
 
     # Low balance mode is applied here via reference_balance
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
@@ -376,7 +371,7 @@ def _risk_profile_snapshot(
         reason_bits.append("risk_manager_active")
         mode_value = getattr(risk_manager_module, "mode", None) or getattr(risk_manager_module, "current_mode", None)
         if mode_value:
-    reason_bits.append(f"mode={mode_value}")
+            reason_bits.append(f"mode={mode_value}")
     else:
         reason_bits.append("settings_fallback")
 
@@ -384,16 +379,16 @@ def _risk_profile_snapshot(
     if isinstance(mode_context, dict):
         protection_current = str(mode_context.get("protection_current") or "").strip()
         if protection_current and protection_current != "inactive":
-    reason_bits.append(f"protection={protection_current}")
+            reason_bits.append(f"protection={protection_current}")
 
     drawdown = result.get("drawdown_status")
     if drawdown is not None:
         try:
-    reason_bits.append(
-    f"drawdown={float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}%/level{int(getattr(drawdown, 'level', 0) or 0)}"
-    )
+            reason_bits.append(
+                f"drawdown={float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}%/level{int(getattr(drawdown, 'level', 0) or 0)}"
+            )
         except Exception:
-    pass
+            pass
 
     loss_guard = result.get("loss_streak_guard") or {}
     if isinstance(loss_guard, dict) and loss_guard.get("active"):
@@ -458,19 +453,19 @@ def _snapshot_risk_manager_state(settings: Settings) -> dict:
 
     if reference_balance > 0 and position_margin > 0:
         return {
-    "source": "risk_manager",
-    "reference_balance_usdt": reference_balance,
-    "margin_usdt": position_margin,
-    "position_pct": position_pct,
+            "source": "risk_manager",
+            "reference_balance_usdt": reference_balance,
+            "margin_usdt": position_margin,
+            "position_pct": position_pct,
         }
 
     fallback_margin = _compute_margin_from_reference(reference_balance, settings)
     if reference_balance > 0 and fallback_margin > 0:
         return {
-    "source": "risk_manager_balance_only",
-    "reference_balance_usdt": reference_balance,
-    "margin_usdt": fallback_margin,
-    "position_pct": (fallback_margin / reference_balance) * 100.0 if reference_balance > 0 else 0.0,
+            "source": "risk_manager_balance_only",
+            "reference_balance_usdt": reference_balance,
+            "margin_usdt": fallback_margin,
+            "position_pct": (fallback_margin / reference_balance) * 100.0 if reference_balance > 0 else 0.0,
         }
 
     return {}
@@ -493,9 +488,9 @@ def _resolve_entry_margin_plan(
     balance_response = None
     if okx_client is not None and getattr(okx_client, "configured", False):
         try:
-    balance_response = okx_client.get_balance()
+            balance_response = okx_client.get_balance()
         except Exception:
-    balance_response = None
+            balance_response = None
 
     okx_reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
 
@@ -504,21 +499,21 @@ def _resolve_entry_margin_plan(
     now_ts = _time.time()
     with _CACHED_OKX_BALANCE_LOCK:
         if okx_reference_balance > 0:
-    _CACHED_OKX_BALANCE = okx_reference_balance
-    _CACHED_OKX_BALANCE_TS = now_ts
-    print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
+            _CACHED_OKX_BALANCE = okx_reference_balance
+            _CACHED_OKX_BALANCE_TS = now_ts
+            print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
         elif _CACHED_OKX_BALANCE > 0 and (now_ts - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-    okx_reference_balance = _CACHED_OKX_BALANCE
-    print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
+            okx_reference_balance = _CACHED_OKX_BALANCE
+            print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
 
     okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
         return {
-    "source": "okx_balance",
-    "reference_balance_usdt": okx_reference_balance,
-    "margin_usdt": okx_margin,
-    "position_pct": (okx_margin / okx_reference_balance) * 100.0 if okx_reference_balance > 0 else 0.0,
-    "reason": "daily_reference_from_okx_balance",
+            "source": "okx_balance",
+            "reference_balance_usdt": okx_reference_balance,
+            "margin_usdt": okx_margin,
+            "position_pct": (okx_margin / okx_reference_balance) * 100.0 if okx_reference_balance > 0 else 0.0,
+            "reason": "daily_reference_from_okx_balance",
         }
 
     live_okx_mode = bool(
@@ -528,12 +523,12 @@ def _resolve_entry_margin_plan(
     )
     if live_okx_mode:
         return {
-    "source": "okx_balance",
-    "reference_balance_usdt": 0.0,
-    "margin_usdt": 0.0,
-    "position_pct": 0.0,
-    "reason": "live_okx_balance_zero_or_unavailable",
-    "balance_fetch_msg": str((balance_response or {}).get("msg") or ""),
+            "source": "okx_balance",
+            "reference_balance_usdt": 0.0,
+            "margin_usdt": 0.0,
+            "position_pct": 0.0,
+            "reason": "live_okx_balance_zero_or_unavailable",
+            "balance_fetch_msg": str((balance_response or {}).get("msg") or ""),
         }
 
     risk_snapshot = _snapshot_risk_manager_state(settings)
@@ -565,21 +560,21 @@ def _resolve_portfolio_state_inputs(
     # ✅ FIX: لو live mode والـ balance = 0 → استخدم الـ cache بـ lock
     if live_okx_mode and reference_balance <= 0:
         with _CACHED_OKX_BALANCE_LOCK:
-    _cached = _CACHED_OKX_BALANCE
-    _cached_ts = _CACHED_OKX_BALANCE_TS
+            _cached = _CACHED_OKX_BALANCE
+            _cached_ts = _CACHED_OKX_BALANCE_TS
         if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-    reference_balance = _cached
-    margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
-    print(f"💰 portfolio_state_inputs using cached balance: {reference_balance:.2f} USDT", flush=True)
+            reference_balance = _cached
+            margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
+            print(f"💰 portfolio_state_inputs using cached balance: {reference_balance:.2f} USDT", flush=True)
         else:
-    margin_per_trade = 0.0
+            margin_per_trade = 0.0
     elif margin_per_trade <= 0:
         margin_per_trade = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
 
     if reference_balance <= 0 and not live_okx_mode:
         allocation_pct, slot_count = _risk_sizing_constants(settings)
         if allocation_pct > 0 and slot_count > 0:
-    reference_balance = margin_per_trade * float(slot_count) / (allocation_pct / 100.0)
+            reference_balance = margin_per_trade * float(slot_count) / (allocation_pct / 100.0)
 
     reference_balance = max(reference_balance, 0.0)
     leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
@@ -631,7 +626,7 @@ def _row_float(row: dict, *keys: str) -> float:
     for key in keys:
         value = _safe_float((row or {}).get(key), 0.0)
         if abs(value) > 0:
-    return value
+            return value
     return 0.0
 
 
@@ -641,13 +636,13 @@ def _extract_live_okx_position_inst_ids(positions_result: dict | None) -> set[st
     live: set[str] = set()
     for row in positions_result.get("rows") or []:
         if not isinstance(row, dict):
-    continue
+            continue
         inst_id = _row_inst_id(row)
         if not inst_id:
-    continue
+            continue
         pos_size = _row_float(row, "pos", "availPos", "notionalUsd", "imr", "margin")
         if abs(pos_size) > 0:
-    live.add(inst_id)
+            live.add(inst_id)
     return live
 
 
@@ -657,11 +652,11 @@ def _extract_pending_okx_order_inst_ids(pending_result: dict | None) -> set[str]
     pending: set[str] = set()
     for row in pending_result.get("rows") or []:
         if not isinstance(row, dict):
-    continue
+            continue
         inst_id = _row_inst_id(row)
         state = str(row.get("state") or row.get("ordState") or "").lower()
         if inst_id and state not in {"filled", "canceled", "mmp_canceled"}:
-    pending.add(inst_id)
+            pending.add(inst_id)
     return pending
 
 
@@ -718,11 +713,11 @@ def _reconcile_execution_trades_with_okx(
     removed_symbols = []
     for trade in list(trades or []):
         if _is_open_execution_trade_for_reconcile(trade):
-    inst_id = _trade_symbol_inst_id(trade)
-    if inst_id and inst_id not in protected_inst_ids:
-    removed += 1
-    removed_symbols.append(inst_id)
-    continue
+            inst_id = _trade_symbol_inst_id(trade)
+            if inst_id and inst_id not in protected_inst_ids:
+                removed += 1
+                removed_symbols.append(inst_id)
+                continue
         kept.append(trade)
 
     stats.update({
@@ -789,12 +784,12 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
         symbol = str(raw.get("instId") or raw.get("symbol") or "")
         price = _safe_float(raw.get("last") or raw.get("lastPrice"))
         if symbol and price > 0:
-    price_map[symbol] = price
+            price_map[symbol] = price
     for pair in fallback_pairs or []:
         symbol = str(getattr(pair, "symbol", "") or "")
         price = _safe_float(getattr(pair, "last_price", 0.0))
         if symbol and price > 0 and symbol not in price_map:
-    price_map[symbol] = price
+            price_map[symbol] = price
     return price_map
 
 
@@ -815,11 +810,11 @@ def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "1
 
     try:
         rows = fetch_okx_candles(
-    settings.okx_base_url,
-    symbol,
-    bar=bar,
-    limit=limit,
-    timeout=settings.request_timeout,
+            settings.okx_base_url,
+            symbol,
+            bar=bar,
+            limit=limit,
+            timeout=settings.request_timeout,
         )
     except Exception:
         return []
@@ -832,17 +827,17 @@ def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "1
 
     for row in reversed(closed_rows):
         if not isinstance(row, (list, tuple)) or len(row) < 5:
-    continue
+            continue
         try:
-    candles.append({
-    "timestamp": row[0],
-    "open": float(row[1]),
-    "high": float(row[2]),
-    "low": float(row[3]),
-    "close": float(row[4]),
-    })
+            candles.append({
+                "timestamp": row[0],
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+            })
         except Exception:
-    continue
+            continue
 
     return candles
 
@@ -861,50 +856,50 @@ def _build_4h_resistance_context_for_pair(pair, settings: Settings, bar: str = "
 
     if not symbol or last_price <= 0:
         return {
-    "status": "unknown",
-    "distance_pct": None,
-    "resistance": None,
-    "reason": "missing_symbol_or_price",
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "missing_symbol_or_price",
         }
 
     try:
         rows = fetch_okx_candles(
-    settings.okx_base_url,
-    symbol,
-    bar=bar,
-    limit=limit,
-    timeout=settings.request_timeout,
+            settings.okx_base_url,
+            symbol,
+            bar=bar,
+            limit=limit,
+            timeout=settings.request_timeout,
         )
     except Exception as exc:
         return {
-    "status": "unknown",
-    "distance_pct": None,
-    "resistance": None,
-    "reason": f"fetch_failed:{exc}",
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": f"fetch_failed:{exc}",
         }
 
     if not isinstance(rows, list) or len(rows) < 6:
         return {
-    "status": "unknown",
-    "distance_pct": None,
-    "resistance": None,
-    "reason": "not_enough_4h_candles",
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "not_enough_4h_candles",
         }
 
     highs: list[float] = []
     for row in rows[1:]:  # skip current forming candle
         if not isinstance(row, (list, tuple)) or len(row) < 3:
-    continue
+            continue
         high = _safe_float(row[2], 0.0)
         if high > 0:
-    highs.append(high)
+            highs.append(high)
 
     if not highs:
         return {
-    "status": "unknown",
-    "distance_pct": None,
-    "resistance": None,
-    "reason": "no_valid_highs",
+            "status": "unknown",
+            "distance_pct": None,
+            "resistance": None,
+            "reason": "no_valid_highs",
         }
 
     resistance = max(highs)
@@ -1031,10 +1026,10 @@ def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: Market
     result["mode_transition_message"] = None
     result["block_alert_preview"] = (
         build_block_escalation_alert(
-    state,
-    affected=len(result.get("trades", [])),
-    protected=sum(1 for t in result.get("trades", []) if getattr(t, "pnl_pct", 0) > 0),
-    tightened=sum(1 for t in result.get("trades", []) if getattr(t, "tp2_hit", False)),
+            state,
+            affected=len(result.get("trades", [])),
+            protected=sum(1 for t in result.get("trades", []) if getattr(t, "pnl_pct", 0) > 0),
+            tightened=sum(1 for t in result.get("trades", []) if getattr(t, "tp2_hit", False)),
         )
         if state.mode == MODE_BLOCK_LONGS else None
     )
@@ -1059,13 +1054,13 @@ def _run_market_mode_guard(
     if guarded_state.mode != previous_mode:
         reminder_tracker.clear()
         transition_message = _build_mode_message(
-    guarded_state,
-    snapshot,
-    block_protection_status(guarded_state),
-    variant="transition",
-    old_mode=previous_mode,
-    settings=settings,
-    result=result,
+            guarded_state,
+            snapshot,
+            block_protection_status(guarded_state),
+            variant="transition",
+            old_mode=previous_mode,
+            settings=settings,
+            result=result,
         )
         result["mode_transition_message"] = transition_message
         _send_text(sender, transition_message)
@@ -1077,13 +1072,13 @@ def _run_market_mode_guard(
 def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
     try:
         if not pair or float(getattr(pair, "last_price", 0.0) or 0.0) <= 0:
-    return False
+            return False
         turnover = float(getattr(pair, "turnover_usdt", 0.0) or 0.0)
         tags = set(getattr(pair, "tags", []) or [])
         if turnover < 500_000:
-    return False
+            return False
         if current_mode == MODE_BLOCK_LONGS:
-    return turnover >= 2_000_000 or bool(tags & {"rs_btc", "breakout", "rebound", "major"})
+            return turnover >= 2_000_000 or bool(tags & {"rs_btc", "breakout", "rebound", "major"})
         return True
     except Exception:
         return False
@@ -1104,17 +1099,17 @@ def _is_trade_closed(trade) -> bool:
 
     return bool(
         (
-    getattr(trade, "is_closed", False)
-    and not bool(getattr(trade, "tp2_hit", False))
+            getattr(trade, "is_closed", False)
+            and not bool(getattr(trade, "tp2_hit", False))
         )
         or status in {
-    "closed",
-    "stopped",
-    "closed_win",
-    "closed_loss",
-    "breakeven_after_tp1",
-    "trailing_hit",
-    "expired",
+            "closed",
+            "stopped",
+            "closed_win",
+            "closed_loss",
+            "breakeven_after_tp1",
+            "trailing_hit",
+            "expired",
         }
     )
 
@@ -1180,20 +1175,20 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
 
     for trade in closed_trades:
         if bool(getattr(trade, "tp1_hit", False)):
-    streak = 0
-    streak_symbols = []
-    last_loss_at = None
-    continue
+            streak = 0
+            streak_symbols = []
+            last_loss_at = None
+            continue
 
         if _is_sl_before_tp1_loss(trade):
-    streak += 1
-    streak_symbols.append(str(getattr(trade, "symbol", "") or "-"))
-    last_loss_at = _trade_closed_at(trade)
+            streak += 1
+            streak_symbols.append(str(getattr(trade, "symbol", "") or "-"))
+            last_loss_at = _trade_closed_at(trade)
         else:
-    # Non-SL/non-TP1 closure breaks a pure SL streak.
-    streak = 0
-    streak_symbols = []
-    last_loss_at = None
+            # Non-SL/non-TP1 closure breaks a pure SL streak.
+            streak = 0
+            streak_symbols = []
+            last_loss_at = None
 
     cooldown_until = None
     active = False
@@ -1202,12 +1197,12 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
         cooldown_until = last_loss_at + timedelta(minutes=LOSS_STREAK_COOLDOWN_MINUTES)
         active = now < cooldown_until
         if active:
-    remaining_minutes = max(1, int((cooldown_until - now).total_seconds() // 60))
+            remaining_minutes = max(1, int((cooldown_until - now).total_seconds() // 60))
         else:
-    # ✅ FIX: cooldown انتهى → صفّر الـ streak
-    # يمنع إيقاف التداول فوراً عند أول SL بعد انتهاء الـ cooldown
-    streak = 0
-    streak_symbols = []
+            # ✅ FIX: cooldown انتهى → صفّر الـ streak
+            # يمنع إيقاف التداول فوراً عند أول SL بعد انتهاء الـ cooldown
+            streak = 0
+            streak_symbols = []
 
     return {
         "active": active,
@@ -1239,7 +1234,7 @@ def _loss_streak_base_trades_for_runtime(
     result = result or {}
     if _is_simulation_mode(settings):
         if simulation_trades is not None:
-    return list(simulation_trades or [])
+            return list(simulation_trades or [])
         return list(result.get("simulation_trades", []) or [])
     if execution_trades is not None:
         return list(execution_trades or [])
@@ -1274,9 +1269,9 @@ def _execution_slot_counts(trades) -> dict[str, int]:
     counts = {"general": 0, "block_exception": 0, "recovery": 0}
     for trade in trades or []:
         if not getattr(trade, "execution_trade", False):
-    continue
+            continue
         if not _is_counted_open_trade(trade):
-    continue
+            continue
         counts[_trade_slot_path(trade)] = counts.get(_trade_slot_path(trade), 0) + 1
     return counts
 
@@ -1288,9 +1283,9 @@ def _has_active_same_symbol(trades, candidate_trade) -> bool:
     # Do not allow duplicates just because tracking bucket or execution path changed.
     for trade in trades or []:
         if getattr(trade, "symbol", "") != symbol:
-    continue
+            continue
         if _blocks_same_symbol_reentry(trade):
-    return True
+            return True
     return False
 
 
@@ -1324,8 +1319,8 @@ def _simulation_margin_usdt(balance: float, settings: Settings | None = None) ->
         allocation_pct = SIMULATION_ALLOCATION_PCT
         slot_count = 7
         if risk_manager_module is not None:
-    allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
-    slot_count = max(1, int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count))
+            allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
+            slot_count = max(1, int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count))
 
     if float(balance or 0.0) <= 0 or int(slot_count or 0) <= 0:
         return 0.0
@@ -1341,11 +1336,11 @@ def _simulation_equity_from_trades(
     for trade in sim_trades or []:
         margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
         if margin <= 0:
-    margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
         try:
-    pct = _report_trade_effective_pnl(trade)
+            pct = _report_trade_effective_pnl(trade)
         except Exception:
-    pct = _trade_effective_pnl_pct(trade)
+            pct = _trade_effective_pnl_pct(trade)
         equity += _money_from_pct(pct, margin=margin)
     return equity
 
@@ -1357,12 +1352,12 @@ def _load_simulation_daily_log(trade_store: RedisTradeStore | None = None) -> li
         raw = trade_store.client.hgetall(SIMULATION_DAILY_BALANCE_HASH) or {}
         rows = []
         for day, payload in raw.items():
-    try:
-    item = json.loads(payload)
-    except Exception:
-    continue
-    item.setdefault("date", str(day))
-    rows.append(item)
+            try:
+                item = json.loads(payload)
+            except Exception:
+                continue
+            item.setdefault("date", str(day))
+            rows.append(item)
         return sorted(rows, key=lambda x: str(x.get("date", "")))
     except Exception as exc:
         print(f"⚠️ Simulation daily log load failed: {exc}", flush=True)
@@ -1419,11 +1414,11 @@ def _ensure_simulation_daily_log(
 
     if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
         try:
-    trade_store.client.hset(SIMULATION_DAILY_BALANCE_HASH, today, json.dumps(row, ensure_ascii=False, default=str))
-    trade_store.client.expire(SIMULATION_DAILY_BALANCE_HASH, 180 * 24 * 60 * 60)
-    trade_store.client.set(SIMULATION_BALANCE_STATE_KEY, json.dumps(row, ensure_ascii=False, default=str), ex=180 * 24 * 60 * 60)
+            trade_store.client.hset(SIMULATION_DAILY_BALANCE_HASH, today, json.dumps(row, ensure_ascii=False, default=str))
+            trade_store.client.expire(SIMULATION_DAILY_BALANCE_HASH, 180 * 24 * 60 * 60)
+            trade_store.client.set(SIMULATION_BALANCE_STATE_KEY, json.dumps(row, ensure_ascii=False, default=str), ex=180 * 24 * 60 * 60)
         except Exception as exc:
-    print(f"⚠️ Simulation daily log save failed: {exc}", flush=True)
+            print(f"⚠️ Simulation daily log save failed: {exc}", flush=True)
 
     return row
 
@@ -1432,12 +1427,12 @@ def _build_simulation_daily_balance_text(trade_store: RedisTradeStore | None = N
     rows = _load_simulation_daily_log(trade_store)
     if not rows:
         rows = [{
-    "date": _simulation_today_key(),
-    "start_balance": SIMULATION_START_BALANCE_USDT,
-    "current_balance": SIMULATION_START_BALANCE_USDT,
-    "realized": 0.0,
-    "floating": 0.0,
-    "open_trades": 0,
+            "date": _simulation_today_key(),
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "realized": 0.0,
+            "floating": 0.0,
+            "open_trades": 0,
         }]
 
     selected = rows[-max(1, int(limit or 10)):]
@@ -1451,7 +1446,7 @@ def _build_simulation_daily_balance_text(trade_store: RedisTradeStore | None = N
         delta = current - start
         icon = "🟢" if delta >= 0 else "🔴"
         lines.append(
-    f"{icon} {item.get('date')} | Start {start:.2f} → {current:.2f} | Δ {delta:+.2f} | Open {int(item.get('open_trades', 0) or 0)}"
+            f"{icon} {item.get('date')} | Start {start:.2f} → {current:.2f} | Δ {delta:+.2f} | Open {int(item.get('open_trades', 0) or 0)}"
         )
     return "\n".join(lines)
 
@@ -1464,20 +1459,20 @@ def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
     try:
         ids = set(trade_store.client.smembers(SIMULATION_OPEN_SET) or []) | set(trade_store.client.smembers(SIMULATION_HISTORY_SET) or [])
         for trade_id in ids:
-    raw = trade_store.client.get(_simulation_trade_key(trade_id))
-    if not raw:
-    continue
-    try:
-    trade = trade_from_dict(json.loads(raw))
-    except Exception:
-    trade = None
-    if trade:
-    setattr(trade, "trade_source", "simulation")
-    setattr(trade, "tracking_bucket", "execution")
-    setattr(trade, "execution_trade", True)
-    if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
-    setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
-    trades.append(trade)
+            raw = trade_store.client.get(_simulation_trade_key(trade_id))
+            if not raw:
+                continue
+            try:
+                trade = trade_from_dict(json.loads(raw))
+            except Exception:
+                trade = None
+            if trade:
+                setattr(trade, "trade_source", "simulation")
+                setattr(trade, "tracking_bucket", "execution")
+                setattr(trade, "execution_trade", True)
+                if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+                    setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
+                trades.append(trade)
     except Exception as exc:
         print(f"⚠️ Simulation load failed: {exc}", flush=True)
     return trades
@@ -1490,25 +1485,25 @@ def _save_simulation_trades(trades: list, trade_store: RedisTradeStore | None = 
     try:
         pipe = trade_store.client.pipeline()
         for trade in trades or []:
-    trade_id = str(getattr(trade, "trade_id", "") or "")
-    if not trade_id:
-    continue
+            trade_id = str(getattr(trade, "trade_id", "") or "")
+            if not trade_id:
+                continue
 
-    setattr(trade, "trade_source", "simulation")
-    setattr(trade, "tracking_bucket", "execution")
-    setattr(trade, "execution_trade", True)
-    payload = json.dumps(trade_to_dict(trade), ensure_ascii=False, default=str)
-    key = _simulation_trade_key(trade_id)
+            setattr(trade, "trade_source", "simulation")
+            setattr(trade, "tracking_bucket", "execution")
+            setattr(trade, "execution_trade", True)
+            payload = json.dumps(trade_to_dict(trade), ensure_ascii=False, default=str)
+            key = _simulation_trade_key(trade_id)
 
-    if _is_trade_closed(trade):
-    pipe.set(key, payload, ex=90 * 24 * 60 * 60)
-    pipe.srem(SIMULATION_OPEN_SET, trade_id)
-    pipe.sadd(SIMULATION_HISTORY_SET, trade_id)
-    pipe.expire(SIMULATION_HISTORY_SET, 90 * 24 * 60 * 60)
-    else:
-    pipe.set(key, payload, ex=90 * 24 * 60 * 60)
-    pipe.sadd(SIMULATION_OPEN_SET, trade_id)
-    pipe.srem(SIMULATION_HISTORY_SET, trade_id)
+            if _is_trade_closed(trade):
+                pipe.set(key, payload, ex=90 * 24 * 60 * 60)
+                pipe.srem(SIMULATION_OPEN_SET, trade_id)
+                pipe.sadd(SIMULATION_HISTORY_SET, trade_id)
+                pipe.expire(SIMULATION_HISTORY_SET, 90 * 24 * 60 * 60)
+            else:
+                pipe.set(key, payload, ex=90 * 24 * 60 * 60)
+                pipe.sadd(SIMULATION_OPEN_SET, trade_id)
+                pipe.srem(SIMULATION_HISTORY_SET, trade_id)
 
         pipe.execute()
     except Exception as exc:
@@ -1523,10 +1518,10 @@ def _append_simulation_execution_checks(execution_results: list[dict], trade_sto
         now = datetime.now(timezone.utc).isoformat()
         pipe = trade_store.client.pipeline()
         for item in execution_results:
-    payload = dict(item or {})
-    payload["ts"] = now
-    payload["simulation_mode"] = True
-    pipe.lpush(SIMULATION_EXEC_CHECKS_LIST, json.dumps(payload, ensure_ascii=False, default=str))
+            payload = dict(item or {})
+            payload["ts"] = now
+            payload["simulation_mode"] = True
+            pipe.lpush(SIMULATION_EXEC_CHECKS_LIST, json.dumps(payload, ensure_ascii=False, default=str))
         pipe.ltrim(SIMULATION_EXEC_CHECKS_LIST, 0, max(0, limit - 1))
         pipe.execute()
     except Exception as exc:
@@ -1540,10 +1535,10 @@ def _load_simulation_execution_checks(trade_store: RedisTradeStore | None = None
         rows = trade_store.client.lrange(SIMULATION_EXEC_CHECKS_LIST, 0, max(0, int(limit or 500) - 1)) or []
         out = []
         for raw in reversed(rows):
-    try:
-    out.append(json.loads(raw))
-    except Exception:
-    continue
+            try:
+                out.append(json.loads(raw))
+            except Exception:
+                continue
         return out
     except Exception as exc:
         print(f"⚠️ Simulation checks load failed: {exc}", flush=True)
@@ -1559,14 +1554,14 @@ def _trade_effective_pnl_pct(trade) -> float:
         pnl_pct = _safe_float(getattr(trade, "pnl_pct", 0.0), 0.0)
 
         if abs(realized) > 0 or abs(floating) > 0:
-    return realized + floating
+            return realized + floating
         if abs(pnl_pct) > 0:
-    return pnl_pct
+            return pnl_pct
 
         entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
         current = _safe_float(getattr(trade, "current_price", 0.0), 0.0)
         if entry > 0 and current > 0:
-    return ((current - entry) / entry) * 100.0
+            return ((current - entry) / entry) * 100.0
     except Exception:
         pass
     return 0.0
@@ -1595,16 +1590,16 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
     for trade in sim_trades or []:
         margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
         if margin <= 0:
-    margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
         try:
-    pct = _report_trade_effective_pnl(trade)
+            pct = _report_trade_effective_pnl(trade)
         except Exception:
-    pct = _trade_effective_pnl_pct(trade)
+            pct = _trade_effective_pnl_pct(trade)
         usd = _money_from_pct(pct, margin=margin)
         if _is_trade_closed(trade):
-    realized += usd
+            realized += usd
         else:
-    floating += usd
+            floating += usd
 
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT) + realized + floating
     return {
@@ -1638,24 +1633,24 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
 
     for item in rows or []:
         if not isinstance(item, dict):
-    continue
+            continue
         day = str(item.get("date") or "").strip()
         if not day:
-    continue
+            continue
         merged.append(item)
 
     if isinstance(current_row, dict):
         day = str(current_row.get("date") or "").strip()
         if day:
-    merged = [item for item in merged if str(item.get("date") or "") != day]
-    merged.append(current_row)
+            merged = [item for item in merged if str(item.get("date") or "") != day]
+            merged.append(current_row)
 
     if not merged:
         merged = [{
-    "date": _simulation_today_key(),
-    "start_balance": SIMULATION_START_BALANCE_USDT,
-    "current_balance": SIMULATION_START_BALANCE_USDT,
-    "end_balance": SIMULATION_START_BALANCE_USDT,
+            "date": _simulation_today_key(),
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "end_balance": SIMULATION_START_BALANCE_USDT,
         }]
 
     merged = sorted(merged, key=lambda item: str(item.get("date") or ""))
@@ -1703,23 +1698,23 @@ def _simulation_wallet_journal_rows(
 
     for item in rows or []:
         if not isinstance(item, dict):
-    continue
+            continue
         day = str(item.get("date") or "").strip()
         if day:
-    merged[day] = dict(item)
+            merged[day] = dict(item)
 
     if isinstance(current_row, dict):
         day = str(current_row.get("date") or "").strip()
         if day:
-    merged[day] = dict(current_row)
+            merged[day] = dict(current_row)
 
     if not merged:
         today = _simulation_today_key()
         merged[today] = {
-    "date": today,
-    "start_balance": SIMULATION_START_BALANCE_USDT,
-    "current_balance": SIMULATION_START_BALANCE_USDT,
-    "end_balance": SIMULATION_START_BALANCE_USDT,
+            "date": today,
+            "start_balance": SIMULATION_START_BALANCE_USDT,
+            "current_balance": SIMULATION_START_BALANCE_USDT,
+            "end_balance": SIMULATION_START_BALANCE_USDT,
         }
 
     sorted_items = sorted(
@@ -1733,34 +1728,34 @@ def _simulation_wallet_journal_rows(
     for item in sorted_items:
         day_text = str(item.get("date") or "").strip()
         if not day_text:
-    continue
+            continue
 
         stored_start = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
         start_balance = previous_close if previous_close is not None else stored_start
         if start_balance <= 0:
-    start_balance = SIMULATION_START_BALANCE_USDT
+            start_balance = SIMULATION_START_BALANCE_USDT
 
         close_balance = _safe_float(item.get("end_balance") or item.get("current_balance"), start_balance)
         if close_balance <= 0:
-    close_balance = start_balance
+            close_balance = start_balance
 
         pnl = close_balance - start_balance
         pnl_pct = (pnl / start_balance * 100.0) if start_balance else 0.0
         if pnl > 0:
-    result = "🟢 Profit"
+            result = "🟢 Profit"
         elif pnl < 0:
-    result = "🔴 Loss"
+            result = "🔴 Loss"
         else:
-    result = "⚪ Flat"
+            result = "⚪ Flat"
 
         journal.append({
-    "date": day_text,
-    "day": _parse_simulation_wallet_day(day_text),
-    "start": start_balance,
-    "pnl": pnl,
-    "pnl_pct": pnl_pct,
-    "close": close_balance,
-    "result": result,
+            "date": day_text,
+            "day": _parse_simulation_wallet_day(day_text),
+            "start": start_balance,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "close": close_balance,
+            "result": result,
         })
         previous_close = close_balance
 
@@ -1792,10 +1787,10 @@ def _format_simulation_wallet_money(value: object, signed: bool = False) -> str:
 def _build_simulation_wallet_period_block(title: str, rows: list[dict]) -> str:
     if not rows:
         return "\n".join([
-    f"📊 <b>{title}</b>",
-    "From: - → -",
-    "",
-    "<code>No wallet rows yet.</code>",
+            f"📊 <b>{title}</b>",
+            "From: - → -",
+            "",
+            "<code>No wallet rows yet.</code>",
         ])
 
     from_date = _format_simulation_wallet_day(rows[0].get("date"), include_year=True)
@@ -1806,12 +1801,12 @@ def _build_simulation_wallet_period_block(title: str, rows: list[dict]) -> str:
     ]
     for row in rows:
         table_lines.append(
-    f"{_format_simulation_wallet_day(row.get('date')):<7} "
-    f"{_format_simulation_wallet_money(row.get('start')):>10} "
-    f"{_format_simulation_wallet_money(row.get('pnl'), signed=True):>10} "
-    f"{_safe_float(row.get('pnl_pct'), 0.0):+7.2f}% "
-    f"{_format_simulation_wallet_money(row.get('close')):>10} "
-    f"{row.get('result') or '-'}"
+            f"{_format_simulation_wallet_day(row.get('date')):<7} "
+            f"{_format_simulation_wallet_money(row.get('start')):>10} "
+            f"{_format_simulation_wallet_money(row.get('pnl'), signed=True):>10} "
+            f"{_safe_float(row.get('pnl_pct'), 0.0):+7.2f}% "
+            f"{_format_simulation_wallet_money(row.get('close')):>10} "
+            f"{row.get('result') or '-'}"
         )
 
     return "\n".join([
@@ -1940,39 +1935,39 @@ def _build_simulation_wallet_export_files(result: dict | None, title: str, days:
         writer = csv.DictWriter(fh, fieldnames=["date", "start_usdt", "pnl_usdt", "pnl_pct", "close_usdt", "result"])
         writer.writeheader()
         for row in rows:
-    writer.writerow({
-    "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
-    "start_usdt": round(_safe_float(row.get("start"), 0.0), 6),
-    "pnl_usdt": round(_safe_float(row.get("pnl"), 0.0), 6),
-    "pnl_pct": round(_safe_float(row.get("pnl_pct"), 0.0), 6),
-    "close_usdt": round(_safe_float(row.get("close"), 0.0), 6),
-    "result": str(row.get("result") or ""),
-    })
+            writer.writerow({
+                "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+                "start_usdt": round(_safe_float(row.get("start"), 0.0), 6),
+                "pnl_usdt": round(_safe_float(row.get("pnl"), 0.0), 6),
+                "pnl_pct": round(_safe_float(row.get("pnl_pct"), 0.0), 6),
+                "close_usdt": round(_safe_float(row.get("close"), 0.0), 6),
+                "result": str(row.get("result") or ""),
+            })
 
     json_payload = dict(payload)
     json_payload["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     json_payload["rows"] = [
         {
-    "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
-    "raw_date": str(row.get("date") or ""),
-    "start_usdt": _safe_float(row.get("start"), 0.0),
-    "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
-    "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
-    "close_usdt": _safe_float(row.get("close"), 0.0),
-    "result": str(row.get("result") or ""),
+            "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+            "raw_date": str(row.get("date") or ""),
+            "start_usdt": _safe_float(row.get("start"), 0.0),
+            "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
+            "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
+            "close_usdt": _safe_float(row.get("close"), 0.0),
+            "result": str(row.get("result") or ""),
         }
         for row in rows
     ]
     for key in ("best_day", "worst_day"):
         row = json_payload.get(key)
         if isinstance(row, dict):
-    json_payload[key] = {
-    "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
-    "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
-    "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
-    "close_usdt": _safe_float(row.get("close"), 0.0),
-    "result": str(row.get("result") or ""),
-    }
+            json_payload[key] = {
+                "date": _format_simulation_wallet_day(row.get("date"), include_year=True),
+                "pnl_usdt": _safe_float(row.get("pnl"), 0.0),
+                "pnl_pct": _safe_float(row.get("pnl_pct"), 0.0),
+                "close_usdt": _safe_float(row.get("close"), 0.0),
+                "result": str(row.get("result") or ""),
+            }
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(json_payload, fh, ensure_ascii=False, indent=2, default=str)
 
@@ -2065,7 +2060,7 @@ def _clean_orphan_wallet_icon_before_daily_balance(text: str) -> str:
         is_orphan_icon = stripped in {"💰", "💼"}
         next_few = "\n".join(lines[idx + 1: idx + 5])
         if is_orphan_icon and ("💰 Daily Balance" in next_few or "💰 <b>Simulation Daily Balance</b>" in next_few or "Simulation Daily Balance" in next_few):
-    continue
+            continue
         cleaned.append(line)
 
     value = "\n".join(cleaned)
@@ -2092,23 +2087,23 @@ def _inject_simulation_account_summary(text: str, result: dict | None = None) ->
     for marker in wallet_markers:
         idx = value.find(marker)
         if idx >= 0:
-    before = value[:idx].rstrip()
-    after = value[idx:].lstrip()
+            before = value[:idx].rstrip()
+            after = value[idx:].lstrip()
 
-    # Defensive cleanup for split-title formats:
-    #   💰
-    #   Wallet Impact
-    before_lines = before.splitlines()
-    while before_lines and before_lines[-1].strip() in {"💰", "💼", ""}:
-    last = before_lines[-1].strip()
-    before_lines.pop()
-    if last in {"💰", "💼"}:
-    break
-    before = "\n".join(before_lines).rstrip()
+            # Defensive cleanup for split-title formats:
+            #   💰
+            #   Wallet Impact
+            before_lines = before.splitlines()
+            while before_lines and before_lines[-1].strip() in {"💰", "💼", ""}:
+                last = before_lines[-1].strip()
+                before_lines.pop()
+                if last in {"💰", "💼"}:
+                    break
+            before = "\n".join(before_lines).rstrip()
 
-    return _clean_orphan_wallet_icon_before_daily_balance(
-    before + "\n\n" + block + "\n" + after
-    )
+            return _clean_orphan_wallet_icon_before_daily_balance(
+                before + "\n\n" + block + "\n" + after
+            )
 
     return _clean_orphan_wallet_icon_before_daily_balance(block + "\n" + value)
 
@@ -2162,7 +2157,7 @@ def _simulation_wallet_capital_base(result: dict | None = None) -> float:
     ):
         base = _safe_float(value, 0.0)
         if base > 0:
-    return base
+            return base
     return SIMULATION_START_BALANCE_USDT
 
 
@@ -2210,9 +2205,9 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         "📅 <b>Simulation Daily Balance</b>",
         "━━━━━━━━━━━━",
         *_format_simulation_equity_curve_rows(
-    list(result.get("simulation_daily_log", []) or []),
-    result.get("simulation_daily_balance") or {},
-    limit=10,
+            list(result.get("simulation_daily_log", []) or []),
+            result.get("simulation_daily_balance") or {},
+            limit=10,
         ),
     ]))
 
@@ -2276,32 +2271,32 @@ def run_once(
     )
     if persisted_trades:
         persisted_trades, exchange_reconcile_stats = _reconcile_execution_trades_with_okx(
-    persisted_trades,
-    okx_client,
-    settings,
+            persisted_trades,
+            okx_client,
+            settings,
         )
         if exchange_reconcile_stats.get("changed") and trade_store:
-    trade_store.save_trades(persisted_trades)
+            trade_store.save_trades(persisted_trades)
     else:
         exchange_reconcile_stats = {"enabled": False, "changed": False, "removed": 0, "reason": "no_trades"}
     if persisted_trades:
         persisted_trades = update_open_trades(
-    persisted_trades,
-    initial_price_map,
-    protection_level=initial_protection.get("level", 0),
-    okx_client=okx_client if exchange_reconcile_enabled else None,
-    sync_exchange=exchange_reconcile_enabled,
-    sync_exchange_stop=exchange_stop_sync_enabled,
+            persisted_trades,
+            initial_price_map,
+            protection_level=initial_protection.get("level", 0),
+            okx_client=okx_client if exchange_reconcile_enabled else None,
+            sync_exchange=exchange_reconcile_enabled,
+            sync_exchange_stop=exchange_stop_sync_enabled,
         )
 
     if simulation_trades:
         simulation_trades = update_open_trades(
-    simulation_trades,
-    initial_price_map,
-    protection_level=initial_protection.get("level", 0),
-    okx_client=None,
-    sync_exchange=False,
-    sync_exchange_stop=False,
+            simulation_trades,
+            initial_price_map,
+            protection_level=initial_protection.get("level", 0),
+            okx_client=None,
+            sync_exchange=False,
+            sync_exchange_stop=False,
         )
 
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
@@ -2323,9 +2318,9 @@ def run_once(
     _okx_orders_active = bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
     if not _redis_enabled and _okx_orders_active:
         print(
-    "🚨 SAFETY GUARD: Redis is OFF but OKX orders are ON — "
-    "blocking all execution to prevent untracked positions.",
-    flush=True,
+            "🚨 SAFETY GUARD: Redis is OFF but OKX orders are ON — "
+            "blocking all execution to prevent untracked positions.",
+            flush=True,
         )
         # نحوّل الـ mode لـ scan فقط مؤقتاً
         _okx_orders_active = False
@@ -2344,13 +2339,13 @@ def run_once(
     # Block Exception و Recovery بيفضلوا على حدودهم الأصلية.
     if simulation_mode_active:
         _sim_wallet_balance = _safe_float(
-    _build_simulation_wallet_snapshot(simulation_trades).get("equity"),
-    SIMULATION_START_BALANCE_USDT,
+            _build_simulation_wallet_snapshot(simulation_trades).get("equity"),
+            SIMULATION_START_BALANCE_USDT,
         )
         _effective_reference_balance = _sim_wallet_balance
     else:
         _effective_reference_balance = _safe_float(
-    portfolio_state_inputs.get("reference_portfolio"), 0.0
+            portfolio_state_inputs.get("reference_portfolio"), 0.0
         )
 
     _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
@@ -2372,17 +2367,17 @@ def run_once(
 
     if _low_balance_mode:
         print(
-    f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
-    f"general={effective_max_positions} | block={effective_max_block_positions} | "
-    f"recovery={effective_max_recovery_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
-    flush=True,
+            f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
+            f"general={effective_max_positions} | block={effective_max_block_positions} | "
+            f"recovery={effective_max_recovery_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
+            flush=True,
         )
     else:
         print(
-    f"✅ NORMAL_MODE | balance={_effective_reference_balance:.2f} | "
-    f"general={effective_max_positions} | block={effective_max_block_positions} | "
-    f"recovery={effective_max_recovery_positions} | alloc=24%",
-    flush=True,
+            f"✅ NORMAL_MODE | balance={_effective_reference_balance:.2f} | "
+            f"general={effective_max_positions} | block={effective_max_block_positions} | "
+            f"recovery={effective_max_recovery_positions} | alloc=24%",
+            flush=True,
         )
 
     print(
@@ -2392,83 +2387,83 @@ def run_once(
 
     for pair in filtered_pairs:
         try:
-    setattr(pair, "btc_bounce_pct", btc_bounce_pct)
+            setattr(pair, "btc_bounce_pct", btc_bounce_pct)
         except Exception:
-    pass
+            pass
 
         try:
-    recent_candles = _build_price_action_candles_for_pair(pair, settings)
-    setattr(
-    pair,
-    "recent_candles",
-    recent_candles,
-    )
-    print(
-    f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
-    flush=True,
-    )
+            recent_candles = _build_price_action_candles_for_pair(pair, settings)
+            setattr(
+                pair,
+                "recent_candles",
+                recent_candles,
+            )
+            print(
+                f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
+                flush=True,
+            )
         except Exception as exc:
-    print(
-    f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
-    flush=True,
-    )
+            print(
+                f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
+                flush=True,
+            )
 
         try:
-    resistance_4h_context = _build_4h_resistance_context_for_pair(pair, settings)
-    setattr(pair, "resistance_4h_context", resistance_4h_context)
-    print(
-    f"4H_RESISTANCE | {pair.symbol} | "
-    f"status={resistance_4h_context.get('status')} | "
-    f"distance={resistance_4h_context.get('distance_pct')}",
-    flush=True,
-    )
+            resistance_4h_context = _build_4h_resistance_context_for_pair(pair, settings)
+            setattr(pair, "resistance_4h_context", resistance_4h_context)
+            print(
+                f"4H_RESISTANCE | {pair.symbol} | "
+                f"status={resistance_4h_context.get('status')} | "
+                f"distance={resistance_4h_context.get('distance_pct')}",
+                flush=True,
+            )
         except Exception as exc:
-    print(
-    f"4H_RESISTANCE | {getattr(pair, 'symbol', '-')} | error={exc}",
-    flush=True,
-    )
+            print(
+                f"4H_RESISTANCE | {getattr(pair, 'symbol', '-')} | error={exc}",
+                flush=True,
+            )
 
         signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
         if not signal:
-    continue
+            continue
 
         if not drawdown_status.allowed:
-    exec_result = {
-    "status": "rejected_risk",
-    "reason": drawdown_status.reason,
-    "path": "",
-    "slot_scope": "drawdown",
-    "drawdown_level": drawdown_status.level,
-    "drawdown_pct": drawdown_status.drawdown_pct,
-    "drawdown_message": drawdown_status.message_ar,
-    }
+            exec_result = {
+                "status": "rejected_risk",
+                "reason": drawdown_status.reason,
+                "path": "",
+                "slot_scope": "drawdown",
+                "drawdown_level": drawdown_status.level,
+                "drawdown_pct": drawdown_status.drawdown_pct,
+                "drawdown_message": drawdown_status.message_ar,
+            }
         elif loss_streak_guard.get("active"):
-    exec_result = _loss_streak_rejection(loss_streak_guard)
+            exec_result = _loss_streak_rejection(loss_streak_guard)
         else:
-    exec_result = process_trade_candidate(
-    signal,
-    open_trades=[*gate_base_trades, *local_gate_trades],
-    current_open_positions=slot_counts.get("general", 0),
-    max_open_positions=effective_max_positions,
-    min_execution_score=settings.min_execution_score,
-    recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
-    block_open_positions=slot_counts.get("block_exception", 0),
-    max_block_positions=effective_max_block_positions,
-    recovery_open_positions=slot_counts.get("recovery", 0),
-    max_recovery_positions=effective_max_recovery_positions,
-    drawdown_status=drawdown_status,
-    risk_mode=state.mode,
-    )
-    exec_result["decision_engine"] = "process_trade_candidate"
-    exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
-    exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
-    print(
-    f"DECISION_ENGINE | {signal.symbol} | "
-    f"runtime={exec_result.get('runtime_mode')} | "
-    f"engine={exec_result.get('decision_engine')} | "
-    f"status={exec_result.get('status')} | reason={exec_result.get('reason')}",
-    flush=True,
-    )
+            exec_result = process_trade_candidate(
+                signal,
+                open_trades=[*gate_base_trades, *local_gate_trades],
+                current_open_positions=slot_counts.get("general", 0),
+                max_open_positions=effective_max_positions,
+                min_execution_score=settings.min_execution_score,
+                recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
+                block_open_positions=slot_counts.get("block_exception", 0),
+                max_block_positions=effective_max_block_positions,
+                recovery_open_positions=slot_counts.get("recovery", 0),
+                max_recovery_positions=effective_max_recovery_positions,
+                drawdown_status=drawdown_status,
+                risk_mode=state.mode,
+            )
+            exec_result["decision_engine"] = "process_trade_candidate"
+            exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
+            exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
+            print(
+                f"DECISION_ENGINE | {signal.symbol} | "
+                f"runtime={exec_result.get('runtime_mode')} | "
+                f"engine={exec_result.get('decision_engine')} | "
+                f"status={exec_result.get('status')} | reason={exec_result.get('reason')}",
+                flush=True,
+            )
 
         exec_status = str(exec_result.get("status") or "").strip().lower()
         consumes_live_slot = exec_status in {"accepted_preview", "pending_pullback_preview"}
@@ -2478,88 +2473,88 @@ def run_once(
         setattr(candidate_trade, "announced_to_telegram", False)
 
         eligible_for_activation = consumes_live_slot and not _has_active_same_symbol(
-    [*gate_base_trades, *local_gate_trades],
-    candidate_trade,
+            [*gate_base_trades, *local_gate_trades],
+            candidate_trade,
         )
 
         if eligible_for_activation:
-    path = str(exec_result.get("path") or "general")
-    if path == "block_exception":
-    slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
-    # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
-    if slot_counts["block_exception"] > effective_max_block_positions:
-    slot_counts["block_exception"] -= 1
-    eligible_for_activation = False
-    elif path == "recovery":
-    slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
-    # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
-    if slot_counts["recovery"] > effective_max_recovery_positions:
-    slot_counts["recovery"] -= 1
-    eligible_for_activation = False
-    else:
-    recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
-    if state.mode == MODE_RECOVERY_LONG:
-    state = register_recovery_trade(state)
-    else:
-    slot_counts["general"] = slot_counts.get("general", 0) + 1
-    # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
-    if slot_counts["general"] > effective_max_positions:
-    slot_counts["general"] -= 1
-    eligible_for_activation = False
+            path = str(exec_result.get("path") or "general")
+            if path == "block_exception":
+                slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["block_exception"] > effective_max_block_positions:
+                    slot_counts["block_exception"] -= 1
+                    eligible_for_activation = False
+            elif path == "recovery":
+                slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["recovery"] > effective_max_recovery_positions:
+                    slot_counts["recovery"] -= 1
+                    eligible_for_activation = False
+                else:
+                    recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
+                    if state.mode == MODE_RECOVERY_LONG:
+                        state = register_recovery_trade(state)
+            else:
+                slot_counts["general"] = slot_counts.get("general", 0) + 1
+                # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
+                if slot_counts["general"] > effective_max_positions:
+                    slot_counts["general"] -= 1
+                    eligible_for_activation = False
 
-    # Reserve this trade for same-scan gating.
-    local_gate_trades.append(candidate_trade)
+            # Reserve this trade for same-scan gating.
+            local_gate_trades.append(candidate_trade)
 
-    # Simulation mode must mirror the trading decision immediately:
-    # if process_trade_candidate accepts it and the slot/same-symbol gate allows it,
-    # open a virtual tracked trade regardless of Telegram delivery/dedup.
-    if simulation_mode_active and consumes_live_slot:
-    candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result, settings=settings, balance=_build_simulation_wallet_snapshot(simulation_trades).get('equity', SIMULATION_START_BALANCE_USDT))
-    existing_ids = {str(getattr(t, "trade_id", "") or "") for t in simulation_trades}
-    candidate_id = str(getattr(candidate_trade, "trade_id", "") or "")
-    if candidate_id and candidate_id not in existing_ids:
-    simulation_trades.append(candidate_trade)
-    elif not candidate_id:
-    simulation_trades.append(candidate_trade)
-    local_gate_trades[-1] = candidate_trade
-    print(
-    f"SIM_TRADE_OPEN | {candidate_trade.symbol} | "
-    f"id={candidate_id or '-'} | entry={getattr(candidate_trade, 'entry', '-')} | "
-    f"path={getattr(candidate_trade, 'execution_path', '-')}",
-    flush=True,
-    )
+            # Simulation mode must mirror the trading decision immediately:
+            # if process_trade_candidate accepts it and the slot/same-symbol gate allows it,
+            # open a virtual tracked trade regardless of Telegram delivery/dedup.
+            if simulation_mode_active and consumes_live_slot:
+                candidate_trade = _prepare_simulated_trade(candidate_trade, exec_result, settings=settings, balance=_build_simulation_wallet_snapshot(simulation_trades).get('equity', SIMULATION_START_BALANCE_USDT))
+                existing_ids = {str(getattr(t, "trade_id", "") or "") for t in simulation_trades}
+                candidate_id = str(getattr(candidate_trade, "trade_id", "") or "")
+                if candidate_id and candidate_id not in existing_ids:
+                    simulation_trades.append(candidate_trade)
+                elif not candidate_id:
+                    simulation_trades.append(candidate_trade)
+                local_gate_trades[-1] = candidate_trade
+                print(
+                    f"SIM_TRADE_OPEN | {candidate_trade.symbol} | "
+                    f"id={candidate_id or '-'} | entry={getattr(candidate_trade, 'entry', '-')} | "
+                    f"path={getattr(candidate_trade, 'execution_path', '-')}",
+                    flush=True,
+                )
 
         signal_items.append({
-    "signal": signal,
-    "execution": exec_result,
-    "message": build_signal_message(signal, exec_result),
-    "candidate_trade": candidate_trade,
-    "eligible_for_activation": eligible_for_activation,
-    "telegram_announced": False,
-    "exchange_required": False,
-    "exchange_order_ok": False,
-    "exchange_order_result": None,
-    "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
-    "simulation_mode": simulation_mode_active,
+            "signal": signal,
+            "execution": exec_result,
+            "message": build_signal_message(signal, exec_result),
+            "candidate_trade": candidate_trade,
+            "eligible_for_activation": eligible_for_activation,
+            "telegram_announced": False,
+            "exchange_required": False,
+            "exchange_order_ok": False,
+            "exchange_order_result": None,
+            "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
+            "simulation_mode": simulation_mode_active,
         })
         current_execution_results.append(exec_result)
 
         if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)):
-    technical_snapshot_records.append(
-    build_signal_snapshot(
-    scan_id,
-    signal,
-    exec_result,
-    market_context={
-    "mode": state.mode,
-    "btc_change_15m": float(snapshot.btc_change_15m or 0.0),
-    "avg_change_15m": float(snapshot.avg_change_15m or 0.0),
-    "red_ratio_15m": float(snapshot.red_ratio_15m or 0.0),
-    "strong_coins_count": int(snapshot.strong_coins_count or 0),
-    "market_guard_valid_count": int(getattr(snapshot, "market_guard_valid_count", 0) or 0),
-    },
-    )
-    )
+            technical_snapshot_records.append(
+                build_signal_snapshot(
+                    scan_id,
+                    signal,
+                    exec_result,
+                    market_context={
+                        "mode": state.mode,
+                        "btc_change_15m": float(snapshot.btc_change_15m or 0.0),
+                        "avg_change_15m": float(snapshot.avg_change_15m or 0.0),
+                        "red_ratio_15m": float(snapshot.red_ratio_15m or 0.0),
+                        "strong_coins_count": int(snapshot.strong_coins_count or 0),
+                        "market_guard_valid_count": int(getattr(snapshot, "market_guard_valid_count", 0) or 0),
+                    },
+                )
+            )
 
     price_map = _build_live_price_map(tickers, fallback_pairs=filtered_pairs)
     # ✅ FIX: fallback لو price_map فاضي
@@ -2576,8 +2571,8 @@ def run_once(
         exchange_reconcile_enabled
         and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
         and (
-    (state.mode == MODE_BLOCK_LONGS and int(protection.get("level", 0) or 0) >= 2)
-    or any(getattr(t, "tp2_hit", False) for t in persisted_trades)
+            (state.mode == MODE_BLOCK_LONGS and int(protection.get("level", 0) or 0) >= 2)
+            or any(getattr(t, "tp2_hit", False) for t in persisted_trades)
         )
     )
 
@@ -2603,23 +2598,23 @@ def run_once(
         # ✅ FIX: Redis retry بـ exponential backoff
         _redis_saved = False
         for _attempt in range(3):
-    try:
-    trade_store.save_trades(trades)
-    _redis_saved = True
-    break
-    except Exception as _exc:
-    _wait = 0.5 * (2 ** _attempt)
-    print(f"⚠️ Redis save_trades attempt {_attempt+1}/3 failed: {_exc} — retry in {_wait}s", flush=True)
-    time.sleep(_wait)
+            try:
+                trade_store.save_trades(trades)
+                _redis_saved = True
+                break
+            except Exception as _exc:
+                _wait = 0.5 * (2 ** _attempt)
+                print(f"⚠️ Redis save_trades attempt {_attempt+1}/3 failed: {_exc} — retry in {_wait}s", flush=True)
+                time.sleep(_wait)
         if not _redis_saved:
-    print("🚨 Redis save_trades failed after 3 attempts — trades may be lost on restart", flush=True)
+            print("🚨 Redis save_trades failed after 3 attempts — trades may be lost on restart", flush=True)
 
         _save_simulation_trades(simulation_trades, trade_store)
         _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings)
         if simulation_mode_active:
-    _append_simulation_execution_checks(current_execution_results, trade_store)
+            _append_simulation_execution_checks(current_execution_results, trade_store)
         else:
-    trade_store.append_execution_checks(current_execution_results)
+            trade_store.append_execution_checks(current_execution_results)
         execution_results_for_reports = trade_store.load_execution_checks(limit=500) or current_execution_results
         simulation_execution_results_for_reports = _load_simulation_execution_checks(trade_store, limit=500)
     else:
@@ -2629,7 +2624,7 @@ def run_once(
     if technical_snapshot_records:
         snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings, redis_client=_snapshot_redis_client(trade_store))
         if not snapshot_write_result.get("ok"):
-    print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
+            print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
 
     mode_message = _build_mode_message(state, snapshot, protection, settings=settings)
     mode_context = _build_mode_context(state, snapshot, protection)
@@ -2648,12 +2643,12 @@ def run_once(
         "mode": state.mode,
         "mode_message": mode_message,
         "mode_transition_message": _build_mode_message(
-    state,
-    snapshot,
-    protection,
-    variant="transition",
-    old_mode=initial_mode.mode,
-    settings=settings,
+            state,
+            snapshot,
+            protection,
+            variant="transition",
+            old_mode=initial_mode.mode,
+            settings=settings,
         ) if state.mode != initial_mode.mode else None,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
@@ -2668,11 +2663,11 @@ def run_once(
         "loss_streak_guard": loss_streak_guard,
         "portfolio_state_inputs": portfolio_state_inputs,
         "help": build_master_help(
-    mode=state.mode,
-    execution_enabled=settings.execution_enabled,
-    risk_enabled=True,
-    okx_orders=_runtime_mode_snapshot(settings).get("orders_enabled", False),
-    runtime_snapshot=_runtime_mode_snapshot(settings),
+            mode=state.mode,
+            execution_enabled=settings.execution_enabled,
+            risk_enabled=True,
+            okx_orders=_runtime_mode_snapshot(settings).get("orders_enabled", False),
+            runtime_snapshot=_runtime_mode_snapshot(settings),
         ),
         "help_execution": build_execution_help(),
         "help_normal": build_normal_help(),
@@ -2701,31 +2696,31 @@ def _run_ai_export(result: dict, settings: Settings | None = None) -> None:
 
     def _do_export():
         try:
-    # Simulation export
-    sim_stats = export_ai_snapshot(result, source="simulation")
-    if not sim_stats.get("ok"):
-    print(f"⚠️ AI export simulation failed: {sim_stats.get('error')}", flush=True)
-    else:
-    print(
-    f"📊 AI export simulation | trades={sim_stats.get('trades_written')} | "
-    f"rejections={sim_stats.get('rejections_written')} | "
-    f"snapshot={'✅' if sim_stats.get('daily_snapshot_written') else '❌'}",
-    flush=True,
-    )
+            # Simulation export
+            sim_stats = export_ai_snapshot(result, source="simulation")
+            if not sim_stats.get("ok"):
+                print(f"⚠️ AI export simulation failed: {sim_stats.get('error')}", flush=True)
+            else:
+                print(
+                    f"📊 AI export simulation | trades={sim_stats.get('trades_written')} | "
+                    f"rejections={sim_stats.get('rejections_written')} | "
+                    f"snapshot={'✅' if sim_stats.get('daily_snapshot_written') else '❌'}",
+                    flush=True,
+                )
 
-    # Execution export
-    exec_stats = export_ai_snapshot(result, source="execution")
-    if not exec_stats.get("ok"):
-    print(f"⚠️ AI export execution failed: {exec_stats.get('error')}", flush=True)
-    else:
-    print(
-    f"📊 AI export execution | trades={exec_stats.get('trades_written')} | "
-    f"rejections={exec_stats.get('rejections_written')} | "
-    f"snapshot={'✅' if exec_stats.get('daily_snapshot_written') else '❌'}",
-    flush=True,
-    )
+            # Execution export
+            exec_stats = export_ai_snapshot(result, source="execution")
+            if not exec_stats.get("ok"):
+                print(f"⚠️ AI export execution failed: {exec_stats.get('error')}", flush=True)
+            else:
+                print(
+                    f"📊 AI export execution | trades={exec_stats.get('trades_written')} | "
+                    f"rejections={exec_stats.get('rejections_written')} | "
+                    f"snapshot={'✅' if exec_stats.get('daily_snapshot_written') else '❌'}",
+                    flush=True,
+                )
         except Exception as exc:
-    print(f"⚠️ AI export thread error: {exc}", flush=True)
+            print(f"⚠️ AI export thread error: {exc}", flush=True)
 
     import threading
     t = threading.Thread(target=_do_export, daemon=True, name="ai_export")
@@ -2802,16 +2797,16 @@ def _activate_announced_trade(
 
     for trade in trades:
         if trade_id and getattr(trade, "trade_id", None) == trade_id:
-    setattr(trade, "telegram_announced", True)
-    setattr(trade, "announced_to_telegram", True)
-    setattr(trade, "telegram_announced_at", announced_at)
-    _attach_exchange_state_to_trade(trade, item.get("exchange_order_result"))
-    updated_existing = True
-    break
+            setattr(trade, "telegram_announced", True)
+            setattr(trade, "announced_to_telegram", True)
+            setattr(trade, "telegram_announced_at", announced_at)
+            _attach_exchange_state_to_trade(trade, item.get("exchange_order_result"))
+            updated_existing = True
+            break
 
     if exec_status != "accepted_preview":
         if updated_existing:
-    _refresh_runtime_result_outputs(result, trade_store=trade_store)
+            _refresh_runtime_result_outputs(result, trade_store=trade_store)
         return True
 
     if not bool(item.get("eligible_for_activation")):
@@ -2920,9 +2915,9 @@ def _activate_simulated_trade(
 
     for idx, trade in enumerate(sim_trades):
         if trade_id and getattr(trade, "trade_id", None) == trade_id:
-    sim_trades[idx] = candidate_trade
-    updated_existing = True
-    break
+            sim_trades[idx] = candidate_trade
+            updated_existing = True
+            break
 
     if not updated_existing:
         sim_trades.append(candidate_trade)
@@ -2959,37 +2954,37 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
         1 for t in trades
         if bool(getattr(t, "protected_runner", False))
         or (
-    bool(getattr(t, "tp2_hit", False))
-    and bool(
-    getattr(t, "runner_active", False)
-    or getattr(t, "has_open_runner", False)
-    )
+            bool(getattr(t, "tp2_hit", False))
+            and bool(
+                getattr(t, "runner_active", False)
+                or getattr(t, "has_open_runner", False)
+            )
         )
     )
 
     print(
         " | ".join([
-    f"📊 Scan ranked={scan.get('ranked_pairs', 0)}",
-    f"prefilter={scan.get('after_prefilter', 0)}",
-    f"scanned={scan.get('scanned_pairs', 0)}",
+            f"📊 Scan ranked={scan.get('ranked_pairs', 0)}",
+            f"prefilter={scan.get('after_prefilter', 0)}",
+            f"scanned={scan.get('scanned_pairs', 0)}",
         ]),
         flush=True,
     )
     print(
         " | ".join([
-    f"🧭 Mode={result.get('mode', 'UNKNOWN')}",
-    f"Avg15m={float(ctx.get('avg15m', 0) or 0):+.2f}%",
-    f"Red={float(ctx.get('red_ratio', 0) or 0):.0f}%",
-    f"Strong={int(ctx.get('strong_coins', 0) or 0)}",
+            f"🧭 Mode={result.get('mode', 'UNKNOWN')}",
+            f"Avg15m={float(ctx.get('avg15m', 0) or 0):+.2f}%",
+            f"Red={float(ctx.get('red_ratio', 0) or 0):.0f}%",
+            f"Strong={int(ctx.get('strong_coins', 0) or 0)}",
         ]),
         flush=True,
     )
     print(
         " | ".join([
-    f"⚡ Execution checked={checked}",
-    f"accepted={accepted}",
-    f"rejected={rejected}",
-    f"candidate_only={candidate_only}",
+            f"⚡ Execution checked={checked}",
+            f"accepted={accepted}",
+            f"rejected={rejected}",
+            f"candidate_only={candidate_only}",
         ]),
         flush=True,
     )
@@ -2997,10 +2992,10 @@ def _print_scan_summary(result: dict, trade_store: RedisTradeStore | None = None
     sim_open = sum(1 for t in sim_trades if _is_counted_open_trade(t))
     print(
         " | ".join([
-    f"📂 Open trades={open_trades}",
-    f"simulation_open={sim_open}",
-    f"protected runners={protected}",
-    f"Redis={'ON' if trade_store and trade_store.enabled else 'OFF'}",
+            f"📂 Open trades={open_trades}",
+            f"simulation_open={sim_open}",
+            f"protected runners={protected}",
+            f"Redis={'ON' if trade_store and trade_store.enabled else 'OFF'}",
         ]),
         flush=True,
     )
@@ -3087,9 +3082,9 @@ def _iter_signal_items_for_dispatch(result: dict) -> list[dict]:
         # - pullback previews
         # - any rejected_* status, including PA gate rejects
         if _is_actionable_signal_status(exec_status):
-    actionable_items.append(item)
+            actionable_items.append(item)
         else:
-    normal_items.append(item)
+            normal_items.append(item)
 
     # Always send all actionable trading-mode alerts.
     # Limit only non-actionable normal observations to avoid Telegram spam.
@@ -3132,6 +3127,7 @@ def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) ->
     _safe_set_trade_attr(trade, "managed_trade_plan", plan)
 
 
+
 def _execute_managed_okx_order(
     okx_client: OKXTradeClient,
     signal,
@@ -3139,58 +3135,55 @@ def _execute_managed_okx_order(
 ) -> dict:
     sl_value = float(getattr(signal, "sl", 0.0) or 0.0)
     raw_tp1 = getattr(signal, "tp1", None)
-raw_tp2 = getattr(signal, "tp2", None)
-
-tp1_value = float(raw_tp1) if raw_tp1 not in (None, "", "-", 0) else None
-tp2_value = float(raw_tp2) if raw_tp2 not in (None, "", "-", 0) else None
+    raw_tp2 = getattr(signal, "tp2", None)
+    tp1_value = float(raw_tp1) if raw_tp1 not in (None, "", "-", 0) else None
+    tp2_value = float(raw_tp2) if raw_tp2 not in (None, "", "-", 0) else None
     entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
 
     sizing = _resolve_entry_margin_plan(okx_client, settings)
-    margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0) or max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
+    margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0) or max(
+        _safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0
+    ) or 35.0
 
-    # ✅ FIX: إجبار cross margin دايماً — isolation مش مدعوم في هذا البوت
     TD_MODE = "cross"
 
-    # ✅ FIX: set leverage على OKX قبل أي أمر عشان نضمن الرافعة الصح
-    # لو العملة مش بتدعم 15x → يستخدم أقصى رافعة متاحة تلقائياً
     leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
-    effective_leverage = leverage  # هيتحدث لو OKX كابه
+    effective_leverage = leverage
     leverage_set_result = None
     try:
         if hasattr(okx_client, "set_leverage"):
-    leverage_set_result = okx_client.set_leverage(
-    inst_id=signal.symbol,
-    lever=leverage,
-    mgn_mode=TD_MODE,
-    )
-    if isinstance(leverage_set_result, dict):
-    if leverage_set_result.get("ok"):
-    # استخدم الـ leverage الفعلي اللي اتضبط على OKX
-    actual = int(_safe_float(
-    leverage_set_result.get("lever_set") or
-    leverage_set_result.get("capped_to_max") or
-    leverage,
-    leverage,
-    ))
-    if actual > 0 and actual != leverage:
-    print(
-    f"⚠️ Leverage capped for {signal.symbol}: "
-    f"requested={leverage}x → actual={actual}x",
-    flush=True,
-    )
-    effective_leverage = max(1, actual)
-    else:
-    print(
-    f"⚠️ set_leverage failed for {signal.symbol}: "
-    f"{leverage_set_result.get('msg') or leverage_set_result}",
-    flush=True,
-    )
+            leverage_set_result = okx_client.set_leverage(
+                inst_id=signal.symbol,
+                lever=leverage,
+                mgn_mode=TD_MODE,
+            )
+            if isinstance(leverage_set_result, dict):
+                if leverage_set_result.get("ok"):
+                    actual = int(_safe_float(
+                        leverage_set_result.get("lever_set")
+                        or leverage_set_result.get("capped_to_max")
+                        or leverage,
+                        leverage,
+                    ))
+                    if actual > 0 and actual != leverage:
+                        print(
+                            f"⚠️ Leverage capped for {signal.symbol}: "
+                            f"requested={leverage}x → actual={actual}x",
+                            flush=True,
+                        )
+                    effective_leverage = max(1, actual)
+                else:
+                    print(
+                        f"⚠️ set_leverage failed for {signal.symbol}: "
+                        f"{leverage_set_result.get('msg') or leverage_set_result}",
+                        flush=True,
+                    )
         else:
-    print(
-    f"⚠️ set_leverage method not found on okx_client — "
-    f"skipping leverage pre-set for {signal.symbol}",
-    flush=True,
-    )
+            print(
+                f"⚠️ set_leverage method not found on okx_client — "
+                f"skipping leverage pre-set for {signal.symbol}",
+                flush=True,
+            )
     except Exception as exc:
         print(f"⚠️ set_leverage exception for {signal.symbol}: {exc}", flush=True)
 
@@ -3198,79 +3191,83 @@ tp2_value = float(raw_tp2) if raw_tp2 not in (None, "", "-", 0) else None
         signal.symbol,
         entry_value,
         margin_usdt=margin_usdt,
-        leverage=effective_leverage,  # ← الرافعة الفعلية
+        leverage=effective_leverage,
         td_mode=TD_MODE,
         sl_trigger_px=sl_value if sl_value > 0 else None,
         tag="entry",
     )
 
     plan = {}
-    if entry_value > 0 and sl_value > 0 and tp1_value > 0 and tp2_value > 0:
+    if entry_value > 0 and sl_value > 0 and tp1_value and tp2_value:
         plan = okx_client.build_managed_trade_plan(
-    signal.symbol,
-    entry_value,
-    margin_usdt,
-    effective_leverage,  # ← الرافعة الفعلية
-    sl_value,
-    tp1_value,
-    tp2_value,
+            signal.symbol,
+            entry_value,
+            margin_usdt,
+            effective_leverage,
+            sl_value,
+            tp1_value,
+            tp2_value,
         )
 
     tp_split_result = None
-    if entry_result.get("ok") and tp1_value > 0 and tp2_value > 0:
-        tp_split_result = if tp1_value is None or tp2_value is None:
-    logger.warning(f"⚠️ Skipping TP placement due to invalid TP values: tp1={tp1_value}, tp2={tp2_value}")
-else:
-    try:
-        tp_success = True
-tp_response = None
-
-if tp1_value is None or tp2_value is None:
-    logger.warning(
-        f"⚠️ Skipping TP placement due to invalid TP values: tp1={tp1_value}, tp2={tp2_value}"
-    )
-    tp_success = False
-else:
-    try:
-        tp_response = okx_client.place_reduce_only_tp_split(
-    symbol=signal.symbol,
-    tp1_price=tp1_value,
-    tp2_price=tp2_value,
-        )
-
-        # ✅ تحقق من رد OKX
-        if not tp_response:
-    logger.error("❌ TP response is empty")
-    tp_success = False
-
-        elif isinstance(tp_response, dict):
-    ok_flag = tp_response.get("ok")
-    data = tp_response.get("data")
-
-    if not ok_flag:
-    logger.error(f"❌ TP rejected by OKX: {tp_response}")
-    tp_success = False
-
-    elif not data:
-    logger.error("❌ TP response missing data")
-    tp_success = False
-
-    else:
-    logger.info(f"✅ TP placed successfully: {data}")
-
+    if entry_result.get("ok"):
+        if tp1_value is None or tp2_value is None:
+            print(
+                f"⚠️ Skipping TP placement due to invalid TP values: "
+                f"tp1={tp1_value}, tp2={tp2_value}",
+                flush=True,
+            )
+            tp_split_result = {
+                "ok": False,
+                "reason": "invalid_tp_values",
+                "tp1_price": tp1_value,
+                "tp2_price": tp2_value,
+            }
         else:
-    logger.warning(f"⚠️ Unexpected TP response format: {tp_response}")
+            try:
+                tp_response = okx_client.place_reduce_only_tp_split(
+                    signal.symbol,
+                    entry_value,
+                    margin_usdt,
+                    effective_leverage,
+                    tp1_price=tp1_value,
+                    tp2_price=tp2_value,
+                    td_mode=TD_MODE,
+                    tag="tp",
+                )
 
-    except Exception as e:
-        logger.error(f"❌ TP placement failed (exception): {e}")
-        tp_success = False
-
-if not tp_success:
-    logger.warning("⚠️ TP failed — trade continues without TP")
-
-    td_mode=TD_MODE,
-    tag="tp",
-        )
+                if not tp_response:
+                    print("❌ TP response is empty", flush=True)
+                    tp_split_result = {"ok": False, "reason": "empty_tp_response"}
+                elif isinstance(tp_response, dict):
+                    ok_flag = bool(tp_response.get("ok"))
+                    data = tp_response.get("data")
+                    if not ok_flag:
+                        print(f"❌ TP rejected by OKX: {tp_response}", flush=True)
+                        tp_split_result = tp_response
+                    elif not data:
+                        print("❌ TP response missing data", flush=True)
+                        tp_split_result = {
+                            **tp_response,
+                            "ok": False,
+                            "reason": "missing_tp_data",
+                        }
+                    else:
+                        print(f"✅ TP placed successfully: {data}", flush=True)
+                        tp_split_result = tp_response
+                else:
+                    print(f"⚠️ Unexpected TP response format: {tp_response}", flush=True)
+                    tp_split_result = {
+                        "ok": False,
+                        "reason": "unexpected_tp_response_format",
+                        "raw": str(tp_response),
+                    }
+            except Exception as exc:
+                print(f"❌ TP placement failed (exception): {exc}", flush=True)
+                tp_split_result = {
+                    "ok": False,
+                    "reason": f"tp_exception:{exc}",
+                }
 
     return {
         "ok": bool(entry_result.get("ok")),
@@ -3281,13 +3278,16 @@ if not tp_success:
         "used_margin_usdt": margin_usdt,
         "td_mode": TD_MODE,
         "requested_leverage": leverage,
-        "effective_leverage": effective_leverage,  # ← الرافعة الفعلية المستخدمة
+        "effective_leverage": effective_leverage,
         "leverage_set_result": leverage_set_result,
-        "sl_attached": bool(sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))),
+        "sl_attached": bool(
+            sl_value > 0 and ((entry_result.get("payload") or {}).get("attachAlgoOrds"))
+        ),
         "tp_orders_ok": None if tp_split_result is None else bool(tp_split_result.get("ok")),
-        "requires_runner_trailing": bool((plan.get("runner") or {}).get("requires_trailing_after_tp2")) if isinstance(plan, dict) else False,
+        "requires_runner_trailing": bool(
+            (plan.get("runner") or {}).get("requires_trailing_after_tp2")
+        ) if isinstance(plan, dict) else False,
     }
-
 
 
 def _bool_label(value: bool) -> str:
@@ -3316,8 +3316,8 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
     path = str((getattr(signal, "meta", {}) or {}).get("execution_path") or "")
     entry_price = getattr(signal, "entry", "-")
     sl_price = getattr(signal, "sl", "-")
-    tp1_price = tp1_value if tp1_value is not None else "-"
-    tp2_price = tp2_value if tp2_value is not None else "-"
+    tp1_price = getattr(signal, "tp1", "-")
+    tp2_price = getattr(signal, "tp2", "-")
     mode_text = _mode_label(entry.get("simulated"))
     reason_text = _reason_label(
         entry.get("reason") or managed_order_result.get("reason") or ("submitted" if ok else "not_submitted")
@@ -3340,7 +3340,7 @@ def _build_compact_okx_result_message(signal, managed_order_result: dict | None,
 
     if sizing:
         lines.append(
-    f"💼 Balance {_fmt_money(sizing.get('reference_balance_usdt'))} | Margin {_fmt_money(sizing.get('margin_usdt'))} USDT | {_safe_float(sizing.get('position_pct'), 0.0):.2f}%"
+            f"💼 Balance {_fmt_money(sizing.get('reference_balance_usdt'))} | Margin {_fmt_money(sizing.get('margin_usdt'))} USDT | {_safe_float(sizing.get('position_pct'), 0.0):.2f}%"
         )
 
     runner_pct = (plan.get('runner', {}) or {}).get('close_pct', '-') if isinstance(plan, dict) else '-'
@@ -3378,7 +3378,7 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
 
     if sizing:
         lines.append(
-    f"• Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT ({_safe_float(sizing.get('position_pct'), 0.0):.2f}%)"
+            f"• Margin: {_fmt_money(sizing.get('margin_usdt'))} USDT ({_safe_float(sizing.get('position_pct'), 0.0):.2f}%)"
         )
 
     tp1_pct = "-"
@@ -3392,13 +3392,13 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
 
     def _pct_text(value) -> str:
         try:
-    return str(int(round(float(value))))
+            return str(int(round(float(value))))
         except Exception:
-    return str(value or "-")
+            return str(value or "-")
 
     if tp1_pct != "-" or tp2_pct != "-" or runner_pct != "-":
         lines.append(
-    f"📌 <b>Plan</b>: TP1 {_pct_text(tp1_pct)}% • TP2 {_pct_text(tp2_pct)}% • Runner {_pct_text(runner_pct)}%"
+            f"📌 <b>Plan</b>: TP1 {_pct_text(tp1_pct)}% • TP2 {_pct_text(tp2_pct)}% • Runner {_pct_text(runner_pct)}%"
         )
 
     if managed_order_result.get("requires_runner_trailing"):
@@ -3436,9 +3436,9 @@ def _build_runtime_track_buttons(signal, source: str | None = None) -> dict:
         buttons = dict(buttons or {})
         rows = [list(row) for row in buttons.get("inline_keyboard", [])]
         if rows and rows[0] and symbol:
-    rows[0][0] = dict(rows[0][0])
-    rows[0][0]["callback_data"] = f"track:{src}:{symbol}"[:64]
-    buttons["inline_keyboard"] = rows
+            rows[0][0] = dict(rows[0][0])
+            rows[0][0]["callback_data"] = f"track:{src}:{symbol}"[:64]
+            buttons["inline_keyboard"] = rows
     except Exception:
         return build_signal_buttons(signal)
     return buttons
@@ -3474,17 +3474,17 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         can_place_order = exec_status == "accepted_preview"
         if not _should_dispatch_signal_item(item, settings):
-    item["announcement_status"] = "filtered_signal_mode"
-    continue
+            item["announcement_status"] = "filtered_signal_mode"
+            continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
         if _is_duplicate_signal_fingerprint(
-    fingerprint,
-    sent_fingerprints,
-    trade_store,
-    ttl_seconds=_signal_fingerprint_ttl(exec_result),
+            fingerprint,
+            sent_fingerprints,
+            trade_store,
+            ttl_seconds=_signal_fingerprint_ttl(exec_result),
         ):
-    item["announcement_status"] = "deduplicated"
-    continue
+            item["announcement_status"] = "deduplicated"
+            continue
 
         text = item["message"]
         managed_order_result = None
@@ -3492,79 +3492,79 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         simulation_mode_active = str(runtime.get("active_mode")) == "simulation"
         _redis_ok = bool(trade_store and getattr(trade_store, "enabled", False))
         exchange_required = bool(
-    can_place_order
-    and str(runtime.get("active_mode")) == "trading"
-    and bool(runtime.get("effective_orders_enabled"))
-    and settings.execution_enabled
-    and okx_client
-    and _redis_ok  # ✅ SAFETY: لا تفتح صفقات بدون Redis
+            can_place_order
+            and str(runtime.get("active_mode")) == "trading"
+            and bool(runtime.get("effective_orders_enabled"))
+            and settings.execution_enabled
+            and okx_client
+            and _redis_ok  # ✅ SAFETY: لا تفتح صفقات بدون Redis
         )
         if can_place_order and not _redis_ok and str(runtime.get("active_mode")) == "trading":
-    print(
-    f"🚨 SAFETY: Blocked OKX order for {getattr(item.get('signal'), 'symbol', '-')} "
-    f"— Redis is OFF, execution blocked to prevent untracked positions.",
-    flush=True,
-    )
+            print(
+                f"🚨 SAFETY: Blocked OKX order for {getattr(item.get('signal'), 'symbol', '-')} "
+                f"— Redis is OFF, execution blocked to prevent untracked positions.",
+                flush=True,
+            )
         exchange_order_ok = True
 
         if simulation_mode_active:
-    text = _simulation_signal_badge(text)
+            text = _simulation_signal_badge(text)
 
         if exchange_required:
-    managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
-    exchange_order_ok = bool(managed_order_result.get("ok"))
-    text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
+            managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
+            exchange_order_ok = bool(managed_order_result.get("ok"))
+            text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
         elif simulation_mode_active and can_place_order:
-    text += "\n\n" + "\n".join([
-    "🧪 <b>Simulation Execution</b>",
-    "• Virtual fill only",
-    "• OKX live orders forced OFF",
-    f"• Start Balance: {SIMULATION_START_BALANCE_USDT:.2f} USDT",
-    ])
+            text += "\n\n" + "\n".join([
+                "🧪 <b>Simulation Execution</b>",
+                "• Virtual fill only",
+                "• OKX live orders forced OFF",
+                f"• Start Balance: {SIMULATION_START_BALANCE_USDT:.2f} USDT",
+            ])
 
         item["exchange_required"] = exchange_required
         item["exchange_order_result"] = managed_order_result
         item["exchange_order_ok"] = exchange_order_ok
 
         if exchange_required:
-    _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
+            _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
 
         track_source = "simulation" if simulation_mode_active else ("execution" if exchange_required else "auto")
         send_result = _send_text(sender, text, reply_markup=_build_runtime_track_buttons(signal, track_source))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
         _telegram_send_pause(
-    TELEGRAM_EXECUTION_SEND_GAP_SECONDS if is_execution else TELEGRAM_NORMAL_SEND_GAP_SECONDS
+            TELEGRAM_EXECUTION_SEND_GAP_SECONDS if is_execution else TELEGRAM_NORMAL_SEND_GAP_SECONDS
         )
 
         if exchange_required:
-    try:
-    _send_text(
-    sender,
-    _build_compact_okx_result_message(
-    signal,
-    managed_order_result,
-    ok=exchange_order_ok,
-    ),
-    reply_markup=_build_runtime_track_buttons(signal, "execution"),
-    )
-    _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
-    except Exception:
-    pass
+            try:
+                _send_text(
+                    sender,
+                    _build_compact_okx_result_message(
+                        signal,
+                        managed_order_result,
+                        ok=exchange_order_ok,
+                    ),
+                    reply_markup=_build_runtime_track_buttons(signal, "execution"),
+                )
+                _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+            except Exception:
+                pass
 
         if send_ok and is_execution:
-    if simulation_mode_active and can_place_order:
-    _activate_simulated_trade(result, item, trade_store=trade_store, settings=settings)
-    continue
-    if exchange_required and not exchange_order_ok:
-    item["announcement_status"] = "exchange_failed"
-    _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
-    continue
-    try:
-    _activate_announced_trade(result, item, trade_store=trade_store)
-    except Exception as e:
-    logger.error(f"❌ Trade registration failed: {e}")
+            if simulation_mode_active and can_place_order:
+                _activate_simulated_trade(result, item, trade_store=trade_store, settings=settings)
+                continue
+            if exchange_required and not exchange_order_ok:
+                item["announcement_status"] = "exchange_failed"
+                _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
+                continue
+            try:
+                _activate_announced_trade(result, item, trade_store=trade_store)
+            except Exception as exc:
+                print(f"❌ Trade registration failed: {exc}", flush=True)
         else:
-    item["announcement_status"] = "sent" if send_ok else "send_failed"
+            item["announcement_status"] = "sent" if send_ok else "send_failed"
 
 def _build_execution_balance_header(result: dict, settings: Settings) -> str:
     """بلوك رصيد OKX يظهر في أعلى تقارير التنفيذ.
@@ -3594,19 +3594,19 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
 def _build_exec_intel_keyboard() -> dict:
     return {
         "inline_keyboard": [
-    [
-    {"text": "📊 تقرير التنفيذ", "callback_data": "cmd:/report_execution_intelligence"},
-    ],
-    [
-    {"text": "📋 Trades JSONL", "callback_data": "ai:exec_trades"},
-    {"text": "📋 Rejections JSONL", "callback_data": "ai:exec_rejections"},
-    ],
-    [
-    {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:exec_snapshot"},
-    ],
-    [
-    {"text": "🔙 رجوع", "callback_data": "menu:main"},
-    ],
+            [
+                {"text": "📊 تقرير التنفيذ", "callback_data": "cmd:/report_execution_intelligence"},
+            ],
+            [
+                {"text": "📋 Trades JSONL", "callback_data": "ai:exec_trades"},
+                {"text": "📋 Rejections JSONL", "callback_data": "ai:exec_rejections"},
+            ],
+            [
+                {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:exec_snapshot"},
+            ],
+            [
+                {"text": "🔙 رجوع", "callback_data": "menu:main"},
+            ],
         ]
     }
 
@@ -3614,19 +3614,19 @@ def _build_exec_intel_keyboard() -> dict:
 def _build_sim_intel_keyboard() -> dict:
     return {
         "inline_keyboard": [
-    [
-    {"text": "📊 تقرير المحاكاة", "callback_data": "cmd:/report_simulation_intelligence"},
-    ],
-    [
-    {"text": "📋 Trades JSONL", "callback_data": "ai:sim_trades"},
-    {"text": "📋 Rejections JSONL", "callback_data": "ai:sim_rejections"},
-    ],
-    [
-    {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:sim_snapshot"},
-    ],
-    [
-    {"text": "🔙 رجوع", "callback_data": "menu:main"},
-    ],
+            [
+                {"text": "📊 تقرير المحاكاة", "callback_data": "cmd:/report_simulation_intelligence"},
+            ],
+            [
+                {"text": "📋 Trades JSONL", "callback_data": "ai:sim_trades"},
+                {"text": "📋 Rejections JSONL", "callback_data": "ai:sim_rejections"},
+            ],
+            [
+                {"text": "📦 Daily Snapshot JSON", "callback_data": "ai:sim_snapshot"},
+            ],
+            [
+                {"text": "🔙 رجوع", "callback_data": "menu:main"},
+            ],
         ]
     }
 
@@ -3677,16 +3677,16 @@ def _build_ai_report_panel(result: dict, settings: Settings, trade_store: RedisT
 
     def _count_lines(path: Path) -> int:
         try:
-    with open(path, "r", encoding="utf-8") as fh:
-    return sum(1 for _ in fh)
+            with open(path, "r", encoding="utf-8") as fh:
+                return sum(1 for _ in fh)
         except Exception:
-    return 0
+            return 0
 
     def _file_size_kb(path: Path) -> float:
         try:
-    return round(path.stat().st_size / 1024, 1)
+            return round(path.stat().st_size / 1024, 1)
         except Exception:
-    return 0.0
+            return 0.0
 
     lines = [
         "🤖 <b>AI Research Export Layer</b>",
@@ -3708,13 +3708,13 @@ def _build_ai_report_panel(result: dict, settings: Settings, trade_store: RedisT
         s_exists = snapshot_path.exists()
 
         if label == "Execution":
-    lines.append("")
-    lines.append(f"🚀 <b>{label}</b>")
+            lines.append("")
+            lines.append(f"🚀 <b>{label}</b>")
 
         lines += [
-    f"• Trades JSONL: {t_count} records | {_file_size_kb(trades_path)} KB",
-    f"• Rejections JSONL: {r_count} records | {_file_size_kb(rejections_path)} KB",
-    f"• Daily Snapshot: {'✅' if s_exists else '❌ not yet'}",
+            f"• Trades JSONL: {t_count} records | {_file_size_kb(trades_path)} KB",
+            f"• Rejections JSONL: {r_count} records | {_file_size_kb(rejections_path)} KB",
+            f"• Daily Snapshot: {'✅' if s_exists else '❌ not yet'}",
         ]
 
     lines += [
@@ -3787,8 +3787,8 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     loss_guard = result.get("loss_streak_guard") or {}
     if loss_guard.get("active"):
         loss_guard_line = (
-    f"ACTIVE | streak={int(loss_guard.get('streak', 0) or 0)} | "
-    f"remaining={int(loss_guard.get('remaining_minutes', 0) or 0)}m"
+            f"ACTIVE | streak={int(loss_guard.get('streak', 0) or 0)} | "
+            f"remaining={int(loss_guard.get('remaining_minutes', 0) or 0)}m"
         )
     else:
         loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
@@ -3875,9 +3875,9 @@ def _build_okx_status_panel(
 
     if not configured:
         lines.extend([
-    "",
-    "⚠️ لم يتم ضبط مفاتيح OKX بالكامل.",
-    "المطلوب: OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE",
+            "",
+            "⚠️ لم يتم ضبط مفاتيح OKX بالكامل.",
+            "المطلوب: OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE",
         ])
         return "\n".join(lines)
 
@@ -3899,9 +3899,9 @@ def _build_okx_status_panel(
 
     if ok:
         lines.extend([
-    f"• Reference Balance: <b>{reference_balance:,.2f} USDT</b>",
-    f"• Allocation: {allocation_pct:.2f}% / {slot_count} slots",
-    f"• Planned Margin / Trade: <b>{sizing:,.2f} USDT</b>",
+            f"• Reference Balance: <b>{reference_balance:,.2f} USDT</b>",
+            f"• Allocation: {allocation_pct:.2f}% / {slot_count} slots",
+            f"• Planned Margin / Trade: <b>{sizing:,.2f} USDT</b>",
         ])
     else:
         lines.append(f"• Error: {_okx_response_error(balance_response)}")
@@ -3917,9 +3917,9 @@ def _extract_commands(text: str) -> list[str]:
     commands: list[str] = []
     for line in str(text or "").splitlines():
         for token in line.strip().split():
-    if token.startswith("/"):
-    commands.append(token.split("@", 1)[0])
-    break
+            if token.startswith("/"):
+                commands.append(token.split("@", 1)[0])
+                break
     return commands
 
 
@@ -3953,19 +3953,19 @@ def _chunk_text_for_telegram(text: str, max_len: int = 3600) -> list[str]:
     for line in value.splitlines():
         add_len = len(line) + 1
         if current and current_len + add_len > max_len:
-    chunks.append("\n".join(current))
-    current = [line]
-    current_len = add_len
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = add_len
         elif add_len > max_len:
-    if current:
-    chunks.append("\n".join(current))
-    current = []
-    current_len = 0
-    for i in range(0, len(line), max_len):
-    chunks.append(line[i:i + max_len])
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i:i + max_len])
         else:
-    current.append(line)
-    current_len += add_len
+            current.append(line)
+            current_len += add_len
     if current:
         chunks.append("\n".join(current))
     return chunks or [""]
@@ -3982,20 +3982,20 @@ def _send_text(sender: TelegramSender, text: str, reply_markup: dict | None = No
         chunks = _chunk_text_for_telegram(raw_text, max_len=3600)
         last_result = None
         for idx, chunk in enumerate(chunks):
-    suffix = f"\n\n({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-    chunk_text = chunk + suffix
-    last_result = sender.send_message(
-    chunk_text,
-    parse_mode=parse_mode,
-    reply_markup=reply_markup if idx == len(chunks) - 1 else None,
-    )
-    if isinstance(last_result, dict) and not last_result.get("ok") and parse_mode:
-    last_result = sender.send_message(
-    _strip_basic_html(chunk_text),
-    parse_mode=None,
-    reply_markup=reply_markup if idx == len(chunks) - 1 else None,
-    )
-    _telegram_send_pause(0.45)
+            suffix = f"\n\n({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            chunk_text = chunk + suffix
+            last_result = sender.send_message(
+                chunk_text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup if idx == len(chunks) - 1 else None,
+            )
+            if isinstance(last_result, dict) and not last_result.get("ok") and parse_mode:
+                last_result = sender.send_message(
+                    _strip_basic_html(chunk_text),
+                    parse_mode=None,
+                    reply_markup=reply_markup if idx == len(chunks) - 1 else None,
+                )
+            _telegram_send_pause(0.45)
         return last_result
 
     result = sender.send_message(raw_text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -4056,9 +4056,9 @@ def _set_runtime_okx_orders(settings: Settings, enabled: bool) -> bool:
         setattr(settings, "okx_place_orders", bool(enabled))
     except Exception:
         try:
-    object.__setattr__(settings, "okx_place_orders", bool(enabled))
+            object.__setattr__(settings, "okx_place_orders", bool(enabled))
         except Exception:
-    pass
+            pass
     return _get_runtime_okx_orders(settings) == bool(enabled)
 
 
@@ -4132,9 +4132,9 @@ def _set_runtime_signal_delivery_mode(settings: Settings, mode: str) -> bool:
         setattr(settings, "signal_delivery_mode", normalized)
     except Exception:
         try:
-    object.__setattr__(settings, "signal_delivery_mode", normalized)
+            object.__setattr__(settings, "signal_delivery_mode", normalized)
         except Exception:
-    pass
+            pass
 
     return _get_signal_delivery_mode(settings) == normalized
 
@@ -4161,7 +4161,7 @@ def _should_dispatch_signal_item(item: dict, settings: Settings) -> bool:
     if _get_signal_delivery_mode(settings) == "scan":
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         if not settings.send_normal_signals and not is_execution:
-    return False
+            return False
         return True
     return _is_actionable_signal_status(exec_status)
 
@@ -4183,27 +4183,27 @@ def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None)
 
     return {
         "inline_keyboard": [
-    [
-    {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
-    {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
-    {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
-    ],
-    [
-    {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "menu:exec_intel"},
-    {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
-    {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "menu:sim_intel"},
-    ],
-    [
-    {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
-    ],
-    [
-    {"text": "🧠 Diagnostics", "callback_data": "menu:diagnostics"},
-    {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
-    ],
-    [
-    {"text": "⚙️ Admin", "callback_data": "menu:admin"},
-    {"text": "📘 System Info", "callback_data": "menu:system_info"},
-    ],
+            [
+                {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
+                {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
+                {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
+            ],
+            [
+                {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "menu:exec_intel"},
+                {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
+                {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "menu:sim_intel"},
+            ],
+            [
+                {"text": "🧭 أوضاع البوت", "callback_data": "menu:bot_modes"},
+            ],
+            [
+                {"text": "🧠 Diagnostics", "callback_data": "menu:diagnostics"},
+                {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
+            ],
+            [
+                {"text": "⚙️ Admin", "callback_data": "menu:admin"},
+                {"text": "📘 System Info", "callback_data": "menu:system_info"},
+            ],
         ]
     }
 
@@ -4244,17 +4244,17 @@ def _build_bot_modes_keyboard(settings: Settings | None = None) -> dict:
 
     return {
         "inline_keyboard": [
-    [
-    {"text": mark("scan", "📡 وضع الاسكان"), "callback_data": "signal_mode:scan"},
-    {"text": mark("trading", "🎯 وضع التداول"), "callback_data": "signal_mode:trading"},
-    ],
-    [
-    {"text": mark("simulation", "🧪 وضع المحاكاة"), "callback_data": "signal_mode:simulation"},
-    ],
-    [
-    {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
-    {"text": "🔄 تحديث", "callback_data": "menu:bot_modes"},
-    ],
+            [
+                {"text": mark("scan", "📡 وضع الاسكان"), "callback_data": "signal_mode:scan"},
+                {"text": mark("trading", "🎯 وضع التداول"), "callback_data": "signal_mode:trading"},
+            ],
+            [
+                {"text": mark("simulation", "🧪 وضع المحاكاة"), "callback_data": "signal_mode:simulation"},
+            ],
+            [
+                {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
+                {"text": "🔄 تحديث", "callback_data": "menu:bot_modes"},
+            ],
         ]
     }
 
@@ -4269,18 +4269,18 @@ def _build_okx_control_keyboard(settings: Settings) -> dict:
 
     return {
         "inline_keyboard": [
-    [{"text": toggle_text, "callback_data": toggle_data}],
-    [
-    {"text": "📡 وضع الاسكان", "callback_data": "signal_mode:scan"},
-    {"text": "🎯 وضع التداول", "callback_data": "signal_mode:trading"},
-    ],
-    [
-    {"text": "🧪 وضع المحاكاة", "callback_data": "signal_mode:simulation"},
-    ],
-    [
-    {"text": "📘 حالة OKX", "callback_data": "cmd:/okx_status"},
-    {"text": "🔄 تحديث", "callback_data": "menu:okx_control"},
-    ],
+            [{"text": toggle_text, "callback_data": toggle_data}],
+            [
+                {"text": "📡 وضع الاسكان", "callback_data": "signal_mode:scan"},
+                {"text": "🎯 وضع التداول", "callback_data": "signal_mode:trading"},
+            ],
+            [
+                {"text": "🧪 وضع المحاكاة", "callback_data": "signal_mode:simulation"},
+            ],
+            [
+                {"text": "📘 حالة OKX", "callback_data": "cmd:/okx_status"},
+                {"text": "🔄 تحديث", "callback_data": "menu:okx_control"},
+            ],
         ]
     }
 
@@ -4325,18 +4325,18 @@ def _format_clean_preview(stats: dict, title: str, confirm_command: str) -> str:
     ]
     if stats.get("mode") == "deep":
         lines += [
-    f"Keys to delete: {stats.get('keys_to_delete', 0)}",
-    "",
-    "⚠️ Deep Clean سيمسح بيانات البوت تحت نفس Prefix ويبدأ baseline جديد.",
-    f"للتأكيد أرسل: {confirm_command}",
+            f"Keys to delete: {stats.get('keys_to_delete', 0)}",
+            "",
+            "⚠️ Deep Clean سيمسح بيانات البوت تحت نفس Prefix ويبدأ baseline جديد.",
+            f"للتأكيد أرسل: {confirm_command}",
         ]
     else:
         lines += [
-    f"Stale open candidates: {stats.get('stale_open_candidates', 0)}",
-    f"Old execution checks: {stats.get('old_execution_checks', 0)}",
-    "",
-    "🧹 Soft Clean ينظف القديم/المعطوب فقط ولا يمسح كل التاريخ.",
-    f"للتأكيد أرسل: {confirm_command}",
+            f"Stale open candidates: {stats.get('stale_open_candidates', 0)}",
+            f"Old execution checks: {stats.get('old_execution_checks', 0)}",
+            "",
+            "🧹 Soft Clean ينظف القديم/المعطوب فقط ولا يمسح كل التاريخ.",
+            f"للتأكيد أرسل: {confirm_command}",
         ]
     if stats.get("error"):
         lines.append(f"Error: {stats.get('error')}")
@@ -4354,27 +4354,27 @@ def _format_clean_result(stats: dict, title: str) -> str:
         lines.append(f"Delete Attempted: {attempted}")
         lines.append(f"Deleted keys: {deleted}")
         if "current_namespace_keys" in stats:
-    lines.append(f"Current namespace keys: {int(stats.get('current_namespace_keys', 0) or 0)}")
+            lines.append(f"Current namespace keys: {int(stats.get('current_namespace_keys', 0) or 0)}")
         lines.append(f"Remaining keys: {remaining}")
         if stats.get("error"):
-    lines.append(f"⚠️ Error: {stats.get('error')}")
+            lines.append(f"⚠️ Error: {stats.get('error')}")
         elif deleted > 0 and remaining == 0:
-    lines.append("✅ تم مسح بيانات Redis الخاصة بالبوت بالكامل.")
+            lines.append("✅ تم مسح بيانات Redis الخاصة بالبوت بالكامل.")
         elif deleted > 0 and remaining > 0:
-    lines.append("⚠️ تم حذف جزء من البيانات لكن ما زالت هناك مفاتيح متبقية.")
-    lines.append("🔁 أعد تشغيل /deep_clean_confirm مرة أخرى أو راجع Redis namespace.")
+            lines.append("⚠️ تم حذف جزء من البيانات لكن ما زالت هناك مفاتيح متبقية.")
+            lines.append("🔁 أعد تشغيل /deep_clean_confirm مرة أخرى أو راجع Redis namespace.")
         else:
-    lines.append("⚠️ لم يتم العثور على مفاتيح للحذف، لذلك لم يتم تصفير Redis فعليًا.")
+            lines.append("⚠️ لم يتم العثور على مفاتيح للحذف، لذلك لم يتم تصفير Redis فعليًا.")
     else:
         lines += [
-    f"Removed open members: {stats.get('removed_open_members', 0)}",
-    f"Deleted stale trade keys: {stats.get('deleted_trade_keys', 0)}",
-    f"Removed old checks: {stats.get('removed_execution_checks', 0)}",
-    f"Kept checks: {stats.get('kept_execution_checks', 0)}",
-    "✅ تم تنظيف البيانات القديمة/المعطوبة فقط.",
+            f"Removed open members: {stats.get('removed_open_members', 0)}",
+            f"Deleted stale trade keys: {stats.get('deleted_trade_keys', 0)}",
+            f"Removed old checks: {stats.get('removed_execution_checks', 0)}",
+            f"Kept checks: {stats.get('kept_execution_checks', 0)}",
+            "✅ تم تنظيف البيانات القديمة/المعطوبة فقط.",
         ]
         if stats.get("error"):
-    lines.append(f"⚠️ Error: {stats.get('error')}")
+            lines.append(f"⚠️ Error: {stats.get('error')}")
     return "\n".join(lines)
 
 
@@ -4476,10 +4476,10 @@ def _delete_redis_keys_by_patterns(trade_store: RedisTradeStore | None, patterns
     keys: set[str] = set()
     try:
         for pattern in patterns:
-    for key in client.scan_iter(pattern):
-    keys.add(str(key))
+            for key in client.scan_iter(pattern):
+                keys.add(str(key))
         if keys:
-    return int(client.delete(*sorted(keys)) or 0)
+            return int(client.delete(*sorted(keys)) or 0)
     except Exception as exc:
         print(f"⚠️ reset redis delete failed: {exc}", flush=True)
     return 0
@@ -4489,9 +4489,9 @@ def _reset_reports_preview(kind: str, trade_store: RedisTradeStore | None, resul
     live_trades = []
     if trade_store:
         try:
-    live_trades = trade_store.load_trades() or []
+            live_trades = trade_store.load_trades() or []
         except Exception:
-    live_trades = []
+            live_trades = []
     if not live_trades and result is not None:
         live_trades = list(result.get("trades", []) or [])
 
@@ -4577,10 +4577,10 @@ def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisT
     runtime_settings = settings or get_settings()
     result["loss_streak_guard"] = _build_loss_streak_guard(
         _loss_streak_base_trades_for_runtime(
-    runtime_settings,
-    result,
-    execution_trades=refreshed_trades,
-    simulation_trades=refreshed_sim_trades,
+            runtime_settings,
+            result,
+            execution_trades=refreshed_trades,
+            simulation_trades=refreshed_sim_trades,
         )
     )
 
@@ -4590,9 +4590,9 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
     live_trades = []
     if trade_store:
         try:
-    live_trades = trade_store.load_trades() or []
+            live_trades = trade_store.load_trades() or []
         except Exception:
-    live_trades = []
+            live_trades = []
     if not live_trades and result is not None:
         live_trades = list(result.get("trades", []) or [])
 
@@ -4606,20 +4606,20 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
 
         remove = False
         if kind in {"execution", "all"} and is_exec:
-    remove = True
-    removed_execution += 1
+            remove = True
+            removed_execution += 1
         elif kind in {"normal", "all"} and is_norm:
-    remove = True
-    removed_normal += 1
+            remove = True
+            removed_normal += 1
 
         if not remove:
-    kept_live.append(trade)
+            kept_live.append(trade)
 
     if trade_store and getattr(trade_store, "enabled", False):
         try:
-    trade_store.save_trades(kept_live)
+            trade_store.save_trades(kept_live)
         except Exception as exc:
-    print(f"⚠️ save after report reset failed: {exc}", flush=True)
+            print(f"⚠️ save after report reset failed: {exc}", flush=True)
 
     if result is not None:
         result["trades"] = kept_live
@@ -4629,21 +4629,21 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
     if kind in {"simulation", "all"}:
         sim_trades = _load_simulation_trades(trade_store)
         if not sim_trades and result is not None:
-    sim_trades = list(result.get("simulation_trades", []) or [])
+            sim_trades = list(result.get("simulation_trades", []) or [])
         removed_simulation = len(sim_trades)
         deleted_sim_keys = _delete_redis_keys_by_patterns(
-    trade_store,
-    [
-    f"{SIMULATION_REDIS_PREFIX}:*",
-    ],
+            trade_store,
+            [
+                f"{SIMULATION_REDIS_PREFIX}:*",
+            ],
         )
         if result is not None:
-    result["simulation_trades"] = []
-    result["simulation_execution_results"] = []
-    result["simulation_signal_items"] = []
-    result["simulation_wallet"] = _build_simulation_wallet_snapshot([])
-    result["simulation_daily_balance"] = _ensure_simulation_daily_log([], trade_store=trade_store)
-    result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
+            result["simulation_trades"] = []
+            result["simulation_execution_results"] = []
+            result["simulation_signal_items"] = []
+            result["simulation_wallet"] = _build_simulation_wallet_snapshot([])
+            result["simulation_daily_balance"] = _ensure_simulation_daily_log([], trade_store=trade_store)
+            result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
 
     _refresh_runtime_after_report_reset(result, trade_store=trade_store, settings=get_settings())
 
@@ -4672,9 +4672,9 @@ def _handle_admin_clean_command(
     if command in reset_preview_commands:
         kind, confirm_command, title = reset_preview_commands[command]
         return _format_reset_reports_preview(
-    _reset_reports_preview(kind, trade_store, result),
-    confirm_command,
-    title,
+            _reset_reports_preview(kind, trade_store, result),
+            confirm_command,
+            title,
         )
 
     reset_confirm_commands = {
@@ -4686,8 +4686,8 @@ def _handle_admin_clean_command(
     if command in reset_confirm_commands:
         kind, title = reset_confirm_commands[command]
         return _format_reset_reports_done(
-    _reset_reports_confirm(kind, trade_store, result),
-    title,
+            _reset_reports_confirm(kind, trade_store, result),
+            title,
         )
 
     if command in {"/soft_clean", "/soft_clean_preview"}:
@@ -4696,33 +4696,33 @@ def _handle_admin_clean_command(
     if command == "/soft_clean_confirm":
         stats = trade_store.soft_clean() if trade_store else {"enabled": False, "mode": "soft"}
         if result is not None and stats.get("enabled"):
-    refreshed_trades = trade_store.load_trades() if trade_store else []
-    refreshed_checks = trade_store.load_execution_checks(limit=500) if trade_store else []
-    portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
-    reports = build_report_bundle(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
-    result["trades"] = refreshed_trades
-    result["signal_items"] = []
-    result["signals"] = []
-    result["execution_results"] = refreshed_checks
-    result["current_execution_results"] = []
-    result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
-    result.update(reports)
-    portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **portfolio_state_inputs)
-    result["portfolio_state"] = portfolio_state
-    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
-    result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    runtime_settings = settings or get_settings()
-    refreshed_sim_trades = _load_simulation_trades(trade_store) if trade_store else list(result.get("simulation_trades", []) or [])
-    result["loss_streak_guard"] = _build_loss_streak_guard(
-    _loss_streak_base_trades_for_runtime(
-    runtime_settings,
-    result,
-    execution_trades=refreshed_trades,
-    simulation_trades=refreshed_sim_trades,
-    )
-    )
+            refreshed_trades = trade_store.load_trades() if trade_store else []
+            refreshed_checks = trade_store.load_execution_checks(limit=500) if trade_store else []
+            portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
+            execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
+            reports = build_report_bundle(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
+            result["trades"] = refreshed_trades
+            result["signal_items"] = []
+            result["signals"] = []
+            result["execution_results"] = refreshed_checks
+            result["current_execution_results"] = []
+            result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
+            result.update(reports)
+            portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
+            portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **portfolio_state_inputs)
+            result["portfolio_state"] = portfolio_state
+            result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+            result["drawdown_report"] = build_drawdown_report(portfolio_state)
+            runtime_settings = settings or get_settings()
+            refreshed_sim_trades = _load_simulation_trades(trade_store) if trade_store else list(result.get("simulation_trades", []) or [])
+            result["loss_streak_guard"] = _build_loss_streak_guard(
+                _loss_streak_base_trades_for_runtime(
+                    runtime_settings,
+                    result,
+                    execution_trades=refreshed_trades,
+                    simulation_trades=refreshed_sim_trades,
+                )
+            )
         return _format_clean_result(stats, "🧹 Soft Clean Done")
     if command in {"/deep_clean", "/deep_clean_preview"}:
         stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
@@ -4730,7 +4730,7 @@ def _handle_admin_clean_command(
     if command == "/deep_clean_confirm":
         stats = trade_store.deep_clean() if trade_store else {"enabled": False, "mode": "deep"}
         if result is not None and stats.get("enabled"):
-    _reset_runtime_state_after_clean(result, keep_mode_state=True)
+            _reset_runtime_state_after_clean(result, keep_mode_state=True)
         return _format_clean_result(stats, "🧨 Deep Clean Done")
     return None
 
@@ -4762,9 +4762,9 @@ def _refresh_track_trades_before_reply(
 
     try:
         tickers = fetch_okx_tickers(
-    settings.okx_base_url,
-    settings.request_timeout,
-    settings.offline_test_mode,
+            settings.okx_base_url,
+            settings.request_timeout,
+            settings.offline_test_mode,
         )
         price_map = _build_live_price_map(tickers)
     except Exception as exc:
@@ -4782,34 +4782,34 @@ def _refresh_track_trades_before_reply(
     # ✅ READ-ONLY: update in-memory only, never save to Redis
     if trades:
         try:
-    refreshed_trades = update_open_trades(
-    trades,
-    price_map,
-    protection_level=protection_level,
-    okx_client=None,
-    sync_exchange=False,
-    sync_exchange_stop=False,
-    )
-    result["trades"] = refreshed_trades
-    # ✅ NO trade_store.save_trades() — read-only
+            refreshed_trades = update_open_trades(
+                trades,
+                price_map,
+                protection_level=protection_level,
+                okx_client=None,
+                sync_exchange=False,
+                sync_exchange_stop=False,
+            )
+            result["trades"] = refreshed_trades
+            # ✅ NO trade_store.save_trades() — read-only
         except Exception as exc:
-    print(f"⚠️ track execution refresh failed: {exc}", flush=True)
+            print(f"⚠️ track execution refresh failed: {exc}", flush=True)
 
     if simulation_trades:
         try:
-    refreshed_sim_trades = update_open_trades(
-    simulation_trades,
-    price_map,
-    protection_level=protection_level,
-    okx_client=None,
-    sync_exchange=False,
-    sync_exchange_stop=False,
-    )
-    result["simulation_trades"] = refreshed_sim_trades
-    result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
-    # ✅ NO _save_simulation_trades() — read-only
+            refreshed_sim_trades = update_open_trades(
+                simulation_trades,
+                price_map,
+                protection_level=protection_level,
+                okx_client=None,
+                sync_exchange=False,
+                sync_exchange_stop=False,
+            )
+            result["simulation_trades"] = refreshed_sim_trades
+            result["simulation_wallet"] = _build_simulation_wallet_snapshot(refreshed_sim_trades)
+            # ✅ NO _save_simulation_trades() — read-only
         except Exception as exc:
-    print(f"⚠️ track simulation refresh failed: {exc}", flush=True)
+            print(f"⚠️ track simulation refresh failed: {exc}", flush=True)
 
 
 def _build_track_message_with_status(
@@ -4831,19 +4831,19 @@ def _build_track_message_with_status(
 
     if is_executed:
         label = "\n".join([
-    "🚀 <b>EXECUTED TRADE</b>",
-    "• Slot Reserved: <b>YES</b>",
-    "• Included In Live Reports: <b>YES</b>",
-    "• Protection System: <b>ACTIVE</b>",
-    "━━━━━━━━━━━━",
+            "🚀 <b>EXECUTED TRADE</b>",
+            "• Slot Reserved: <b>YES</b>",
+            "• Included In Live Reports: <b>YES</b>",
+            "• Protection System: <b>ACTIVE</b>",
+            "━━━━━━━━━━━━",
         ])
     else:
         label = "\n".join([
-    "👁 <b>TRACKING ONLY</b>",
-    "• Slot Reserved: <b>NO</b>",
-    "• Included In Live Reports: <b>NO</b>",
-    "• Protection System: <b>INACTIVE</b>",
-    "━━━━━━━━━━━━",
+            "👁 <b>TRACKING ONLY</b>",
+            "• Slot Reserved: <b>NO</b>",
+            "• Included In Live Reports: <b>NO</b>",
+            "• Protection System: <b>INACTIVE</b>",
+            "━━━━━━━━━━━━",
         ])
 
     return label + "\n" + str(base or "")
@@ -4859,18 +4859,18 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         key = data.split(":", 1)[1]
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cmd_map = {
-    "exec_trades":       "/ai_report_exec_trades",
-    "exec_rejections":   "/ai_report_exec_rejections",
-    "exec_snapshot":     "/ai_report_snapshot_exec",
-    "sim_trades":        "/ai_report_sim_trades",
-    "sim_rejections":    "/ai_report_sim_rejections",
-    "sim_snapshot":      "/ai_report_snapshot_sim",
+            "exec_trades":       "/ai_report_exec_trades",
+            "exec_rejections":   "/ai_report_exec_rejections",
+            "exec_snapshot":     "/ai_report_snapshot_exec",
+            "sim_trades":        "/ai_report_sim_trades",
+            "sim_rejections":    "/ai_report_sim_rejections",
+            "sim_snapshot":      "/ai_report_snapshot_sim",
         }
         cmd = cmd_map.get(key)
         if cmd:
-    _send_ai_report_file(sender, cmd, today)
+            _send_ai_report_file(sender, cmd, today)
         else:
-    _send_text(sender, "⚠️ أمر AI غير معروف.")
+            _send_text(sender, "⚠️ أمر AI غير معروف.")
         return
 
     if data.startswith("okx_orders:"):
@@ -4878,19 +4878,19 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         desired_enabled = desired == "on"
         runtime_settings = settings or get_settings()
         if desired_enabled:
-    _set_runtime_signal_delivery_mode(runtime_settings, "trading")
+            _set_runtime_signal_delivery_mode(runtime_settings, "trading")
         applied = _set_runtime_okx_orders(runtime_settings, desired_enabled)
         state_text = "ON" if desired_enabled else "OFF"
         prefix = "✅" if applied else "⚠️"
         _send_text(
-    sender,
-    "\n".join([
-    f"{prefix} OKX Orders Runtime Toggle",
-    "┄┄┄┄┄┄┄┄",
-    f"Requested State: {state_text}",
-    f"Applied: {'YES' if applied else 'NO'}",
-    ]),
-    reply_markup=_build_okx_control_keyboard(runtime_settings),
+            sender,
+            "\n".join([
+                f"{prefix} OKX Orders Runtime Toggle",
+                "┄┄┄┄┄┄┄┄",
+                f"Requested State: {state_text}",
+                f"Applied: {'YES' if applied else 'NO'}",
+            ]),
+            reply_markup=_build_okx_control_keyboard(runtime_settings),
         )
         return
 
@@ -4901,15 +4901,15 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         mode_text = _signal_delivery_mode_label(runtime_settings)
         prefix = "✅" if applied else "⚠️"
         _send_text(
-    sender,
-    "\n".join([
-    f"{prefix} Bot Mode Runtime Toggle",
-    "┄┄┄┄┄┄┄┄",
-    f"Requested Mode: {desired_mode.upper() if desired_mode else '-'}",
-    f"Applied: {'YES' if applied else 'NO'}",
-    f"Current Mode: {mode_text}",
-    ]),
-    reply_markup=_build_bot_modes_keyboard(runtime_settings),
+            sender,
+            "\n".join([
+                f"{prefix} Bot Mode Runtime Toggle",
+                "┄┄┄┄┄┄┄┄",
+                f"Requested Mode: {desired_mode.upper() if desired_mode else '-'}",
+                f"Applied: {'YES' if applied else 'NO'}",
+                f"Current Mode: {mode_text}",
+            ]),
+            reply_markup=_build_bot_modes_keyboard(runtime_settings),
         )
         return
 
@@ -4918,93 +4918,93 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         _refresh_track_trades_before_reply(result, runtime_settings, trade_store=trade_store, okx_client=okx_client)
         parts = data.split(":", 2)
         if len(parts) >= 3:
-    track_source = parts[1].strip().lower() or "auto"
-    symbol = parts[2]
+            track_source = parts[1].strip().lower() or "auto"
+            symbol = parts[2]
         else:
-    track_source = "auto"
-    symbol = data.split(":", 1)[1]
+            track_source = "auto"
+            symbol = data.split(":", 1)[1]
         matching_trade = None
         track_candidates = _track_candidates_for_source(result, track_source, runtime_settings)
         symbol_trades = [trade for trade in track_candidates if getattr(trade, "symbol", "") == symbol]
         if not symbol_trades and track_source != "auto":
-    # Fallback for old messages or after mode switches: search both, but only
-    # after the requested bucket fails.
-    symbol_trades = [trade for trade in _track_candidates_for_source(result, "auto", runtime_settings) if getattr(trade, "symbol", "") == symbol]
+            # Fallback for old messages or after mode switches: search both, but only
+            # after the requested bucket fails.
+            symbol_trades = [trade for trade in _track_candidates_for_source(result, "auto", runtime_settings) if getattr(trade, "symbol", "") == symbol]
         if symbol_trades:
-    def _track_sort_key(trade):
-    return (
-    1 if not getattr(trade, "is_closed", False) else 0,
-    getattr(trade, "updated_at", None) or getattr(trade, "opened_at", None) or datetime.min.replace(tzinfo=timezone.utc),
-    )
-    matching_trade = sorted(symbol_trades, key=_track_sort_key, reverse=True)[0]
+            def _track_sort_key(trade):
+                return (
+                    1 if not getattr(trade, "is_closed", False) else 0,
+                    getattr(trade, "updated_at", None) or getattr(trade, "opened_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                )
+            matching_trade = sorted(symbol_trades, key=_track_sort_key, reverse=True)[0]
         for item in result.get("signal_items", []):
-    signal = item.get("signal")
-    if signal and signal.symbol == symbol:
-    _send_text(sender, _build_track_message_with_status(signal, item.get("execution"), trade=matching_trade))
-    return
+            signal = item.get("signal")
+            if signal and signal.symbol == symbol:
+                _send_text(sender, _build_track_message_with_status(signal, item.get("execution"), trade=matching_trade))
+                return
         if matching_trade is not None:
-    _send_text(sender, _build_track_message_with_status(None, None, trade=matching_trade))
-    return
+            _send_text(sender, _build_track_message_with_status(None, None, trade=matching_trade))
+            return
         sender.send_message("📊 Track\n┄┄┄┄┄┄┄┄\nلم أجد هذه الصفقة في آخر دورة Scan أو في سجل Redis.")
         return
 
     if data.startswith("menu:"):
         key = data.split(":", 1)[1]
         if key == "execution":
-    _send_text(sender, result.get("help_execution", ""))
+            _send_text(sender, result.get("help_execution", ""))
         elif key == "normal":
-    _send_text(sender, result.get("help_normal", ""))
+            _send_text(sender, result.get("help_normal", ""))
         elif key == "simulation":
-    _send_text(sender, _build_simulation_help())
+            _send_text(sender, _build_simulation_help())
         elif key == "exec_intel":
-    _send_text(sender, _build_exec_intel_panel(), reply_markup=_build_exec_intel_keyboard())
+            _send_text(sender, _build_exec_intel_panel(), reply_markup=_build_exec_intel_keyboard())
         elif key == "sim_intel":
-    _send_text(sender, _build_sim_intel_panel(), reply_markup=_build_sim_intel_keyboard())
+            _send_text(sender, _build_sim_intel_panel(), reply_markup=_build_sim_intel_keyboard())
         elif key == "main":
-    runtime_settings = settings or get_settings()
-    dashboard = build_master_help(
-    mode=result.get("mode", "UNKNOWN"),
-    execution_enabled=runtime_settings.execution_enabled,
-    risk_enabled=True,
-    okx_orders=_runtime_mode_snapshot(runtime_settings).get("orders_enabled", False),
-    runtime_snapshot=_runtime_mode_snapshot(runtime_settings),
-    )
-    _send_text(sender, dashboard, reply_markup=_build_main_inline_keyboard_with_bot_modes(runtime_settings))
+            runtime_settings = settings or get_settings()
+            dashboard = build_master_help(
+                mode=result.get("mode", "UNKNOWN"),
+                execution_enabled=runtime_settings.execution_enabled,
+                risk_enabled=True,
+                okx_orders=_runtime_mode_snapshot(runtime_settings).get("orders_enabled", False),
+                runtime_snapshot=_runtime_mode_snapshot(runtime_settings),
+            )
+            _send_text(sender, dashboard, reply_markup=_build_main_inline_keyboard_with_bot_modes(runtime_settings))
         elif key == "diagnostics":
-    _send_text(sender, build_diagnostics_help())
+            _send_text(sender, build_diagnostics_help())
         elif key == "bot_modes":
-    runtime_settings = settings or get_settings()
-    _send_text(sender, _build_bot_modes_panel(runtime_settings), reply_markup=_build_bot_modes_keyboard())
+            runtime_settings = settings or get_settings()
+            _send_text(sender, _build_bot_modes_panel(runtime_settings), reply_markup=_build_bot_modes_keyboard())
         elif key == "okx_control":
-    runtime_settings = settings or get_settings()
-    _send_text(sender, _build_okx_control_panel(runtime_settings), reply_markup=_build_okx_control_keyboard(runtime_settings))
+            runtime_settings = settings or get_settings()
+            _send_text(sender, _build_okx_control_panel(runtime_settings), reply_markup=_build_okx_control_keyboard(runtime_settings))
         elif key == "admin":
-    _send_text(sender, _build_admin_panel())
+            _send_text(sender, _build_admin_panel())
         elif key == "system_info":
-    _send_text(sender, _build_fast_status(result, settings or get_settings(), trade_store))
+            _send_text(sender, _build_fast_status(result, settings or get_settings(), trade_store))
         else:
-    sender.send_message("القسم غير متاح حاليًا.")
+            sender.send_message("القسم غير متاح حاليًا.")
         return
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
         if command == "/okx_status":
-    _send_text(sender, _build_okx_status_panel(settings or get_settings(), okx_client=okx_client))
-    return
+            _send_text(sender, _build_okx_status_panel(settings or get_settings(), okx_client=okx_client))
+            return
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
-    simulation_outputs.get(command)
-    or result.get("command_outputs", {}).get(command)
-    or "الأمر غير متاح في هذه النسخة."
+            simulation_outputs.get(command)
+            or result.get("command_outputs", {}).get(command)
+            or "الأمر غير متاح في هذه النسخة."
         )
         # أضف رصيد OKX في أعلى تقارير التنفيذ فقط
         _cb_settings = settings or get_settings()
         _is_exec_report_cb = (
-    command.startswith("/report_execution")
-    and command not in simulation_outputs
+            command.startswith("/report_execution")
+            and command not in simulation_outputs
         )
         if _is_exec_report_cb and reply and not _is_simulation_mode(_cb_settings):
-    reply = _build_execution_balance_header(result, _cb_settings) + "\n" + reply
+            reply = _build_execution_balance_header(result, _cb_settings) + "\n" + reply
         _send_text(sender, reply)
         return
 
@@ -5123,21 +5123,21 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
 
     if trade_store and _is_live_okx_execution_mode(settings, okx_client):
         try:
-    live_trades = trade_store.load_trades() or []
-    reconciled_trades, reconcile_stats = _reconcile_execution_trades_with_okx(live_trades, okx_client, settings)
-    if reconcile_stats.get("changed"):
-    trade_store.save_trades(reconciled_trades)
-    _rebuild_runtime_reports_after_reconcile(result, reconciled_trades, trade_store, settings, okx_client, reconcile_stats)
+            live_trades = trade_store.load_trades() or []
+            reconciled_trades, reconcile_stats = _reconcile_execution_trades_with_okx(live_trades, okx_client, settings)
+            if reconcile_stats.get("changed"):
+                trade_store.save_trades(reconciled_trades)
+                _rebuild_runtime_reports_after_reconcile(result, reconciled_trades, trade_store, settings, okx_client, reconcile_stats)
         except Exception as exc:
-    print(f"⚠️ command exchange reconcile failed: {exc}", flush=True)
+            print(f"⚠️ command exchange reconcile failed: {exc}", flush=True)
 
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
         offset = int(update.get("update_id", 0)) + 1
         callback_query = update.get("callback_query")
         if callback_query:
-    _handle_callback_query(sender, result, callback_query, settings, okx_client=okx_client, trade_store=trade_store)
-    continue
+            _handle_callback_query(sender, result, callback_query, settings, okx_client=okx_client, trade_store=trade_store)
+            continue
 
         message = update.get("message") or update.get("channel_post") or {}
         text = str(message.get("text") or "")
@@ -5145,278 +5145,278 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         plain_text = text.strip()
 
         if not commands and plain_text:
-    button_map = {
-    "🚀 Execution": "/help_execution",
-    "🟢🚀 Execution": "/help_execution",
-    "Execution": "/help_execution",
-    "📊 Normal Trades": "/help_normal",
-    "🟢📊 Normal Trades": "/help_normal",
-    "Normal Trades": "/help_normal",
-    "🧪 Simulation": "/help_simulation",
-    "🟢🧪 Simulation": "/help_simulation",
-    "Simulation": "/help_simulation",
-    "🧠🚀 Execution Intelligence": "/report_execution_intelligence",
-    "🟢🧠🚀 Exec Intel": "/report_execution_intelligence",
-    "🧠🚀 Exec Intel": "/report_execution_intelligence",
-    "Exec Intelligence": "/report_execution_intelligence",
-    "🧠📊 Market Intelligence": "/report_intelligence",
-    "🟢🧠📊 Market Intel": "/report_intelligence",
-    "🧠📊 Market Intel": "/report_intelligence",
-    "Market Intelligence": "/report_intelligence",
-    "🧠🧪 Sim Intel": "/report_simulation_intelligence",
-    "🟢🧠🧪 Sim Intel": "/report_simulation_intelligence",
-    "🧭 أوضاع البوت": "/bot_modes",
-    "Bot Modes": "/bot_modes",
-    "اوضاع البوت": "/bot_modes",
-    "🧠 Diagnostics": "/report_diagnostics",
-    "Diagnostics": "/report_diagnostics",
-    "🤖 OKX Control": "/okx_control",
-    "OKX Control": "/okx_control",
-    "📘 حالة OKX": "/okx_status",
-    "حالة OKX": "/okx_status",
-    "OKX Status": "/okx_status",
-    "⚙️ Admin": "/admin",
-    "Admin": "/admin",
-    "📘 System Info": "/status",
-    "System Info": "/status",
-    }
-    mapped = button_map.get(plain_text)
-    if mapped:
-    commands = [mapped]
+            button_map = {
+                "🚀 Execution": "/help_execution",
+                "🟢🚀 Execution": "/help_execution",
+                "Execution": "/help_execution",
+                "📊 Normal Trades": "/help_normal",
+                "🟢📊 Normal Trades": "/help_normal",
+                "Normal Trades": "/help_normal",
+                "🧪 Simulation": "/help_simulation",
+                "🟢🧪 Simulation": "/help_simulation",
+                "Simulation": "/help_simulation",
+                "🧠🚀 Execution Intelligence": "/report_execution_intelligence",
+                "🟢🧠🚀 Exec Intel": "/report_execution_intelligence",
+                "🧠🚀 Exec Intel": "/report_execution_intelligence",
+                "Exec Intelligence": "/report_execution_intelligence",
+                "🧠📊 Market Intelligence": "/report_intelligence",
+                "🟢🧠📊 Market Intel": "/report_intelligence",
+                "🧠📊 Market Intel": "/report_intelligence",
+                "Market Intelligence": "/report_intelligence",
+                "🧠🧪 Sim Intel": "/report_simulation_intelligence",
+                "🟢🧠🧪 Sim Intel": "/report_simulation_intelligence",
+                "🧭 أوضاع البوت": "/bot_modes",
+                "Bot Modes": "/bot_modes",
+                "اوضاع البوت": "/bot_modes",
+                "🧠 Diagnostics": "/report_diagnostics",
+                "Diagnostics": "/report_diagnostics",
+                "🤖 OKX Control": "/okx_control",
+                "OKX Control": "/okx_control",
+                "📘 حالة OKX": "/okx_status",
+                "حالة OKX": "/okx_status",
+                "OKX Status": "/okx_status",
+                "⚙️ Admin": "/admin",
+                "Admin": "/admin",
+                "📘 System Info": "/status",
+                "System Info": "/status",
+            }
+            mapped = button_map.get(plain_text)
+            if mapped:
+                commands = [mapped]
 
         if not commands:
-    continue
+            continue
 
         for command in commands:
-    clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
-    if clean_reply is not None:
-    _send_text(sender, clean_reply)
-    continue
+            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
+            if clean_reply is not None:
+                _send_text(sender, clean_reply)
+                continue
 
-    # /help must always use the original dashboard + main keyboard.
-    # Simulation reports are handled only by /help_simulation or /report_simulation*
-    # and must never shadow /help.
-    if command in ("/start", "/help"):
-    reply = build_master_help(
-    mode=result.get("mode", "UNKNOWN"),
-    execution_enabled=settings.execution_enabled,
-    risk_enabled=True,
-    okx_orders=_runtime_mode_snapshot(settings).get("orders_enabled", False),
-    runtime_snapshot=_runtime_mode_snapshot(settings),
-    )
-    sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
-    sender.send_message(reply, reply_markup=_build_main_inline_keyboard_with_bot_modes(settings))
-    continue
+            # /help must always use the original dashboard + main keyboard.
+            # Simulation reports are handled only by /help_simulation or /report_simulation*
+            # and must never shadow /help.
+            if command in ("/start", "/help"):
+                reply = build_master_help(
+                    mode=result.get("mode", "UNKNOWN"),
+                    execution_enabled=settings.execution_enabled,
+                    risk_enabled=True,
+                    okx_orders=_runtime_mode_snapshot(settings).get("orders_enabled", False),
+                    runtime_snapshot=_runtime_mode_snapshot(settings),
+                )
+                sender.send_message("⌨️ تم إغلاق لوحة /help القديمة.", reply_markup={"remove_keyboard": True})
+                sender.send_message(reply, reply_markup=_build_main_inline_keyboard_with_bot_modes(settings))
+                continue
 
-    simulation_outputs = _build_simulation_command_outputs(result)
-    if command in _SIM_WALLET_PERIOD_COMMANDS:
-    _key, title, days = _SIM_WALLET_PERIOD_COMMANDS[command]
-    _send_text(sender, simulation_outputs.get(command) or _simulation_header(_build_simulation_wallet_period_report(result, title, days)))
-    for export in _build_simulation_wallet_export_files(result, title, days):
-    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Simulation Wallet Export"))
-    if not doc_result.get("ok"):
-    _send_text(sender, "⚠️ فشل إرسال ملف Wallet export. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
-    continue
-    if command in simulation_outputs:
-    _send_text(sender, simulation_outputs[command])
-    continue
-    if command in ("/diagnostics_help", "/help_diagnostics"):
-    _send_text(sender, build_diagnostics_commands_help())
-    continue
-    if command == "/tech_snapshot_on":
-    status = set_snapshot_enabled(True, settings, redis_client=_snapshot_redis_client(trade_store))
-    _send_text(sender, "✅ Technical Snapshot: ON" if status.get("ok") else f"⚠️ لم أستطع تشغيل التسجيل: {status.get('error')}")
-    continue
-    if command == "/tech_snapshot_off":
-    status = set_snapshot_enabled(False, settings, redis_client=_snapshot_redis_client(trade_store))
-    _send_text(sender, "⏸ Technical Snapshot: OFF" if status.get("ok") else f"⚠️ لم أستطع إيقاف التسجيل: {status.get('error')}")
-    continue
-    if command == "/tech_snapshot_status":
-    _send_text(sender, build_technical_dataset_status(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/tech_snapshot_export":
-    _send_text(sender, build_technical_dataset_export(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/tech_snapshot_export_file":
-    export = build_technical_dataset_export_file(settings, redis_client=_snapshot_redis_client(trade_store))
-    if not export.get("ok"):
-    _send_text(sender, "⚠️ " + str(export.get("message") or "Technical snapshot export failed."))
-    else:
-    # ✅ FIX 1b: doc_result بدل result — يمنع shadowing على scan result
-    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Live Technical Snapshot Dataset"))
-    if not doc_result.get("ok"):
-    _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
-    continue
-    if command == "/tech_snapshot_clear":
-    _send_text(sender, build_clear_snapshot_result(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/gate_suggestions":
-    _send_text(sender, build_gate_suggestions_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/gate_sim_normal":
-    _send_gate_sim_artifact(sender, "normal", settings, trade_store=trade_store)
-    continue
-    if command == "/gate_sim_recovery":
-    _send_gate_sim_artifact(sender, "recovery", settings, trade_store=trade_store)
-    continue
-    if command == "/gate_sim_strong":
-    _send_gate_sim_artifact(sender, "strong", settings, trade_store=trade_store)
-    continue
-    if command == "/gate_sim_block":
-    _send_gate_sim_artifact(sender, "block", settings, trade_store=trade_store)
-    continue
-    if command == "/gate_sim_all":
-    # ✅ FIX Phase 3: Lock بدل global bool — thread-safe
-    if not _GATE_SIM_LOCK.acquire(blocking=False):
-    _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
-    continue
-    try:
-    _send_text(sender, "⏳ جاري تحليل /gate_sim_all على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
-    artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
-    _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
-    if artifact.get("ok") and artifact.get("path"):
-    doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
-    if not doc_result.get("ok"):
-    _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
-    finally:
-    _GATE_SIM_LOCK.release()
-    continue
-    if command == "/score_calibration":
-    _send_text(sender, "⏳ جاري حساب Score Calibration بين replay و live snapshots...")
-    _send_text(sender, build_score_calibration_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/mode_coverage":
-    _send_text(sender, "⏳ جاري حساب Mode Coverage بين replay و live snapshots...")
-    _send_text(sender, build_mode_coverage_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/historical_report":
-    _send_text(sender, build_historical_report(settings))
-    continue
-    if command == "/help_technical_dataset":
-    _send_text(sender, build_technical_dataset_help())
-    continue
-    if command == "/help_historical_replay":
-    _send_text(sender, build_historical_replay_help())
-    continue
-    if command == "/replay_start_30d":
-    _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=30))
-    continue
-    if command == "/replay_start_45d":
-    _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=45))
-    continue
-    if command == "/replay_start_90d":
-    _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=90))
-    continue
-    if command == "/replay_status":
-    _send_text(sender, build_replay_status_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/replay_stop":
-    _send_text(sender, build_replay_stop_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/replay_export":
-    _send_text(sender, build_replay_export_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/replay_export_file":
-    export = build_replay_export_file(settings, redis_client=_snapshot_redis_client(trade_store))
-    if not export.get("ok"):
-    _send_text(sender, "⚠️ " + str(export.get("message") or "Replay export failed."))
-    else:
-    # ✅ FIX 1d: doc_result بدل result — يمنع shadowing على scan result
-    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Historical Replay Dataset"))
-    if not doc_result.get("ok"):
-    _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
-    continue
-    if command == "/replay_summary":
-    _send_text(sender, build_replay_summary_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/replay_clear":
-    _send_text(sender, build_replay_clear_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/compare_live_vs_replay":
-    _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
-    continue
-    if command == "/okx_status":
-    reply = _build_okx_status_panel(settings, okx_client=okx_client)
-    elif command == "/ai_report":
-    _send_text(sender, _build_ai_report_panel(settings))
-    continue
-    elif command in {
-    "/ai_report_sim_trades", "/ai_report_sim_rejections",
-    "/ai_report_exec_trades", "/ai_report_exec_rejections",
-    "/ai_report_snapshot_sim", "/ai_report_snapshot_exec",
-    }:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    _send_ai_report_file(sender, command, today)
-    continue
-    elif command == "/status":
-    reply = _build_fast_status(result, settings, trade_store)
-    elif command == "/mood":
-    reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
-    elif command == "/help_execution":
-    reply = result.get("help_execution", "")
-    elif command == "/help_normal":
-    reply = result.get("help_normal", "")
-    elif command == "/okx_orders_on":
-    mode_applied = _set_runtime_signal_delivery_mode(settings, "trading")
-    applied = bool(mode_applied and _set_runtime_okx_orders(settings, True) and _runtime_mode_snapshot(settings).get("active_mode") == "trading")
-    reply = "✅ تم تشغيل وضع التداول وتنفيذ OKX." if applied else "⚠️ تعذر تشغيل تنفيذ OKX لأن Runtime Mode لم يصبح Trading."
-    elif command == "/okx_orders_off":
-    applied = _set_runtime_okx_orders(settings, False)
-    reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
-    elif command in ("/help_simulation", "/simulation_help"):
-    reply = _build_simulation_help()
-    elif command in ("/admin", "/help_admin"):
-    reply = _build_admin_panel()
-    elif command in ("/bot_modes", "/modes", "/mode"):
-    reply = _build_bot_modes_panel(settings)
-    _send_text(sender, reply, reply_markup=_build_bot_modes_keyboard())
-    continue
-    elif command == "/okx_control":
-    reply = _build_okx_control_panel(settings)
-    _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
-    continue
-    else:
-    simulation_outputs = _build_simulation_command_outputs(result)
-    reply = (
-    simulation_outputs.get(command)
-    or command_outputs.get(command)
-    or command_outputs.get(command.lstrip("/"))
-    or "الأمر غير متاح في نسخة v123 بعد."
-    )
-    # أضف رصيد OKX في أعلى تقارير التنفيذ فقط
-    _is_exec_report = (
-    command.startswith("/report_execution")
-    and not command.startswith("/report_execution_intelligence")
-    and command not in simulation_outputs
-    )
-    if _is_exec_report and reply and not _is_simulation_mode(settings):
-    balance_header = _build_execution_balance_header(result, settings)
-    reply = balance_header + "\n" + reply
-    _send_text(sender, reply)
+            simulation_outputs = _build_simulation_command_outputs(result)
+            if command in _SIM_WALLET_PERIOD_COMMANDS:
+                _key, title, days = _SIM_WALLET_PERIOD_COMMANDS[command]
+                _send_text(sender, simulation_outputs.get(command) or _simulation_header(_build_simulation_wallet_period_report(result, title, days)))
+                for export in _build_simulation_wallet_export_files(result, title, days):
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Simulation Wallet Export"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال ملف Wallet export. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+                continue
+            if command in simulation_outputs:
+                _send_text(sender, simulation_outputs[command])
+                continue
+            if command in ("/diagnostics_help", "/help_diagnostics"):
+                _send_text(sender, build_diagnostics_commands_help())
+                continue
+            if command == "/tech_snapshot_on":
+                status = set_snapshot_enabled(True, settings, redis_client=_snapshot_redis_client(trade_store))
+                _send_text(sender, "✅ Technical Snapshot: ON" if status.get("ok") else f"⚠️ لم أستطع تشغيل التسجيل: {status.get('error')}")
+                continue
+            if command == "/tech_snapshot_off":
+                status = set_snapshot_enabled(False, settings, redis_client=_snapshot_redis_client(trade_store))
+                _send_text(sender, "⏸ Technical Snapshot: OFF" if status.get("ok") else f"⚠️ لم أستطع إيقاف التسجيل: {status.get('error')}")
+                continue
+            if command == "/tech_snapshot_status":
+                _send_text(sender, build_technical_dataset_status(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/tech_snapshot_export":
+                _send_text(sender, build_technical_dataset_export(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/tech_snapshot_export_file":
+                export = build_technical_dataset_export_file(settings, redis_client=_snapshot_redis_client(trade_store))
+                if not export.get("ok"):
+                    _send_text(sender, "⚠️ " + str(export.get("message") or "Technical snapshot export failed."))
+                else:
+                    # ✅ FIX 1b: doc_result بدل result — يمنع shadowing على scan result
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Live Technical Snapshot Dataset"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+                continue
+            if command == "/tech_snapshot_clear":
+                _send_text(sender, build_clear_snapshot_result(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/gate_suggestions":
+                _send_text(sender, build_gate_suggestions_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/gate_sim_normal":
+                _send_gate_sim_artifact(sender, "normal", settings, trade_store=trade_store)
+                continue
+            if command == "/gate_sim_recovery":
+                _send_gate_sim_artifact(sender, "recovery", settings, trade_store=trade_store)
+                continue
+            if command == "/gate_sim_strong":
+                _send_gate_sim_artifact(sender, "strong", settings, trade_store=trade_store)
+                continue
+            if command == "/gate_sim_block":
+                _send_gate_sim_artifact(sender, "block", settings, trade_store=trade_store)
+                continue
+            if command == "/gate_sim_all":
+                # ✅ FIX Phase 3: Lock بدل global bool — thread-safe
+                if not _GATE_SIM_LOCK.acquire(blocking=False):
+                    _send_text(sender, "⏳ Gate Simulation شغال بالفعل. استنى النتيجة الحالية قبل تشغيل أمر جديد.")
+                    continue
+                try:
+                    _send_text(sender, "⏳ جاري تحليل /gate_sim_all على replay + live snapshots... قد يستغرق عدة دقائق مع 90d.")
+                    artifact = build_gate_sim_all_artifact(settings, redis_client=_snapshot_redis_client(trade_store))
+                    _send_text(sender, artifact.get("text") or "⚠️ Gate simulation failed.")
+                    if artifact.get("ok") and artifact.get("path"):
+                        doc_result = sender.send_document(str(artifact.get("path")), caption=str(artifact.get("caption") or "Gate Simulation JSON"))
+                        if not doc_result.get("ok"):
+                            _send_text(sender, "⚠️ فشل إرسال ملف JSON. الملف جاهز على السيرفر:\n" + str(artifact.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+                finally:
+                    _GATE_SIM_LOCK.release()
+                continue
+            if command == "/score_calibration":
+                _send_text(sender, "⏳ جاري حساب Score Calibration بين replay و live snapshots...")
+                _send_text(sender, build_score_calibration_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/mode_coverage":
+                _send_text(sender, "⏳ جاري حساب Mode Coverage بين replay و live snapshots...")
+                _send_text(sender, build_mode_coverage_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/historical_report":
+                _send_text(sender, build_historical_report(settings))
+                continue
+            if command == "/help_technical_dataset":
+                _send_text(sender, build_technical_dataset_help())
+                continue
+            if command == "/help_historical_replay":
+                _send_text(sender, build_historical_replay_help())
+                continue
+            if command == "/replay_start_30d":
+                _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=30))
+                continue
+            if command == "/replay_start_45d":
+                _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=45))
+                continue
+            if command == "/replay_start_90d":
+                _send_text(sender, build_replay_start_report(settings, redis_client=_snapshot_redis_client(trade_store), days=90))
+                continue
+            if command == "/replay_status":
+                _send_text(sender, build_replay_status_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/replay_stop":
+                _send_text(sender, build_replay_stop_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/replay_export":
+                _send_text(sender, build_replay_export_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/replay_export_file":
+                export = build_replay_export_file(settings, redis_client=_snapshot_redis_client(trade_store))
+                if not export.get("ok"):
+                    _send_text(sender, "⚠️ " + str(export.get("message") or "Replay export failed."))
+                else:
+                    # ✅ FIX 1d: doc_result بدل result — يمنع shadowing على scan result
+                    doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Historical Replay Dataset"))
+                    if not doc_result.get("ok"):
+                        _send_text(sender, "⚠️ فشل إرسال الملف عبر Telegram. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
+                continue
+            if command == "/replay_summary":
+                _send_text(sender, build_replay_summary_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/replay_clear":
+                _send_text(sender, build_replay_clear_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/compare_live_vs_replay":
+                _send_text(sender, build_compare_live_vs_replay_report(settings, redis_client=_snapshot_redis_client(trade_store)))
+                continue
+            if command == "/okx_status":
+                reply = _build_okx_status_panel(settings, okx_client=okx_client)
+            elif command == "/ai_report":
+                _send_text(sender, _build_ai_report_panel(settings))
+                continue
+            elif command in {
+                "/ai_report_sim_trades", "/ai_report_sim_rejections",
+                "/ai_report_exec_trades", "/ai_report_exec_rejections",
+                "/ai_report_snapshot_sim", "/ai_report_snapshot_exec",
+            }:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                _send_ai_report_file(sender, command, today)
+                continue
+            elif command == "/status":
+                reply = _build_fast_status(result, settings, trade_store)
+            elif command == "/mood":
+                reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
+            elif command == "/help_execution":
+                reply = result.get("help_execution", "")
+            elif command == "/help_normal":
+                reply = result.get("help_normal", "")
+            elif command == "/okx_orders_on":
+                mode_applied = _set_runtime_signal_delivery_mode(settings, "trading")
+                applied = bool(mode_applied and _set_runtime_okx_orders(settings, True) and _runtime_mode_snapshot(settings).get("active_mode") == "trading")
+                reply = "✅ تم تشغيل وضع التداول وتنفيذ OKX." if applied else "⚠️ تعذر تشغيل تنفيذ OKX لأن Runtime Mode لم يصبح Trading."
+            elif command == "/okx_orders_off":
+                applied = _set_runtime_okx_orders(settings, False)
+                reply = "⏸ تم إيقاف تنفيذ OKX." if applied else "⚠️ تعذر إيقاف تنفيذ OKX."
+            elif command in ("/help_simulation", "/simulation_help"):
+                reply = _build_simulation_help()
+            elif command in ("/admin", "/help_admin"):
+                reply = _build_admin_panel()
+            elif command in ("/bot_modes", "/modes", "/mode"):
+                reply = _build_bot_modes_panel(settings)
+                _send_text(sender, reply, reply_markup=_build_bot_modes_keyboard())
+                continue
+            elif command == "/okx_control":
+                reply = _build_okx_control_panel(settings)
+                _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
+                continue
+            else:
+                simulation_outputs = _build_simulation_command_outputs(result)
+                reply = (
+                    simulation_outputs.get(command)
+                    or command_outputs.get(command)
+                    or command_outputs.get(command.lstrip("/"))
+                    or "الأمر غير متاح في نسخة v123 بعد."
+                )
+                # أضف رصيد OKX في أعلى تقارير التنفيذ فقط
+                _is_exec_report = (
+                    command.startswith("/report_execution")
+                    and not command.startswith("/report_execution_intelligence")
+                    and command not in simulation_outputs
+                )
+                if _is_exec_report and reply and not _is_simulation_mode(settings):
+                    balance_header = _build_execution_balance_header(result, settings)
+                    reply = balance_header + "\n" + reply
+            _send_text(sender, reply)
     return offset
 
 
 def _block_protection_alert_for_level(level: int, affected: int = 0, protected: int = 0, tightened: int = 0) -> str:
     if level <= 1:
         return "\n".join([
-    "🛡 متابعة حماية البلوك",
-    "┄┄┄┄┄┄┄┄",
-    "🟡 المستوى 1 — مراقبة فقط",
-    f"📊 الصفقات المتأثرة: {affected}",
-    "⚙️ الإجراء: مراقبة بدون تعديل SL أو trailing",
-    "⏭ Soft Protection بعد ~5m إذا استمر BLOCK_LONGS",
+            "🛡 متابعة حماية البلوك",
+            "┄┄┄┄┄┄┄┄",
+            "🟡 المستوى 1 — مراقبة فقط",
+            f"📊 الصفقات المتأثرة: {affected}",
+            "⚙️ الإجراء: مراقبة بدون تعديل SL أو trailing",
+            "⏭ Soft Protection بعد ~5m إذا استمر BLOCK_LONGS",
         ])
     if level == 2:
         return "\n".join([
-    "🛡 تفعيل حماية البلوك",
-    "┄┄┄┄┄┄┄┄",
-    "🟠 المستوى 2 — حماية مرنة",
-    f"📊 الصفقات المتأثرة: {affected}",
-    f"✅ الأرباح المحمية: {protected}",
-    f"🔧 Runners تحت حماية أخف: {tightened}",
-    "⚪ الصفقات السلبية ما زالت على SL الأصلي",
-    "⚙️ الإجراء: حماية الأرباح الحالية بدون إغلاق عشوائي",
-    "⏭ Defensive Protection بعد ~10m إذا استمر BLOCK_LONGS",
+            "🛡 تفعيل حماية البلوك",
+            "┄┄┄┄┄┄┄┄",
+            "🟠 المستوى 2 — حماية مرنة",
+            f"📊 الصفقات المتأثرة: {affected}",
+            f"✅ الأرباح المحمية: {protected}",
+            f"🔧 Runners تحت حماية أخف: {tightened}",
+            "⚪ الصفقات السلبية ما زالت على SL الأصلي",
+            "⚙️ الإجراء: حماية الأرباح الحالية بدون إغلاق عشوائي",
+            "⏭ Defensive Protection بعد ~10m إذا استمر BLOCK_LONGS",
         ])
     return "\n".join([
         "🛡 تصعيد حماية البلوك",
@@ -5467,11 +5467,11 @@ def _enrich_reminder_context(result: dict, base_context: dict, settings: Setting
         t for t in trades
         if bool(getattr(t, "protected_runner", False))
         or (
-    bool(getattr(t, "tp2_hit", False))
-    and bool(
-    getattr(t, "runner_active", False)
-    or getattr(t, "has_open_runner", False)
-    )
+            bool(getattr(t, "tp2_hit", False))
+            and bool(
+                getattr(t, "runner_active", False)
+                or getattr(t, "has_open_runner", False)
+            )
         )
     ]
 
@@ -5507,26 +5507,26 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
 
     if mode == MODE_BLOCK_LONGS:
         for threshold, level in BLOCK_REMINDER_THRESHOLDS:
-    if minutes_in_mode >= threshold and level not in tracker["block_levels_sent"]:
-    tracker["block_levels_sent"].add(level)
-    context = _enrich_reminder_context(result, result.get("mode_context", {}), settings=settings)
-    context.update({
-    "reminder_count": level,
-    "minutes_in_mode": minutes_in_mode,
-    "protection_current": f"LEVEL {level} — " + ("Monitor Only" if level == 1 else "Soft Protection" if level == 2 else "Defensive Protection"),
-    "protection_next": "Soft Protection" if level == 1 else "Defensive Protection" if level == 2 else "Max protection active",
-    "remaining_minutes": 5 if level == 1 else 5 if level == 2 else 0,
-    })
-    # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
-    _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
-    trades = _reminder_trades_for_runtime(result, settings)
-    _send_text(sender, _block_protection_alert_for_level(
-    level,
-    affected=len(trades),
-    protected=sum(1 for t in trades if getattr(t, "pnl_pct", 0) > 0),
-    tightened=sum(1 for t in trades if getattr(t, "tp2_hit", False)),
-    ))
-    break
+            if minutes_in_mode >= threshold and level not in tracker["block_levels_sent"]:
+                tracker["block_levels_sent"].add(level)
+                context = _enrich_reminder_context(result, result.get("mode_context", {}), settings=settings)
+                context.update({
+                    "reminder_count": level,
+                    "minutes_in_mode": minutes_in_mode,
+                    "protection_current": f"LEVEL {level} — " + ("Monitor Only" if level == 1 else "Soft Protection" if level == 2 else "Defensive Protection"),
+                    "protection_next": "Soft Protection" if level == 1 else "Defensive Protection" if level == 2 else "Max protection active",
+                    "remaining_minutes": 5 if level == 1 else 5 if level == 2 else 0,
+                })
+                # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
+                _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
+                trades = _reminder_trades_for_runtime(result, settings)
+                _send_text(sender, _block_protection_alert_for_level(
+                    level,
+                    affected=len(trades),
+                    protected=sum(1 for t in trades if getattr(t, "pnl_pct", 0) > 0),
+                    tightened=sum(1 for t in trades if getattr(t, "tp2_hit", False)),
+                ))
+                break
         return
 
     expected_count = minutes_in_mode // GENERAL_MODE_REMINDER_MINUTES
@@ -5588,20 +5588,20 @@ def live_worker() -> None:
     def _command_thread_loop():
         nonlocal telegram_offset
         while True:
-    try:
-    if sender.enabled and settings.telegram_enabled and last_result is not None:
-    with _cmd_lock:
-    telegram_offset = _poll_telegram_commands_safe(
-    sender,
-    last_result,
-    telegram_offset,
-    settings,
-    trade_store,
-    okx_client=okx_client,
-    )
-    except Exception as exc:
-    print(f"⚠️ command thread error: {exc}", flush=True)
-    time.sleep(0.5)
+            try:
+                if sender.enabled and settings.telegram_enabled and last_result is not None:
+                    with _cmd_lock:
+                        telegram_offset = _poll_telegram_commands_safe(
+                            sender,
+                            last_result,
+                            telegram_offset,
+                            settings,
+                            trade_store,
+                            okx_client=okx_client,
+                        )
+            except Exception as exc:
+                print(f"⚠️ command thread error: {exc}", flush=True)
+            time.sleep(0.5)
 
     _cmd_thread = threading.Thread(
         target=_command_thread_loop,
@@ -5628,45 +5628,45 @@ def live_worker() -> None:
 
     while True:
         try:
-    previous_scan_mode = state.mode if state is not None else None
-    result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
-    state = result["state"]
-    if sender.enabled and settings.telegram_enabled:
-    if settings.send_mode_status_each_scan:
-    mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
-    if mode_changed_in_scan and result.get("mode_transition_message"):
-    _send_text(sender, result.get("mode_transition_message", ""))
-    else:
-    _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
-    next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
-    _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
-    _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
+            previous_scan_mode = state.mode if state is not None else None
+            result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
+            state = result["state"]
+            if sender.enabled and settings.telegram_enabled:
+                if settings.send_mode_status_each_scan:
+                    mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
+                    if mode_changed_in_scan and result.get("mode_transition_message"):
+                        _send_text(sender, result.get("mode_transition_message", ""))
+                    else:
+                        _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
+                next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
+                _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
+                _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
 
-    last_result = result
-    _run_ai_export(result, settings)
-    if settings.verbose_logs:
-    print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
-    else:
-    _print_scan_summary(result, trade_store)
+            last_result = result
+            _run_ai_export(result, settings)
+            if settings.verbose_logs:
+                print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
+            else:
+                _print_scan_summary(result, trade_store)
         except Exception as exc:
-    error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
-    print(error_text, flush=True)
-    if sender.enabled and settings.telegram_enabled:
-    sender.send_message(error_text)
+            error_text = f"❌ OKX bot loop error: {exc}\n{traceback.format_exc()[-1200:]}"
+            print(error_text, flush=True)
+            if sender.enabled and settings.telegram_enabled:
+                sender.send_message(error_text)
 
         wait_until = time.time() + max(30, int(settings.scan_interval_seconds))
         while time.time() < wait_until:
-    if sender.enabled and settings.telegram_enabled:
-    try:
-    now_ts = time.time()
-    if last_result is not None:
-    if now_ts >= next_mode_guard_ts:
-    state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
-    next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
-    _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
-    except Exception as exc:
-    print(f"mode reminder error: {exc}", flush=True)
-    time.sleep(max(0.5, float(TELEGRAM_COMMAND_POLL_SLEEP_SECONDS)))
+            if sender.enabled and settings.telegram_enabled:
+                try:
+                    now_ts = time.time()
+                    if last_result is not None:
+                        if now_ts >= next_mode_guard_ts:
+                            state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
+                            next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
+                        _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
+                except Exception as exc:
+                    print(f"mode reminder error: {exc}", flush=True)
+            time.sleep(max(0.5, float(TELEGRAM_COMMAND_POLL_SLEEP_SECONDS)))
 
 
 if __name__ == "__main__":
