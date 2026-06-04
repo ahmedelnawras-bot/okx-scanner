@@ -2472,12 +2472,17 @@ def run_once(
         setattr(candidate_trade, "telegram_announced", False)
         setattr(candidate_trade, "announced_to_telegram", False)
 
+        # Only already-open trades should consume slots in trading mode.
+        # Same-scan provisional reservation is kept for simulation only,
+        # because simulation activates immediately inside this same cycle.
+        reserve_same_scan_slot = bool(simulation_mode_active and consumes_live_slot)
+
         eligible_for_activation = consumes_live_slot and not _has_active_same_symbol(
             [*gate_base_trades, *local_gate_trades],
             candidate_trade,
         )
 
-        if eligible_for_activation:
+        if eligible_for_activation and reserve_same_scan_slot:
             path = str(exec_result.get("path") or "general")
             if path == "block_exception":
                 slot_counts["block_exception"] = slot_counts.get("block_exception", 0) + 1
@@ -2502,7 +2507,7 @@ def run_once(
                     slot_counts["general"] -= 1
                     eligible_for_activation = False
 
-            # Reserve this trade for same-scan gating.
+            # Reserve this trade for same-scan gating only in simulation mode.
             local_gate_trades.append(candidate_trade)
 
             # Simulation mode must mirror the trading decision immediately:
@@ -2777,6 +2782,8 @@ def _activate_announced_trade(
 
     exchange_required = bool(item.get("exchange_required"))
     exchange_order_ok = bool(item.get("exchange_order_ok", not exchange_required))
+    register_as_open_trade = bool(item.get("register_as_open_trade", False))
+
     if exec_status == "accepted_preview" and exchange_required and not exchange_order_ok:
         item["announcement_status"] = "exchange_failed"
         _attach_exchange_state_to_trade(candidate_trade, item.get("exchange_order_result"))
@@ -2810,12 +2817,16 @@ def _activate_announced_trade(
         return True
 
     if not bool(item.get("eligible_for_activation")):
-        # This execution check passed a gate label, but it was not eligible to
-        # become a live tracked trade in this scan (same-symbol / slot context).
+        return True
+
+    # accepted_preview must become an open tracked trade ONLY after real OKX success.
+    # Preview-only / orders-off / rejected-by-exchange signals are announced, but never
+    # inserted into Open Trades or execution reports.
+    if not register_as_open_trade:
+        item["announcement_status"] = "preview_only_sent"
         return True
 
     if not updated_existing:
-        # ✅ تأكد إن الـ flags صح قبل الحفظ في Redis
         setattr(candidate_trade, "execution_trade", True)
         setattr(candidate_trade, "tracking_bucket", "execution")
         trades.append(candidate_trade)
@@ -3525,6 +3536,9 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         item["exchange_required"] = exchange_required
         item["exchange_order_result"] = managed_order_result
         item["exchange_order_ok"] = exchange_order_ok
+        item["register_as_open_trade"] = bool(
+            simulation_mode_active or (exchange_required and exchange_order_ok)
+        )
 
         if exchange_required:
             _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
