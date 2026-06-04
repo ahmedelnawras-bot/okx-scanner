@@ -12,6 +12,7 @@ from utils.constants import (
 
 from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
+from .candle_reversal_gate import evaluate_candle_reversal_gate
 
 
 # ─────────────────────────────────────────
@@ -197,6 +198,7 @@ def _base_response(
     reason: str,
     slot_scope: str = "",
     order: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     execution_score = _get_execution_score(signal)
     path = gate.get("path") if isinstance(gate, dict) else ""
@@ -256,6 +258,10 @@ def _base_response(
         payload["drawdown_level"] = risk.get("drawdown_level")
         payload["drawdown_pct"] = risk.get("drawdown_pct")
 
+    # ✅ Candle gate metadata — للـ logging والـ reports فقط
+    if isinstance(extra, dict):
+        payload.update(extra)
+
     return payload
 
 
@@ -313,6 +319,28 @@ def process_trade_candidate(
             gate=gate,
             status=status,
             reason=gate["reason"],
+        )
+
+    # ─────────────────────────────────────────
+    # Candle Reversal Gate
+    # Normal:   يمنع شراء القمم (bearish reversal)
+    # Recovery: يشترط bullish reversal
+    # لا يغير الـ score أو الـ ranking
+    # ─────────────────────────────────────────
+    _candle_gate = evaluate_candle_reversal_gate(signal, risk_mode)
+    if not _candle_gate["execution_allowed"]:
+        return _base_response(
+            signal=signal,
+            gate=gate,
+            status="rejected_quality",
+            reason=_candle_gate["reason"],
+            extra={
+                "candle_gate": _candle_gate,
+                "bearish_reversal_detected": _candle_gate["bearish_reversal_detected"],
+                "bullish_reversal_detected": _candle_gate["bullish_reversal_detected"],
+                "reversal_pattern": _candle_gate["pattern"],
+                "reversal_strength": _candle_gate["reversal_strength"],
+            },
         )
 
     # ─────────────────────────────────────────
