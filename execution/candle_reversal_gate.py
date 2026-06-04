@@ -258,9 +258,11 @@ def evaluate_candle_reversal_gate(
     """
     meta = getattr(signal, "meta", {}) or {}
     raw_candles = list(meta.get("raw_candles", []) or [])
+    symbol = str(getattr(signal, "symbol", "-") or "-")
 
     # لو مفيش candles → اسمح بالتنفيذ (لا تبلوك بدون بيانات)
     if not raw_candles:
+        print(f"🕯 CANDLE_GATE | {symbol} | no_candle_data → allowed", flush=True)
         return {
             "bullish_reversal_detected": False,
             "bearish_reversal_detected": False,
@@ -324,6 +326,12 @@ def evaluate_candle_reversal_gate(
                 bearish_strength = strengths.get(pattern, 0.70)
                 break  # أول pattern يكفي للمنع
 
+        print(
+            f"🕯 CANDLE_GATE | {symbol} | mode=normal | "
+            f"bearish={bearish_found} | pattern={bearish_pattern or 'none'} | "
+            f"allowed={not bearish_found}",
+            flush=True,
+        )
         return {
             "bullish_reversal_detected": False,
             "bearish_reversal_detected": bearish_found,
@@ -363,6 +371,12 @@ def evaluate_candle_reversal_gate(
             bullish_strength = strengths.get(pattern, 0.70)
             break
 
+    print(
+        f"🕯 CANDLE_GATE | {symbol} | mode=recovery | "
+        f"bullish={bullish_found} | pattern={bullish_pattern or 'none'} | "
+        f"allowed={bullish_found}",
+        flush=True,
+    )
     return {
         "bullish_reversal_detected": bullish_found,
         "bearish_reversal_detected": False,
