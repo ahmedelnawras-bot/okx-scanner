@@ -257,7 +257,11 @@ def evaluate_candle_reversal_gate(
         }
     """
     meta = getattr(signal, "meta", {}) or {}
-    raw_candles = list(meta.get("raw_candles", []) or [])
+    raw_candles = list(
+        meta.get("raw_candles")
+        or meta.get("recent_candles")
+        or []
+    )
     symbol = str(getattr(signal, "symbol", "-") or "-")
 
     # لو مفيش candles → اسمح بالتنفيذ (لا تبلوك بدون بيانات)
