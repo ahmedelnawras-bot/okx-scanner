@@ -4485,6 +4485,51 @@ def _delete_redis_keys_by_patterns(trade_store: RedisTradeStore | None, patterns
     return 0
 
 
+
+
+def _replace_persisted_live_trades(
+    trade_store: RedisTradeStore | None,
+    trades: list | None,
+) -> None:
+    """Hard-replace current live-trade snapshot in Redis.
+
+    save_trades() upserts provided trades but does not delete omitted closed/history
+    records from Redis. This helper clears current trade/check keys first, then
+    writes back only the trades that should remain.
+    """
+    if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
+        return
+
+    client = trade_store.client
+    keep_trades = list(trades or [])
+    try:
+        namespace_keys = []
+        try:
+            namespace_keys = list(getattr(trade_store, "_current_namespace_keys")() or [])
+        except Exception:
+            namespace_keys = []
+
+        keys_to_delete = []
+        for key in namespace_keys:
+            key_text = str(key or "")
+            if (
+                ":trade:" in key_text
+                or key_text.endswith(":trades:open")
+                or key_text.endswith(":trades:history")
+                or key_text.endswith(":execution:checks")
+            ):
+                keys_to_delete.append(key_text)
+
+        if keys_to_delete:
+            for i in range(0, len(keys_to_delete), 500):
+                client.delete(*keys_to_delete[i:i + 500])
+
+        if keep_trades:
+            trade_store.save_trades(keep_trades)
+    except Exception as exc:
+        print(f"⚠️ replace persisted live trades failed: {exc}", flush=True)
+
+
 def _reset_reports_preview(kind: str, trade_store: RedisTradeStore | None, result: dict | None = None) -> dict:
     live_trades = []
     if trade_store:
@@ -4617,7 +4662,7 @@ def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, resul
 
     if trade_store and getattr(trade_store, "enabled", False):
         try:
-            trade_store.save_trades(kept_live)
+            _replace_persisted_live_trades(trade_store, kept_live)
         except Exception as exc:
             print(f"⚠️ save after report reset failed: {exc}", flush=True)
 
@@ -4730,7 +4775,11 @@ def _handle_admin_clean_command(
     if command == "/deep_clean_confirm":
         stats = trade_store.deep_clean() if trade_store else {"enabled": False, "mode": "deep"}
         if result is not None and stats.get("enabled"):
-            _reset_runtime_state_after_clean(result, keep_mode_state=True)
+            _refresh_runtime_after_report_reset(
+                result,
+                trade_store=trade_store,
+                settings=settings or get_settings(),
+            )
         return _format_clean_result(stats, "🧨 Deep Clean Done")
     return None
 
