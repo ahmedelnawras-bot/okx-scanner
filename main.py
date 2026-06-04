@@ -1,3 +1,6 @@
+import logging
+logger = logging.getLogger(__name__)
+
 """OKX Long Bot clean rebuild v125 mode-guard/report-style worker.
 
 Preserved design:
@@ -3517,7 +3520,10 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 item["announcement_status"] = "exchange_failed"
                 _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
                 continue
-            _activate_announced_trade(result, item, trade_store=trade_store)
+            try:
+                _activate_announced_trade(result, item, trade_store=trade_store)
+            except Exception as e:
+                logger.error(f"❌ Trade registration failed: {e}")
         else:
             item["announcement_status"] = "sent" if send_ok else "send_failed"
 
