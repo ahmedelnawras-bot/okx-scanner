@@ -651,7 +651,6 @@ def _resolve_simulation_portfolio_state_inputs(
         "start_of_day_balance": float(start_balance),
         "margin_per_trade": float(margin_per_trade or 0.0),
         "leverage": leverage,
-        "source": "simulation_wallet_daily_balance",
     }
 
 
