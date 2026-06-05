@@ -42,6 +42,55 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+
+
+def _candle_color(metric: dict) -> str:
+    if not metric:
+        return "unknown"
+    return "green" if bool(metric.get("is_bullish")) else "red"
+
+
+def _body_ratio(metric: dict) -> float:
+    total_range = _safe_float(metric.get("total_range"), 0.0) if metric else 0.0
+    body = _safe_float(metric.get("body"), 0.0) if metric else 0.0
+    return body / total_range if total_range > 0 else 0.0
+
+
+def _candle_export_fields(
+    curr: dict | None = None,
+    closed: list[dict] | None = None,
+    *,
+    pattern: str = "",
+    reversal_strength: float = 0.0,
+    reversal_kind: str = "",
+) -> dict:
+    """Return export-only candle analytics without changing gate logic."""
+    curr = curr or {}
+    closed = closed or []
+
+    upper_wick_ratio = _safe_float(curr.get("upper_wick_ratio"), 0.0)
+    lower_wick_ratio = _safe_float(curr.get("lower_wick_ratio"), 0.0)
+
+    if reversal_kind == "bullish":
+        wick_ratio = lower_wick_ratio
+    elif reversal_kind == "bearish":
+        wick_ratio = upper_wick_ratio
+    else:
+        wick_ratio = max(upper_wick_ratio, lower_wick_ratio)
+
+    return {
+        "entry_pattern": str(pattern or ""),
+        "reversal_type": str(pattern or ""),
+        "wick_ratio": wick_ratio,
+        "body_ratio": _body_ratio(curr),
+        "body_pct": _safe_float(curr.get("body_pct"), 0.0),
+        "upper_wick_ratio": upper_wick_ratio,
+        "lower_wick_ratio": lower_wick_ratio,
+        "candle_strength": _safe_float(reversal_strength, 0.0),
+        "last_3_candles": [_candle_color(c) for c in list(closed or [])[:3]],
+    }
+
+
 def _candle_metrics(c: dict) -> dict:
     """احسب المقاييس الأساسية لشمعة واحدة."""
     o = _safe_float(c.get("open"))
@@ -274,6 +323,7 @@ def evaluate_candle_reversal_gate(
             "execution_allowed": True,
             "reason": "no_candle_data",
             "pattern": "",
+            **_candle_export_fields(pattern="", reversal_strength=0.0, reversal_kind=""),
         }
 
     # احسب metrics لآخر شمعتين مغلقتين
@@ -291,6 +341,7 @@ def evaluate_candle_reversal_gate(
             "execution_allowed": True,
             "reason": "no_closed_candles",
             "pattern": "",
+            **_candle_export_fields(pattern="", reversal_strength=0.0, reversal_kind=""),
         }
 
     curr = closed[0]                          # آخر شمعة مغلقة
@@ -343,6 +394,13 @@ def evaluate_candle_reversal_gate(
             "execution_allowed": not bearish_found,
             "reason": f"bearish_reversal:{bearish_pattern}" if bearish_found else "candle_ok",
             "pattern": bearish_pattern,
+            **_candle_export_fields(
+                curr,
+                closed,
+                pattern=bearish_pattern,
+                reversal_strength=bearish_strength,
+                reversal_kind="bearish" if bearish_found else "",
+            ),
         }
 
     # ─────────────────────────────────────────
@@ -388,4 +446,11 @@ def evaluate_candle_reversal_gate(
         "execution_allowed": bullish_found,
         "reason": f"bullish_reversal:{bullish_pattern}" if bullish_found else "no_bullish_reversal_in_recovery",
         "pattern": bullish_pattern,
+        **_candle_export_fields(
+            curr,
+            closed,
+            pattern=bullish_pattern,
+            reversal_strength=bullish_strength,
+            reversal_kind="bullish" if bullish_found else "",
+        ),
     }
