@@ -108,6 +108,11 @@ LOW_BALANCE_THRESHOLD_USDT: float = 109.0
 LOW_BALANCE_ALLOCATION_PCT: float = 40.0
 LOW_BALANCE_MAX_SLOTS: int = 3
 
+# Live execution hard guard: never send OKX orders when planned margin is too small
+# to survive OKX lot/min-size normalization. This prevents normalized_size_zero
+# and also blocks zero/tiny OKX balances before exchange placement.
+LIVE_MIN_EXECUTION_MARGIN_USDT: float = 1.0
+
 # Telegram send pacing.
 # This only spaces Telegram messages after decisions are already made.
 # It does not delay process_trade_candidate, OKX execution, slots, or simulation tracking.
@@ -341,22 +346,11 @@ def _risk_profile_snapshot(
 
     reference_balance = _safe_float(reference_balance, 0.0)
 
-    # ✅ FIX: لو الرصيد 0 في execution mode
-    # ١. جرب الـ cache أولاً
-    # ٢. لو الـ cache فاضي، اجلب من OKX مباشرة وخزن في cache
-    import time as _time
+    # Live execution must display the current OKX-derived balance only.
+    # Do not borrow cached/paper/simulation balances here; zero/tiny OKX balance
+    # must remain visible so execution can be blocked safely.
     if reference_balance <= 0 and risk_context == "execution":
-        with _CACHED_OKX_BALANCE_LOCK:
-            _cached = _CACHED_OKX_BALANCE
-            _cached_ts = _CACHED_OKX_BALANCE_TS
-        if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-            reference_balance = _cached
-            resolved_source = "okx_balance_cached"
-        else:
-            _direct_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
-            if _direct_balance > 0:
-                reference_balance = _direct_balance
-                resolved_source = "okx_balance_inputs"
+        resolved_source = "live_okx_balance_zero_or_unavailable"
 
     # Low balance mode is applied here via reference_balance
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
@@ -364,12 +358,19 @@ def _risk_profile_snapshot(
     margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
     if risk_context == "simulation" or margin_per_trade <= 0:
         margin_per_trade = _compute_margin_from_reference(reference_balance, settings) if reference_balance > 0 else 0.0
+    if risk_context == "execution" and margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
+        margin_per_trade = 0.0
 
     reason_bits: list[str] = []
     if risk_context == "simulation":
         reason_bits.append("simulation_wallet_balance")
     elif risk_context == "execution":
-        reason_bits.append("okx_live_balance")
+        if reference_balance <= 0:
+            reason_bits.append("live_okx_balance_zero_or_unavailable")
+        elif margin_per_trade <= 0:
+            reason_bits.append("live_okx_margin_too_small")
+        else:
+            reason_bits.append("okx_live_balance")
     else:
         reason_bits.append("scan_or_paper_sizing")
 
@@ -500,20 +501,33 @@ def _resolve_entry_margin_plan(
 
     okx_reference_balance = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
 
-    # ✅ FIX: cache آخر رصيد صح من OKX — thread-safe
+    # Cache may be updated for diagnostics only. Live execution sizing never
+    # falls back to cached balance, because a current zero/tiny OKX balance must
+    # block execution instead of reusing stale capital.
     import time as _time
     now_ts = _time.time()
     with _CACHED_OKX_BALANCE_LOCK:
         if okx_reference_balance > 0:
             _CACHED_OKX_BALANCE = okx_reference_balance
             _CACHED_OKX_BALANCE_TS = now_ts
-            print(f"💰 OKX balance cached: {okx_reference_balance:.2f} USDT", flush=True)
-        elif _CACHED_OKX_BALANCE > 0 and (now_ts - _CACHED_OKX_BALANCE_TS) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-            okx_reference_balance = _CACHED_OKX_BALANCE
-            print(f"💰 OKX balance from cache: {okx_reference_balance:.2f} USDT (age={(now_ts - _CACHED_OKX_BALANCE_TS):.0f}s)", flush=True)
+            print(f"💰 OKX balance cached: {okx_reference_balance:.4f} USDT", flush=True)
 
     okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
+        live_okx_mode = bool(
+            okx_client is not None
+            and getattr(okx_client, "configured", False)
+            and not bool(getattr(settings, "okx_simulated", True))
+        )
+        if live_okx_mode and okx_margin < LIVE_MIN_EXECUTION_MARGIN_USDT:
+            return {
+                "source": "okx_balance",
+                "reference_balance_usdt": okx_reference_balance,
+                "margin_usdt": 0.0,
+                "position_pct": 0.0,
+                "reason": "live_okx_margin_too_small",
+                "min_execution_margin_usdt": LIVE_MIN_EXECUTION_MARGIN_USDT,
+            }
         return {
             "source": "okx_balance",
             "reference_balance_usdt": okx_reference_balance,
@@ -552,7 +566,6 @@ def _resolve_portfolio_state_inputs(
     okx_client: OKXTradeClient | None,
     settings: Settings,
 ) -> dict:
-    import time as _time
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     reference_balance = _safe_float((sizing or {}).get("reference_balance_usdt"), 0.0)
     margin_per_trade = _safe_float((sizing or {}).get("margin_usdt"), 0.0)
@@ -563,16 +576,10 @@ def _resolve_portfolio_state_inputs(
         and not bool(getattr(settings, "okx_simulated", True))
     )
 
-    # ✅ FIX: لو live mode والـ balance = 0 → استخدم الـ cache بـ lock
-    if live_okx_mode and reference_balance <= 0:
-        with _CACHED_OKX_BALANCE_LOCK:
-            _cached = _CACHED_OKX_BALANCE
-            _cached_ts = _CACHED_OKX_BALANCE_TS
-        if _cached > 0 and (_time.time() - _cached_ts) < _CACHED_OKX_BALANCE_TTL_SECONDS:
-            reference_balance = _cached
-            margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
-            print(f"💰 portfolio_state_inputs using cached balance: {reference_balance:.2f} USDT", flush=True)
-        else:
+    # In live execution mode, never use cache or paper fallback for sizing.
+    # OKX balance zero/tiny => margin 0 and execution remains blocked.
+    if live_okx_mode:
+        if reference_balance <= 0 or margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
             margin_per_trade = 0.0
     elif margin_per_trade <= 0:
         margin_per_trade = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
@@ -3796,11 +3803,43 @@ def _execute_managed_okx_order(
     entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
 
     sizing = _resolve_entry_margin_plan(okx_client, settings)
-    margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0) or max(
-        _safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0
-    ) or 35.0
+    margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0)
 
     TD_MODE = "cross"
+
+    live_okx_mode = bool(
+        okx_client is not None
+        and getattr(okx_client, "configured", False)
+        and not bool(getattr(settings, "okx_simulated", True))
+    )
+    if live_okx_mode and margin_usdt < LIVE_MIN_EXECUTION_MARGIN_USDT:
+        reason = str(sizing.get("reason") or "live_okx_margin_too_small")
+        entry_result = {
+            "ok": False,
+            "reason": reason,
+            "simulated": False,
+            "balance": sizing.get("reference_balance_usdt"),
+            "margin_usdt": margin_usdt,
+            "min_execution_margin_usdt": LIVE_MIN_EXECUTION_MARGIN_USDT,
+        }
+        return {
+            "ok": False,
+            "entry": entry_result,
+            "tp_split": None,
+            "plan": {},
+            "sizing": sizing,
+            "used_margin_usdt": margin_usdt,
+            "td_mode": TD_MODE,
+            "requested_leverage": max(1, int(getattr(settings, "default_leverage", 1) or 1)),
+            "effective_leverage": max(1, int(getattr(settings, "default_leverage", 1) or 1)),
+            "leverage_set_result": None,
+            "sl_attached": False,
+            "tp_orders_ok": False,
+            "requires_runner_trailing": False,
+            "reason": reason,
+        }
+    if not live_okx_mode and margin_usdt <= 0:
+        margin_usdt = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
 
     leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
     effective_leverage = leverage
