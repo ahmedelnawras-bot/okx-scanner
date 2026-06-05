@@ -81,8 +81,139 @@ SMART_SL_MAX_PCT = 3.40
 SMART_TP1_MIN_RR = 1.15
 SMART_TP1_MAX_RR = 2.10
 
+
 SMART_TP2_MIN_RR = 1.90
 SMART_TP2_MAX_RR = 3.20
+
+
+def _safe_float(
+    value: object,
+    default: float = 0.0,
+) -> float:
+
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _recent_structure_context(
+    pair: PairCandidate,
+    entry: float,
+) -> dict:
+
+    candles = list(getattr(pair, "recent_candles", []) or [])
+    if entry <= 0 or not candles:
+        return {
+            "available": False,
+            "reason": "no_recent_candles",
+            "anchor_low": 0.0,
+            "anchor_range_pct": 0.0,
+            "buffer_pct": 0.0,
+            "structure_risk_pct": 0.0,
+        }
+
+    valid: list[dict] = []
+    for candle in candles[-6:]:
+        if not isinstance(candle, dict):
+            continue
+
+        low = _safe_float(candle.get("low"), 0.0)
+        high = _safe_float(candle.get("high"), 0.0)
+        close = _safe_float(candle.get("close"), 0.0)
+        if low <= 0 or high <= low or close <= 0:
+            continue
+
+        valid.append({
+            "low": low,
+            "high": high,
+            "close": close,
+            "range_pct": ((high - low) / close) * 100.0 if close > 0 else 0.0,
+        })
+
+    if len(valid) < 3:
+        return {
+            "available": False,
+            "reason": "not_enough_valid_candles",
+            "anchor_low": 0.0,
+            "anchor_range_pct": 0.0,
+            "buffer_pct": 0.0,
+            "structure_risk_pct": 0.0,
+        }
+
+    recent_window = valid[-4:]
+    anchor_low = min(c["low"] for c in recent_window)
+    avg_range_pct = sum(c["range_pct"] for c in recent_window) / max(1, len(recent_window))
+
+    buffer_pct = _clamp(
+        avg_range_pct * 0.22,
+        0.12,
+        0.45,
+    )
+
+    structure_stop = anchor_low * (1.0 - (buffer_pct / 100.0))
+    structure_risk_pct = ((entry - structure_stop) / entry) * 100.0 if entry > 0 else 0.0
+
+    return {
+        "available": structure_risk_pct > 0,
+        "reason": "ok" if structure_risk_pct > 0 else "invalid_structure_stop",
+        "anchor_low": round(anchor_low, 8),
+        "anchor_range_pct": round(avg_range_pct, 4),
+        "buffer_pct": round(buffer_pct, 4),
+        "structure_risk_pct": round(max(0.0, structure_risk_pct), 4),
+    }
+
+
+def _blend_structure_risk_pct(
+    pair: PairCandidate,
+    entry: float,
+    base_risk_pct: float,
+    entry_timing: str,
+) -> tuple[float, dict]:
+
+    structure_context = _recent_structure_context(pair, entry)
+    if not structure_context.get("available"):
+        return round(
+            _clamp(
+                base_risk_pct,
+                SMART_SL_MIN_PCT,
+                SMART_SL_MAX_PCT,
+            ),
+            4,
+        ), structure_context
+
+    structure_risk_pct = float(structure_context.get("structure_risk_pct") or 0.0)
+    clamped_structure = _clamp(
+        structure_risk_pct,
+        SMART_SL_MIN_PCT,
+        SMART_SL_MAX_PCT,
+    )
+
+    structure_weight = 0.62 if entry_timing == "pullback" else 0.52
+    blended = (
+        (float(base_risk_pct) * (1.0 - structure_weight))
+        + (clamped_structure * structure_weight)
+    )
+
+    final_risk_pct = round(
+        _clamp(
+            blended,
+            SMART_SL_MIN_PCT,
+            SMART_SL_MAX_PCT,
+        ),
+        4,
+    )
+
+    structure_context = {
+        **structure_context,
+        "base_risk_pct": round(float(base_risk_pct), 4),
+        "blended_risk_pct": final_risk_pct,
+        "structure_weight": round(structure_weight, 3),
+        "sl_engine": "hybrid_structure_risk_cap_v1",
+    }
+    return final_risk_pct, structure_context
 
 
 def _clamp(
@@ -671,6 +802,13 @@ def _calculate_adaptive_targets(
             SMART_SL_MAX_PCT,
         ),
         4,
+    )
+
+    risk_pct, structure_stop_context = _blend_structure_risk_pct(
+        pair=pair,
+        entry=float(pair.last_price or 0.0),
+        base_risk_pct=risk_pct,
+        entry_timing=entry_timing,
     )
 
     # TP1
@@ -1351,6 +1489,7 @@ def build_signal_candidate(
             "nour filter moved downstream",
             "global anti-chase score refinement",
             "pa sub-score pre-nour enabled",
+            "hybrid structure-aware sl enabled",
         ],
 
         meta={
@@ -1372,6 +1511,27 @@ def build_signal_candidate(
 
             "risk_pct":
                 risk_pct,
+
+            "sl_engine":
+                structure_stop_context.get("sl_engine", "adaptive_percent_risk"),
+
+            "structure_stop_context":
+                structure_stop_context,
+
+            "structure_anchor_low":
+                structure_stop_context.get("anchor_low"),
+
+            "structure_anchor_range_pct":
+                structure_stop_context.get("anchor_range_pct"),
+
+            "structure_buffer_pct":
+                structure_stop_context.get("buffer_pct"),
+
+            "structure_risk_pct":
+                structure_stop_context.get("structure_risk_pct"),
+
+            "base_risk_pct_before_structure":
+                structure_stop_context.get("base_risk_pct", risk_pct),
 
             "target_model":
                 target_profile.get(
