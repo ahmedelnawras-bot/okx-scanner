@@ -144,16 +144,16 @@ def _btc_dominance_line(context: dict) -> str:
         unknown_flag = True
 
     if raw is None or unknown_flag:
-        return "• 🧭 BTC Dominance (1h): ⚪ N/A"
+        return "• 🧭 Alt Strength: ⚪ N/A"
 
-    if dom > 0:
-        icon = "↗"
-    elif dom < 0:
-        icon = "↘"
+    if dom >= 0.25:
+        status = "🔴 Weakening"
+    elif dom <= -0.25:
+        status = "🟢 Improving"
     else:
-        icon = "➖"
+        status = "➖ Neutral"
 
-    return f"• 🧭 BTC Dominance (1h): {icon} {dom:+.2f}%"
+    return f"• 🧭 Alt Strength: {status} ({dom:+.2f}%)"
 
 
 def _market_mix_lines(context: dict) -> list[str]:
