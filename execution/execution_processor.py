@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from analysis.models import SignalCandidate
@@ -148,6 +149,89 @@ def _managed_target_model(signal: SignalCandidate, path: str) -> tuple[str, floa
     return "standard_40_40_20", 40.0, 40.0, 20.0
 
 
+
+def _build_decision_trace_id(signal: SignalCandidate) -> str:
+    """Stable-enough id to connect one scan decision to trade/rejection exports."""
+    meta = getattr(signal, "meta", {}) or {}
+    existing = meta.get("decision_trace_id") or meta.get("trace_id")
+    if existing:
+        return str(existing)
+    symbol = str(getattr(signal, "symbol", "") or "unknown")
+    return f"decision_{symbol}_{int(time.time() * 1000)}"
+
+
+def _classify_rejection(status: str, reason: str) -> str:
+    """Normalize rejection reasons into analytics categories only."""
+    status_l = str(status or "").strip().lower()
+    reason_l = str(reason or "").strip().lower()
+
+    if status_l == "rejected_same_symbol" or reason_l == "same_symbol_active_trade":
+        return "same_symbol"
+    if reason_l in {"max_positions_reached", "recovery_cycle_full"} or status_l == "rejected_limit":
+        return "max_positions"
+    if status_l == "rejected_risk" or any(token in reason_l for token in ("drawdown", "risk", "loss_streak")):
+        return "risk_management"
+    if reason_l.startswith("bearish_reversal") or reason_l.startswith("bullish_reversal") or "candle" in reason_l:
+        return "technical_filter"
+    if reason_l in {
+        "late_risky_execution_context",
+        "weak_drift_execution_block",
+        "recovery_quality_not_confirmed",
+        "velocity_instability",
+        "expansion_exhaustion",
+        "pa_structure_weak",
+        "pa_weak_breakout_danger",
+    }:
+        return "technical_filter"
+    if "market" in reason_l or "block" in reason_l:
+        return "market_protection"
+    if status_l.startswith("rejected") or status_l == "candidate_only":
+        return "execution_block"
+    return "accepted" if status_l in {"accepted_preview", "pending_pullback_preview"} else "unknown"
+
+
+def _decision_context(
+    *,
+    decision_trace_id: str,
+    status: str,
+    reason: str,
+    path: str,
+    risk_mode: str,
+    slot_scope: str = "",
+) -> dict[str, Any]:
+    rejection_category = _classify_rejection(status, reason)
+    accepted = status in {"accepted_preview", "pending_pullback_preview"}
+    return {
+        "decision_trace_id": decision_trace_id,
+        "entry_reason": reason if accepted else "",
+        "acceptance_path": path if accepted else "",
+        "risk_mode": risk_mode,
+        "rejection_category": "" if accepted else rejection_category,
+        "status": status,
+        "reason": reason,
+        "path": path,
+        "slot_scope": slot_scope,
+    }
+
+
+def _candle_extra(candle_gate: dict[str, Any]) -> dict[str, Any]:
+    """Flatten candle-gate diagnostics for trade/rejection exports."""
+    pattern = str(candle_gate.get("entry_pattern") or candle_gate.get("pattern") or "")
+    strength = candle_gate.get("candle_strength", candle_gate.get("reversal_strength", 0.0))
+    return {
+        "candle_gate": candle_gate,
+        "bearish_reversal_detected": bool(candle_gate.get("bearish_reversal_detected")),
+        "bullish_reversal_detected": bool(candle_gate.get("bullish_reversal_detected")),
+        "reversal_pattern": pattern,
+        "reversal_strength": strength,
+        "entry_pattern": pattern,
+        "reversal_type": str(candle_gate.get("reversal_type") or pattern),
+        "wick_ratio": float(candle_gate.get("wick_ratio") or 0.0),
+        "body_ratio": float(candle_gate.get("body_ratio") or 0.0),
+        "candle_strength": float(strength or 0.0),
+        "last_3_candles": list(candle_gate.get("last_3_candles") or []),
+    }
+
 def _build_managed_trade_preview(signal: SignalCandidate, path: str) -> dict[str, Any]:
     target_model, tp1_pct, tp2_pct, runner_pct = _managed_target_model(signal, path)
     entry = float(getattr(signal, "entry", 0.0) or 0.0)
@@ -199,9 +283,21 @@ def _base_response(
     slot_scope: str = "",
     order: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
+    decision_trace_id: str = "",
+    effective_risk_mode: str = "",
 ) -> dict[str, Any]:
     execution_score = _get_execution_score(signal)
     path = gate.get("path") if isinstance(gate, dict) else ""
+    decision_trace_id = decision_trace_id or _build_decision_trace_id(signal)
+    effective_risk_mode = str(effective_risk_mode or "")
+    decision_ctx = _decision_context(
+        decision_trace_id=decision_trace_id,
+        status=status,
+        reason=reason,
+        path=str(path or ""),
+        risk_mode=effective_risk_mode,
+        slot_scope=slot_scope,
+    )
     managed_trade_plan = _build_managed_trade_preview(signal, str(path or ""))
     target_model, tp1_pct, tp2_pct, runner_pct = _managed_target_model(signal, str(path or ""))
 
@@ -210,6 +306,12 @@ def _base_response(
         "reason": reason,
         "path": path,
         "slot_scope": slot_scope,
+        "decision_trace_id": decision_trace_id,
+        "decision_context": decision_ctx,
+        "rejection_category": decision_ctx.get("rejection_category", ""),
+        "entry_reason": decision_ctx.get("entry_reason", ""),
+        "acceptance_path": decision_ctx.get("acceptance_path", ""),
+        "risk_mode": effective_risk_mode,
         "gate": gate,
         "nour_filter_name": gate.get("nour_filter_name") if isinstance(gate, dict) else None,
         "nour_filter_passed": gate.get("nour_filter_passed") if isinstance(gate, dict) else None,
@@ -280,6 +382,8 @@ def process_trade_candidate(
     risk_mode: str = "normal",
 ) -> dict:
 
+    decision_trace_id = _build_decision_trace_id(signal)
+
     # ─────────────────────────────────────────
     # Execution intelligence gate
     # IMPORTANT:
@@ -287,6 +391,12 @@ def process_trade_candidate(
     # must stay inside execution layer
     # NOT scoring architecture
     # ─────────────────────────────────────────
+    try:
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta["decision_trace_id"] = decision_trace_id
+    except Exception:
+        pass
+
     gate = decide_execution_candidate(
         signal,
         recovery_slots_remaining=recovery_slots_remaining,
@@ -319,6 +429,8 @@ def process_trade_candidate(
             gate=gate,
             status=status,
             reason=gate["reason"],
+            decision_trace_id=decision_trace_id,
+            effective_risk_mode=risk_mode,
         )
 
     # ─────────────────────────────────────────
@@ -328,19 +440,21 @@ def process_trade_candidate(
     # لا يغير الـ score أو الـ ranking
     # ─────────────────────────────────────────
     _candle_gate = evaluate_candle_reversal_gate(signal, risk_mode)
+    try:
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta.update(_candle_extra(_candle_gate))
+        signal.meta["decision_trace_id"] = decision_trace_id
+    except Exception:
+        pass
     if not _candle_gate["execution_allowed"]:
         return _base_response(
             signal=signal,
             gate=gate,
             status="rejected_quality",
             reason=_candle_gate["reason"],
-            extra={
-                "candle_gate": _candle_gate,
-                "bearish_reversal_detected": _candle_gate["bearish_reversal_detected"],
-                "bullish_reversal_detected": _candle_gate["bullish_reversal_detected"],
-                "reversal_pattern": _candle_gate["pattern"],
-                "reversal_strength": _candle_gate["reversal_strength"],
-            },
+            extra=_candle_extra(_candle_gate),
+            decision_trace_id=decision_trace_id,
+            effective_risk_mode=risk_mode,
         )
 
     # ─────────────────────────────────────────
@@ -365,6 +479,8 @@ def process_trade_candidate(
                 gate=gate,
                 status="rejected_same_symbol",
                 reason="same_symbol_active_trade",
+                decision_trace_id=decision_trace_id,
+                effective_risk_mode=risk_mode,
             ) | {
                 "existing_trade_status": trade_status,
             }
@@ -435,6 +551,8 @@ def process_trade_candidate(
             ),
             reason=risk["reason"],
             slot_scope=slot_scope,
+            decision_trace_id=decision_trace_id,
+            effective_risk_mode=risk_mode,
         )
 
     # ─────────────────────────────────────────
@@ -456,4 +574,7 @@ def process_trade_candidate(
         reason=gate["reason"],
         slot_scope=slot_scope,
         order=order,
+        extra=_candle_extra(_candle_gate),
+        decision_trace_id=decision_trace_id,
+        effective_risk_mode=risk_mode,
     )
