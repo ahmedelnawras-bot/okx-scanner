@@ -3805,7 +3805,7 @@ def _execute_managed_okx_order(
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0)
 
-    TD_MODE = "cross"
+    TD_MODE = "isolated"
 
     live_okx_mode = bool(
         okx_client is not None
@@ -3850,6 +3850,7 @@ def _execute_managed_okx_order(
                 inst_id=signal.symbol,
                 lever=leverage,
                 mgn_mode=TD_MODE,
+                pos_side="long",
             )
             if isinstance(leverage_set_result, dict):
                 if leverage_set_result.get("ok"):
