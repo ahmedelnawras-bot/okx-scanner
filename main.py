@@ -1288,11 +1288,13 @@ def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str
         f"Daily DD الحالي: <code>{dd_line}</code>",
         f"Loss Streak الحالي: <code>{int(loss_guard.get('streak', 0) or 0)} / {int(loss_guard.get('limit', LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)}</code>",
         "",
-        "عند التأكيد سيتم:",
-        "1) اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
-        "2) تصفير عداد حماية 5 صفقات لم تحقق TP1 من هذه اللحظة.",
-        "3) تسجيل manual_resume_at داخل حالة الحماية.",
+        "🧯 <b>عند التأكيد سيتم:</b>",
+        "• إعادة تفعيل فتح الصفقات.",
+        "• تصفير عداد 5SL / No TP1 من هذه اللحظة.",
+        "• اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
+        "• تسجيل manual_resume_at داخل حالة الحماية.",
         "",
+        "⚠️ لا يتم التنفيذ إلا بعد التأكيد الصريح.",
         "للتنفيذ أرسل: <code>/confirm_resume_trading</code>",
     ])
 
@@ -1342,7 +1344,8 @@ def _confirm_manual_resume_trading(
         "━━━━━━━━━━━━",
         f"النطاق: <b>{scope}</b>",
         f"Baseline جديد للـ Daily DD: <b>{equity:,.2f} USDT</b>",
-        "تم تصفير عداد حماية 5 صفقات لم تحقق TP1 من هذه اللحظة.",
+        "تم تصفير عداد حماية 5SL / No TP1 من هذه اللحظة.",
+        "تم اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
         "أي تفعيل جديد للحماية سيُحسب من الصفقات التي تُغلق بعد وقت الاستئناف فقط.",
     ])
 
@@ -1451,6 +1454,13 @@ def _format_remaining_minutes_ar(minutes: object) -> str:
     return f"{total} دقيقة"
 
 
+def _minutes_until_utc_day_end(now: datetime | None = None) -> int:
+    """Minutes until the next UTC day boundary for Daily DD automatic reset display."""
+    now = now or datetime.now(timezone.utc)
+    end = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return max(0, int((end - now).total_seconds() // 60))
+
+
 def _loss_streak_guard_message_ar(guard: dict | None) -> str:
     """Human-readable Arabic message for the 5-loss protection pause."""
     guard = dict(guard or {})
@@ -1462,12 +1472,13 @@ def _loss_streak_guard_message_ar(guard: dict | None) -> str:
     lines = [
         (
             f"🛡️ تم إيقاف فتح صفقات جديدة لمدة {cooldown} دقيقة بسبب "
-            f"{max(streak, limit)} صفقات متتالية لم تحقق TP1. "
-            "هذا إجراء وقائي يهدف إلى الحد من التداول أثناء فترات ضعف أداء السوق."
-        )
+            f"{max(streak, limit)} صفقات متتالية لم تحقق TP1."
+        ),
+        "هذا إجراء وقائي يهدف إلى الحد من التداول أثناء فترات ضعف أداء السوق.",
     ]
     if bool(guard.get("active")):
         lines.append(f"⏳ الوقت المتبقي: {_format_remaining_minutes_ar(remaining)}.")
+    lines.append("سيستمر البوت في متابعة السوق وإرسال الإشارات، لكن بدون فتح صفقات جديدة أثناء الحماية.")
     return "\n".join(lines)
 
 
@@ -1487,9 +1498,12 @@ def _drawdown_protection_message_ar(drawdown_status) -> str:
         return ""
 
     if not allowed:
+        remaining = _format_remaining_minutes_ar(_minutes_until_utc_day_end())
         return (
             f"🛡️ تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومية.\n"
             f"📉 الخسارة اليومية الحالية: {dd_pct:.2f}%.\n"
+            f"⏳ المتبقي لنهاية اليوم: {remaining}.\n"
+            "لن يتم فتح أي صفقات جديدة حتى نهاية اليوم أو حتى استئناف التداول يدويًا.\n"
             f"{message}"
         ).strip()
 
@@ -1654,6 +1668,86 @@ def _hard_execution_protection_rejection(drawdown_status=None, loss_streak_guard
         }
 
     return None
+
+
+def _active_protections_snapshot(result: dict | None) -> list[dict]:
+    """Compact machine-readable protection list for reports and AI exports."""
+    result = result or {}
+    out: list[dict] = []
+
+    loss_guard = result.get("loss_streak_guard") or {}
+    if isinstance(loss_guard, dict):
+        out.append({
+            "type": "loss_streak_guard",
+            "active": bool(loss_guard.get("active")),
+            "streak": int(loss_guard.get("streak", 0) or 0),
+            "limit": int(loss_guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT),
+            "remaining_minutes": int(loss_guard.get("remaining_minutes", 0) or 0),
+            "cooldown_until": str(loss_guard.get("cooldown_until") or ""),
+            "reset_at": str(loss_guard.get("reset_at") or ""),
+            "no_exceptions": bool(loss_guard.get("active")),
+        })
+
+    drawdown = result.get("drawdown_status")
+    if drawdown is not None:
+        try:
+            allowed = bool(getattr(drawdown, "allowed", True))
+            level = int(getattr(drawdown, "level", 0) or 0)
+            dd_pct = float(getattr(drawdown, "drawdown_pct", 0.0) or 0.0)
+        except Exception:
+            allowed, level, dd_pct = True, 0, 0.0
+        out.append({
+            "type": "daily_drawdown_guard",
+            "active": not allowed,
+            "level": level,
+            "drawdown_pct": dd_pct,
+            "remaining_minutes": _minutes_until_utc_day_end() if not allowed else 0,
+            "no_exceptions": not allowed,
+        })
+
+    return out
+
+
+def _risk_protection_summary(result: dict | None) -> dict:
+    """Expose protection state with the priority agreed for JSON/AI reports."""
+    result = result or {}
+    protection_state = dict(result.get("protection_state") or {})
+    loss_guard = dict(result.get("loss_streak_guard") or {})
+    drawdown = result.get("drawdown_status")
+    daily_active = False
+    daily_level = 0
+    daily_pct = 0.0
+    if drawdown is not None:
+        try:
+            daily_active = not bool(getattr(drawdown, "allowed", True))
+            daily_level = int(getattr(drawdown, "level", 0) or 0)
+            daily_pct = float(getattr(drawdown, "drawdown_pct", 0.0) or 0.0)
+        except Exception:
+            pass
+    return {
+        "priority": ["daily_drawdown_guard", "loss_streak_guard", "market_block_recovery", "normal_filters"],
+        "hard_protection_active": bool(daily_active or loss_guard.get("active")),
+        "no_exceptions_when_hard_active": bool(daily_active or loss_guard.get("active")),
+        "active_protections": _active_protections_snapshot(result),
+        "loss_streak_guard": {
+            "active": bool(loss_guard.get("active")),
+            "streak": int(loss_guard.get("streak", 0) or 0),
+            "limit": int(loss_guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT),
+            "remaining_minutes": int(loss_guard.get("remaining_minutes", 0) or 0),
+            "reset_at": str(loss_guard.get("reset_at") or protection_state.get("loss_streak_reset_at") or ""),
+            "cooldown_until": str(loss_guard.get("cooldown_until") or ""),
+        },
+        "daily_dd_guard": {
+            "active": daily_active,
+            "level": daily_level,
+            "drawdown_pct": daily_pct,
+            "remaining_minutes": _minutes_until_utc_day_end() if daily_active else 0,
+            "manual_baseline": _safe_float(protection_state.get("daily_dd_baseline"), 0.0),
+        },
+        "manual_resume_at": str(protection_state.get("manual_resume_at") or ""),
+        "loss_streak_reset_at": str(protection_state.get("loss_streak_reset_at") or ""),
+        "daily_dd_baseline": _safe_float(protection_state.get("daily_dd_baseline"), 0.0),
+    }
 
 
 def _trade_slot_path(trade) -> str:
@@ -2835,34 +2929,49 @@ def run_once(
         if not signal:
             continue
 
+        # First let the normal execution decision run, including BLOCK/RECOVERY
+        # exception logic. Then, if a higher hard protection is active
+        # (Daily DD or 5SL/No-TP1), override the final execution result to
+        # protection_pause with no exceptions. This preserves decision visibility
+        # while still preventing any execution.
+        pre_protection_exec_result = process_trade_candidate(
+            signal,
+            open_trades=[*gate_base_trades, *local_gate_trades],
+            current_open_positions=slot_counts.get("general", 0),
+            max_open_positions=effective_max_positions,
+            min_execution_score=settings.min_execution_score,
+            recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
+            block_open_positions=slot_counts.get("block_exception", 0),
+            max_block_positions=effective_max_block_positions,
+            recovery_open_positions=slot_counts.get("recovery", 0),
+            max_recovery_positions=effective_max_recovery_positions,
+            drawdown_status=drawdown_status,
+            risk_mode=state.mode,
+        )
+        pre_protection_exec_result["decision_engine"] = "process_trade_candidate"
+        pre_protection_exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
+        pre_protection_exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
+
         hard_protection_rejection = _hard_execution_protection_rejection(drawdown_status, loss_streak_guard)
         if hard_protection_rejection:
-            exec_result = hard_protection_rejection
-        else:
-            exec_result = process_trade_candidate(
-                signal,
-                open_trades=[*gate_base_trades, *local_gate_trades],
-                current_open_positions=slot_counts.get("general", 0),
-                max_open_positions=effective_max_positions,
-                min_execution_score=settings.min_execution_score,
-                recovery_slots_remaining=recovery_remaining if state.mode == MODE_RECOVERY_LONG else None,
-                block_open_positions=slot_counts.get("block_exception", 0),
-                max_block_positions=effective_max_block_positions,
-                recovery_open_positions=slot_counts.get("recovery", 0),
-                max_recovery_positions=effective_max_recovery_positions,
-                drawdown_status=drawdown_status,
-                risk_mode=state.mode,
-            )
-            exec_result["decision_engine"] = "process_trade_candidate"
+            exec_result = dict(hard_protection_rejection)
+            exec_result["pre_protection_status"] = pre_protection_exec_result.get("status")
+            exec_result["pre_protection_reason"] = pre_protection_exec_result.get("reason")
+            exec_result["pre_protection_path"] = pre_protection_exec_result.get("path")
+            exec_result["decision_engine"] = "hard_protection_after_candidate"
             exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
-            exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
-            print(
-                f"DECISION_ENGINE | {signal.symbol} | "
-                f"runtime={exec_result.get('runtime_mode')} | "
-                f"engine={exec_result.get('decision_engine')} | "
-                f"status={exec_result.get('status')} | reason={exec_result.get('reason')}",
-                flush=True,
-            )
+            exec_result["risk_mode"] = scan_mode
+        else:
+            exec_result = pre_protection_exec_result
+
+        print(
+            f"DECISION_ENGINE | {signal.symbol} | "
+            f"runtime={exec_result.get('runtime_mode')} | "
+            f"engine={exec_result.get('decision_engine')} | "
+            f"status={exec_result.get('status')} | reason={exec_result.get('reason')} | "
+            f"pre={exec_result.get('pre_protection_status', '-')}",
+            flush=True,
+        )
 
         exec_status = str(exec_result.get("status") or "").strip().lower()
         consumes_live_slot = exec_status in {"accepted_preview", "pending_pullback_preview"}
@@ -3030,7 +3139,6 @@ def run_once(
         if not snapshot_write_result.get("ok"):
             print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
 
-    mode_message = _build_mode_message(state, snapshot, protection, settings=settings)
     mode_context = _build_mode_context(state, snapshot, protection)
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
@@ -3046,6 +3154,27 @@ def run_once(
     if loss_streak_guard.get("reset_recommended_at"):
         loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
 
+    display_result_for_protection = {
+        "mode": state.mode,
+        "mode_context": mode_context,
+        "drawdown_status": drawdown_status,
+        "loss_streak_guard": loss_streak_guard,
+        "protection_state": protection_state,
+        "portfolio_state_inputs": portfolio_state_inputs,
+        "simulation_wallet": _build_simulation_wallet_snapshot(simulation_trades),
+    }
+    mode_message = _build_mode_message(state, snapshot, protection, settings=settings, result=display_result_for_protection)
+    mode_transition_message = _build_mode_message(
+        state,
+        snapshot,
+        protection,
+        variant="transition",
+        old_mode=initial_mode.mode,
+        settings=settings,
+        result=display_result_for_protection,
+    ) if state.mode != initial_mode.mode else None
+    protection_summary = _risk_protection_summary(display_result_for_protection)
+
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
     command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
@@ -3054,14 +3183,7 @@ def run_once(
         "state": state,
         "mode": state.mode,
         "mode_message": mode_message,
-        "mode_transition_message": _build_mode_message(
-            state,
-            snapshot,
-            protection,
-            variant="transition",
-            old_mode=initial_mode.mode,
-            settings=settings,
-        ) if state.mode != initial_mode.mode else None,
+        "mode_transition_message": mode_transition_message,
         "block_alert_preview": build_block_escalation_alert(state, affected=len(trades), protected=sum(1 for t in trades if t.pnl_pct > 0), tightened=sum(1 for t in trades if t.tp2_hit)) if state.mode == MODE_BLOCK_LONGS else None,
         "menu": build_main_menu_layout(),
         "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(settings),
@@ -3074,6 +3196,9 @@ def run_once(
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
+        "active_protections": protection_summary.get("active_protections", []),
+        "protection_status": protection_summary,
+        "risk_protection_summary": protection_summary,
         "portfolio_state_inputs": portfolio_state_inputs,
         "help": build_master_help(
             mode=state.mode,
@@ -3169,6 +3294,10 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
         _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades),
         reset_at=_parse_protection_dt(protection_state.get("loss_streak_reset_at")),
     )
+    protection_summary = _risk_protection_summary(result)
+    result["active_protections"] = protection_summary.get("active_protections", [])
+    result["protection_status"] = protection_summary
+    result["risk_protection_summary"] = protection_summary
 
     if trade_store:
         trade_store.save_trades(trades)
@@ -4680,6 +4809,7 @@ def _build_bot_modes_panel(settings: Settings) -> str:
         "نفس قرارات وضع التداول لكن تنفيذ داخلي فقط، و OKX live orders OFF.",
         "",
         "🧯 <b>استئناف التداول</b>",
+        "يعيد تفعيل التداول ويصفر عداد 5SL / No TP1 ويعتمد الرصيد الحالي كبداية جديدة للـ Daily DD.",
         "يعرض Preview ثم يحتاج تأكيد: /confirm_resume_trading",
     ])
 
@@ -6065,9 +6195,32 @@ def _maybe_send_protection_activation_alert(
         tracker["protection_alerts_sent"] = sent_keys
 
     active_keys = {key for key, _message in alerts}
-    # Allow a fresh alert next time after a protection fully disappears or changes level.
+    expired_sent = tracker.setdefault("protection_expiry_sent", set())
+    if not isinstance(expired_sent, set):
+        expired_sent = set(expired_sent or [])
+        tracker["protection_expiry_sent"] = expired_sent
+
+    # Allow a fresh alert next time after a protection fully disappears or changes level,
+    # and send one clear standalone expiry/resume message.
     for old_key in list(sent_keys):
-        if old_key.startswith(("loss_streak_guard:", "daily_drawdown:")) and old_key not in active_keys:
+        if old_key.startswith("loss_streak_guard:") and old_key not in active_keys:
+            if old_key not in expired_sent:
+                _send_text(sender, "\n".join([
+                    "✅ <b>انتهت فترة الحماية الوقائية</b>",
+                    "تمت إعادة تفعيل فتح الصفقات تلقائيًا.",
+                    "سيبدأ احتساب سلسلة 5SL / No TP1 من جديد من هذه اللحظة.",
+                ]))
+                expired_sent.add(old_key)
+                _telegram_send_pause(TELEGRAM_NORMAL_SEND_GAP_SECONDS)
+            sent_keys.discard(old_key)
+        elif old_key.startswith("daily_drawdown:") and old_key not in active_keys:
+            if old_key not in expired_sent:
+                _send_text(sender, "\n".join([
+                    "✅ <b>انتهت حماية السحب اليومي</b>",
+                    "تمت إعادة تقييم الـ Daily DD وأصبح فتح الصفقات مسموحًا حسب القواعد الحالية.",
+                ]))
+                expired_sent.add(old_key)
+                _telegram_send_pause(TELEGRAM_NORMAL_SEND_GAP_SECONDS)
             sent_keys.discard(old_key)
 
     for key, message in alerts:
@@ -6093,6 +6246,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
         # in the inner loop. This only affects Telegram de-dup state; it does
         # not change any protection/trading decision logic.
         protection_alerts_sent = tracker.get("protection_alerts_sent", set())
+        protection_expiry_sent = tracker.get("protection_expiry_sent", set())
         tracker.clear()
         tracker.update({
             "mode": mode,
@@ -6100,6 +6254,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
             "general_sent": 0,
             "block_levels_sent": set(),
             "protection_alerts_sent": protection_alerts_sent if isinstance(protection_alerts_sent, set) else set(protection_alerts_sent or []),
+            "protection_expiry_sent": protection_expiry_sent if isinstance(protection_expiry_sent, set) else set(protection_expiry_sent or []),
         })
 
     protection = block_protection_status(state, now=now)
