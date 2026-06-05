@@ -467,6 +467,206 @@ def _build_trade_record(trade: Any, source: str, exported_at: str) -> dict:
     }
 
 
+
+# =========================================================
+# Protection Intelligence Helpers
+# =========================================================
+
+def _minutes_text_ar(minutes: Any) -> str:
+    value = max(0, _i(minutes))
+    if value <= 0:
+        return "انتهت فترة التهدئة أو لا يوجد وقت متبقٍ"
+    if value < 60:
+        return f"{value} دقيقة"
+    hours = value // 60
+    mins = value % 60
+    if mins:
+        return f"{hours} ساعة و {mins} دقيقة"
+    return f"{hours} ساعة"
+
+
+def _loss_streak_message_ar(guard: dict | None) -> str:
+    guard = _safe_dict(guard)
+    cooldown = _i(guard.get("cooldown_minutes"), 120)
+    limit = _i(guard.get("limit"), 5)
+    remaining = _i(guard.get("remaining_minutes"), 0)
+    base = (
+        f"🛡️ تم إيقاف فتح صفقات جديدة لمدة {cooldown} دقيقة بسبب {limit} صفقات متتالية لم تحقق TP1. "
+        "هذا إجراء وقائي يهدف إلى الحد من التداول أثناء فترات ضعف أداء السوق."
+    )
+    if remaining > 0:
+        base += f" ⏳ الوقت المتبقي: {_minutes_text_ar(remaining)}."
+    return base
+
+
+def _build_loss_streak_protection(guard: dict | None) -> dict | None:
+    guard = _safe_dict(guard)
+    active = _b(guard.get("active"))
+    streak = _i(guard.get("streak"))
+    limit = _i(guard.get("limit"), 5)
+    if not active and streak <= 0:
+        return None
+    severity = 3 if active else (2 if streak >= max(1, limit - 1) else 1)
+    return {
+        "type": "loss_streak_guard",
+        "active": active,
+        "severity": severity,
+        "level": severity,
+        "streak": streak,
+        "limit": limit,
+        "cooldown_minutes": _i(guard.get("cooldown_minutes"), 120),
+        "remaining_minutes": _i(guard.get("remaining_minutes")),
+        "cooldown_until": _s(guard.get("cooldown_until")),
+        "last_loss_at": _s(guard.get("last_loss_at")),
+        "symbols": _safe_list(guard.get("symbols")),
+        "reason": _s(guard.get("reason") or "loss_streak_no_tp1_guard"),
+        "message_ar": _loss_streak_message_ar(guard) if active else f"⚠️ سلسلة خسائر قبل TP1: {streak}/{limit}. لم يتم تفعيل الإيقاف الوقائي بعد.",
+    }
+
+
+def _build_drawdown_protection(drawdown: dict | None) -> dict | None:
+    dd = _safe_dict(drawdown)
+    level = _i(dd.get("level"))
+    if not dd:
+        return None
+    active = bool(level > 0 or not _b(dd.get("allowed", True)))
+    if not active:
+        return None
+    label = "تحذير" if level == 1 else "إيقاف مرن" if level == 2 else "إيقاف كامل" if level >= 3 else "طبيعي"
+    return {
+        "type": "daily_drawdown_guard",
+        "active": active,
+        "severity": level,
+        "level": level,
+        "allowed": _b(dd.get("allowed")),
+        "reason": _s(dd.get("reason")),
+        "drawdown_pct": _f(dd.get("drawdown_pct")),
+        "drawdown_usdt": _f(dd.get("drawdown_usdt")),
+        "current_equity": _f(dd.get("current_equity")),
+        "start_of_day_balance": _f(dd.get("start_of_day_balance")),
+        "remaining_minutes": 0,
+        "message_ar": _s(dd.get("message_ar")) or f"🛡️ تم تفعيل حماية الخسارة اليومية — المستوى {level}: {label}.",
+    }
+
+
+def _build_market_mode_protection(mode_context: dict | None) -> dict | None:
+    ctx = _safe_dict(mode_context)
+    current = _s(ctx.get("protection_current"))
+    if not current or current.lower() == "inactive":
+        return None
+    level = _i(ctx.get("protection_level") or ctx.get("level"))
+    if level <= 0:
+        # Existing main.py stores level in text only; infer it safely from protection_current.
+        lowered = current.lower()
+        if "level 3" in lowered:
+            level = 3
+        elif "level 2" in lowered:
+            level = 2
+        elif "level 1" in lowered:
+            level = 1
+    remaining = _i(ctx.get("remaining_minutes"))
+    message = (
+        f"🛡️ حماية السوق نشطة — {current}. "
+        f"المرحلة التالية: {_s(ctx.get('protection_next') or 'غير محدد')}."
+    )
+    if remaining > 0:
+        message += f" ⏳ الوقت المتبقي للمرحلة الحالية: {_minutes_text_ar(remaining)}."
+    return {
+        "type": "market_block_protection",
+        "active": True,
+        "severity": max(1, level),
+        "level": level,
+        "current": current,
+        "next": _s(ctx.get("protection_next")),
+        "remaining_minutes": remaining,
+        "mode": _s(ctx.get("mode")),
+        "message_ar": message,
+    }
+
+
+def _build_active_protections(
+    *,
+    mode_context: dict | None,
+    drawdown: dict | None,
+    loss_streak_guard: dict | None,
+) -> list[dict]:
+    protections: list[dict] = []
+    for item in (
+        _build_loss_streak_protection(loss_streak_guard),
+        _build_drawdown_protection(drawdown),
+        _build_market_mode_protection(mode_context),
+    ):
+        if item:
+            protections.append(item)
+    return sorted(protections, key=lambda x: _i(x.get("severity")), reverse=True)
+
+
+def _build_risk_protection_summary(active_protections: list[dict]) -> dict:
+    highest = max((_i(item.get("severity")) for item in active_protections), default=0)
+    active_now = [item for item in active_protections if _b(item.get("active"))]
+    primary = active_now[0] if active_now else (active_protections[0] if active_protections else {})
+    return {
+        "has_active_protection": bool(active_now),
+        "active_count": len(active_now),
+        "tracked_count": len(active_protections),
+        "highest_level": highest,
+        "primary_type": _s(primary.get("type")),
+        "primary_message_ar": _s(primary.get("message_ar")),
+        "total_remaining_minutes": sum(_i(item.get("remaining_minutes")) for item in active_now),
+        "protection_types": [_s(item.get("type")) for item in active_protections],
+    }
+
+
+def _build_rejection_protection_context(exec_result: dict | None) -> dict:
+    exec_result = _safe_dict(exec_result)
+    status = _s(exec_result.get("status"))
+    reason = _s(exec_result.get("reason"))
+    slot_scope = _s(exec_result.get("slot_scope"))
+    is_loss_guard = bool(
+        "loss_streak" in status.lower()
+        or "loss_streak" in reason.lower()
+        or slot_scope == "loss_streak_guard"
+    )
+    is_drawdown = bool(
+        "drawdown" in reason.lower()
+        or slot_scope == "drawdown"
+        or _i(exec_result.get("drawdown_level")) > 0
+    )
+    if is_loss_guard:
+        cooldown = _i(exec_result.get("cooldown_minutes"), 120)
+        limit = _i(exec_result.get("loss_streak_limit"), 5)
+        remaining = _i(exec_result.get("cooldown_remaining_minutes"))
+        message = (
+            f"🛡️ تم إيقاف فتح صفقات جديدة لمدة {cooldown} دقيقة بسبب {limit} صفقات متتالية لم تحقق TP1. "
+            "هذا إجراء وقائي يهدف إلى الحد من التداول أثناء فترات ضعف أداء السوق."
+        )
+        if remaining > 0:
+            message += f" ⏳ الوقت المتبقي: {_minutes_text_ar(remaining)}."
+        return {
+            "protection_active": True,
+            "protection_type": "loss_streak_guard",
+            "protection_remaining_minutes": remaining,
+            "protection_level": 3,
+            "human_reason": message,
+        }
+    if is_drawdown:
+        level = _i(exec_result.get("drawdown_level"))
+        message = _s(exec_result.get("drawdown_message")) or "🛡️ تم تفعيل حماية الخسارة اليومية وفق مستوى الـ Daily Drawdown الحالي."
+        return {
+            "protection_active": bool(level > 0 or status.startswith("rejected")),
+            "protection_type": "daily_drawdown_guard",
+            "protection_remaining_minutes": 0,
+            "protection_level": level,
+            "human_reason": message,
+        }
+    return {
+        "protection_active": False,
+        "protection_type": "",
+        "protection_remaining_minutes": 0,
+        "protection_level": 0,
+        "human_reason": "",
+    }
+
 # =========================================================
 # Rejection Record Builder
 # =========================================================
@@ -482,6 +682,9 @@ def _build_rejection_record(signal_item: dict, source: str, exported_at: str) ->
     status = _s(exec_result.get("status"))
     decision_trace_id = _s(meta.get("decision_trace_id") or exec_result.get("decision_trace_id")) or _build_decision_trace_id(symbol, exported_at, setup_type)
     rejection_category = _s(exec_result.get("rejection_category") or meta.get("rejection_category")) or _classify_rejection_reason(reason, status)
+    protection_context = _build_rejection_protection_context(exec_result)
+    if protection_context.get("protection_active"):
+        rejection_category = "protection_pause"
 
     return {
         # ── Meta
@@ -514,6 +717,13 @@ def _build_rejection_record(signal_item: dict, source: str, exported_at: str) ->
         "rejection_path": _s(exec_result.get("path")),
         "slot_scope": _s(exec_result.get("slot_scope")),
         "drawdown_level": _i(exec_result.get("drawdown_level")),
+
+        # ── Protection Context (clear reason for risk pauses)
+        "protection_active": _b(protection_context.get("protection_active")),
+        "protection_type": _s(protection_context.get("protection_type")),
+        "protection_remaining_minutes": _i(protection_context.get("protection_remaining_minutes")),
+        "protection_level": _i(protection_context.get("protection_level")),
+        "human_reason": _s(protection_context.get("human_reason")),
 
         # ── Gate State at Rejection
         "gate_snapshot": {
@@ -743,6 +953,13 @@ def _build_daily_snapshot(
     if exit_efficiencies:
         lessons_today.append(f"Average exit efficiency: {round(sum(exit_efficiencies) / max(1, len(exit_efficiencies)), 2)}%")
 
+    active_protections = _build_active_protections(
+        mode_context=mode_context,
+        drawdown=dd_dict,
+        loss_streak_guard=loss_streak_guard,
+    )
+    risk_protection_summary = _build_risk_protection_summary(active_protections)
+
     return {
         "record_type": "daily_snapshot",
         "export_version": EXPORT_VERSION,
@@ -804,6 +1021,18 @@ def _build_daily_snapshot(
         # ── Market Mode Distribution
         "market_mode_distribution": mode_distribution,
         "current_mode": dict(mode_context or {}),
+
+        # ── Unified Protection Intelligence
+        "active_protections": active_protections,
+        "protection_status": {
+            "active": bool(risk_protection_summary.get("has_active_protection")),
+            "primary_type": risk_protection_summary.get("primary_type"),
+            "highest_level": risk_protection_summary.get("highest_level"),
+            "remaining_minutes": risk_protection_summary.get("total_remaining_minutes"),
+            "message_ar": risk_protection_summary.get("primary_message_ar"),
+        },
+        "risk_protection_summary": risk_protection_summary,
+        "protection_history": active_protections,
 
         # ── AI Development Schema #3: Snapshot intelligence
         "comparison": {
