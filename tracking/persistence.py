@@ -128,12 +128,15 @@ def trade_from_dict(data: dict[str, Any]) -> TrackedTrade | None:
 
         dict_fields = (
             "entry_order_payload",
-            "sl_attached_payload",
             "managed_trade_plan",
         )
         for key in dict_fields:
             if key in clean and clean[key] is not None and not isinstance(clean[key], dict):
                 clean[key] = {}
+
+        # sl_attached_payload is a list[dict], not a dict — handle separately
+        if "sl_attached_payload" in clean and not isinstance(clean["sl_attached_payload"], list):
+            clean["sl_attached_payload"] = []
 
         return TrackedTrade(**clean)
     except Exception:
