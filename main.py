@@ -1612,6 +1612,50 @@ def _loss_streak_rejection(guard: dict) -> dict:
     }
 
 
+def _hard_execution_protection_rejection(drawdown_status=None, loss_streak_guard: dict | None = None) -> dict | None:
+    """Return a no-exceptions execution block for true danger protections.
+
+    Hard protections are deliberately stronger than market-mode exceptions:
+    - Daily DD hard stop (drawdown_status.allowed == False)
+    - Loss-streak cooldown after repeated SL/no-TP1 losses
+
+    Signals may still be built and reported, but no whitelist/elite/recovery/
+    block-exception path is allowed to open a trade while this returns a row.
+    """
+    loss_guard = dict(loss_streak_guard or {})
+    if loss_guard.get("active"):
+        row = _loss_streak_rejection(loss_guard)
+        row["hard_protection"] = True
+        row["no_exceptions"] = True
+        row["execution_block_only"] = True
+        row["reason"] = "hard_loss_streak_pause_no_exceptions"
+        row.setdefault("raw_reason", loss_guard.get("reason") or "loss_streak_no_tp1_guard")
+        return row
+
+    if drawdown_status is not None and not bool(getattr(drawdown_status, "allowed", True)):
+        message_ar = _drawdown_protection_message_ar(drawdown_status)
+        return {
+            "status": "protection_pause",
+            "reason": "hard_daily_drawdown_pause_no_exceptions",
+            "raw_reason": str(getattr(drawdown_status, "reason", "") or "daily_drawdown_guard"),
+            "path": "",
+            "slot_scope": "daily_drawdown_guard",
+            "rejection_category": "protection_pause",
+            "protection_active": True,
+            "protection_type": "daily_drawdown_guard",
+            "hard_protection": True,
+            "no_exceptions": True,
+            "execution_block_only": True,
+            "drawdown_level": int(getattr(drawdown_status, "level", 0) or 0),
+            "drawdown_pct": float(getattr(drawdown_status, "drawdown_pct", 0.0) or 0.0),
+            "drawdown_message": str(getattr(drawdown_status, "message_ar", "") or ""),
+            "human_reason": message_ar,
+            "message_ar": message_ar,
+        }
+
+    return None
+
+
 def _trade_slot_path(trade) -> str:
     path = str(getattr(trade, "execution_path", "") or "")
     if path == "block_exception":
@@ -2791,18 +2835,9 @@ def run_once(
         if not signal:
             continue
 
-        if not drawdown_status.allowed:
-            exec_result = {
-                "status": "rejected_risk",
-                "reason": drawdown_status.reason,
-                "path": "",
-                "slot_scope": "drawdown",
-                "drawdown_level": drawdown_status.level,
-                "drawdown_pct": drawdown_status.drawdown_pct,
-                "drawdown_message": drawdown_status.message_ar,
-            }
-        elif loss_streak_guard.get("active"):
-            exec_result = _loss_streak_rejection(loss_streak_guard)
+        hard_protection_rejection = _hard_execution_protection_rejection(drawdown_status, loss_streak_guard)
+        if hard_protection_rejection:
+            exec_result = hard_protection_rejection
         else:
             exec_result = process_trade_candidate(
                 signal,
@@ -3860,6 +3895,21 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
     for item in _iter_signal_items_for_dispatch(result):
         signal = item["signal"]
         exec_result = item["execution"]
+
+        # Final safety net: true danger protections have zero exceptions.
+        # Even if a stale/older result item reached dispatch as accepted_preview,
+        # convert it to protection_pause before any simulation fill or OKX order.
+        hard_protection_rejection = _hard_execution_protection_rejection(
+            (result or {}).get("drawdown_status"),
+            (result or {}).get("loss_streak_guard"),
+        )
+        if hard_protection_rejection and str((exec_result or {}).get("status") or "").strip().lower() in {"accepted_preview", "pending_pullback_preview"}:
+            exec_result = dict(hard_protection_rejection)
+            item["execution"] = exec_result
+            item["message"] = build_signal_message(signal, exec_result)
+            item["eligible_for_activation"] = False
+            item["register_as_open_trade"] = False
+
         exec_status = str(exec_result.get("status") or "")
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         can_place_order = exec_status == "accepted_preview"
@@ -4628,6 +4678,9 @@ def _build_bot_modes_panel(settings: Settings) -> str:
         "",
         f"{mark('simulation')} 🧪 <b>وضع المحاكاة</b>",
         "نفس قرارات وضع التداول لكن تنفيذ داخلي فقط، و OKX live orders OFF.",
+        "",
+        "🧯 <b>استئناف التداول</b>",
+        "يعرض Preview ثم يحتاج تأكيد: /confirm_resume_trading",
     ])
 
 
@@ -5445,13 +5498,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
-        runtime_settings = settings or get_settings()
-        clean_reply = _handle_admin_clean_command(command, trade_store, result, runtime_settings)
-        if clean_reply is not None:
-            _send_text(sender, clean_reply, reply_markup=_build_bot_modes_keyboard(runtime_settings))
-            return
         if command == "/okx_status":
-            _send_text(sender, _build_okx_status_panel(runtime_settings, okx_client=okx_client))
+            _send_text(sender, _build_okx_status_panel(settings or get_settings(), okx_client=okx_client))
             return
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
@@ -6182,11 +6230,9 @@ def live_worker() -> None:
             previous_scan_mode = state.mode if state is not None else None
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
             state = result["state"]
-
-            # Make Telegram commands use the freshest completed scan immediately,
-            # before any slow Telegram signal/protection dispatch happens.
+            # Make Telegram commands responsive immediately after the scan result is ready,
+            # before Telegram signal/reminder dispatch starts.
             last_result = result
-
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
