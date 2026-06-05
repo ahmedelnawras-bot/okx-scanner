@@ -963,6 +963,7 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
         "signal_rules": "normal signal first → execution later",
         "requirements": "quality up" if state.mode != MODE_NORMAL_LONG else "balanced normal scanning",
         "execution_notes": "whitelist / elite / recovery / block-exception",
+        "protection_level": protection.get("level", 0),
         "protection_current": protection.get("current", "inactive"),
         "protection_next": protection.get("next", "inactive"),
         "remaining_minutes": protection.get("remaining_minutes", 0),
@@ -994,7 +995,7 @@ def _build_mode_message(
     risk_result.setdefault("mode_context", context)
     risk_profile = _risk_profile_snapshot(runtime_settings, risk_result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(runtime_settings, risk_profile))
-    return message + "\n" + risk_block
+    return _append_protection_notice(message + "\n" + risk_block, risk_result)
 
 
 def _refresh_risk_block_in_mode_message(message: str, settings: Settings, result: dict | None = None) -> str:
@@ -1012,9 +1013,10 @@ def _refresh_risk_block_in_mode_message(message: str, settings: Settings, result
         base,
         flags=re.DOTALL,
     ).strip()
-    risk_profile = _risk_profile_snapshot(settings, result or {})
+    risk_result = dict(result or {})
+    risk_profile = _risk_profile_snapshot(settings, risk_result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
-    return (base + "\n" + risk_block).strip()
+    return _append_protection_notice(base + "\n" + risk_block, risk_result)
 
 
 def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: MarketSnapshot, settings: Settings | None = None) -> dict:
@@ -1219,6 +1221,135 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
 
 
 
+def _format_remaining_minutes_ar(minutes: object) -> str:
+    """Arabic display helper for protection cooldown counters."""
+    total = max(0, int(_safe_float(minutes, 0.0) or 0))
+    if total >= 60:
+        hours = total // 60
+        mins = total % 60
+        if mins:
+            return f"{hours} ساعة و {mins} دقيقة"
+        return f"{hours} ساعة"
+    return f"{total} دقيقة"
+
+
+def _loss_streak_guard_message_ar(guard: dict | None) -> str:
+    """Human-readable Arabic message for the 5-loss protection pause."""
+    guard = dict(guard or {})
+    streak = int(guard.get("streak", 0) or 0)
+    limit = int(guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)
+    cooldown = int(guard.get("cooldown_minutes", LOSS_STREAK_COOLDOWN_MINUTES) or LOSS_STREAK_COOLDOWN_MINUTES)
+    remaining = int(guard.get("remaining_minutes", 0) or 0)
+
+    lines = [
+        (
+            f"🛡️ تم إيقاف فتح صفقات جديدة لمدة {cooldown} دقيقة بسبب "
+            f"{max(streak, limit)} صفقات متتالية لم تحقق TP1. "
+            "هذا إجراء وقائي يهدف إلى الحد من التداول أثناء فترات ضعف أداء السوق."
+        )
+    ]
+    if bool(guard.get("active")):
+        lines.append(f"⏳ الوقت المتبقي: {_format_remaining_minutes_ar(remaining)}.")
+    return "\n".join(lines)
+
+
+def _drawdown_protection_message_ar(drawdown_status) -> str:
+    """Human-readable Arabic message for daily drawdown protection."""
+    if drawdown_status is None:
+        return ""
+    try:
+        level = int(getattr(drawdown_status, "level", 0) or 0)
+        allowed = bool(getattr(drawdown_status, "allowed", True))
+        dd_pct = float(getattr(drawdown_status, "drawdown_pct", 0.0) or 0.0)
+        message = str(getattr(drawdown_status, "message_ar", "") or "").strip()
+    except Exception:
+        return ""
+
+    if level <= 0 and allowed:
+        return ""
+
+    if not allowed:
+        return (
+            f"🛡️ تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومية.\n"
+            f"📉 الخسارة اليومية الحالية: {dd_pct:.2f}%.\n"
+            f"{message}"
+        ).strip()
+
+    return (
+        f"🛡️ حماية السحب اليومي نشطة — مستوى {level}.\n"
+        f"📉 الخسارة اليومية الحالية: {dd_pct:.2f}%.\n"
+        f"{message}"
+    ).strip()
+
+
+def _block_mode_protection_message_ar(result: dict | None) -> str:
+    """Human-readable Arabic message for market BLOCK reminder protection."""
+    result = result or {}
+    ctx = dict(result.get("mode_context") or {})
+    mode = str(result.get("mode") or ctx.get("mode") or "").strip()
+    if mode != MODE_BLOCK_LONGS:
+        return ""
+
+    level = int(_safe_float(ctx.get("protection_level") or 0, 0.0) or 0)
+    # Older context does not include protection_level, so infer it from text.
+    current = str(ctx.get("protection_current") or "").strip()
+    if level <= 0:
+        if "LEVEL 3" in current:
+            level = 3
+        elif "LEVEL 2" in current:
+            level = 2
+        elif "LEVEL 1" in current:
+            level = 1
+
+    remaining = int(_safe_float(ctx.get("remaining_minutes"), 0.0) or 0)
+    if level <= 0 and current in {"", "inactive"}:
+        return ""
+
+    lines = [
+        f"🛡️ حماية السوق نشطة — مستوى {max(level, 1)}.",
+        "تم تشديد التعامل مع فتح الصفقات بسبب ضغط واضح في حالة السوق.",
+    ]
+    if remaining > 0:
+        lines.append(f"⏳ الوقت المتبقي للمرحلة الحالية: {_format_remaining_minutes_ar(remaining)}.")
+    return "\n".join(lines)
+
+
+def _protection_notice_text(result: dict | None) -> str:
+    """Build a compact Arabic protection notice for mode/reminder/status messages."""
+    result = result or {}
+    notices: list[str] = []
+
+    loss_guard = result.get("loss_streak_guard") or {}
+    if isinstance(loss_guard, dict) and loss_guard.get("active"):
+        notices.append(_loss_streak_guard_message_ar(loss_guard))
+
+    drawdown_message = _drawdown_protection_message_ar(result.get("drawdown_status"))
+    if drawdown_message:
+        notices.append(drawdown_message)
+
+    block_message = _block_mode_protection_message_ar(result)
+    if block_message:
+        notices.append(block_message)
+
+    notices = [notice.strip() for notice in notices if str(notice or "").strip()]
+    if not notices:
+        return ""
+
+    return "🛡️ <b>تنبيه الحماية</b>\n" + "\n\n".join(notices)
+
+
+def _append_protection_notice(message: str, result: dict | None) -> str:
+    notice = _protection_notice_text(result)
+    if not notice:
+        return str(message or "").strip()
+    base = str(message or "").strip()
+    if "🛡️ <b>تنبيه الحماية</b>" in base:
+        return base
+    return (base + "\n\n" + notice).strip()
+
+
+
+
 def _loss_streak_base_trades_for_runtime(
     settings: Settings,
     result: dict | None = None,
@@ -1242,17 +1373,24 @@ def _loss_streak_base_trades_for_runtime(
 
 
 def _loss_streak_rejection(guard: dict) -> dict:
+    message_ar = _loss_streak_guard_message_ar(guard)
     return {
-        "status": "rejected_loss_streak_guard",
-        "reason": guard.get("reason") or "loss_streak_no_tp1_guard",
+        "status": "protection_pause",
+        "reason": "cooldown_after_consecutive_losses",
+        "raw_reason": guard.get("reason") or "loss_streak_no_tp1_guard",
         "path": "",
         "slot_scope": "loss_streak_guard",
+        "rejection_category": "protection_pause",
+        "protection_active": bool(guard.get("active")),
+        "protection_type": "loss_streak_guard",
+        "protection_remaining_minutes": int(guard.get("remaining_minutes", 0) or 0),
         "loss_streak": int(guard.get("streak", 0) or 0),
         "loss_streak_limit": int(guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT),
         "cooldown_minutes": int(guard.get("cooldown_minutes", LOSS_STREAK_COOLDOWN_MINUTES) or LOSS_STREAK_COOLDOWN_MINUTES),
         "cooldown_remaining_minutes": int(guard.get("remaining_minutes", 0) or 0),
         "cooldown_until": guard.get("cooldown_until", ""),
-        "message_ar": f"تم إيقاف التنفيذ مؤقتًا بعد {int(guard.get('streak', 0) or 0)} ضربات SL متتالية بدون TP1.",
+        "human_reason": message_ar,
+        "message_ar": message_ar,
     }
 
 
@@ -5553,6 +5691,83 @@ def _enrich_reminder_context(result: dict, base_context: dict, settings: Setting
     return ctx
 
 
+
+def _maybe_send_protection_activation_alert(
+    sender: TelegramSender,
+    result: dict | None,
+    tracker: dict,
+    settings: Settings | None = None,
+) -> None:
+    """Send one standalone Telegram alert when a protection state becomes active.
+
+    Display-only:
+    - does not change trading logic
+    - does not change cooldowns or drawdown levels
+    - avoids spam by remembering the last sent protection key in tracker
+    """
+    result = result or {}
+    if not isinstance(tracker, dict):
+        return
+
+    alerts: list[tuple[str, str]] = []
+
+    loss_guard = result.get("loss_streak_guard") or {}
+    if isinstance(loss_guard, dict) and loss_guard.get("active"):
+        cooldown_until = str(loss_guard.get("cooldown_until") or "")
+        streak = int(loss_guard.get("streak", 0) or 0)
+        key = f"loss_streak_guard:{cooldown_until or streak}"
+        alerts.append((
+            key,
+            "\n".join([
+                "🛡️ <b>تم تفعيل الحماية الوقائية</b>",
+                _loss_streak_guard_message_ar(loss_guard),
+                "",
+                "سيستمر البوت في متابعة السوق، وسيُستأنف فتح الصفقات تلقائيًا بعد انتهاء فترة التهدئة.",
+            ]).strip(),
+        ))
+
+    drawdown_status = result.get("drawdown_status")
+    drawdown_message = _drawdown_protection_message_ar(drawdown_status)
+    if drawdown_message:
+        try:
+            dd_level = int(getattr(drawdown_status, "level", 0) or 0)
+            dd_reason = str(getattr(drawdown_status, "reason", "") or "")
+            dd_pct = float(getattr(drawdown_status, "drawdown_pct", 0.0) or 0.0)
+        except Exception:
+            dd_level = 0
+            dd_reason = "drawdown_protection"
+            dd_pct = 0.0
+        key = f"daily_drawdown:{dd_level}:{dd_reason}"
+        title = "🛡️ <b>تم تفعيل حماية السحب اليومي</b>" if dd_level < 3 else "🛑 <b>تم تفعيل الإيقاف اليومي الكامل</b>"
+        alerts.append((
+            key,
+            "\n".join([
+                title,
+                f"مستوى الحماية: {dd_level} | الخسارة اليومية: {dd_pct:.2f}%",
+                drawdown_message,
+                "",
+                "سيظهر هذا الوضع أيضًا في رسائل المود والـ reminders وتقارير JSON للمحاكاة والتنفيذ.",
+            ]).strip(),
+        ))
+
+    sent_keys = tracker.setdefault("protection_alerts_sent", set())
+    if not isinstance(sent_keys, set):
+        sent_keys = set(sent_keys or [])
+        tracker["protection_alerts_sent"] = sent_keys
+
+    active_keys = {key for key, _message in alerts}
+    # Allow a fresh alert next time after a protection fully disappears or changes level.
+    for old_key in list(sent_keys):
+        if old_key.startswith(("loss_streak_guard:", "daily_drawdown:")) and old_key not in active_keys:
+            sent_keys.discard(old_key)
+
+    for key, message in alerts:
+        if key in sent_keys:
+            continue
+        _send_text(sender, message)
+        sent_keys.add(key)
+        _telegram_send_pause(TELEGRAM_NORMAL_SEND_GAP_SECONDS)
+
 def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict, settings: Settings | None = None) -> None:
     state = result.get("state")
     if not state:
@@ -5581,7 +5796,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
                     "remaining_minutes": 5 if level == 1 else 5 if level == 2 else 0,
                 })
                 # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
-                _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
+                _send_text(sender, _append_protection_notice(build_market_mode_sections(mode, context, variant="reminder"), result))
                 trades = _reminder_trades_for_runtime(result, settings)
                 _send_text(sender, _block_protection_alert_for_level(
                     level,
@@ -5598,7 +5813,7 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
         context = _enrich_reminder_context(result, result.get("mode_context", {}), settings=settings)
         context.update({"reminder_count": expected_count, "minutes_in_mode": minutes_in_mode})
         # ✅ FIX: _send_text لدعم HTML tags في الـ reminder
-        _send_text(sender, build_market_mode_sections(mode, context, variant="reminder"))
+        _send_text(sender, _append_protection_notice(build_market_mode_sections(mode, context, variant="reminder"), result))
 
 
 
@@ -5702,6 +5917,7 @@ def live_worker() -> None:
                     else:
                         _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
+                _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings)
                 _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
 
@@ -5726,6 +5942,7 @@ def live_worker() -> None:
                         if now_ts >= next_mode_guard_ts:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
+                        _maybe_send_protection_activation_alert(sender, last_result, reminder_tracker, settings=settings)
                         _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
                 except Exception as exc:
                     print(f"mode reminder error: {exc}", flush=True)
