@@ -85,17 +85,42 @@ def trade_from_dict(data: dict[str, Any]) -> TrackedTrade | None:
         allowed = set(TrackedTrade.__dataclass_fields__.keys())
         clean = {k: v for k, v in dict(data).items() if k in allowed}
 
-        for dt_key in ("opened_at", "updated_at", "closed_at"):
+        datetime_fields = (
+            "opened_at",
+            "updated_at",
+            "closed_at",
+            "last_exchange_sync_at",
+            "last_sl_amend_at",
+            "tp1_hit_at",
+            "tp2_hit_at",
+            "sl_move_to_entry_at",
+            "sl_move_to_tp1_at",
+            "trailing_started_at",
+            "trailing_tightened_at",
+        )
+        nullable_datetime_fields = {
+            "closed_at",
+            "last_exchange_sync_at",
+            "last_sl_amend_at",
+            "tp1_hit_at",
+            "tp2_hit_at",
+            "sl_move_to_entry_at",
+            "sl_move_to_tp1_at",
+            "trailing_started_at",
+            "trailing_tightened_at",
+        }
+        for dt_key in datetime_fields:
             if dt_key in clean:
                 parsed = _parse_dt(clean.get(dt_key))
                 if parsed is not None:
                     clean[dt_key] = parsed
-                elif dt_key == "closed_at":
+                elif dt_key in nullable_datetime_fields:
                     clean[dt_key] = None
 
         list_fields = (
             "execution_setup_tags",
             "warnings",
+            "last_3_candles",
         )
         for key in list_fields:
             if key in clean and not isinstance(clean[key], list):
