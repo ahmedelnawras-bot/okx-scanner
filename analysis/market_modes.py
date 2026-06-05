@@ -272,10 +272,10 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
     # тЬЕ BTC Dominance ┘Г╪╣╪з┘Е┘Д ┘Е╪│╪з╪╣╪п
     # dom_change > +0.3 тЖТ BTC.D ╪з╪▒╪к┘Б╪╣ тЖТ alts ╪╢╪╣┘К┘Б╪й тЖТ ┘К╪┤╪п╪п weak_breadth
     # dom_change < -0.3 тЖТ BTC.D ┘Ж╪▓┘Д тЖТ alts ┘В┘И┘К╪й тЖТ ┘К╪о┘Б┘Б weak_breadth
-    if dom_change > 0.3 and not weak_breadth and (red_ratio >= 0.50 or avg <= -0.25):
+    if dom_change > 0.25 and not weak_breadth and (red_ratio >= 0.50 or avg <= -0.25):
         weak_breadth = True
         print(f"тЪая╕П DOM_PRESSURE: dom_change={dom_change:+.2f} тЖТ weak_breadth forced True", flush=True)
-    elif dom_change < -0.3 and weak_breadth and red_ratio < 0.55 and avg > -0.30:
+    elif dom_change < -0.25 and weak_breadth and red_ratio < 0.55 and avg > -0.30:
         weak_breadth = False
         print(f"тЬЕ DOM_RELIEF: dom_change={dom_change:+.2f} тЖТ weak_breadth relieved", flush=True)
 
