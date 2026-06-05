@@ -2797,7 +2797,12 @@ def run_once(
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
-    portfolio_state = build_portfolio_state_from_trades(persisted_trades, **portfolio_state_inputs)
+    # Daily DD must use the active runtime bucket:
+    # - Simulation mode evaluates the virtual simulation wallet/trades.
+    # - Trading/execution evaluates live execution trades.
+    # This keeps DD protection independent between simulation and execution.
+    dd_base_trades = simulation_trades if simulation_mode_active else persisted_trades
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
@@ -3143,7 +3148,10 @@ def run_once(
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
-    portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
+    # Final Daily DD snapshot must also follow the active runtime bucket.
+    # Without this, simulation DD would be calculated from execution trades.
+    dd_base_trades = simulation_trades if simulation_mode_active else trades
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
     drawdown_report = build_drawdown_report(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
@@ -3286,12 +3294,18 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     result["portfolio_state_inputs"] = portfolio_state_inputs
     result["protection_state"] = protection_state
-    portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
+    dd_base_trades = _loss_streak_base_trades_for_runtime(
+        runtime_settings,
+        result,
+        execution_trades=trades,
+        simulation_trades=list(result.get("simulation_trades", []) or []),
+    )
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
     result["loss_streak_guard"] = _build_loss_streak_guard(
-        _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades),
+        dd_base_trades,
         reset_at=_parse_protection_dt(protection_state.get("loss_streak_reset_at")),
     )
     protection_summary = _risk_protection_summary(result)
