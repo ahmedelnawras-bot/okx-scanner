@@ -107,20 +107,53 @@ def _btc_ma5_guard_line(context: dict) -> str:
         gap_f = 0.0
 
     is_unknown = (
-        source in {"", "unavailable", "unknown"}
-        or close_f <= 0
+        close_f <= 0
         or ma5_f <= 0
         or gap is None
     )
 
     if is_unknown:
         status = "⚪ UNKNOWN"
+        gap_text = "N/A"
     elif context.get("hourly_ma5_pressure"):
         status = "⚠️ PRESSURE"
+        gap_text = _fmt_pct(gap_f, 2)
     else:
         status = "✅ CLEAR"
+        gap_text = _fmt_pct(gap_f, 2)
 
-    return f"• 🛡 BTC MA5 Guard (30m): {status} | Gap {_fmt_pct(gap_f, 2)}"
+    return f"• 🛡 BTC MA5 Guard (30m): {status} | Gap {gap_text}"
+
+
+def _btc_dominance_line(context: dict) -> str:
+    raw = (
+        context.get("btc_dominance_change_1h")
+        if "btc_dominance_change_1h" in context
+        else context.get("dom_change", context.get("dominance_change_1h"))
+    )
+    unknown_flag = bool(
+        context.get("btc_dominance_unknown")
+        or context.get("btc_dominance_unavailable")
+        or context.get("dominance_unknown")
+    )
+
+    try:
+        dom = float(raw)
+    except Exception:
+        dom = 0.0
+        unknown_flag = True
+
+    if raw is None or unknown_flag:
+        return "• 🧭 BTC Dominance (1h): ⚪ N/A"
+
+    if dom > 0:
+        icon = "↗"
+    elif dom < 0:
+        icon = "↘"
+    else:
+        icon = "➖"
+
+    return f"• 🧭 BTC Dominance (1h): {icon} {dom:+.2f}%"
 
 
 def _market_mix_lines(context: dict) -> list[str]:
@@ -130,6 +163,7 @@ def _market_mix_lines(context: dict) -> list[str]:
             f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
             f"• Avg 15m Move: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
             _btc_ma5_guard_line(context),
+            _btc_dominance_line(context),
             f"• Action: {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• Action: {context.get('action', '') or _mix_action('', context)}",
         ]
     return [
@@ -250,6 +284,7 @@ def _build_compact_market_reminder(mode: str, context: dict) -> str:
         "",
         "📊 <b>Market Snapshot</b>",
         f"• BTC: {btc_icon} {btc:+.2f}%",
+        _btc_dominance_line(context),
         f"• Alts: {alts_icon} {alts_label}",
         f"• Red: {red:.0f}% | Avg: {avg:+.2f}%",
         f"• Strong Setups: {strong} / {scanned}",
