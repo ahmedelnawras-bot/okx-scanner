@@ -91,13 +91,45 @@ def _signal_rules(mode: str, context: dict) -> list[str]:
     ]
 
 
+def _btc_ma5_guard_line(context: dict) -> str:
+    source = str(context.get("hourly_ma_guard_source", "") or "").lower()
+    close = context.get("btc_1h_close")
+    ma5 = context.get("btc_1h_ma5")
+    gap = context.get("btc_1h_ma5_gap_pct")
+
+    try:
+        close_f = float(close)
+        ma5_f = float(ma5)
+        gap_f = float(gap)
+    except Exception:
+        close_f = 0.0
+        ma5_f = 0.0
+        gap_f = 0.0
+
+    is_unknown = (
+        source in {"", "unavailable", "unknown"}
+        or close_f <= 0
+        or ma5_f <= 0
+        or gap is None
+    )
+
+    if is_unknown:
+        status = "⚪ UNKNOWN"
+    elif context.get("hourly_ma5_pressure"):
+        status = "⚠️ PRESSURE"
+    else:
+        status = "✅ CLEAR"
+
+    return f"• 🛡 BTC MA5 Guard (30m): {status} | Gap {_fmt_pct(gap_f, 2)}"
+
+
 def _market_mix_lines(context: dict) -> list[str]:
     if any(k in context for k in ("strong_coins", "red_ratio", "avg15m")):
         return [
             f"• Strong Coins: {context.get('strong_coins', 0)}",
             f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
             f"• Avg 15m Move: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
-            f"• 🛡 BTC MA5 Guard (30m): {'⚠️ PRESSURE' if context.get('hourly_ma5_pressure') else '✅ CLEAR'} | Gap {_fmt_pct(context.get('btc_1h_ma5_gap_pct', 0.0), 2)}",
+            _btc_ma5_guard_line(context),
             f"• Action: {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• Action: {context.get('action', '') or _mix_action('', context)}",
         ]
     return [
