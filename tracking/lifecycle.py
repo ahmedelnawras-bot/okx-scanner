@@ -7,7 +7,7 @@ from utils.constants import TRAILING_STOP_AFTER_TP2_PCT, BREAKEVEN_BUFFER_PCT
 from .models import TrackedTrade
 
 
-_CLOSED_STATUSES = {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}
+_CLOSED_STATUSES = {"closed_win", "closed_loss", "breakeven_after_tp1", "protected_entry_exit", "trailing_hit", "expired"}
 
 _FILLED_STATES = {
     "filled",
@@ -89,6 +89,31 @@ def _tp2_confirmed(trade: TrackedTrade, current_price: float) -> tuple[bool, str
     return current_price >= trade.tp2, "price"
 
 
+def _stamp_once(trade: TrackedTrade, field_name: str, now: datetime | None = None) -> None:
+    """Set a timestamp field only once, if the enhanced model supports it."""
+    try:
+        if getattr(trade, field_name, None) is None:
+            setattr(trade, field_name, now or datetime.now(timezone.utc))
+    except Exception:
+        pass
+
+
+def _update_exit_analysis(trade: TrackedTrade) -> None:
+    """Best-effort analytics only; does not affect trade management."""
+    try:
+        mfe = max(0.0, float(getattr(trade, "max_favorable_pct", 0.0) or 0.0))
+        realized = float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0)
+        if mfe > 0:
+            efficiency = max(0.0, min(100.0, (realized / mfe) * 100.0))
+            _safe_setattr(trade, "exit_efficiency_pct", round(efficiency, 4))
+            _safe_setattr(trade, "missed_runner_profit_pct", round(max(0.0, mfe - max(0.0, realized)), 4))
+        else:
+            _safe_setattr(trade, "exit_efficiency_pct", 0.0)
+            _safe_setattr(trade, "missed_runner_profit_pct", 0.0)
+    except Exception:
+        pass
+
+
 def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
     trade.status = status
     trade.closed_at = trade.closed_at or datetime.now(timezone.utc)
@@ -98,6 +123,7 @@ def _mark_closed(trade: TrackedTrade, status: str) -> TrackedTrade:
     trade.same_symbol_block_exempt = True
     trade.runner_active = False
     trade.protected_runner = False
+    _update_exit_analysis(trade)
     if not trade.slot_exempt_reason:
         trade.slot_exempt_reason = status
     return trade
@@ -131,6 +157,8 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
         trade.protected_reason = "market_mode_block_longs"
         buffered_entry = trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0)
         if trade.tp2_hit:
+            if not trade.trailing_tightened:
+                _stamp_once(trade, "trailing_tightened_at")
             trade.trailing_tightened = True
             trade.protected_sl = max(trade.protected_sl or 0.0, buffered_entry)
         elif not trade.tp1_hit:
@@ -139,6 +167,8 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
             trade.protected_sl = max(trade.protected_sl or 0.0, buffered_entry)
     if protection_level >= 3 and trade.pnl_pct > 0:
         trade.protection_level = 3
+        if trade.tp2_hit and not trade.trailing_tightened:
+            _stamp_once(trade, "trailing_tightened_at")
         trade.trailing_tightened = trade.tp2_hit or trade.trailing_tightened
         trade.protected_sl = max(trade.protected_sl or 0.0, trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0))
     return trade
@@ -148,6 +178,7 @@ def _apply_tp1_partial(trade: TrackedTrade, tp1_close_pct: float, source: str) -
     if trade.tp1_hit:
         return trade
     trade.tp1_hit = True
+    _stamp_once(trade, "tp1_hit_at")
     trade.closed_portion_pct = tp1_close_pct
     trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
     trade.status = "tp1_partial"
@@ -161,10 +192,14 @@ def _apply_tp2_partial(trade: TrackedTrade, tp1_close_pct: float, tp2_close_pct:
     if trade.tp2_hit:
         return trade
     trade.tp2_hit = True
+    _stamp_once(trade, "tp2_hit_at")
     trade.trailing_active = True
+    _stamp_once(trade, "trailing_started_at")
     trade.runner_active = True
     trade.sl_moved_to_entry = True   # backward compat — يفضل True عشان post_tp1_sl logic
+    _stamp_once(trade, "sl_move_to_entry_at")
     trade.sl_moved_to_tp1 = True     # ✅ الـ flag الجديد — SL انتقل لـ TP1
+    _stamp_once(trade, "sl_move_to_tp1_at")
     trade.closed_portion_pct = tp1_close_pct + tp2_close_pct
     trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp2) * (tp2_close_pct / 100.0)
     trade.status = "tp2_partial"
@@ -195,7 +230,9 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
 
     # Direct SL before TP1: full loss/BE depending on active protection.
     if current_price <= active_sl and not trade.tp1_hit:
-        status = "closed_loss" if active_sl < trade.entry else "breakeven_after_tp1"
+        # Do not label this as breakeven_after_tp1 unless TP1 was actually hit.
+        # A protected/entry exit before TP1 gets its own status for cleaner reports.
+        status = "closed_loss" if active_sl < trade.entry else "protected_entry_exit"
         trade.closed_portion_pct = 100.0
         trade.realized_pnl_pct = _pnl_pct(trade.entry, active_sl)
         trade.runner_pnl_pct = 0.0
@@ -224,6 +261,7 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         trade = _apply_tp2_partial(trade, tp1_close_pct, tp2_close_pct, tp2_source)
 
     if trade.tp2_hit:
+        _stamp_once(trade, "trailing_started_at")
         trade = _mark_protected_runner(trade)
         trail_pct = max(0.9, TRAILING_STOP_AFTER_TP2_PCT - (0.6 if trade.trailing_tightened else 0.0))
         trail_anchor = max(trade.highest_price, trade.tp2)
