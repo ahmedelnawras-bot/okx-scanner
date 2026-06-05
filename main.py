@@ -1332,54 +1332,32 @@ def _current_equity_for_manual_resume(result: dict | None, settings: Settings, p
 
 def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
     scope = _protection_scope(settings)
-    scope_label = str(scope or "-").strip().capitalize()
     equity = _current_equity_for_manual_resume(result, settings)
     loss_guard = (result or {}).get("loss_streak_guard") or {}
     drawdown = (result or {}).get("drawdown_status")
-
-    dd_pct = 0.0
+    dd_line = "غير متاح"
     if drawdown is not None:
         try:
-            dd_pct = float(getattr(drawdown, "drawdown_pct", 0.0) or 0.0)
+            dd_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.2f}% | مستوى {int(getattr(drawdown, 'level', 0) or 0)}"
         except Exception:
-            dd_pct = 0.0
-
-    streak = int(loss_guard.get("streak", 0) or 0)
-    limit = int(loss_guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)
-
-    if streak >= limit:
-        protection_trigger = "5 Consecutive Losses"
-    elif drawdown is not None and not bool(getattr(drawdown, "allowed", True)):
-        protection_trigger = "Daily Drawdown Protection"
-    else:
-        protection_trigger = "Manual Protection Resume"
-
+            pass
     return "\n".join([
-        "🚨 تأكيد Manual Resume",
+        "⚠️ <b>استئناف يدوي للتداول — Preview</b>",
         "━━━━━━━━━━━━",
+        f"النطاق: <b>{scope}</b>",
+        f"الرصيد/الـ equity الحالي: <b>{equity:,.2f} USDT</b>",
+        f"Daily DD الحالي: <code>{dd_line}</code>",
+        f"Loss Streak الحالي: <code>{int(loss_guard.get('streak', 0) or 0)} / {int(loss_guard.get('limit', LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)}</code>",
         "",
-        "📊 الحالة الحالية",
-        f"• Scope: {scope_label}",
-        f"• Equity: {equity:,.2f} USDT",
-        f"• Daily DD: {dd_pct:.2f}%",
-        f"• Loss Streak: {streak} / {limit}",
-        f"• Protection Trigger: {protection_trigger}",
+        "🧯 <b>عند التأكيد سيتم:</b>",
+        "• إعادة تفعيل فتح الصفقات.",
+        "• تصفير عداد 5SL / No TP1 من هذه اللحظة.",
+        "• اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
+        "• تسجيل manual_resume_at داخل حالة الحماية.",
         "",
-        "عند التأكيد سيتم:",
-        "✅ إعادة تفعيل البوت",
-        "✅ تصفير عداد 5SL",
-        "✅ تصفير عداد No TP1",
-        "✅ اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD",
-        "✅ تسجيل Manual Resume في السجل",
-        "",
-        "⚠️ تحذير",
-        "سيتم تجاهل سبب الإيقاف الحالي",
-        "وسيتم بدء دورة حماية جديدة من الرصيد الحالي.",
-        "",
-        "🔐 للتأكيد:",
-        "/confirm_resume_trading",
+        "⚠️ لا يتم التنفيذ إلا بعد التأكيد الصريح.",
+        "للتنفيذ أرسل: <code>/confirm_resume_trading</code>",
     ])
-
 
 
 def _confirm_manual_resume_trading(
@@ -1388,7 +1366,6 @@ def _confirm_manual_resume_trading(
     trade_store: RedisTradeStore | None = None,
 ) -> str:
     scope = _protection_scope(settings)
-    scope_label = str(scope or "-").strip().capitalize()
     now = datetime.now(timezone.utc)
     equity = _current_equity_for_manual_resume(result, settings)
     state = _load_protection_state(trade_store, scope)
@@ -1424,27 +1401,14 @@ def _confirm_manual_resume_trading(
             print(f"⚠️ manual resume runtime refresh failed: {exc}", flush=True)
 
     return "\n".join([
-        "✅ Manual Resume Completed",
+        "✅ <b>تم استئناف التداول يدويًا</b>",
         "━━━━━━━━━━━━",
-        "",
-        f"📊 Scope: {scope_label}",
-        "",
-        "💰 Daily DD Baseline Updated",
-        f"New Baseline: {equity:,.2f} USDT",
-        "",
-        "🔄 Protection Counters Reset",
-        "✅ 5SL Counter Cleared",
-        "✅ No TP1 Counter Cleared",
-        "",
-        "🛡️ Protection Status",
-        "• Daily DD restarted",
-        "• Current balance adopted as reference",
-        "• Future protection calculations start from now",
-        "",
-        "📝 Event Logged",
-        "Manual Resume recorded successfully",
+        f"النطاق: <b>{scope}</b>",
+        f"Baseline جديد للـ Daily DD: <b>{equity:,.2f} USDT</b>",
+        "تم تصفير عداد حماية 5SL / No TP1 من هذه اللحظة.",
+        "تم اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
+        "أي تفعيل جديد للحماية سيُحسب من الصفقات التي تُغلق بعد وقت الاستئناف فقط.",
     ])
-
 
 
 def _maybe_finalize_loss_streak_cooldown(
@@ -4483,24 +4447,15 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
         None,
     )
-    last_status = "none"
-    last_reason = "none"
+    rejection_reason = "none"
     if last_rejection:
-        last_status = str(last_rejection.get("status") or "unknown")
-        last_reason = str(last_rejection.get("reason") or "unknown")
+        rejection_reason = f"{last_rejection.get('status')} | {last_rejection.get('reason', 'unknown')}"
 
     redis_stats = trade_store.health_snapshot() if trade_store else {"enabled": False}
     drawdown = result.get("drawdown_status")
-    drawdown_pct = 0.0
-    drawdown_level = 0
-    drawdown_allowed = True
+    drawdown_line = "n/a"
     if drawdown is not None:
-        try:
-            drawdown_pct = float(getattr(drawdown, "drawdown_pct", 0.0) or 0.0)
-            drawdown_level = int(getattr(drawdown, "level", 0) or 0)
-            drawdown_allowed = bool(getattr(drawdown, "allowed", True))
-        except Exception:
-            pass
+        drawdown_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}% | level={int(getattr(drawdown, 'level', 0) or 0)} | {'ALLOWED' if getattr(drawdown, 'allowed', True) else 'HALTED'}"
 
     protection_state = result.get("protection_state") or {}
     manual_resume_line = "OFF"
@@ -4508,60 +4463,61 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         manual_resume_line = str(protection_state.get("manual_resume_at"))
 
     loss_guard = result.get("loss_streak_guard") or {}
-    loss_streak = int(loss_guard.get("streak", 0) or 0)
-    loss_limit = int(loss_guard.get("limit", LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)
-    trading_allowed = bool(drawdown_allowed and not loss_guard.get("active"))
+    if loss_guard.get("active"):
+        loss_guard_line = (
+            f"ACTIVE | streak={int(loss_guard.get('streak', 0) or 0)} | "
+            f"remaining={int(loss_guard.get('remaining_minutes', 0) or 0)}m"
+        )
+    else:
+        loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
 
     runtime = _runtime_mode_snapshot(settings)
     simulation_active = str(runtime.get("active_mode") or "").lower() == "simulation"
     if simulation_active:
-        trading_state_line = "ALLOWED (SIMULATION)" if trading_allowed else "HALTED (SIMULATION)"
-        okx_status_line = "FORCED OFF (Simulation)"
+        okx_status_line = f"FORCED OFF in Simulation | raw={'ON' if runtime.get('orders_enabled') else 'OFF'} | effective=OFF"
         live_status_line = "DISABLED BY SIMULATION"
     else:
-        trading_state_line = "ALLOWED" if trading_allowed else "HALTED"
         okx_status_line = f"{'ON' if runtime.get('orders_enabled') else 'OFF'} | Effective: {'ON' if runtime.get('effective_orders_enabled') else 'OFF'}"
         live_status_line = "ALLOWED" if settings.allow_live_trading else "BLOCKED"
-
     risk_profile = _risk_profile_snapshot(settings, result)
-    wallet_value = _safe_float(
-        (result.get("simulation_wallet") or {}).get("equity"),
-        _safe_float(risk_profile.get("reference_balance_usdt"), SIMULATION_START_BALANCE_USDT),
-    )
+    risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
+
+    trading_state_line = "🛡️ Trading State: ACTIVE"
+    if drawdown_state == "halted":
+        trading_state_line = "🛡️ Trading State: HALTED | Reason: Daily DD"
 
     return "\n".join([
         "🟢 Bot Status",
         "━━━━━━━━━━━━",
-        "",
-        f"🚦 Trading State: {trading_state_line}",
-        "",
-        "⚙️ التشغيل",
+        trading_state_line,
         f"📈 Market Mode: {result.get('mode', 'UNKNOWN')}",
         f"⚡ Execution Engine: {'ON' if settings.execution_enabled else 'OFF'}",
-        f"🧪 OKX Orders: {okx_status_line}",
-        f"🔒 Live Trading: {live_status_line}",
+        "🔌 OKX",
+        f"• Orders: {'ON' if runtime.get('orders_enabled') else 'OFF'}",
+        f"• Raw: {'ON' if runtime.get('orders_enabled') else 'OFF'}",
+        f"• Effective: {'ON' if runtime.get('effective_orders_enabled') else 'OFF'}",
+        f"• Live Trading: {live_status_line}",
+        f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
+        f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
         "",
-        "💰 رأس المال",
-        f"🧪 Wallet: {wallet_value:,.2f} USDT",
-        f"📊 Slots: {int(risk_profile.get('slot_count', 0) or 0)}",
-        f"📈 Allocation: {_safe_float(risk_profile.get('allocation_pct'), 0.0):.2f}%",
-        f"💵 Margin / Trade: {_safe_float(risk_profile.get('margin_per_trade'), 0.0):,.2f} USDT",
+        risk_block,
         "",
-        "🛡️ الحماية",
-        f"💼 Daily DD: {drawdown_pct:.2f}% | Level {drawdown_level}",
-        f"🛑 Loss Streak: {loss_streak} / {loss_limit}",
-        f"🧯 Manual Resume: {manual_resume_line}",
-        "",
-        "🧠 النظام",
         f"📡 Telegram: {'ON' if settings.telegram_enabled else 'OFF'}",
-        f"🧠 Redis: {'ON' if redis_stats.get('enabled') else '🚨 OFF'} | checks={redis_stats.get('execution_checks', 0)}",
+        f"🧠 Redis: {'ON' if redis_stats.get('enabled') else '🚨 OFF — OKX execution BLOCKED for safety'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
+        f"💼 Drawdown: {drawdown_line}",
+        f"🛑 Loss Streak Guard: {loss_guard_line}",
+        f"🧯 Manual Resume: {manual_resume_line}",
+        f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
+        f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
         "",
-        "📌 آخر قرار",
-        f"Status: {last_status}",
-        f"Reason: {last_reason}",
+        "📌 Last Decision:",
+        f"• {rejection_reason}",
+        "",
+        "🕹 Runtime Toggle: /okx_orders_on | /okx_orders_off",
+        "✅ Managed OKX entry + SL + TP split enabled" if runtime.get("effective_orders_enabled") else "✅ Preview mode only — managed exchange placement paused",
     ])
 
 
