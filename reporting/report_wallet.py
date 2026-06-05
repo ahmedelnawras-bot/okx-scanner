@@ -4,10 +4,9 @@ from tracking.models import TrackedTrade
 from reporting.report_format import (
     DEFAULT_MARGIN_PER_TRADE,
     SEP,
-    money_from_exposure_pct,
     open_trades,
     closed_trades,
-    trade_effective_pnl,
+    trade_money_pnl,
     filter_trades_by_period,
     period_label,
 )
@@ -16,9 +15,18 @@ from reporting.report_format import (
 def _net_parts(trades: list[TrackedTrade], margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE) -> tuple[float, float, float]:
     closed = closed_trades(trades)
     opened = open_trades(trades)
-    closed_net = sum(trade_effective_pnl(t) for t in closed)
-    open_net = sum(trade_effective_pnl(t) for t in opened)
-    return money_from_exposure_pct(closed_net, margin_per_trade), money_from_exposure_pct(open_net, margin_per_trade), money_from_exposure_pct(closed_net + open_net, margin_per_trade)
+
+    # Accurate wallet impact: sum each trade with its own stored margin.
+    # margin_per_trade remains only as a fallback for legacy trades.
+    closed_net = sum(
+        trade_money_pnl(t, fallback_margin=margin_per_trade)
+        for t in closed
+    )
+    open_net = sum(
+        trade_money_pnl(t, fallback_margin=margin_per_trade)
+        for t in opened
+    )
+    return closed_net, open_net, closed_net + open_net
 
 
 def build_wallet_report(trades: list[TrackedTrade], starting_balance: float = 1000.0, margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE, title: str = "💼 Wallet Impact — Execution") -> str:
