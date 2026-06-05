@@ -887,6 +887,9 @@ def _calculate_adaptive_targets(
 
         "sl_max_pct":
             SMART_SL_MAX_PCT,
+
+        "structure_stop_context":
+            structure_stop_context,
     }
 
 
@@ -1366,6 +1369,10 @@ def build_signal_candidate(
                 ]
             ),
         )
+    )
+
+    structure_stop_context = dict(
+        target_profile.get("structure_stop_context") or {}
     )
 
     rr1 = float(
