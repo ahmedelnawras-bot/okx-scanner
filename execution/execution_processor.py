@@ -316,6 +316,9 @@ def _base_response(
         "nour_filter_name": gate.get("nour_filter_name") if isinstance(gate, dict) else None,
         "nour_filter_passed": gate.get("nour_filter_passed") if isinstance(gate, dict) else None,
         "nour_filter_reason": gate.get("nour_filter_reason") if isinstance(gate, dict) else None,
+        # UI/report diagnostics only — does not change execution decisions.
+        "weak_drift": gate.get("weak_drift") if isinstance(gate, dict) else None,
+        "weak_drift_passed": gate.get("weak_drift_passed") if isinstance(gate, dict) else None,
         "execution_score": round(execution_score, 2),
         "display_score": round(float(signal.score), 2),
         "target_model": target_model,
