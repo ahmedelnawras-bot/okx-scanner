@@ -593,6 +593,68 @@ def _resolve_portfolio_state_inputs(
     }
 
 
+def _resolve_simulation_portfolio_state_inputs(
+    simulation_trades: list,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    daily_balance: dict | None = None,
+) -> dict:
+    """Build Daily DD inputs from the Simulation wallet only.
+
+    This deliberately does not call _resolve_portfolio_state_inputs(), because
+    that function is execution/OKX-oriented and may fall back to risk_manager
+    micro-values. Simulation DD must use the virtual wallet journal:
+    - start_of_day_balance: today's simulation daily start
+    - reference_portfolio: current simulation wallet equity
+    - margin_per_trade: simulation sizing for the same virtual account
+
+    Execution/trading mode remains OKX-based through _resolve_portfolio_state_inputs().
+    """
+    wallet = _build_simulation_wallet_snapshot(
+        list(simulation_trades or []),
+        start_balance=SIMULATION_START_BALANCE_USDT,
+    )
+
+    row = dict(daily_balance or {})
+    if not row:
+        try:
+            row = _ensure_simulation_daily_log(
+                list(simulation_trades or []),
+                trade_store=trade_store,
+                settings=settings,
+            )
+        except Exception:
+            row = {}
+
+    start_balance = _safe_float(row.get("start_balance"), 0.0)
+    if start_balance <= 0:
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    if start_balance <= 0:
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    current_equity = _safe_float(wallet.get("equity"), 0.0)
+    if current_equity <= 0:
+        current_equity = _safe_float(row.get("current_balance") or row.get("end_balance"), start_balance)
+    if current_equity <= 0:
+        current_equity = start_balance
+
+    margin_per_trade = _safe_float(row.get("margin_per_trade"), 0.0)
+    if margin_per_trade <= 0:
+        margin_per_trade = _simulation_margin_usdt(start_balance, settings)
+    if margin_per_trade <= 0:
+        margin_per_trade = _simulation_margin_usdt(current_equity, settings)
+
+    leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
+
+    return {
+        "reference_portfolio": float(current_equity),
+        "start_of_day_balance": float(start_balance),
+        "margin_per_trade": float(margin_per_trade or 0.0),
+        "leverage": leverage,
+        "source": "simulation_wallet_daily_balance",
+    }
+
+
 def _execution_report_balance_kwargs(portfolio_state_inputs: dict | None = None) -> dict:
     """Use real execution wallet context in execution reports.
 
@@ -2793,7 +2855,21 @@ def run_once(
             sync_exchange_stop=False,
         )
 
-    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
+    if simulation_mode_active:
+        simulation_daily_balance_snapshot = _ensure_simulation_daily_log(
+            simulation_trades,
+            trade_store=trade_store,
+            settings=settings,
+        )
+        portfolio_state_inputs = _resolve_simulation_portfolio_state_inputs(
+            simulation_trades,
+            settings,
+            trade_store=trade_store,
+            daily_balance=simulation_daily_balance_snapshot,
+        )
+    else:
+        simulation_daily_balance_snapshot = None
+        portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
@@ -3147,6 +3223,18 @@ def run_once(
     mode_context = _build_mode_context(state, snapshot, protection)
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
+    if simulation_mode_active:
+        simulation_daily_balance_snapshot = _ensure_simulation_daily_log(
+            simulation_trades,
+            trade_store=trade_store,
+            settings=settings,
+        )
+        portfolio_state_inputs = _resolve_simulation_portfolio_state_inputs(
+            simulation_trades,
+            settings,
+            trade_store=trade_store,
+            daily_balance=simulation_daily_balance_snapshot,
+        )
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     # Final Daily DD snapshot must also follow the active runtime bucket.
     # Without this, simulation DD would be calculated from execution trades.
@@ -3225,7 +3313,7 @@ def run_once(
         "simulation_execution_results": simulation_execution_results_for_reports,
         "simulation_signal_items": signal_items if simulation_mode_active else [],
         "simulation_wallet": _build_simulation_wallet_snapshot(simulation_trades),
-        "simulation_daily_balance": _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings),
+        "simulation_daily_balance": simulation_daily_balance_snapshot if simulation_daily_balance_snapshot is not None else _ensure_simulation_daily_log(simulation_trades, trade_store=trade_store, settings=settings),
         "simulation_daily_log": _load_simulation_daily_log(trade_store),
         "trades": trades,
         "command_outputs": command_outputs,
