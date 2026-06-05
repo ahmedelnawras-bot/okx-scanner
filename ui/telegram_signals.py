@@ -795,6 +795,70 @@ def _format_market_context_line(signal: SignalCandidate, execution_result: dict 
 
 
 
+def _format_weak_drift_lines(execution_result: dict | None = None) -> list[str]:
+    """Human-readable Weak Drift diagnostics for Telegram only.
+
+    UI-only: this does not change gate logic, scores, or execution decisions.
+    """
+    result = execution_result or {}
+    reason = str(result.get("reason") or "").strip().lower()
+    drift = result.get("weak_drift") or {}
+
+    if reason != "weak_drift_execution_block" or not isinstance(drift, dict):
+        return []
+
+    details = drift.get("details") or {}
+    drift_reasons = [
+        part.strip()
+        for part in str(drift.get("reason") or "").split(",")
+        if part.strip()
+    ]
+
+    label_map = {
+        "low_momentum": "Low Momentum",
+        "weak_market_drift": "Weak Market Drift",
+        "soft_chase": "Soft Chase / extended from MA",
+        "near_resistance_without_force": "Near Resistance without confirmation",
+        "late_or_danger": "Late / danger entry",
+    }
+
+    lines = ["", "🌀 Weak Drift"]
+
+    if drift_reasons:
+        lines.append("• Reasons: " + " | ".join(label_map.get(r, _clean_name(r)) for r in drift_reasons))
+
+    try:
+        dist_ma = float(details.get("dist_ma") or 0.0)
+        lines.append(f"• Distance from MA: {dist_ma:.2f}%")
+    except Exception:
+        pass
+
+    try:
+        vol_ratio = float(details.get("vol_ratio") or 0.0)
+        if vol_ratio > 0:
+            lines.append(f"• Volume Ratio: {vol_ratio:.2f}x")
+    except Exception:
+        pass
+
+    if "mtf_confirmed" in details:
+        lines.append(f"• MTF Confirmed: {'✅ Yes' if bool(details.get('mtf_confirmed')) else '❌ No'}")
+
+    try:
+        setup_weight = int(details.get("setup_weight") or 0)
+        lines.append(f"• Setup Weight: {setup_weight}")
+    except Exception:
+        pass
+
+    tags = details.get("tags")
+    if isinstance(tags, list) and tags:
+        clean_tags = " | ".join(_clean_name(t) for t in tags[:4])
+        if clean_tags:
+            lines.append(f"• Tags: {clean_tags}")
+
+    return lines
+
+
+
 
 def _localized_warning_notes(warnings, limit: int = 3) -> list[str]:
     """Return clean Arabic notes for Telegram signal messages.
@@ -1035,6 +1099,7 @@ def build_signal_message(signal: SignalCandidate, execution_result: dict | None 
             f"Status: {status or 'not_candidate'}",
             f"Reason: {reason or 'normal_signal_only'}",
         ])
+        lines.extend(_format_weak_drift_lines(execution_result))
 
     return "\n".join(lines)
 
