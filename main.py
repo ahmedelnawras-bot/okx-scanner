@@ -4482,6 +4482,8 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
+    # UI-only status flag. Keep it local to avoid NameError in Telegram command polling.
+    drawdown_state = "halted" if (drawdown is not None and not bool(getattr(drawdown, "allowed", True))) else "active"
     trading_state_line = "🛡️ Trading State: ACTIVE"
     if drawdown_state == "halted":
         trading_state_line = "🛡️ Trading State: HALTED | Reason: Daily DD"
