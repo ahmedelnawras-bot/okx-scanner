@@ -964,9 +964,9 @@ class OKXTradeClient:
         self,
         inst_id: str,
         lever: int,
-        mgn_mode: str = "cross",
+        mgn_mode: str = "isolated",
         *,
-        pos_side: str | None = None,
+        pos_side: str | None = "long",
     ) -> dict[str, Any]:
         """اضبط الرافعة لعملة معينة قبل الأوردر.
 
@@ -974,7 +974,8 @@ class OKXTradeClient:
         - بيجيب أقصى رافعة متاحة
         - بيضبطها تلقائياً
 
-        دايماً cross margin.
+        isolated margin: كل صفقة معزولة بمارجينها بس.
+        بيبعت posSide=long تلقائياً لأن OKX بيطلبها مع isolated.
         """
         guard = self._trade_guard_error()
         if guard:
