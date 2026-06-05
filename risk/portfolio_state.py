@@ -120,6 +120,28 @@ def _same_utc_day(value: datetime | None, day_ref: datetime) -> bool:
         return False
 
 
+def _trade_margin_usdt(trade, fallback_margin: float) -> float:
+    """Return the margin stored on this specific trade.
+
+    This keeps portfolio-state USD calculations aligned with compounding and
+    historical trade sizing. fallback_margin is used only for old trades that
+    were saved before margin fields existed.
+    """
+    for attr in (
+        "used_margin_usdt",
+        "simulation_margin_usdt",
+        "margin_usdt",
+        "allocated_margin_usdt",
+    ):
+        try:
+            value = float(getattr(trade, attr, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            return value
+    return float(fallback_margin or 0.0)
+
+
 def build_portfolio_state_from_trades(
     trades: list,
     reference_portfolio: float = REFERENCE_PORTFOLIO_USDT,
@@ -154,13 +176,16 @@ def build_portfolio_state_from_trades(
         else now.replace(hour=0, minute=0, second=0, microsecond=0)
     )
 
-    trade_value = float(margin_per_trade) * float(leverage)
-
     for trade in trades or []:
         is_closed = _trade_is_closed(trade)
         opened_at = getattr(trade, "opened_at", None)
         pnl_pct = float(getattr(trade, "pnl_pct", 0.0) or 0.0)
         realized_pnl_pct = float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0)
+
+        # Use the trade's own historical margin when available.
+        # This makes USD PnL accurate under compounding / dynamic sizing.
+        trade_margin = _trade_margin_usdt(trade, float(margin_per_trade))
+        trade_value = trade_margin * float(leverage)
 
         pnl_usdt = (pnl_pct / 100.0) * trade_value
 
