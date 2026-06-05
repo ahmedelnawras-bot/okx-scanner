@@ -97,7 +97,7 @@ def _market_mix_lines(context: dict) -> list[str]:
             f"• Strong Coins: {context.get('strong_coins', 0)}",
             f"• Red Ratio: {_fmt_pct(context.get('red_ratio', 0.0), 0)}",
             f"• Avg 15m Move: {_fmt_pct(context.get('avg15m', 0.0), 2)}",
-            f"• BTC 1h MA5 Guard: {'⚠️ pressure' if context.get('hourly_ma5_pressure') else '✅ clear'} ({_fmt_pct(context.get('btc_1h_ma5_gap_pct', 0.0), 2)})",
+            f"• 🛡 BTC MA5 Guard (30m): {'⚠️ PRESSURE' if context.get('hourly_ma5_pressure') else '✅ CLEAR'} | Gap {_fmt_pct(context.get('btc_1h_ma5_gap_pct', 0.0), 2)}",
             f"• Action: {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• Action: {context.get('action', '') or _mix_action('', context)}",
         ]
     return [
