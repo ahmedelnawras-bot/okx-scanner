@@ -133,6 +133,12 @@ SIMULATION_ALLOCATION_PCT = 24.0
 LOSS_STREAK_NO_TP1_LIMIT = 5
 LOSS_STREAK_COOLDOWN_MINUTES = 120
 
+# Manual protection resume state.
+# Stored in Redis when available; kept in memory as a safe fallback.
+PROTECTION_STATE_PREFIX = "okx:longbot:protection"
+PROTECTION_STATE_TTL_SECONDS = 3 * 24 * 60 * 60
+_PROTECTION_RUNTIME_STATE: dict[str, dict] = {}
+
 try:
     from reporting.ai_exporter import export_ai_snapshot
     _AI_EXPORT_ENABLED = True
@@ -1159,15 +1165,223 @@ def _is_sl_before_tp1_loss(trade) -> bool:
     return bool(status == "closed_loss" and not bool(getattr(trade, "tp1_hit", False)))
 
 
-def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
+
+def _parse_protection_dt(value: object) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _protection_scope(settings: Settings | None = None) -> str:
+    try:
+        runtime_settings = settings or get_settings()
+        return "simulation" if _is_simulation_mode(runtime_settings) else "execution"
+    except Exception:
+        return "execution"
+
+
+def _protection_state_key(scope: str) -> str:
+    scope = str(scope or "execution").strip().lower()
+    if scope not in {"execution", "simulation"}:
+        scope = "execution"
+    return f"{PROTECTION_STATE_PREFIX}:{scope}"
+
+
+def _load_protection_state(trade_store: RedisTradeStore | None = None, scope: str = "execution") -> dict:
+    key = _protection_state_key(scope)
+    state = dict(_PROTECTION_RUNTIME_STATE.get(key) or {})
+    if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
+        try:
+            raw = trade_store.client.get(key)
+            if raw:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    state.update(loaded)
+        except Exception as exc:
+            print(f"⚠️ protection state load failed: {exc}", flush=True)
+    return state
+
+
+def _save_protection_state(trade_store: RedisTradeStore | None, scope: str, state: dict) -> dict:
+    key = _protection_state_key(scope)
+    clean = dict(state or {})
+    clean["scope"] = str(scope or "execution")
+    clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _PROTECTION_RUNTIME_STATE[key] = clean
+    if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
+        try:
+            trade_store.client.set(
+                key,
+                json.dumps(clean, ensure_ascii=False, default=str),
+                ex=PROTECTION_STATE_TTL_SECONDS,
+            )
+        except Exception as exc:
+            print(f"⚠️ protection state save failed: {exc}", flush=True)
+    return clean
+
+
+def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_state: dict | None) -> dict:
+    """Apply manual Daily DD baseline override for the current UTC day only."""
+    inputs = dict(portfolio_state_inputs or {})
+    state = dict(protection_state or {})
+    baseline = _safe_float(state.get("daily_dd_baseline"), 0.0)
+    resumed_at = _parse_protection_dt(state.get("manual_resume_at") or state.get("daily_dd_override_at"))
+    now = datetime.now(timezone.utc)
+    if baseline > 0 and resumed_at and resumed_at.date() == now.date():
+        inputs["start_of_day_balance"] = baseline
+        inputs["manual_daily_dd_override"] = True
+        inputs["manual_daily_dd_baseline"] = baseline
+        inputs["manual_resume_at"] = resumed_at.isoformat()
+    return inputs
+
+
+def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
+    result = result or {}
+    if _is_simulation_mode(settings):
+        wallet = result.get("simulation_wallet") or {}
+        equity = _safe_float(wallet.get("equity"), 0.0)
+        if equity > 0:
+            return equity
+    portfolio_state = result.get("portfolio_state")
+    for attr in ("current_equity", "equity", "balance", "portfolio_value", "current_balance"):
+        try:
+            value = _safe_float(getattr(portfolio_state, attr), 0.0)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    inputs = dict(portfolio_state_inputs or result.get("portfolio_state_inputs") or {})
+    for key in ("reference_portfolio", "start_of_day_balance", "manual_daily_dd_baseline"):
+        value = _safe_float(inputs.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
+    scope = _protection_scope(settings)
+    equity = _current_equity_for_manual_resume(result, settings)
+    loss_guard = (result or {}).get("loss_streak_guard") or {}
+    drawdown = (result or {}).get("drawdown_status")
+    dd_line = "غير متاح"
+    if drawdown is not None:
+        try:
+            dd_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.2f}% | مستوى {int(getattr(drawdown, 'level', 0) or 0)}"
+        except Exception:
+            pass
+    return "\n".join([
+        "⚠️ <b>استئناف يدوي للتداول — Preview</b>",
+        "━━━━━━━━━━━━",
+        f"النطاق: <b>{scope}</b>",
+        f"الرصيد/الـ equity الحالي: <b>{equity:,.2f} USDT</b>",
+        f"Daily DD الحالي: <code>{dd_line}</code>",
+        f"Loss Streak الحالي: <code>{int(loss_guard.get('streak', 0) or 0)} / {int(loss_guard.get('limit', LOSS_STREAK_NO_TP1_LIMIT) or LOSS_STREAK_NO_TP1_LIMIT)}</code>",
+        "",
+        "عند التأكيد سيتم:",
+        "1) اعتماد الرصيد الحالي كبداية جديدة للـ Daily DD لباقي اليوم.",
+        "2) تصفير عداد حماية 5 صفقات لم تحقق TP1 من هذه اللحظة.",
+        "3) تسجيل manual_resume_at داخل حالة الحماية.",
+        "",
+        "للتنفيذ أرسل: <code>/confirm_resume_trading</code>",
+    ])
+
+
+def _confirm_manual_resume_trading(
+    result: dict | None,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+) -> str:
+    scope = _protection_scope(settings)
+    now = datetime.now(timezone.utc)
+    equity = _current_equity_for_manual_resume(result, settings)
+    state = _load_protection_state(trade_store, scope)
+    state.update({
+        "manual_override": True,
+        "manual_resume_at": now.isoformat(),
+        "loss_streak_reset_at": now.isoformat(),
+        "daily_dd_override_at": now.isoformat(),
+        "daily_dd_baseline": equity,
+        "override_type": "manual_resume_trading",
+        "reason": "manual_resume_after_protection",
+    })
+    _save_protection_state(trade_store, scope, state)
+
+    if isinstance(result, dict):
+        result["protection_state"] = state
+        inputs = _apply_daily_dd_manual_baseline(dict(result.get("portfolio_state_inputs") or {}), state)
+        result["portfolio_state_inputs"] = inputs
+        try:
+            trades_for_dd = result.get("simulation_trades") if _is_simulation_mode(settings) else result.get("trades")
+            portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **inputs)
+            result["portfolio_state"] = portfolio_state
+            result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+            result["drawdown_report"] = build_drawdown_report(portfolio_state)
+            base_trades = _loss_streak_base_trades_for_runtime(
+                settings,
+                result,
+                execution_trades=list(result.get("trades", []) or []),
+                simulation_trades=list(result.get("simulation_trades", []) or []),
+            )
+            result["loss_streak_guard"] = _build_loss_streak_guard(base_trades, reset_at=now)
+        except Exception as exc:
+            print(f"⚠️ manual resume runtime refresh failed: {exc}", flush=True)
+
+    return "\n".join([
+        "✅ <b>تم استئناف التداول يدويًا</b>",
+        "━━━━━━━━━━━━",
+        f"النطاق: <b>{scope}</b>",
+        f"Baseline جديد للـ Daily DD: <b>{equity:,.2f} USDT</b>",
+        "تم تصفير عداد حماية 5 صفقات لم تحقق TP1 من هذه اللحظة.",
+        "أي تفعيل جديد للحماية سيُحسب من الصفقات التي تُغلق بعد وقت الاستئناف فقط.",
+    ])
+
+
+def _maybe_finalize_loss_streak_cooldown(
+    guard: dict,
+    trade_store: RedisTradeStore | None,
+    scope: str,
+    protection_state: dict | None = None,
+) -> dict:
+    """Persist reset_at once cooldown naturally ends, then let the next call count fresh losses only."""
+    if not isinstance(guard, dict):
+        return dict(protection_state or {})
+    recommended = _parse_protection_dt(guard.get("reset_recommended_at"))
+    if not recommended:
+        return dict(protection_state or {})
+    state = dict(protection_state or _load_protection_state(trade_store, scope))
+    current_reset = _parse_protection_dt(state.get("loss_streak_reset_at"))
+    if current_reset is None or current_reset < recommended:
+        state["loss_streak_reset_at"] = recommended.isoformat()
+        state["loss_streak_auto_reset_at"] = datetime.now(timezone.utc).isoformat()
+        state["loss_streak_auto_reset_reason"] = "cooldown_finished"
+        state = _save_protection_state(trade_store, scope, state)
+    return state
+
+def _build_loss_streak_guard(trades, now: datetime | None = None, reset_at: datetime | None = None) -> dict:
     """Return execution pause state after consecutive SL losses before TP1.
 
     The streak counts only bot execution trades that closed by SL before TP1.
     Any closed bot execution trade that reached TP1 resets the streak.
     """
     now = now or datetime.now(timezone.utc)
+    reset_at = reset_at if isinstance(reset_at, datetime) else _parse_protection_dt(reset_at)
     closed_trades = sorted(
-        [trade for trade in (trades or []) if _is_execution_closed_trade(trade)],
+        [
+            trade for trade in (trades or [])
+            if _is_execution_closed_trade(trade)
+            and (reset_at is None or _trade_closed_at(trade) > reset_at)
+        ],
         key=_trade_closed_at,
     )
 
@@ -1195,14 +1409,16 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
     cooldown_until = None
     active = False
     remaining_minutes = 0
+    reset_recommended_at = None
     if streak >= LOSS_STREAK_NO_TP1_LIMIT and last_loss_at is not None:
         cooldown_until = last_loss_at + timedelta(minutes=LOSS_STREAK_COOLDOWN_MINUTES)
         active = now < cooldown_until
         if active:
             remaining_minutes = max(1, int((cooldown_until - now).total_seconds() // 60))
         else:
-            # ✅ FIX: cooldown انتهى → صفّر الـ streak
-            # يمنع إيقاف التداول فوراً عند أول SL بعد انتهاء الـ cooldown
+            # Cooldown انتهى طبيعيًا → نوصي بتثبيت reset_at عند نهاية التهدئة.
+            # هذا يمنع إعادة استخدام نفس الخمس خسائر القديمة في أي scan لاحق.
+            reset_recommended_at = cooldown_until
             streak = 0
             streak_symbols = []
 
@@ -1214,6 +1430,8 @@ def _build_loss_streak_guard(trades, now: datetime | None = None) -> dict:
         "remaining_minutes": remaining_minutes,
         "cooldown_until": cooldown_until.isoformat() if cooldown_until else "",
         "last_loss_at": last_loss_at.isoformat() if last_loss_at else "",
+        "reset_at": reset_at.isoformat() if reset_at else "",
+        "reset_recommended_at": reset_recommended_at.isoformat() if reset_recommended_at else "",
         "symbols": streak_symbols[-LOSS_STREAK_NO_TP1_LIMIT:],
         "reason": "loss_streak_no_tp1_guard",
     }
@@ -2438,10 +2656,18 @@ def run_once(
         )
 
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
+    protection_scope = _protection_scope(settings)
+    protection_state = _load_protection_state(trade_store, protection_scope)
+    portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     portfolio_state = build_portfolio_state_from_trades(persisted_trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
-    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades)
+    loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
+    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
+    protection_state = _maybe_finalize_loss_streak_cooldown(loss_streak_guard, trade_store, protection_scope, protection_state)
+    loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
+    if loss_streak_guard.get("reset_recommended_at"):
+        loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
 
     signal_items = []
     current_execution_results = []
@@ -2771,11 +2997,19 @@ def run_once(
 
     mode_message = _build_mode_message(state, snapshot, protection, settings=settings)
     mode_context = _build_mode_context(state, snapshot, protection)
+    protection_scope = _protection_scope(settings)
+    protection_state = _load_protection_state(trade_store, protection_scope)
+    portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
     drawdown_status = evaluate_drawdown(portfolio_state)
     drawdown_report = build_drawdown_report(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
-    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades)
+    loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
+    loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
+    protection_state = _maybe_finalize_loss_streak_cooldown(loss_streak_guard, trade_store, protection_scope, protection_state)
+    loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
+    if loss_streak_guard.get("reset_recommended_at"):
+        loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
 
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
@@ -2804,6 +3038,7 @@ def run_once(
         "drawdown_status": drawdown_status,
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
+        "protection_state": protection_state,
         "portfolio_state_inputs": portfolio_state_inputs,
         "help": build_master_help(
             mode=state.mode,
@@ -2885,13 +3120,19 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
     result.update(reports)
 
     portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
+    runtime_settings = settings or get_settings()
+    protection_scope = _protection_scope(runtime_settings)
+    protection_state = _load_protection_state(trade_store, protection_scope)
+    portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
+    result["portfolio_state_inputs"] = portfolio_state_inputs
+    result["protection_state"] = protection_state
     portfolio_state = build_portfolio_state_from_trades(trades, **portfolio_state_inputs)
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    runtime_settings = settings or get_settings()
     result["loss_streak_guard"] = _build_loss_streak_guard(
-        _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades)
+        _loss_streak_base_trades_for_runtime(runtime_settings, result, execution_trades=trades),
+        reset_at=_parse_protection_dt(protection_state.get("loss_streak_reset_at")),
     )
 
     if trade_store:
@@ -3936,6 +4177,11 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     if drawdown is not None:
         drawdown_line = f"{float(getattr(drawdown, 'drawdown_pct', 0.0) or 0.0):.1f}% | level={int(getattr(drawdown, 'level', 0) or 0)} | {'ALLOWED' if getattr(drawdown, 'allowed', True) else 'HALTED'}"
 
+    protection_state = result.get("protection_state") or {}
+    manual_resume_line = "OFF"
+    if isinstance(protection_state, dict) and protection_state.get("manual_resume_at"):
+        manual_resume_line = str(protection_state.get("manual_resume_at"))
+
     loss_guard = result.get("loss_streak_guard") or {}
     if loss_guard.get("active"):
         loss_guard_line = (
@@ -3966,6 +4212,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"🧠 Redis: {'ON' if redis_stats.get('enabled') else '🚨 OFF — OKX execution BLOCKED for safety'} | open={redis_stats.get('open_set', 0)} | history={redis_stats.get('history_set', 0)} | checks={redis_stats.get('execution_checks', 0)}",
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
+        f"🧯 Manual Resume: {manual_resume_line}",
         f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
@@ -4860,6 +5107,12 @@ def _handle_admin_clean_command(
     result: dict | None = None,
     settings: Settings | None = None,
 ) -> str | None:
+    runtime_settings = settings or get_settings()
+    if command in {"/resume_trading", "/resume_protection", "/resume_daily_dd"}:
+        return _build_manual_resume_preview(result, runtime_settings)
+    if command in {"/confirm_resume_trading", "/confirm_resume_protection", "/confirm_resume_daily_dd"}:
+        return _confirm_manual_resume_trading(result, runtime_settings, trade_store)
+
     reset_preview_commands = {
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
         "/reset_reports_normal": ("normal", "/confirm_reset_reports_normal", "📊 Reset Normal Reports Preview"),
