@@ -4472,6 +4472,13 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         loss_guard_line = f"OFF | streak={int(loss_guard.get('streak', 0) or 0)}"
 
     runtime = _runtime_mode_snapshot(settings)
+    simulation_active = str(runtime.get("active_mode") or "").lower() == "simulation"
+    if simulation_active:
+        okx_status_line = f"FORCED OFF in Simulation | raw={'ON' if runtime.get('orders_enabled') else 'OFF'} | effective=OFF"
+        live_status_line = "DISABLED BY SIMULATION"
+    else:
+        okx_status_line = f"{'ON' if runtime.get('orders_enabled') else 'OFF'} | Effective: {'ON' if runtime.get('effective_orders_enabled') else 'OFF'}"
+        live_status_line = "ALLOWED" if settings.allow_live_trading else "BLOCKED"
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
@@ -4480,9 +4487,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         "━━━━━━━━━━━━",
         f"📈 Market Mode: {result.get('mode', 'UNKNOWN')}",
         f"⚡ Execution Engine: {'ON' if settings.execution_enabled else 'OFF'}",
-        f"🧪 OKX Orders: {'ON' if runtime.get('orders_enabled') else 'OFF'} | Effective: {'ON' if runtime.get('effective_orders_enabled') else 'OFF'}",
+        f"🧪 OKX Orders: {okx_status_line}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
-        f"🔒 Live Trading: {'ALLOWED' if settings.allow_live_trading else 'BLOCKED'}",
+        f"🔒 Live Trading: {live_status_line}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
         f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
         "",
@@ -4950,8 +4957,15 @@ def _build_bot_modes_keyboard(settings: Settings | None = None) -> dict:
 def _build_okx_control_keyboard(settings: Settings) -> dict:
     runtime = _runtime_mode_snapshot(settings)
     orders_on = bool(runtime.get("orders_enabled"))
-    toggle_text = "⏸ إيقاف تنفيذ OKX" if orders_on else "▶️ تشغيل تنفيذ OKX"
-    toggle_data = "okx_orders:off" if orders_on else "okx_orders:on"
+    simulation_active = str(runtime.get("active_mode") or "").lower() == "simulation"
+    if simulation_active:
+        # In Simulation, OKX live placement is always forced OFF. Keep the raw
+        # toggle available only to clear an old ON flag, but label it safely.
+        toggle_text = "🧪 OKX مجبر OFF في المحاكاة" if not orders_on else "⏸ إيقاف OKX الخام"
+        toggle_data = "okx_orders:off"
+    else:
+        toggle_text = "⏸ إيقاف تنفيذ OKX" if orders_on else "▶️ تشغيل تنفيذ OKX"
+        toggle_data = "okx_orders:off" if orders_on else "okx_orders:on"
 
     return {
         "inline_keyboard": [
@@ -4974,9 +4988,15 @@ def _build_okx_control_keyboard(settings: Settings) -> dict:
 
 def _build_okx_control_panel(settings: Settings) -> str:
     runtime = _runtime_mode_snapshot(settings)
-    runtime_status = "ON" if bool(runtime.get("orders_enabled")) else "OFF"
+    simulation_active = str(runtime.get("active_mode") or "").lower() == "simulation"
+    raw_orders_status = "ON" if bool(runtime.get("orders_enabled")) else "OFF"
     effective_status = "ON" if bool(runtime.get("effective_orders_enabled")) else "OFF"
-    live_guard = "ALLOWED" if bool(getattr(settings, "allow_live_trading", False)) else "BLOCKED"
+    if simulation_active:
+        okx_line = f"FORCED OFF in Simulation | raw={raw_orders_status} | effective=OFF"
+        live_guard = "DISABLED BY SIMULATION"
+    else:
+        okx_line = f"{raw_orders_status} | Effective: {effective_status}"
+        live_guard = "ALLOWED" if bool(getattr(settings, "allow_live_trading", False)) else "BLOCKED"
     simulated = "ON" if bool(runtime.get("simulated_okx")) else "OFF"
     signal_mode = _signal_delivery_mode_label(settings)
     return "\n".join([
@@ -4985,7 +5005,7 @@ def _build_okx_control_panel(settings: Settings) -> str:
         "⚙️ <b>Runtime OKX Control</b>",
         f"• Runtime Mode: <b>{str(runtime.get('active_mode') or '-').upper()}</b>",
         f"• Risk Context: <b>{str(runtime.get('risk_context') or '-')}</b>",
-        f"• OKX Orders: <b>{runtime_status}</b> | Effective: <b>{effective_status}</b>",
+        f"• OKX Orders: <b>{okx_line}</b>",
         f"• Signal Mode: <b>{signal_mode}</b>",
         f"• Simulated Mode: <b>{simulated}</b>",
         f"• Live Trading Guard: <b>{live_guard}</b>",
@@ -5729,8 +5749,18 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
+        runtime_settings = settings or get_settings()
+        admin_reply = _handle_admin_clean_command(
+            command,
+            trade_store,
+            result=result,
+            settings=runtime_settings,
+        )
+        if admin_reply is not None:
+            _send_text(sender, admin_reply, reply_markup=_build_bot_modes_keyboard(runtime_settings))
+            return
         if command == "/okx_status":
-            _send_text(sender, _build_okx_status_panel(settings or get_settings(), okx_client=okx_client))
+            _send_text(sender, _build_okx_status_panel(runtime_settings, okx_client=okx_client))
             return
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
