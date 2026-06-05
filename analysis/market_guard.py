@@ -79,8 +79,11 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data", []) if isinstance(payload, dict) else []
-        return data if isinstance(data, list) else []
-    except Exception:
+        result = data if isinstance(data, list) else []
+        print(f"🕯 CANDLE_FETCH | symbol={symbol} | bar={bar} | url={url} | status={resp.status_code} | rows={len(result)}", flush=True)
+        return result
+    except Exception as e:
+        print(f"❌ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | url={url} | err={e}", flush=True)
         return []
 
 
