@@ -97,6 +97,17 @@ class TrackedTrade:
     protected_sl: float = 0.0
     trailing_tightened: bool = False
 
+    # Position sizing metadata.
+    # Stored per trade so wallet reports can use the real historical margin
+    # instead of a fixed/fallback margin. Does not affect trading logic.
+    used_margin_usdt: float = 0.0
+    simulation_margin_usdt: float = 0.0
+    margin_usdt: float = 0.0
+    allocated_margin_usdt: float = 0.0
+    position_notional_usdt: float = 0.0
+    simulation_balance_reference: float = 0.0
+    effective_leverage: float = 0.0
+
     # AI analytics / research metadata (export-only; does not affect trading logic).
     # Filled progressively by registry/updater/exporter when data is available.
     decision_trace_id: str = ""
