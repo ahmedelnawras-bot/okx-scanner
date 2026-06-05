@@ -291,6 +291,67 @@ def _extract_ai_research_fields(
     }
 
 
+def _extract_position_sizing_fields(
+    execution_result: dict[str, Any],
+    execution_trade: bool,
+) -> dict[str, Any]:
+    """Extract per-trade margin/notional fields for accurate wallet reports.
+
+    This is reporting/persistence metadata only. It does not change position
+    sizing, order placement, TP/SL logic, or risk decisions.
+    """
+    margin = _safe_float(
+        _first_value(
+            execution_result.get("used_margin_usdt"),
+            execution_result.get("simulation_margin_usdt"),
+            execution_result.get("margin_usdt"),
+            execution_result.get("allocated_margin_usdt"),
+            execution_result.get("position_margin_usdt"),
+            execution_result.get("margin"),
+            default=0.0,
+        )
+    )
+
+    notional = _safe_float(
+        _first_value(
+            execution_result.get("position_notional_usdt"),
+            execution_result.get("notional_usdt"),
+            execution_result.get("position_size_usdt"),
+            default=0.0,
+        )
+    )
+
+    leverage = _safe_float(
+        _first_value(
+            execution_result.get("effective_leverage"),
+            execution_result.get("leverage"),
+            default=0.0,
+        )
+    )
+
+    if notional <= 0 and margin > 0 and leverage > 0:
+        notional = round(margin * leverage, 8)
+
+    balance_reference = _safe_float(
+        _first_value(
+            execution_result.get("simulation_balance_reference"),
+            execution_result.get("balance_reference"),
+            execution_result.get("reference_balance"),
+            default=0.0,
+        )
+    )
+
+    return {
+        "used_margin_usdt": margin if execution_trade else 0.0,
+        "simulation_margin_usdt": 0.0 if execution_trade else margin,
+        "margin_usdt": margin,
+        "allocated_margin_usdt": margin,
+        "position_notional_usdt": notional,
+        "simulation_balance_reference": balance_reference,
+        "effective_leverage": leverage,
+    }
+
+
 def register_trade(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -356,6 +417,10 @@ def register_trade(
         execution_path,
         now,
     )
+    position_sizing_fields = _extract_position_sizing_fields(
+        execution_result,
+        execution_trade,
+    )
 
     return TrackedTrade(
         trade_id=str(uuid.uuid4()),
@@ -398,4 +463,5 @@ def register_trade(
         **managed_exchange_fields,
         **lifecycle_fields,
         **ai_research_fields,
+        **position_sizing_fields,
     )
