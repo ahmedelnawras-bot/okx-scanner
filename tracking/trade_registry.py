@@ -170,6 +170,127 @@ def _extract_managed_exchange_fields(execution_result: dict[str, Any] | None) ->
     }
 
 
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_bool(value: Any) -> bool:
+    return bool(value)
+
+
+def _signal_meta(signal: SignalCandidate) -> dict[str, Any]:
+    meta = getattr(signal, "meta", {}) or {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _first_value(*values: Any, default: Any = "") -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        return value
+    return default
+
+
+def _list_value(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _build_decision_trace_id(signal: SignalCandidate, execution_result: dict[str, Any], now: datetime) -> str:
+    explicit = _first_value(
+        execution_result.get("decision_trace_id"),
+        execution_result.get("trace_id"),
+        getattr(signal, "decision_trace_id", ""),
+        default="",
+    )
+    if explicit:
+        return str(explicit)
+    symbol = str(getattr(signal, "symbol", "") or "")
+    return f"trade_{now.strftime('%Y%m%dT%H%M%S%f')}_{symbol}_{uuid.uuid4().hex[:8]}"
+
+
+def _extract_ai_research_fields(
+    signal: SignalCandidate,
+    execution_result: dict[str, Any],
+    execution_path: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Extract export-only analytics fields for TrackedTrade.
+
+    These fields do not affect scoring, filtering, order placement, or lifecycle logic.
+    They only preserve evidence for later AI/research reports.
+    """
+    meta = _signal_meta(signal)
+    candle_gate = execution_result.get("candle_gate") or execution_result.get("candle_reversal_gate") or meta.get("candle_gate") or meta.get("candle_reversal_gate") or {}
+    if not isinstance(candle_gate, dict):
+        candle_gate = {}
+
+    decision_trace_id = _build_decision_trace_id(signal, execution_result, now)
+
+    entry_pattern = str(_first_value(
+        execution_result.get("entry_pattern"),
+        candle_gate.get("entry_pattern"),
+        candle_gate.get("pattern"),
+        meta.get("entry_pattern"),
+        meta.get("pattern"),
+        default="",
+    ) or "")
+
+    reversal_type = str(_first_value(
+        execution_result.get("reversal_type"),
+        candle_gate.get("reversal_type"),
+        candle_gate.get("pattern"),
+        meta.get("reversal_type"),
+        default=entry_pattern,
+    ) or "")
+
+    bullish_reversal = _safe_bool(_first_value(
+        candle_gate.get("bullish_reversal_detected"),
+        meta.get("bullish_reversal_detected"),
+        default=False,
+    ))
+    bearish_reversal = _safe_bool(_first_value(
+        candle_gate.get("bearish_reversal_detected"),
+        meta.get("bearish_reversal_detected"),
+        default=False,
+    ))
+
+    return {
+        "decision_trace_id": decision_trace_id,
+        "strategy_version": str(_first_value(execution_result.get("strategy_version"), meta.get("strategy_version"), default="") or ""),
+        "config_hash": str(_first_value(execution_result.get("config_hash"), meta.get("config_hash"), default="") or ""),
+        "entry_reason": str(_first_value(execution_result.get("entry_reason"), execution_result.get("reason"), meta.get("entry_reason"), default="") or ""),
+        "acceptance_path": str(_first_value(execution_result.get("acceptance_path"), execution_result.get("path"), execution_path, default="") or ""),
+        "risk_mode": str(_first_value(execution_result.get("risk_mode"), meta.get("risk_mode"), getattr(signal, "market_mode", ""), default="") or ""),
+
+        "entry_pattern": entry_pattern,
+        "reversal_detected": bool(bullish_reversal or bearish_reversal),
+        "reversal_type": reversal_type,
+        "wick_ratio": _safe_float(_first_value(candle_gate.get("wick_ratio"), meta.get("wick_ratio"), default=0.0)),
+        "body_ratio": _safe_float(_first_value(candle_gate.get("body_ratio"), meta.get("body_ratio"), default=0.0)),
+        "candle_strength": _safe_float(_first_value(candle_gate.get("candle_strength"), candle_gate.get("reversal_strength"), meta.get("candle_strength"), default=0.0)),
+        "last_3_candles": _list_value(_first_value(candle_gate.get("last_3_candles"), meta.get("last_3_candles"), default=[])),
+
+        "volume_spike_ratio": _safe_float(_first_value(meta.get("volume_spike_ratio"), meta.get("vol_ratio"), meta.get("volume_ratio"), default=0.0)),
+        "spread_pct": _safe_float(_first_value(execution_result.get("spread_pct"), meta.get("spread_pct"), default=0.0)),
+        "slippage_pct": _safe_float(_first_value(execution_result.get("slippage_pct"), meta.get("slippage_pct"), default=0.0)),
+        "distance_from_vwap_pct": _safe_float(_first_value(meta.get("distance_from_vwap_pct"), meta.get("dist_vwap"), default=0.0)),
+        "distance_from_ema20_pct": _safe_float(_first_value(meta.get("distance_from_ema20_pct"), meta.get("dist_ema20"), meta.get("dist_ma"), default=0.0)),
+    }
+
+
 def register_trade(
     signal: SignalCandidate,
     execution_result: dict | None = None,
@@ -229,6 +350,12 @@ def register_trade(
     )
 
     managed_exchange_fields = _extract_managed_exchange_fields(execution_result)
+    ai_research_fields = _extract_ai_research_fields(
+        signal,
+        execution_result,
+        execution_path,
+        now,
+    )
 
     return TrackedTrade(
         trade_id=str(uuid.uuid4()),
@@ -270,4 +397,5 @@ def register_trade(
 
         **managed_exchange_fields,
         **lifecycle_fields,
+        **ai_research_fields,
     )
