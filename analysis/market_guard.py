@@ -35,8 +35,9 @@ BTC_MA5_GUARD_CACHE: dict = {
     "guard": None,
     "ts": 0.0,
 }
-BTC_MA5_GUARD_CACHE_TTL_SECONDS = 90
+BTC_MA5_GUARD_CACHE_TTL_SECONDS = 300
 BTC_MA5_GUARD_STALE_TTL_SECONDS = 15 * 60
+BTC_MA5_GUARD_PREFETCH_GAP_SECONDS = 1.5
 BTC_MA5_GUARD_429_BACKOFF_SECONDS = 5 * 60
 BTC_MA5_GUARD_BACKOFF_UNTIL_TS: float = 0.0
 
@@ -426,6 +427,31 @@ def _fallback_from_pair_change(ranked_pairs, base_url: str = "", timeout: int = 
     return snap
 
 
+
+def _copy_btc_ma5_guard_attrs(target: MarketSnapshot, source: MarketSnapshot) -> MarketSnapshot:
+    """Copy pre-fetched BTC 30m MA5 guard fields into a MarketSnapshot.
+
+    This keeps the BTC 30m guard request separate from the 15m market-breadth
+    candle burst, reducing OKX 429 risk without changing guard timeframe or
+    market-mode logic.
+    """
+    for key in (
+        "hourly_ma5_pressure",
+        "btc_1h_close",
+        "btc_1h_ma5",
+        "btc_1h_ma5_gap_pct",
+        "hourly_ma_guard_source",
+        "hourly_ma_guard_cache_age_sec",
+        "hourly_ma_guard_backoff_until",
+        "hourly_ma_guard_backoff_remaining_sec",
+    ):
+        if hasattr(source, key):
+            try:
+                setattr(target, key, getattr(source, key))
+            except Exception:
+                pass
+    return target
+
 def build_market_guard_snapshot(
     ranked_pairs,
     base_url: str,
@@ -438,6 +464,20 @@ def build_market_guard_snapshot(
 ) -> MarketSnapshot:
     """Build a MarketSnapshot from real candle changes."""
     sample = select_market_guard_sample(ranked_pairs, limit=sample_size)
+
+    # Fetch BTC 30m MA5 guard first, before the 15m breadth candle burst.
+    # This preserves the 30m guard design while reducing 429 risk on the
+    # separate BTC guard request. A tiny pause separates it from the wider
+    # market-candle batch.
+    btc_guard_snapshot = MarketSnapshot()
+    attach_hourly_ma5_guard(btc_guard_snapshot, base_url=base_url, timeout=timeout)
+    try:
+        import time as _time
+        if BTC_MA5_GUARD_PREFETCH_GAP_SECONDS > 0:
+            _time.sleep(float(BTC_MA5_GUARD_PREFETCH_GAP_SECONDS))
+    except Exception:
+        pass
+
     changes: list[GuardChange] = []
 
     def _fetch_pair_change(pair):
@@ -460,7 +500,8 @@ def build_market_guard_snapshot(
                 continue
 
     if len(changes) < max(1, int(min_valid)):
-        snap = _fallback_from_pair_change(ranked_pairs, base_url=base_url, timeout=timeout)
+        snap = _fallback_from_pair_change(ranked_pairs, base_url="", timeout=timeout)
+        _copy_btc_ma5_guard_attrs(snap, btc_guard_snapshot)
         if debug:
             print(
                 "ЁЯУК MODE SNAPSHOT DEBUG | "
@@ -498,7 +539,7 @@ def build_market_guard_snapshot(
     setattr(snap, "market_guard_sample_size", len(sample))
     setattr(snap, "market_guard_valid_count", len(changes))
     setattr(snap, "market_guard_red_count", red_count)
-    attach_hourly_ma5_guard(snap, base_url=base_url, timeout=timeout)
+    _copy_btc_ma5_guard_attrs(snap, btc_guard_snapshot)
 
     if debug:
         gainers = sorted(changes, key=lambda x: x.change_pct, reverse=True)[:5]
