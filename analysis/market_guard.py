@@ -168,6 +168,10 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
     close = closes[0]
     ma5 = sum(closes[1:6]) / 5.0 if len(closes) >= 6 else sum(closes[:5]) / 5.0
     gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
+    print(
+        f"🛡 BTC30m_MA5_GUARD_DEBUG | close={close:.2f} | ma5={ma5:.2f} | gap={gap_pct:+.4f}% | closes={','.join(f'{x:.2f}' for x in closes[:7])}",
+        flush=True,
+    )
     previous_below_ma5 = False
     if len(closes) >= 6:
         prev_close = closes[1]
