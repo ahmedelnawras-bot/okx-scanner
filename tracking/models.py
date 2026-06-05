@@ -97,6 +97,46 @@ class TrackedTrade:
     protected_sl: float = 0.0
     trailing_tightened: bool = False
 
+    # AI analytics / research metadata (export-only; does not affect trading logic).
+    # Filled progressively by registry/updater/exporter when data is available.
+    decision_trace_id: str = ""
+    strategy_version: str = ""
+    config_hash: str = ""
+    entry_reason: str = ""
+    acceptance_path: str = ""
+    risk_mode: str = ""
+
+    # Entry candle / price-action evidence snapshot.
+    entry_pattern: str = ""
+    reversal_detected: bool = False
+    reversal_type: str = ""
+    wick_ratio: float = 0.0
+    body_ratio: float = 0.0
+    candle_strength: float = 0.0
+    last_3_candles: list[str] = field(default_factory=list)
+
+    # Lifecycle timestamps for later AI analysis.
+    tp1_hit_at: datetime | None = None
+    tp2_hit_at: datetime | None = None
+    sl_move_to_entry_at: datetime | None = None
+    sl_move_to_tp1_at: datetime | None = None
+    trailing_started_at: datetime | None = None
+    trailing_tightened_at: datetime | None = None
+
+    # Entry quality / execution quality metrics.
+    volume_spike_ratio: float = 0.0
+    spread_pct: float = 0.0
+    slippage_pct: float = 0.0
+    distance_from_vwap_pct: float = 0.0
+    distance_from_ema20_pct: float = 0.0
+
+    # Exit/post-exit analytics.
+    exit_efficiency_pct: float = 0.0
+    missed_runner_profit_pct: float = 0.0
+    price_after_5m_pct: float = 0.0
+    price_after_15m_pct: float = 0.0
+    price_after_1h_pct: float = 0.0
+
     @property
     def stage_label(self) -> str:
         if self.status == "closed_loss":
