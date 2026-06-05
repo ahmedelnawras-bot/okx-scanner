@@ -56,9 +56,59 @@ def money_from_exposure_pct(
 ) -> float:
     """
     Return wallet impact in USD from a leveraged exposure percentage.
+
+    Backward-compatible helper for places that still pass one aggregate
+    margin. For accurate wallet reports, prefer trade_money_pnl() so each
+    trade uses its own stored margin.
     """
 
     return (float(pct or 0.0) / 100.0) * margin_per_trade
+
+
+def trade_margin_usdt(
+    t: TrackedTrade,
+    fallback: float = DEFAULT_MARGIN_PER_TRADE,
+) -> float:
+    """Return the margin that belonged to this specific trade.
+
+    Priority:
+    1) used_margin_usdt            -> live/execution trade margin
+    2) simulation_margin_usdt      -> simulation trade margin
+    3) margin_usdt                 -> legacy/export aliases
+    4) fallback                    -> backward compatibility only
+    """
+
+    for attr in (
+        "used_margin_usdt",
+        "simulation_margin_usdt",
+        "margin_usdt",
+        "allocated_margin_usdt",
+    ):
+        try:
+            value = float(getattr(t, attr, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            return value
+
+    return float(fallback or DEFAULT_MARGIN_PER_TRADE)
+
+
+def trade_money_pnl(
+    t: TrackedTrade,
+    *,
+    fallback_margin: float = DEFAULT_MARGIN_PER_TRADE,
+) -> float:
+    """USD wallet impact for one trade using that trade's own margin.
+
+    trade_effective_pnl() is already the leveraged/exposure percentage used
+    by reports, so converting to money only needs the stored margin.
+    """
+
+    return (trade_effective_pnl(t) / 100.0) * trade_margin_usdt(
+        t,
+        fallback=fallback_margin,
+    )
 
 
 def color_signed(value: float, unit: str = "%") -> str:
@@ -465,6 +515,32 @@ def wallet_impact_lines(
 
     total = closed_net + floating_net
 
+    closed_profit_usd = sum(
+        max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in closed
+    )
+
+    closed_loss_usd = sum(
+        min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in closed
+    )
+
+    floating_profit_usd = sum(
+        max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in opened
+    )
+
+    floating_loss_usd = sum(
+        min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in opened
+    )
+
+    closed_net_usd = closed_profit_usd + closed_loss_usd
+
+    floating_net_usd = floating_profit_usd + floating_loss_usd
+
+    total_usd = closed_net_usd + floating_net_usd
+
     return [
         f"💰 <b>{title}</b>",
         f"📌 رأس المال: {starting_balance:.0f}$",
@@ -475,17 +551,17 @@ def wallet_impact_lines(
 
         "📈 الأرباح",
 
-        f"{money_from_exposure_pct(closed_profit, margin_per_trade):+.2f}$ | "
+        f"{closed_profit_usd:+.2f}$ | "
         f"{closed_profit:+.2f}% Realized PnL",
 
         "📉 الخسائر",
 
-        f"{money_from_exposure_pct(closed_loss, margin_per_trade):+.2f}$ | "
+        f"{closed_loss_usd:+.2f}$ | "
         f"{closed_loss:+.2f}% Realized PnL",
 
         "⚖️ الصافي",
 
-        f"<b>{money_line(money_from_exposure_pct(closed_net, margin_per_trade))} | "
+        f"<b>{money_line(closed_net_usd)} | "
         f"{closed_net:+.2f}% Realized PnL</b>",
 
         "",
@@ -494,24 +570,24 @@ def wallet_impact_lines(
 
         "📈 الأرباح العائمة",
 
-        f"{money_from_exposure_pct(floating_profit, margin_per_trade):+.2f}$ | "
+        f"{floating_profit_usd:+.2f}$ | "
         f"{floating_profit:+.2f}% Total Floating PnL",
 
         "📉 الخسائر العائمة",
 
-        f"{money_from_exposure_pct(floating_loss, margin_per_trade):+.2f}$ | "
+        f"{floating_loss_usd:+.2f}$ | "
         f"{floating_loss:+.2f}% Total Floating PnL",
 
         "⚖️ Total Floating PnL",
 
-        f"<b>{money_line(money_from_exposure_pct(floating_net, margin_per_trade))} | "
+        f"<b>{money_line(floating_net_usd)} | "
         f"{floating_net:+.2f}% Total Floating PnL</b>",
 
         "",
 
         "💼 <b>التأثير الحالي على المحفظة</b>",
 
-        f"<b>{money_line(money_from_exposure_pct(total, margin_per_trade))}</b>",
+        f"<b>{money_line(total_usd)}</b>",
     ]
 
 
