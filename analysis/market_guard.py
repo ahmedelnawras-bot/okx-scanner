@@ -37,6 +37,8 @@ BTC_MA5_GUARD_CACHE: dict = {
 }
 BTC_MA5_GUARD_CACHE_TTL_SECONDS = 90
 BTC_MA5_GUARD_STALE_TTL_SECONDS = 15 * 60
+BTC_MA5_GUARD_429_BACKOFF_SECONDS = 5 * 60
+BTC_MA5_GUARD_BACKOFF_UNTIL_TS: float = 0.0
 
 
 @dataclass
@@ -105,6 +107,7 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
         return result
     except Exception as exc:
         if symbol == HOURLY_MA_GUARD_SYMBOL and bar == HOURLY_MA_GUARD_BAR:
+            _mark_btc_ma5_guard_backoff_if_429(exc)
             print(
                 f"❌ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | err={exc}",
                 flush=True,
@@ -219,6 +222,35 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
     }
 
 
+def _mark_btc_ma5_guard_backoff_if_429(exc: Exception) -> None:
+    """Pause BTC 30m MA5 fetches after OKX rate-limit errors."""
+    global BTC_MA5_GUARD_BACKOFF_UNTIL_TS
+    text = str(exc or "")
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code == 429 or "429" in text or "Too Many Requests" in text:
+        try:
+            import time as _time
+            BTC_MA5_GUARD_BACKOFF_UNTIL_TS = max(
+                float(BTC_MA5_GUARD_BACKOFF_UNTIL_TS or 0.0),
+                _time.time() + BTC_MA5_GUARD_429_BACKOFF_SECONDS,
+            )
+            print(
+                f"⏳ BTC30m_MA5_GUARD_BACKOFF | 429 detected | "
+                f"pause={BTC_MA5_GUARD_429_BACKOFF_SECONDS}s",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+
+def _btc_ma5_guard_backoff_remaining() -> float:
+    try:
+        import time as _time
+        return max(0.0, float(BTC_MA5_GUARD_BACKOFF_UNTIL_TS or 0.0) - _time.time())
+    except Exception:
+        return 0.0
+
+
 def _btc_ma5_cached_guard(max_age_seconds: int | float) -> dict | None:
     try:
         import time as _time
@@ -259,26 +291,54 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
             flush=True,
         )
     else:
-        candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
-        guard = _calc_hourly_ma5_guard(candles)
-        if str(guard.get("hourly_ma_guard_source") or "") == "unavailable":
+        backoff_remaining = _btc_ma5_guard_backoff_remaining()
+        if backoff_remaining > 0:
             stale = _btc_ma5_cached_guard(BTC_MA5_GUARD_STALE_TTL_SECONDS)
             if stale:
-                stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_after_fetch_fail"
+                stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_during_429_backoff"
                 print(
-                    f"🛡 BTC30m_MA5_GUARD_CACHE | stale_after_fetch_fail | "
+                    f"🛡 BTC30m_MA5_GUARD_CACHE | stale_during_429_backoff | "
+                    f"backoff_remaining={backoff_remaining:.1f}s | "
                     f"age={stale.get('hourly_ma_guard_cache_age_sec')}s | "
                     f"gap={float(stale.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
                     flush=True,
                 )
                 guard = stale
             else:
+                guard = {
+                    "hourly_ma5_pressure": False,
+                    "btc_1h_close": 0.0,
+                    "btc_1h_ma5": 0.0,
+                    "btc_1h_ma5_gap_pct": 0.0,
+                    "hourly_ma_guard_source": "unavailable_429_backoff",
+                    "hourly_ma_guard_backoff_remaining_sec": round(backoff_remaining, 1),
+                }
                 print(
-                    "⚠️ BTC30m_MA5_GUARD_UNAVAILABLE | no valid cache | guard=unknown",
+                    f"⚠️ BTC30m_MA5_GUARD_BACKOFF | no valid cache | "
+                    f"remaining={backoff_remaining:.1f}s | guard=unknown",
                     flush=True,
                 )
         else:
-            _store_btc_ma5_guard_cache(guard)
+            candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
+            guard = _calc_hourly_ma5_guard(candles)
+            if str(guard.get("hourly_ma_guard_source") or "") == "unavailable":
+                stale = _btc_ma5_cached_guard(BTC_MA5_GUARD_STALE_TTL_SECONDS)
+                if stale:
+                    stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_after_fetch_fail"
+                    print(
+                        f"🛡 BTC30m_MA5_GUARD_CACHE | stale_after_fetch_fail | "
+                        f"age={stale.get('hourly_ma_guard_cache_age_sec')}s | "
+                        f"gap={float(stale.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
+                        flush=True,
+                    )
+                    guard = stale
+                else:
+                    print(
+                        "⚠️ BTC30m_MA5_GUARD_UNAVAILABLE | no valid cache | guard=unknown",
+                        flush=True,
+                    )
+            else:
+                _store_btc_ma5_guard_cache(guard)
 
     for key, value in guard.items():
         setattr(snapshot, key, value)
