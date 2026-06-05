@@ -80,10 +80,23 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
         payload = resp.json()
         data = payload.get("data", []) if isinstance(payload, dict) else []
         result = data if isinstance(data, list) else []
-        print(f"🕯 CANDLE_FETCH | symbol={symbol} | bar={bar} | url={url} | status={resp.status_code} | rows={len(result)}", flush=True)
+
+        # Diagnostic only: avoid noisy candle-fetch logs for every market-guard pair.
+        # We only need to verify the BTC 30m MA5 guard feed.
+        if symbol == HOURLY_MA_GUARD_SYMBOL and bar == HOURLY_MA_GUARD_BAR:
+            print(
+                f"🕯 CANDLE_FETCH | symbol={symbol} | bar={bar} | "
+                f"status={resp.status_code} | rows={len(result)}",
+                flush=True,
+            )
+
         return result
-    except Exception as e:
-        print(f"❌ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | url={url} | err={e}", flush=True)
+    except Exception as exc:
+        if symbol == HOURLY_MA_GUARD_SYMBOL and bar == HOURLY_MA_GUARD_BAR:
+            print(
+                f"❌ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | err={exc}",
+                flush=True,
+            )
         return []
 
 
@@ -209,11 +222,13 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
     return snapshot
 
 
-def _fallback_from_pair_change(ranked_pairs) -> MarketSnapshot:
+def _fallback_from_pair_change(ranked_pairs, base_url: str = "", timeout: int = 15) -> MarketSnapshot:
     sample = select_market_guard_sample(ranked_pairs, limit=30)
     if not sample:
         snap = MarketSnapshot()
         setattr(snap, "market_guard_source", "fallback_empty")
+        if base_url:
+            attach_hourly_ma5_guard(snap, base_url=base_url, timeout=timeout)
         return snap
     changes = [_safe_float(getattr(p, "change_pct", 0.0), 0.0) for p in sample]
     red_count = sum(1 for x in changes if x < 0)
@@ -234,6 +249,8 @@ def _fallback_from_pair_change(ranked_pairs) -> MarketSnapshot:
     setattr(snap, "market_guard_red_count", red_count)
     # Add dominance field with fallback
     snap.btc_dominance_change_1h = 0.0
+    if base_url:
+        attach_hourly_ma5_guard(snap, base_url=base_url, timeout=timeout)
     return snap
 
 
@@ -271,7 +288,7 @@ def build_market_guard_snapshot(
                 continue
 
     if len(changes) < max(1, int(min_valid)):
-        snap = _fallback_from_pair_change(ranked_pairs)
+        snap = _fallback_from_pair_change(ranked_pairs, base_url=base_url, timeout=timeout)
         if debug:
             print(
                 "📊 MODE SNAPSHOT DEBUG | "
@@ -323,7 +340,7 @@ def build_market_guard_snapshot(
             f"Avg15m={avg_change:+.2f}% | BTC15m={btc_change:+.2f}% | Strong={strong_count} | "
             f"DomChange1h={dominance_change:+.2f}% | "
             f"FastRebound={fast_rebound} | BTCReclaim={btc_reclaim} | BreadthImproving={breadth_improving} | "
-            f"1hMA5Pressure={getattr(snap, 'hourly_ma5_pressure', False)} (gap={getattr(snap, 'btc_1h_ma5_gap_pct', 0.0):+.2f}%)",
+            f"30mMA5Pressure={getattr(snap, 'hourly_ma5_pressure', False)} (gap={getattr(snap, 'btc_1h_ma5_gap_pct', 0.0):+.4f}%)",
             flush=True,
         )
         if verbose:
