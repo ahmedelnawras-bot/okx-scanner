@@ -4651,6 +4651,9 @@ def _build_bot_modes_keyboard(settings: Settings | None = None) -> dict:
                 {"text": mark("simulation", "🧪 وضع المحاكاة"), "callback_data": "signal_mode:simulation"},
             ],
             [
+                {"text": "🧯 استئناف التداول", "callback_data": "cmd:/resume_trading"},
+            ],
+            [
                 {"text": "🤖 OKX Control", "callback_data": "menu:okx_control"},
                 {"text": "🔄 تحديث", "callback_data": "menu:bot_modes"},
             ],
@@ -5442,8 +5445,13 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
+        runtime_settings = settings or get_settings()
+        clean_reply = _handle_admin_clean_command(command, trade_store, result, runtime_settings)
+        if clean_reply is not None:
+            _send_text(sender, clean_reply, reply_markup=_build_bot_modes_keyboard(runtime_settings))
+            return
         if command == "/okx_status":
-            _send_text(sender, _build_okx_status_panel(settings or get_settings(), okx_client=okx_client))
+            _send_text(sender, _build_okx_status_panel(runtime_settings, okx_client=okx_client))
             return
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
@@ -6174,6 +6182,11 @@ def live_worker() -> None:
             previous_scan_mode = state.mode if state is not None else None
             result = run_once(previous_state=state, settings=settings, trade_store=trade_store, okx_client=okx_client)
             state = result["state"]
+
+            # Make Telegram commands use the freshest completed scan immediately,
+            # before any slow Telegram signal/protection dispatch happens.
+            last_result = result
+
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
@@ -6186,7 +6199,6 @@ def live_worker() -> None:
                 _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
 
-            last_result = result
             _run_ai_export(result, settings)
             if settings.verbose_logs:
                 print(json.dumps(_plain_result(result), ensure_ascii=False, indent=2), flush=True)
