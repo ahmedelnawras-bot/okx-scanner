@@ -4550,7 +4550,7 @@ def _signal_delivery_mode_label(settings: Settings) -> str:
 def _is_actionable_signal_status(exec_status: str) -> bool:
     status = str(exec_status or "").strip().lower()
     return bool(
-        status in {"accepted_preview", "pending_pullback_preview"}
+        status in {"accepted_preview", "pending_pullback_preview", "protection_pause"}
         or status.startswith("rejected")
     )
 
@@ -6031,8 +6031,20 @@ def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dic
     minutes_in_mode = int((now - changed_at).total_seconds() // 60)
 
     if tracker.get("mode") != mode or tracker.get("changed_at") != changed_at:
+        # Preserve protection alert keys across mode-reminder tracker resets.
+        # Otherwise a scan can send the standalone protection alert, then the
+        # reminder reset clears it and the same protection alert is sent again
+        # in the inner loop. This only affects Telegram de-dup state; it does
+        # not change any protection/trading decision logic.
+        protection_alerts_sent = tracker.get("protection_alerts_sent", set())
         tracker.clear()
-        tracker.update({"mode": mode, "changed_at": changed_at, "general_sent": 0, "block_levels_sent": set()})
+        tracker.update({
+            "mode": mode,
+            "changed_at": changed_at,
+            "general_sent": 0,
+            "block_levels_sent": set(),
+            "protection_alerts_sent": protection_alerts_sent if isinstance(protection_alerts_sent, set) else set(protection_alerts_sent or []),
+        })
 
     protection = block_protection_status(state, now=now)
 
