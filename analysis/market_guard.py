@@ -99,7 +99,7 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
         # We only need to verify the BTC 30m MA5 guard feed.
         if symbol == HOURLY_MA_GUARD_SYMBOL and bar == HOURLY_MA_GUARD_BAR:
             print(
-                f"🕯 CANDLE_FETCH | symbol={symbol} | bar={bar} | "
+                f"ЁЯХп CANDLE_FETCH | symbol={symbol} | bar={bar} | "
                 f"status={resp.status_code} | rows={len(result)}",
                 flush=True,
             )
@@ -109,7 +109,7 @@ def fetch_okx_candles(base_url: str, symbol: str, bar: str = MARKET_GUARD_TIMEFR
         if symbol == HOURLY_MA_GUARD_SYMBOL and bar == HOURLY_MA_GUARD_BAR:
             _mark_btc_ma5_guard_backoff_if_429(exc)
             print(
-                f"❌ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | err={exc}",
+                f"тЭМ CANDLE_FETCH_ERROR | symbol={symbol} | bar={bar} | err={exc}",
                 flush=True,
             )
         return []
@@ -131,56 +131,99 @@ def get_last_closed_candle_change_pct(candles: list[list]) -> float | None:
 def fetch_btc_dominance_change_1h() -> float:
     """Return BTC dominance change over last ~1 hour (percentage points).
 
-    يجيب BTC.D من CoinGecko ويحسب الفرق عن ساعة سابقة.
-    - Cache كل 10 دقايق لتجنب rate limits
-    - بيحتفظ بـ history لآخر ساعتين
-    - أول ساعة تشغيل → يرجع 0.0 لحد ما يتجمع بيانات كافية
+    ┘К╪м┘К╪и BTC.D ┘Е┘Ж CoinGecko ┘И┘К╪н╪│╪и ╪з┘Д┘Б╪▒┘В ╪╣┘Ж ╪│╪з╪╣╪й ╪│╪з╪и┘В╪й.
+    Diagnostic logs are intentionally lightweight so we can verify whether:
+    - CoinGecko is being called successfully
+    - dominance history is accumulating
+    - a 1h comparison candidate exists
     """
     global DOMINANCE_CACHE
     try:
         import time as _time
         now = _time.time()
 
-        # لو الـ cache حديث (أقل من 10 دقايق) → مش نجيب من API
+        fetched = False
+        # ┘Д┘И ╪з┘Д┘А cache ╪н╪п┘К╪л (╪г┘В┘Д ┘Е┘Ж 10 ╪п┘В╪з┘К┘В) тЖТ ┘Е╪┤ ┘Ж╪м┘К╪и ┘Е┘Ж API
         if now - DOMINANCE_CACHE["current_ts"] >= 600 or DOMINANCE_CACHE["current"] is None:
-            resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
-            if resp.status_code != 200:
+            try:
+                resp = requests.get(COINGECKO_GLOBAL_URL, timeout=10)
+            except Exception as exc:
+                print(f"тЪая╕П BTC_DOM_FETCH_ERROR | err={exc}", flush=True)
                 return 0.0
+
+            if resp.status_code != 200:
+                print(f"тЪая╕П BTC_DOM_FETCH_FAIL | status={resp.status_code}", flush=True)
+                return 0.0
+
             data = resp.json()
             if not isinstance(data, dict):
+                print("тЪая╕П BTC_DOM_FETCH_FAIL | payload=not_dict", flush=True)
                 return 0.0
+
             market_cap_percentage = data.get("data", {}).get("market_cap_percentage", {})
             btc_dom = _safe_float(market_cap_percentage.get("btc", 0.0), 0.0)
             if btc_dom <= 0:
+                print(f"тЪая╕П BTC_DOM_FETCH_FAIL | btc_dom={btc_dom}", flush=True)
                 return 0.0
 
             DOMINANCE_CACHE["current"] = btc_dom
             DOMINANCE_CACHE["current_ts"] = now
             DOMINANCE_CACHE["history"].append((now, btc_dom))
+            fetched = True
 
-            # احتفظ بآخر ساعتين فقط
+            # ╪з╪н╪к┘Б╪╕ ╪и╪в╪о╪▒ ╪│╪з╪╣╪к┘К┘Ж ┘Б┘В╪╖
             cutoff = now - 7200
             DOMINANCE_CACHE["history"] = [
                 (ts, d) for ts, d in DOMINANCE_CACHE["history"] if ts >= cutoff
             ]
 
+            print(
+                f"ЁЯзн BTC_DOM_FETCH_OK | current={btc_dom:.3f} | "
+                f"history={len(DOMINANCE_CACHE['history'])}",
+                flush=True,
+            )
+
         current = DOMINANCE_CACHE["current"]
         if current is None:
+            print("ЁЯзн BTC_DOM_DEBUG | current=None | change=NA", flush=True)
             return 0.0
 
-        # ابحث عن قيمة قبل ~1 ساعة (±30 دقيقة)
+        # ╪з╪и╪н╪л ╪╣┘Ж ┘В┘К┘Е╪й ┘В╪и┘Д ~1 ╪│╪з╪╣╪й (┬▒30 ╪п┘В┘К┘В╪й)
         target_ts = now - 3600
         candidates = [
             (ts, d) for ts, d in DOMINANCE_CACHE["history"]
             if abs(ts - target_ts) <= 1800
         ]
+        history_len = len(DOMINANCE_CACHE["history"])
+        oldest_age = None
+        newest_age = None
+        if DOMINANCE_CACHE["history"]:
+            oldest_age = round(now - min(ts for ts, _ in DOMINANCE_CACHE["history"]), 1)
+            newest_age = round(now - max(ts for ts, _ in DOMINANCE_CACHE["history"]), 1)
+
         if not candidates:
+            print(
+                f"ЁЯзн BTC_DOM_DEBUG | current={float(current):.3f} | "
+                f"history={history_len} | candidates=0 | "
+                f"oldest_age={oldest_age}s | newest_age={newest_age}s | "
+                f"fetched={fetched} | change=NA",
+                flush=True,
+            )
             return 0.0
 
         closest = min(candidates, key=lambda x: abs(x[0] - target_ts))
-        return round(current - closest[1], 3)
+        change = round(float(current) - float(closest[1]), 3)
+        print(
+            f"ЁЯзн BTC_DOM_DEBUG | current={float(current):.3f} | "
+            f"history={history_len} | candidates={len(candidates)} | "
+            f"closest_age={round(now - closest[0], 1)}s | "
+            f"base={float(closest[1]):.3f} | change={change:+.3f}",
+            flush=True,
+        )
+        return change
 
-    except Exception:
+    except Exception as exc:
+        print(f"тЪая╕П BTC_DOM_DEBUG_ERROR | err={exc}", flush=True)
         return 0.0
 
 
@@ -200,13 +243,13 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
     ma5 = sum(closes[1:6]) / 5.0 if len(closes) >= 6 else sum(closes[:5]) / 5.0
     gap_pct = ((close - ma5) / ma5) * 100.0 if ma5 > 0 else 0.0
     print(
-        f"🛡 BTC30m_MA5_GUARD_DEBUG | close={close:.2f} | ma5={ma5:.2f} | gap={gap_pct:+.4f}% | closes={','.join(f'{x:.2f}' for x in closes[:7])}",
+        f"ЁЯЫб BTC30m_MA5_GUARD_DEBUG | close={close:.2f} | ma5={ma5:.2f} | gap={gap_pct:+.4f}% | closes={','.join(f'{x:.2f}' for x in closes[:7])}",
         flush=True,
     )
     previous_below_ma5 = False
     if len(closes) >= 6:
         prev_close = closes[1]
-        prev_ma5 = sum(closes[2:7]) / 5.0 if len(closes) >= 7 else sum(closes[1:6]) / 5.0  # ✅ FIX: previous window
+        prev_ma5 = sum(closes[2:7]) / 5.0 if len(closes) >= 7 else sum(closes[1:6]) / 5.0  # тЬЕ FIX: previous window
         previous_below_ma5 = prev_ma5 > 0 and prev_close < prev_ma5
     ma5_below_ma10 = False
     if len(closes) >= 10:
@@ -235,7 +278,7 @@ def _mark_btc_ma5_guard_backoff_if_429(exc: Exception) -> None:
                 _time.time() + BTC_MA5_GUARD_429_BACKOFF_SECONDS,
             )
             print(
-                f"⏳ BTC30m_MA5_GUARD_BACKOFF | 429 detected | "
+                f"тП│ BTC30m_MA5_GUARD_BACKOFF | 429 detected | "
                 f"pause={BTC_MA5_GUARD_429_BACKOFF_SECONDS}s",
                 flush=True,
             )
@@ -285,7 +328,7 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
     if guard:
         guard["hourly_ma_guard_source"] = "btc_30m_ma5_cache_fresh"
         print(
-            f"🛡 BTC30m_MA5_GUARD_CACHE | fresh | "
+            f"ЁЯЫб BTC30m_MA5_GUARD_CACHE | fresh | "
             f"age={guard.get('hourly_ma_guard_cache_age_sec')}s | "
             f"gap={float(guard.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
             flush=True,
@@ -297,7 +340,7 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
             if stale:
                 stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_during_429_backoff"
                 print(
-                    f"🛡 BTC30m_MA5_GUARD_CACHE | stale_during_429_backoff | "
+                    f"ЁЯЫб BTC30m_MA5_GUARD_CACHE | stale_during_429_backoff | "
                     f"backoff_remaining={backoff_remaining:.1f}s | "
                     f"age={stale.get('hourly_ma_guard_cache_age_sec')}s | "
                     f"gap={float(stale.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
@@ -314,7 +357,7 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
                     "hourly_ma_guard_backoff_remaining_sec": round(backoff_remaining, 1),
                 }
                 print(
-                    f"⚠️ BTC30m_MA5_GUARD_BACKOFF | no valid cache | "
+                    f"тЪая╕П BTC30m_MA5_GUARD_BACKOFF | no valid cache | "
                     f"remaining={backoff_remaining:.1f}s | guard=unknown",
                     flush=True,
                 )
@@ -326,7 +369,7 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
                 if stale:
                     stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_after_fetch_fail"
                     print(
-                        f"🛡 BTC30m_MA5_GUARD_CACHE | stale_after_fetch_fail | "
+                        f"ЁЯЫб BTC30m_MA5_GUARD_CACHE | stale_after_fetch_fail | "
                         f"age={stale.get('hourly_ma_guard_cache_age_sec')}s | "
                         f"gap={float(stale.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
                         flush=True,
@@ -334,7 +377,7 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
                     guard = stale
                 else:
                     print(
-                        "⚠️ BTC30m_MA5_GUARD_UNAVAILABLE | no valid cache | guard=unknown",
+                        "тЪая╕П BTC30m_MA5_GUARD_UNAVAILABLE | no valid cache | guard=unknown",
                         flush=True,
                     )
             else:
@@ -420,7 +463,7 @@ def build_market_guard_snapshot(
         snap = _fallback_from_pair_change(ranked_pairs, base_url=base_url, timeout=timeout)
         if debug:
             print(
-                "📊 MODE SNAPSHOT DEBUG | "
+                "ЁЯУК MODE SNAPSHOT DEBUG | "
                 f"Source={getattr(snap, 'market_guard_source', 'fallback')} | "
                 f"Sample={len(sample)} | Valid candles={len(changes)} < {min_valid} | "
                 f"Fallback avg={snap.avg_change_15m:.2f}% | Red={snap.red_ratio_15m*100:.0f}%",
@@ -463,7 +506,7 @@ def build_market_guard_snapshot(
         gainers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in gainers)
         losers_txt = ", ".join(f"{x.symbol.replace('-USDT-SWAP','')} {x.change_pct:+.2f}%" for x in losers)
         print(
-            "📊 MODE SNAPSHOT DEBUG | "
+            "ЁЯУК MODE SNAPSHOT DEBUG | "
             f"Source=candles_{timeframe} | Sample={len(sample)} | Valid={len(changes)} | "
             f"Red={red_count}/{len(changes)} ({red_ratio*100:.0f}%) | "
             f"Avg15m={avg_change:+.2f}% | BTC15m={btc_change:+.2f}% | Strong={strong_count} | "
@@ -473,11 +516,11 @@ def build_market_guard_snapshot(
             flush=True,
         )
         if verbose:
-            print(f"📈 Guard top gainers: {gainers_txt}", flush=True)
-            print(f"📉 Guard top losers: {losers_txt}", flush=True)
+            print(f"ЁЯУИ Guard top gainers: {gainers_txt}", flush=True)
+            print(f"ЁЯУЙ Guard top losers: {losers_txt}", flush=True)
 
     return snap
 
 
-# ========== إضافة alias للتوافق مع main.py ==========
+# ========== ╪е╪╢╪з┘Б╪й alias ┘Д┘Д╪к┘И╪з┘Б┘В ┘Е╪╣ main.py ==========
 build_market_guard = build_market_guard_snapshot
