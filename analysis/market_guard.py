@@ -345,7 +345,7 @@ def build_market_guard_snapshot(
             return None
         return GuardChange(symbol=symbol, change_pct=change, turnover_usdt=_turnover_of(pair))
 
-    max_workers = min(12, max(4, len(sample)))
+    max_workers = min(9, max(4, len(sample)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_fetch_pair_change, pair) for pair in sample]
         for future in as_completed(futures):
