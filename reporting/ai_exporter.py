@@ -91,6 +91,71 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _safe_dict(value: Any) -> dict:
+    """Return a dict safely from dict-like values."""
+    try:
+        return dict(value or {})
+    except Exception:
+        return {}
+
+
+def _safe_list(value: Any) -> list:
+    """Return a list safely from list-like values."""
+    try:
+        return list(value or [])
+    except Exception:
+        return []
+
+
+def _duration_minutes(start: Any, end: Any) -> float | None:
+    """Calculate minutes between datetimes safely."""
+    if not start or not end:
+        return None
+    try:
+        s = start if getattr(start, "tzinfo", None) else start.replace(tzinfo=timezone.utc)
+        e = end if getattr(end, "tzinfo", None) else end.replace(tzinfo=timezone.utc)
+        return round((e - s).total_seconds() / 60, 1)
+    except Exception:
+        return None
+
+
+def _calc_exit_efficiency(realized_pnl_pct: float, mfe_pct: float) -> float | None:
+    """How much of max favorable excursion was captured."""
+    try:
+        if mfe_pct <= 0:
+            return None
+        return round(max(0.0, min(100.0, (realized_pnl_pct / mfe_pct) * 100.0)), 2)
+    except Exception:
+        return None
+
+
+def _classify_rejection_reason(reason: str, status: str = "") -> str:
+    """Map raw rejection reason into a stable analytics category."""
+    r = (reason or status or "").lower()
+    if not r:
+        return "unknown"
+    if "not_whitelisted" in r or "whitelist" in r:
+        return "not_whitelisted"
+    if "max_positions" in r or "slot" in r or "position" in r:
+        return "max_positions"
+    if "cooldown" in r or "recovery_cycle_full" in r or "loss_streak" in r:
+        return "cooldown"
+    if "market" in r or "drawdown" in r or "guard" in r or "protection" in r:
+        return "market_protection"
+    if "execution" in r or "weak_drift" in r or "api" in r or "order" in r:
+        return "execution_block"
+    if "nour" in r or "pa_" in r or "bearish_reversal" in r or "mtf" in r or "resistance" in r or "overextended" in r:
+        return "technical_filter"
+    return "other"
+
+
+def _build_decision_trace_id(symbol: str, exported_at: str, setup: str = "") -> str:
+    base = exported_at.replace(":", "").replace("-", "").replace("+", "Z").replace(".", "_")
+    safe_symbol = (symbol or "unknown").replace("/", "_").replace(":", "_")
+    safe_setup = (setup or "unknown").replace("/", "_").replace(":", "_")
+    return f"scan_{base}_{safe_symbol}_{safe_setup}"
+
+
 def _append_jsonl(path: Path, record: dict) -> None:
     """Append one JSON record to a JSONL file safely."""
     _ensure_dir(path.parent)
@@ -145,6 +210,14 @@ def _build_trade_record(trade: Any, source: str, exported_at: str) -> dict:
         reward_tp2_pct = round(((tp2 - entry) / entry) * 100, 4)
         if risk_pct and risk_pct > 0:
             rr_tp2 = round(reward_tp2_pct / risk_pct, 2)
+
+    symbol = _s(getattr(trade, "symbol", ""))
+    setup_type = _s(getattr(trade, "setup_type", ""))
+    realized_pnl_pct = _f(getattr(trade, "realized_pnl_pct", 0.0))
+    mfe_pct = _f(getattr(trade, "max_favorable_pct", 0.0))
+    mae_pct = _f(getattr(trade, "max_adverse_pct", 0.0))
+    exit_efficiency_pct = _calc_exit_efficiency(realized_pnl_pct, mfe_pct)
+    decision_trace_id = _s(meta.get("decision_trace_id")) or _build_decision_trace_id(symbol, exported_at, setup_type)
 
     return {
         # ── Meta
@@ -294,6 +367,101 @@ def _build_trade_record(trade: Any, source: str, exported_at: str) -> dict:
         "execution_trade": _b(getattr(trade, "execution_trade", False)),
         "telegram_announced": _b(getattr(trade, "telegram_announced", False)),
 
+        # ── AI Development Schema #1: Unified trade analytics
+        "strategy_version": _s(meta.get("strategy_version") or meta.get("bot_version") or meta.get("config_version")),
+        "config_hash": _s(meta.get("config_hash")),
+        "decision_trace_id": decision_trace_id,
+        "entry_decision": {
+            "decision_trace_id": decision_trace_id,
+            "entry_reason": _s(meta.get("entry_reason") or meta.get("reason") or meta.get("signal_reason")),
+            "acceptance_path": _s(meta.get("acceptance_path") or meta.get("execution_path")),
+            "risk_mode": _s(meta.get("risk_mode") or meta.get("drawdown_mode") or meta.get("market_context_status")),
+            "entry_quality_label": _s(meta.get("entry_quality_label")),
+            "passed_filters": _safe_list(meta.get("passed_filters")),
+            "weak_but_allowed_filters": _safe_list(meta.get("weak_but_allowed_filters")),
+        },
+        "candles": {
+            "entry_pattern": _s(meta.get("entry_pattern") or meta.get("candlestick_pattern") or meta.get("pa_pattern")),
+            "bullish_pattern": _s(meta.get("bullish_pattern")),
+            "bearish_reversal_found": _b(meta.get("bearish_reversal_found") or meta.get("bearish_reversal_detected")),
+            "bearish_reversal_type": _s(meta.get("bearish_reversal_type") or meta.get("reversal_type")),
+            "wick_ratio": _f(meta.get("wick_ratio")),
+            "upper_wick_ratio": _f(meta.get("upper_wick_ratio")),
+            "lower_wick_ratio": _f(meta.get("lower_wick_ratio")),
+            "body_ratio": _f(meta.get("body_ratio")),
+            "candle_strength": _f(meta.get("candle_strength")),
+            "last_3_candles": _safe_list(meta.get("last_3_candles")),
+            "raw": _safe_dict(meta.get("candles") or meta.get("candle_context")),
+        },
+        "market_snapshot": {
+            "market_mode": _s(getattr(trade, "market_mode", "") or meta.get("market_mode", "")),
+            "btc_change_15m": _f(meta.get("btc_change_15m")),
+            "btc_change_1h": _f(meta.get("btc_change_1h")),
+            "btc_1h_ma5_gap_pct": _f(meta.get("btc_1h_ma5_gap_pct")),
+            "hourly_ma5_pressure": _b(meta.get("hourly_ma5_pressure")),
+            "avg_change_15m": _f(meta.get("avg_change_15m")),
+            "red_ratio_15m": _f(meta.get("red_ratio_15m")),
+            "strong_coins_count": _i(meta.get("strong_coins_count")),
+            "market_guard_valid_count": _i(meta.get("market_guard_valid_count")),
+            "market_context_status": _s(meta.get("market_context_status")),
+            "market_context_reason": _s(meta.get("market_context_reason")),
+        },
+        "entry_quality": {
+            "distance_from_vwap_pct": _f(meta.get("distance_from_vwap_pct") or meta.get("vwap_distance_pct")),
+            "distance_from_ema20_pct": _f(meta.get("distance_from_ema20_pct") or meta.get("ema20_distance_pct")),
+            "volume_spike": _b(meta.get("volume_spike")),
+            "vol_ratio": _f(meta.get("vol_ratio")),
+            "spread_pct": _f(meta.get("spread_pct")),
+            "slippage_pct": _f(meta.get("slippage_pct")),
+            "liquidity_score": _f(meta.get("liquidity_score")),
+        },
+        "timeline": {
+            "opened_at": _iso(opened_at),
+            "tp1_hit_at": _iso(getattr(trade, "tp1_hit_at", None) or meta.get("tp1_hit_at")),
+            "tp2_hit_at": _iso(getattr(trade, "tp2_hit_at", None) or meta.get("tp2_hit_at")),
+            "sl_moved_to_entry_at": _iso(getattr(trade, "sl_moved_to_entry_at", None) or meta.get("sl_moved_to_entry_at")),
+            "sl_moved_to_tp1_at": _iso(getattr(trade, "sl_moved_to_tp1_at", None) or meta.get("sl_moved_to_tp1_at")),
+            "trailing_started_at": _iso(getattr(trade, "trailing_started_at", None) or meta.get("trailing_started_at")),
+            "trailing_tightened_at": _iso(getattr(trade, "trailing_tightened_at", None) or meta.get("trailing_tightened_at")),
+            "closed_at": _iso(closed_at),
+            "time_to_tp1_minutes": _f(meta.get("time_to_tp1_minutes"), -1.0) if meta.get("time_to_tp1_minutes") is not None else None,
+            "time_to_tp2_minutes": _f(meta.get("time_to_tp2_minutes"), -1.0) if meta.get("time_to_tp2_minutes") is not None else None,
+            "holding_minutes": holding_minutes,
+        },
+        "management": {
+            "tp1_order_sent": _b(getattr(trade, "tp1_order_sent", False) or meta.get("tp1_order_sent")),
+            "tp2_order_sent": _b(getattr(trade, "tp2_order_sent", False) or meta.get("tp2_order_sent")),
+            "sl_order_sent": _b(getattr(trade, "sl_order_sent", False) or meta.get("sl_order_sent")),
+            "sl_moved_to_entry_after_tp2": _b(meta.get("sl_moved_to_entry_after_tp2") or (getattr(trade, "tp2_hit", False) and getattr(trade, "sl_moved_to_entry", False))),
+            "trailing_active": _b(getattr(trade, "trailing_active", False)),
+            "trailing_distance_pct": _f(getattr(trade, "trailing_distance_pct", 0.0) or meta.get("trailing_distance_pct")),
+            "protected_runner": _b(getattr(trade, "protected_runner", False)),
+        },
+        "performance": {
+            "pnl_pct": _f(getattr(trade, "pnl_pct", 0.0)),
+            "realized_pnl_pct": realized_pnl_pct,
+            "runner_pnl_pct": _f(getattr(trade, "runner_pnl_pct", 0.0)),
+            "floating_pnl_pct": _f(getattr(trade, "floating_pnl_pct", 0.0)),
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "exit_efficiency_pct": exit_efficiency_pct,
+            "missed_runner_profit_pct": round(max(0.0, mfe_pct - realized_pnl_pct), 4) if mfe_pct > 0 else 0.0,
+            "risk_reward_actual": round(realized_pnl_pct / risk_pct, 4) if risk_pct and risk_pct > 0 else None,
+        },
+        "post_exit": {
+            "price_after_5m_pct": _f(meta.get("price_after_5m_pct")),
+            "price_after_15m_pct": _f(meta.get("price_after_15m_pct")),
+            "price_after_1h_pct": _f(meta.get("price_after_1h_pct")),
+            "would_have_hit_extra_runner": _b(meta.get("would_have_hit_extra_runner")),
+        },
+        "diagnosis": {
+            "result_class": _s(meta.get("result_class") or meta.get("diagnosis_class")),
+            "main_issue": _s(meta.get("main_issue")),
+            "suggestion": _s(meta.get("suggestion")),
+            "exit_efficiency_pct": exit_efficiency_pct,
+            "notes": _s(meta.get("diagnosis_notes")),
+        },
+
         # ── Raw meta (full)
         "_meta_raw": meta,
     }
@@ -308,6 +476,12 @@ def _build_rejection_record(signal_item: dict, source: str, exported_at: str) ->
     signal = signal_item.get("signal")
     exec_result = dict(signal_item.get("execution") or {})
     meta = dict(getattr(signal, "meta", {}) or {}) if signal else {}
+    symbol = _s(getattr(signal, "symbol", "")) if signal else ""
+    setup_type = _s(getattr(signal, "setup_type", "")) if signal else ""
+    reason = _s(exec_result.get("reason"))
+    status = _s(exec_result.get("status"))
+    decision_trace_id = _s(meta.get("decision_trace_id") or exec_result.get("decision_trace_id")) or _build_decision_trace_id(symbol, exported_at, setup_type)
+    rejection_category = _s(exec_result.get("rejection_category") or meta.get("rejection_category")) or _classify_rejection_reason(reason, status)
 
     return {
         # ── Meta
@@ -369,6 +543,25 @@ def _build_rejection_record(signal_item: dict, source: str, exported_at: str) ->
         "dist_ma": _f(meta.get("dist_ma")),
         "mtf_confirmed": _b(meta.get("mtf_confirmed")),
         "resistance_4h": dict(meta.get("resistance_4h_context") or {}),
+
+        # ── AI Development Schema #2: Rejection/decision quality
+        "decision_trace_id": decision_trace_id,
+        "rejection_category": rejection_category,
+        "missed_opportunity_score": _f(exec_result.get("missed_opportunity_score") or meta.get("missed_opportunity_score")),
+        "post_rejection_tracking": {
+            "price_after_5m_pct": _f(exec_result.get("price_after_5m_pct") or meta.get("price_after_5m_pct")),
+            "price_after_15m_pct": _f(exec_result.get("price_after_15m_pct") or meta.get("price_after_15m_pct")),
+            "price_after_1h_pct": _f(exec_result.get("price_after_1h_pct") or meta.get("price_after_1h_pct")),
+            "would_hit_tp1": _b(exec_result.get("would_hit_tp1") or meta.get("would_hit_tp1")),
+            "would_hit_tp2": _b(exec_result.get("would_hit_tp2") or meta.get("would_hit_tp2")),
+            "would_hit_sl": _b(exec_result.get("would_hit_sl") or meta.get("would_hit_sl")),
+            "max_pump_after_rejection_pct": _f(exec_result.get("max_pump_after_rejection_pct") or meta.get("max_pump_after_rejection_pct")),
+            "max_dump_after_rejection_pct": _f(exec_result.get("max_dump_after_rejection_pct") or meta.get("max_dump_after_rejection_pct")),
+        },
+        "rejection_verdict": {
+            "was_correct": exec_result.get("rejection_was_correct", meta.get("rejection_was_correct")),
+            "reason": _s(exec_result.get("rejection_verdict_reason") or meta.get("rejection_verdict_reason")),
+        },
 
         # ── Full exec_result for deep analysis
         "_exec_result_raw": exec_result,
@@ -448,6 +641,108 @@ def _build_daily_snapshot(
             except Exception:
                 pass
 
+    # Symbol performance rankings
+    symbol_stats: dict[str, dict] = {}
+    for t in closed_trades:
+        sym = _s(getattr(t, "symbol", "")) or "unknown"
+        if sym not in symbol_stats:
+            symbol_stats[sym] = {"count": 0, "wins": 0, "pnl_sum": 0.0, "best": -999999.0, "worst": 999999.0}
+        pnl = _f(getattr(t, "realized_pnl_pct", 0.0))
+        symbol_stats[sym]["count"] += 1
+        symbol_stats[sym]["wins"] += 1 if pnl > 0 else 0
+        symbol_stats[sym]["pnl_sum"] = round(symbol_stats[sym]["pnl_sum"] + pnl, 4)
+        symbol_stats[sym]["best"] = max(symbol_stats[sym]["best"], pnl)
+        symbol_stats[sym]["worst"] = min(symbol_stats[sym]["worst"], pnl)
+
+    symbol_rows = [
+        {
+            "symbol": sym,
+            "count": v["count"],
+            "wins": v["wins"],
+            "win_rate": round(v["wins"] / max(1, v["count"]) * 100, 2),
+            "total_pnl_pct": round(v["pnl_sum"], 4),
+            "avg_pnl_pct": round(v["pnl_sum"] / max(1, v["count"]), 4),
+            "best_trade_pct": round(v["best"], 4),
+            "worst_trade_pct": round(v["worst"], 4),
+        }
+        for sym, v in symbol_stats.items()
+    ]
+
+    # Enhanced setup ranking
+    setup_ranking: dict[str, dict] = {}
+    for setup, v in setup_stats.items():
+        setup_trades = [t for t in closed_trades if (_s(getattr(t, "setup_type", "")) or "unknown") == setup]
+        gross_win = sum(max(0.0, _f(getattr(t, "realized_pnl_pct", 0.0))) for t in setup_trades)
+        gross_loss = abs(sum(min(0.0, _f(getattr(t, "realized_pnl_pct", 0.0))) for t in setup_trades))
+        tp2_count = sum(1 for t in setup_trades if getattr(t, "tp2_hit", False))
+        runner_count = sum(1 for t in setup_trades if getattr(t, "runner_active", False) or str(getattr(t, "status", "")) == "trailing_hit")
+        setup_ranking[setup] = {
+            "count": v["count"],
+            "wins": v["wins"],
+            "win_rate": round(v["wins"] / max(1, v["count"]) * 100, 2),
+            "avg_pnl_pct": round(v["pnl_sum"] / max(1, v["count"]), 4),
+            "total_pnl_pct": round(v["pnl_sum"], 4),
+            "profit_factor": round(gross_win / max(0.0001, gross_loss), 4) if gross_loss > 0 else None,
+            "tp2_rate": round(tp2_count / max(1, len(setup_trades)) * 100, 2),
+            "runner_rate": round(runner_count / max(1, len(setup_trades)) * 100, 2),
+        }
+
+    # Exit analysis
+    exit_efficiencies = []
+    missed_runner_profit = 0.0
+    for t in closed_trades:
+        realized = _f(getattr(t, "realized_pnl_pct", 0.0))
+        mfe = _f(getattr(t, "max_favorable_pct", 0.0))
+        eff = _calc_exit_efficiency(realized, mfe)
+        if eff is not None:
+            exit_efficiencies.append(eff)
+        if mfe > realized:
+            missed_runner_profit += max(0.0, mfe - realized)
+
+    # Filter and decision quality from current execution results
+    filter_buckets: dict[str, int] = {}
+    rejection_categories: dict[str, int] = {}
+    correct_rejections = wrong_rejections = unknown_rejections = 0
+    for r in rejected:
+        reason = _s(r.get("reason") or r.get("status") or "unknown")
+        category = _s(r.get("rejection_category")) or _classify_rejection_reason(reason, _s(r.get("status")))
+        rejection_categories[category] = rejection_categories.get(category, 0) + 1
+        if "mtf" in reason.lower():
+            filter_buckets["mtf_confirmation"] = filter_buckets.get("mtf_confirmation", 0) + 1
+        if "pa_" in reason.lower() or "breakout" in reason.lower() or "bearish_reversal" in reason.lower():
+            filter_buckets["pa_gate"] = filter_buckets.get("pa_gate", 0) + 1
+        if "nour" in reason.lower():
+            filter_buckets["nour_filter"] = filter_buckets.get("nour_filter", 0) + 1
+        verdict = r.get("rejection_was_correct")
+        if verdict is True:
+            correct_rejections += 1
+        elif verdict is False:
+            wrong_rejections += 1
+        else:
+            unknown_rejections += 1
+
+    bot_health = {
+        "execution_errors": sum(1 for r in execution_results if "error" in _s(r.get("status")).lower() or "error" in _s(r.get("reason")).lower()),
+        "sync_errors": sum(1 for t in trades if "sync" in _s(getattr(t, "exchange_sync_state", "")).lower() and "error" in _s(getattr(t, "exchange_sync_state", "")).lower()),
+        "order_failures": sum(1 for t in trades if getattr(t, "exchange_order_ok", True) is False),
+        "api_latency_avg_ms": _f(mode_context.get("api_latency_avg_ms") if mode_context else 0.0),
+    }
+
+    lessons_today = []
+    if setup_ranking:
+        best_setup = max(setup_ranking.items(), key=lambda kv: kv[1].get("total_pnl_pct", 0.0))
+        lessons_today.append(f"Best setup today: {best_setup[0]} total_pnl={best_setup[1].get('total_pnl_pct')}%")
+    if symbol_rows:
+        best_symbol = max(symbol_rows, key=lambda x: x.get("total_pnl_pct", 0.0))
+        worst_symbol = min(symbol_rows, key=lambda x: x.get("total_pnl_pct", 0.0))
+        lessons_today.append(f"Best symbol today: {best_symbol['symbol']} total_pnl={best_symbol['total_pnl_pct']}%")
+        lessons_today.append(f"Worst symbol today: {worst_symbol['symbol']} total_pnl={worst_symbol['total_pnl_pct']}%")
+    if rejection_reasons:
+        top_rejection = max(rejection_reasons.items(), key=lambda kv: kv[1])
+        lessons_today.append(f"Top rejection reason: {top_rejection[0]} count={top_rejection[1]}")
+    if exit_efficiencies:
+        lessons_today.append(f"Average exit efficiency: {round(sum(exit_efficiencies) / max(1, len(exit_efficiencies)), 2)}%")
+
     return {
         "record_type": "daily_snapshot",
         "export_version": EXPORT_VERSION,
@@ -509,6 +804,41 @@ def _build_daily_snapshot(
         # ── Market Mode Distribution
         "market_mode_distribution": mode_distribution,
         "current_mode": dict(mode_context or {}),
+
+        # ── AI Development Schema #3: Snapshot intelligence
+        "comparison": {
+            "win_rate_vs_yesterday": None,
+            "profit_vs_yesterday": None,
+            "accept_rate_vs_yesterday": None,
+            "note": "requires previous daily snapshot loader",
+        },
+        "symbol_performance": {
+            "top_winners": sorted(symbol_rows, key=lambda x: -x["total_pnl_pct"])[:10],
+            "top_losers": sorted(symbol_rows, key=lambda x: x["total_pnl_pct"])[:10],
+        },
+        "setup_ranking": dict(sorted(setup_ranking.items(), key=lambda kv: -kv[1].get("total_pnl_pct", 0.0))),
+        "exit_analysis": {
+            "avg_exit_efficiency_pct": round(sum(exit_efficiencies) / max(1, len(exit_efficiencies)), 2) if exit_efficiencies else None,
+            "missed_runner_profit_pct": round(missed_runner_profit, 4),
+            "sample_size": len(exit_efficiencies),
+        },
+        "filter_analysis": {
+            "by_filter_family": filter_buckets,
+            "by_rejection_category": rejection_categories,
+            "most_common_filter_family": max(filter_buckets.items(), key=lambda kv: kv[1])[0] if filter_buckets else None,
+        },
+        "decision_quality": {
+            "correct_rejections": correct_rejections,
+            "wrong_rejections": wrong_rejections,
+            "unknown_rejections": unknown_rejections,
+            "top_wrong_rejections": [],
+            "top_correct_rejections": [],
+            "most_expensive_filter": None,
+            "most_protective_filter": None,
+            "note": "requires post_rejection_tracking population",
+        },
+        "bot_health": bot_health,
+        "lessons_today": lessons_today,
 
         # ── Setup Performance
         "setup_performance": {
