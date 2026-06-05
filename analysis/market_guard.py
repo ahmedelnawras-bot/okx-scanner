@@ -26,6 +26,18 @@ DOMINANCE_CACHE: dict = {
     "history": [],  # [(timestamp, dominance)]
 }
 
+# BTC 30m MA5 guard cache.
+# Purpose:
+# - avoid hammering OKX with repeated BTC 30m candle calls
+# - keep the last valid BTC guard during temporary 429/rate-limit errors
+# - never turn an unavailable BTC feed into a fake fresh value
+BTC_MA5_GUARD_CACHE: dict = {
+    "guard": None,
+    "ts": 0.0,
+}
+BTC_MA5_GUARD_CACHE_TTL_SECONDS = 90
+BTC_MA5_GUARD_STALE_TTL_SECONDS = 15 * 60
+
 
 @dataclass
 class GuardChange:
@@ -203,13 +215,71 @@ def _calc_hourly_ma5_guard(candles: list[list]) -> dict:
         "btc_1h_close": close,
         "btc_1h_ma5": ma5,
         "btc_1h_ma5_gap_pct": gap_pct,
-        "hourly_ma_guard_source": "btc_1h_ma5",
+        "hourly_ma_guard_source": "btc_30m_ma5",
     }
 
 
+def _btc_ma5_cached_guard(max_age_seconds: int | float) -> dict | None:
+    try:
+        import time as _time
+        guard = BTC_MA5_GUARD_CACHE.get("guard")
+        ts = float(BTC_MA5_GUARD_CACHE.get("ts") or 0.0)
+        age = _time.time() - ts
+        if isinstance(guard, dict) and ts > 0 and age <= float(max_age_seconds):
+            cached = dict(guard)
+            cached["hourly_ma_guard_cache_age_sec"] = round(age, 1)
+            return cached
+    except Exception:
+        return None
+    return None
+
+
+def _store_btc_ma5_guard_cache(guard: dict) -> None:
+    if not isinstance(guard, dict):
+        return
+    if str(guard.get("hourly_ma_guard_source") or "") == "unavailable":
+        return
+    try:
+        import time as _time
+        BTC_MA5_GUARD_CACHE["guard"] = dict(guard)
+        BTC_MA5_GUARD_CACHE["ts"] = _time.time()
+    except Exception:
+        pass
+
+
 def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: int = 15) -> MarketSnapshot:
-    candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
-    guard = _calc_hourly_ma5_guard(candles)
+    # Fresh cache first: prevents OKX 429 from repeated BTC 30m requests every scan/fallback.
+    guard = _btc_ma5_cached_guard(BTC_MA5_GUARD_CACHE_TTL_SECONDS)
+    if guard:
+        guard["hourly_ma_guard_source"] = "btc_30m_ma5_cache_fresh"
+        print(
+            f"🛡 BTC30m_MA5_GUARD_CACHE | fresh | "
+            f"age={guard.get('hourly_ma_guard_cache_age_sec')}s | "
+            f"gap={float(guard.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
+            flush=True,
+        )
+    else:
+        candles = fetch_okx_candles(base_url, HOURLY_MA_GUARD_SYMBOL, bar=HOURLY_MA_GUARD_BAR, limit=15, timeout=timeout)
+        guard = _calc_hourly_ma5_guard(candles)
+        if str(guard.get("hourly_ma_guard_source") or "") == "unavailable":
+            stale = _btc_ma5_cached_guard(BTC_MA5_GUARD_STALE_TTL_SECONDS)
+            if stale:
+                stale["hourly_ma_guard_source"] = "btc_30m_ma5_cache_stale_after_fetch_fail"
+                print(
+                    f"🛡 BTC30m_MA5_GUARD_CACHE | stale_after_fetch_fail | "
+                    f"age={stale.get('hourly_ma_guard_cache_age_sec')}s | "
+                    f"gap={float(stale.get('btc_1h_ma5_gap_pct') or 0.0):+.4f}%",
+                    flush=True,
+                )
+                guard = stale
+            else:
+                print(
+                    "⚠️ BTC30m_MA5_GUARD_UNAVAILABLE | no valid cache | guard=unknown",
+                    flush=True,
+                )
+        else:
+            _store_btc_ma5_guard_cache(guard)
+
     for key, value in guard.items():
         setattr(snapshot, key, value)
     try:
@@ -220,7 +290,6 @@ def attach_hourly_ma5_guard(snapshot: MarketSnapshot, base_url: str, timeout: in
     except Exception:
         pass
     return snapshot
-
 
 def _fallback_from_pair_change(ranked_pairs, base_url: str = "", timeout: int = 15) -> MarketSnapshot:
     sample = select_market_guard_sample(ranked_pairs, limit=30)
