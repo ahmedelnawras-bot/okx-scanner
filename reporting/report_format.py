@@ -252,6 +252,45 @@ def trade_stage(t: TrackedTrade) -> str:
     return getattr(t, "stage_label", "OPEN") or "OPEN"
 
 
+def trade_mode_label(t: TrackedTrade) -> str:
+    """Return the market/execution mode label saved on the trade for display only."""
+    mode = ""
+
+    for attr in (
+        "market_mode",
+        "risk_mode",
+        "entry_market_mode",
+        "signal_market_mode",
+        "mode",
+    ):
+        try:
+            value = str(getattr(t, attr, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            mode = value
+            break
+
+    execution_path = str(getattr(t, "execution_path", "") or "").strip()
+
+    if not mode:
+        if execution_path == "recovery":
+            mode = "RECOVERY_LONG"
+        elif execution_path == "block_exception":
+            mode = "BLOCK_EXCEPTION"
+        else:
+            mode = "UNKNOWN"
+
+    # Keep the Telegram card short but informative.
+    mode = mode.replace("MODE_", "").replace("_LONG_ONLY", "").replace("_LONG", "")
+
+    if execution_path and execution_path not in {"general", "normal"}:
+        path_label = execution_path.replace("_", " ").title()
+        return f"{mode} / {path_label}"
+
+    return mode
+
+
 # =========================================================
 # Setup Cleaning + Deduplication
 # =========================================================
@@ -358,6 +397,7 @@ def trade_card_lines(
 
         f"⏱️ {trade_timer_label(t)} | "
         f"{trade_stage(t)} | "
+        f"🧭 {trade_mode_label(t)} | "
         f"⭐ {float(t.score or 0):.2f}"
         f"{extra_text}",
 
@@ -464,7 +504,7 @@ def behavior_summary_lines(
 
     return [
         f"🧠 <b>{label}</b>",
-        "📦 Model: Normal/Strong/Block 40/40/20 | Recovery 50/25/25",
+        "📦 Model: Normal/Strong/Block 30/50/20 | Recovery 50/25/25",
         f"📈 Avg Winner: {avg_winner:+.2f}%",
         f"📉 Avg Loser: {avg_loser:+.2f}%",
         f"🎯 TP1 Rate: {tp1_rate:.1f}% | 🏁 TP2 Rate: {tp2_rate:.1f}%",
