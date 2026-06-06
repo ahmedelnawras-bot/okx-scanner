@@ -146,7 +146,7 @@ def _managed_target_model(signal: SignalCandidate, path: str) -> tuple[str, floa
     normalized_path = str(path or "").strip().lower()
     if normalized_path == "recovery":
         return "recovery_50_25_25", 50.0, 25.0, 25.0
-    return "standard_40_40_20", 40.0, 40.0, 20.0
+    return "standard_30_50_20", 30.0, 50.0, 20.0
 
 
 
