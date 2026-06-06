@@ -3020,6 +3020,16 @@ def run_once(
         if not signal:
             continue
 
+        # ✅ DIAGNOSTIC: تتبع raw_candles داخل الـ signal بعد البناء
+        _signal_candles_count = len((signal.meta or {}).get("raw_candles") or [])
+        print(
+            f"SIGNAL_CANDLES | {signal.symbol} | "
+            f"setup={signal.setup_type} | "
+            f"mode={scan_mode} | "
+            f"raw_candles_in_meta={_signal_candles_count}",
+            flush=True,
+        )
+
         # First let the normal execution decision run, including BLOCK/RECOVERY
         # exception logic. Then, if a higher hard protection is active
         # (Daily DD or 5SL/No-TP1), override the final execution result to
