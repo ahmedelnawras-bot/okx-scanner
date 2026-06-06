@@ -486,6 +486,7 @@ def _resolve_entry_margin_plan(
     settings: Settings,
 ) -> dict:
     global _CACHED_OKX_BALANCE, _CACHED_OKX_BALANCE_TS
+    global _CACHED_OKX_BALANCE_LOG_TS, _CACHED_OKX_BALANCE_LOG_VALUE
     fallback_margin = max(_safe_float(getattr(settings, "paper_margin_usdt", 35.0), 35.0), 0.0) or 35.0
     fallback_plan = {
         "source": "settings.paper_margin_usdt",
@@ -513,7 +514,22 @@ def _resolve_entry_margin_plan(
         if okx_reference_balance > 0:
             _CACHED_OKX_BALANCE = okx_reference_balance
             _CACHED_OKX_BALANCE_TS = now_ts
-            print(f"💰 OKX balance cached: {okx_reference_balance:.4f} USDT", flush=True)
+
+            # Log throttling only:
+            # keep balance cache behavior unchanged, but avoid flooding Railway logs.
+            # Print when the balance meaningfully changes, or once every configured interval.
+            last_log_ts = float(_CACHED_OKX_BALANCE_LOG_TS or 0.0)
+            last_log_value = float(_CACHED_OKX_BALANCE_LOG_VALUE or 0.0)
+            balance_delta = abs(float(okx_reference_balance or 0.0) - last_log_value)
+            should_log_balance = (
+                last_log_ts <= 0
+                or (now_ts - last_log_ts) >= _CACHED_OKX_BALANCE_LOG_INTERVAL_SECONDS
+                or balance_delta >= _CACHED_OKX_BALANCE_LOG_MIN_DELTA_USDT
+            )
+            if should_log_balance:
+                _CACHED_OKX_BALANCE_LOG_TS = now_ts
+                _CACHED_OKX_BALANCE_LOG_VALUE = okx_reference_balance
+                print(f"💰 OKX balance cached: {okx_reference_balance:.4f} USDT", flush=True)
 
     okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
@@ -5444,6 +5460,14 @@ _CACHED_PRICE_MAP_TTL_SECONDS: float = 60.0  # صالح دقيقة واحدة ك
 _CACHED_OKX_BALANCE: float = 0.0
 _CACHED_OKX_BALANCE_TS: float = 0.0
 _CACHED_OKX_BALANCE_TTL_SECONDS: float = 60.0   # دقيقة — يتحدث فوراً بعد تغيير المود
+
+# Log-only throttle for the noisy OKX balance line.
+# Does NOT change sizing, balance caching, execution guards, Redis, reports, or OKX orders.
+_CACHED_OKX_BALANCE_LOG_TS: float = 0.0
+_CACHED_OKX_BALANCE_LOG_VALUE: float = 0.0
+_CACHED_OKX_BALANCE_LOG_INTERVAL_SECONDS: float = 300.0
+_CACHED_OKX_BALANCE_LOG_MIN_DELTA_USDT: float = 0.25
+
 _CACHED_OKX_BALANCE_LOCK = threading.Lock()  # ✅ thread-safe cache access
 
 
