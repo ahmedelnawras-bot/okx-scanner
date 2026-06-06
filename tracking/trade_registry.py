@@ -48,7 +48,7 @@ def _target_plan_for(signal: SignalCandidate, execution_path: str) -> tuple[str,
     if execution_path == "recovery" or signal.market_mode == MODE_RECOVERY_LONG:
         return "recovery_50_25_25", 50.0, 25.0, 25.0
 
-    return "standard_40_40_20", 40.0, 40.0, 20.0
+    return "standard_30_50_20", 30.0, 50.0, 20.0
 
 
 def _resolve_entry_price(
