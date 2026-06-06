@@ -404,6 +404,8 @@ def _risk_profile_snapshot(
     if isinstance(loss_guard, dict) and loss_guard.get("active"):
         reason_bits.append(f"loss_streak={int(loss_guard.get('streak', 0) or 0)}")
 
+    slot_usage = _risk_slot_usage_snapshot(settings, result, reference_balance=reference_balance)
+
     return {
         "context": risk_context,
         "source": resolved_source,
@@ -411,6 +413,7 @@ def _risk_profile_snapshot(
         "allocation_pct": float(allocation_pct or 0.0),
         "slot_count": int(slot_count or 0),
         "margin_per_trade": margin_per_trade,
+        "slot_usage": slot_usage,
         "reason": " | ".join(reason_bits[:4]) if reason_bits else "dynamic risk sizing",
     }
 
@@ -442,11 +445,53 @@ def _compact_mode_message_text(message: str) -> str:
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
 
+
+def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference_balance: float = 0.0) -> dict:
+    """Runtime slot usage for Risk Manager display only.
+
+    This is report/UI-only:
+    - Simulation reads simulation_trades.
+    - Execution reads execution trades.
+    - Low balance uses the active limits: general=3, block=1, recovery=1.
+    - Normal balance uses general=max_execution_positions, block=3, recovery=3.
+    """
+    result = result or {}
+    context = _risk_profile_context(settings, result)
+    base_trades = list(result.get("simulation_trades", []) or []) if context == "simulation" else list(result.get("trades", []) or [])
+    counts = _execution_slot_counts(base_trades)
+    low_balance = bool(0 < _safe_float(reference_balance, 0.0) < LOW_BALANCE_THRESHOLD_USDT)
+    general_limit = LOW_BALANCE_MAX_SLOTS if low_balance else max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
+    block_limit = 1 if low_balance else 3
+    recovery_limit = 1 if low_balance else 3
+    general_used = int(counts.get("general", 0) or 0)
+    block_used = int(counts.get("block_exception", 0) or 0)
+    recovery_used = int(counts.get("recovery", 0) or 0)
+    return {
+        "context": context,
+        "low_balance": low_balance,
+        "general_used": general_used,
+        "general_limit": general_limit,
+        "block_used": block_used,
+        "block_limit": block_limit,
+        "recovery_used": recovery_used,
+        "recovery_limit": recovery_limit,
+        "total_used": general_used + block_used + recovery_used,
+        "total_limit": general_limit + block_limit + recovery_limit,
+    }
+
 def _format_risk_profile_block(profile: dict | None, title: str = "🧮 Risk Profile") -> str:
     profile = profile or {}
+    usage = dict(profile.get("slot_usage") or {})
+    slot_line = f"Slots: <b>{int(profile.get('slot_count', 0) or 0)}</b>"
+    if usage:
+        slot_line = (
+            f"Slots: <b>{int(usage.get('general_used', 0) or 0)} / {int(usage.get('general_limit', profile.get('slot_count', 0)) or 0)}</b> used"
+            f" | Block <b>{int(usage.get('block_used', 0) or 0)}/{int(usage.get('block_limit', 0) or 0)}</b>"
+            f" | Recovery <b>{int(usage.get('recovery_used', 0) or 0)}/{int(usage.get('recovery_limit', 0) or 0)}</b>"
+        )
     return "\n".join([
         f"{title}",
-        f"Slots: <b>{int(profile.get('slot_count', 0) or 0)}</b>",
+        slot_line,
         f"Allocation: <b>{_safe_float(profile.get('allocation_pct'), 0.0):.2f}%</b>",
         f"Reference Balance: <b>{_safe_float(profile.get('reference_balance_usdt'), 0.0):,.2f} USDT</b>",
         f"Margin / Trade: <b>{_safe_float(profile.get('margin_per_trade'), 0.0):,.2f} USDT</b>",
@@ -3684,6 +3729,8 @@ def run_once(
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
         "portfolio_state_inputs": portfolio_state_inputs,
+        "trades": trades,
+        "simulation_trades": simulation_trades,
         "simulation_wallet": _build_simulation_wallet_snapshot(simulation_trades),
     }
     mode_message = _build_mode_message(state, snapshot, protection, settings=settings, result=display_result_for_protection)
