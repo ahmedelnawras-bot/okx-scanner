@@ -136,6 +136,17 @@ SIMULATION_DAILY_BALANCE_HASH = f"{SIMULATION_REDIS_PREFIX}:daily_balance"
 SIMULATION_BALANCE_STATE_KEY = f"{SIMULATION_REDIS_PREFIX}:wallet:state"
 SIMULATION_ALLOCATION_PCT = 24.0
 
+# Execution Daily Baseline
+# Position sizing uses the current OKX balance, but Daily DD uses a daily
+# baseline that is persisted per UTC day. Large external deposits/withdrawals
+# are adjusted into the baseline so cash movements do not look like trading PnL.
+EXECUTION_REDIS_PREFIX = "okx:longbot:execution:v1"
+EXECUTION_DAILY_BALANCE_HASH = f"{EXECUTION_REDIS_PREFIX}:daily_balance"
+EXECUTION_BALANCE_STATE_KEY = f"{EXECUTION_REDIS_PREFIX}:wallet:state"
+EXECUTION_CASHFLOW_MIN_ABS_USDT = 5.0
+EXECUTION_CASHFLOW_MIN_PCT = 10.0
+_EXECUTION_DAILY_RUNTIME_STATE: dict[str, dict] = {}
+
 
 # Loss Streak Guard: pause new execution after repeated SL hits before TP1.
 LOSS_STREAK_NO_TP1_LIMIT = 5
@@ -576,28 +587,48 @@ def _resolve_entry_margin_plan(
                 _CACHED_OKX_BALANCE_LOG_VALUE = okx_reference_balance
                 print(f"💰 OKX balance cached: {okx_reference_balance:.4f} USDT", flush=True)
 
-    okx_margin = _compute_margin_from_reference(okx_reference_balance, settings)
+    live_okx_mode = bool(
+        okx_client is not None
+        and getattr(okx_client, "configured", False)
+        and not bool(getattr(settings, "okx_simulated", True))
+    )
+    sizing_balance = okx_reference_balance
+    execution_daily_for_sizing = {}
+    if live_okx_mode and okx_reference_balance > 0:
+        sizing_balance, execution_daily_for_sizing = _execution_daily_sizing_balance_from_runtime(okx_reference_balance, settings)
+
+    okx_margin = _compute_margin_from_reference(sizing_balance, settings)
     if okx_reference_balance > 0 and okx_margin > 0:
-        live_okx_mode = bool(
-            okx_client is not None
-            and getattr(okx_client, "configured", False)
-            and not bool(getattr(settings, "okx_simulated", True))
-        )
         if live_okx_mode and okx_margin < LIVE_MIN_EXECUTION_MARGIN_USDT:
             return {
                 "source": "okx_balance",
                 "reference_balance_usdt": okx_reference_balance,
+                "sizing_balance_usdt": sizing_balance,
                 "margin_usdt": 0.0,
                 "position_pct": 0.0,
                 "reason": "live_okx_margin_too_small",
                 "min_execution_margin_usdt": LIVE_MIN_EXECUTION_MARGIN_USDT,
+                "execution_daily_baseline": execution_daily_for_sizing,
+            }
+        if live_okx_mode and okx_margin > okx_reference_balance:
+            return {
+                "source": "okx_balance",
+                "reference_balance_usdt": okx_reference_balance,
+                "sizing_balance_usdt": sizing_balance,
+                "margin_usdt": 0.0,
+                "position_pct": 0.0,
+                "reason": "live_okx_balance_below_daily_sizing_margin",
+                "required_margin_usdt": okx_margin,
+                "execution_daily_baseline": execution_daily_for_sizing,
             }
         return {
             "source": "okx_balance",
             "reference_balance_usdt": okx_reference_balance,
+            "sizing_balance_usdt": sizing_balance,
             "margin_usdt": okx_margin,
-            "position_pct": (okx_margin / okx_reference_balance) * 100.0 if okx_reference_balance > 0 else 0.0,
-            "reason": "daily_reference_from_okx_balance",
+            "position_pct": (okx_margin / sizing_balance) * 100.0 if sizing_balance > 0 else 0.0,
+            "reason": "daily_adjusted_baseline_sizing" if live_okx_mode else "daily_reference_from_okx_balance",
+            "execution_daily_baseline": execution_daily_for_sizing,
         }
 
     live_okx_mode = bool(
@@ -626,9 +657,184 @@ def _resolve_entry_margin_plan(
     return fallback_plan
 
 
+
+def _execution_today_key(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return now.date().isoformat()
+
+
+def _execution_cashflow_threshold(last_equity: float, settings: Settings | None = None) -> float:
+    """Minimum balance jump treated as external deposit/withdrawal.
+
+    A balance-only detector cannot perfectly distinguish cashflow from PnL, so
+    this deliberately ignores small OKX equity moves and reacts only to large
+    jumps. The threshold can be tuned from Railway env without code changes.
+    """
+    try:
+        abs_min = _safe_float(
+            os.getenv("EXECUTION_CASHFLOW_MIN_ABS_USDT")
+            or getattr(settings, "execution_cashflow_min_abs_usdt", EXECUTION_CASHFLOW_MIN_ABS_USDT),
+            EXECUTION_CASHFLOW_MIN_ABS_USDT,
+        )
+    except Exception:
+        abs_min = EXECUTION_CASHFLOW_MIN_ABS_USDT
+    try:
+        pct_min = _safe_float(
+            os.getenv("EXECUTION_CASHFLOW_MIN_PCT")
+            or getattr(settings, "execution_cashflow_min_pct", EXECUTION_CASHFLOW_MIN_PCT),
+            EXECUTION_CASHFLOW_MIN_PCT,
+        )
+    except Exception:
+        pct_min = EXECUTION_CASHFLOW_MIN_PCT
+    pct_threshold = abs(_safe_float(last_equity, 0.0)) * max(0.0, pct_min) / 100.0
+    return max(0.0, abs_min, pct_threshold)
+
+
+def _load_execution_daily_balance_row(trade_store: RedisTradeStore | None, day: str) -> dict:
+    row = dict(_EXECUTION_DAILY_RUNTIME_STATE.get(str(day) or "") or {})
+    if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
+        try:
+            raw = trade_store.client.hget(EXECUTION_DAILY_BALANCE_HASH, day)
+            if raw:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    row.update(loaded)
+        except Exception as exc:
+            print(f"⚠️ Execution daily baseline load failed: {exc}", flush=True)
+    return row
+
+
+def _save_execution_daily_balance_row(trade_store: RedisTradeStore | None, day: str, row: dict) -> dict:
+    clean = dict(row or {})
+    clean["date"] = str(day)
+    clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _EXECUTION_DAILY_RUNTIME_STATE[str(day)] = clean
+    if trade_store and getattr(trade_store, "enabled", False) and getattr(trade_store, "client", None):
+        try:
+            payload = json.dumps(clean, ensure_ascii=False, default=str)
+            trade_store.client.hset(EXECUTION_DAILY_BALANCE_HASH, str(day), payload)
+            trade_store.client.expire(EXECUTION_DAILY_BALANCE_HASH, 180 * 24 * 60 * 60)
+            trade_store.client.set(EXECUTION_BALANCE_STATE_KEY, payload, ex=180 * 24 * 60 * 60)
+        except Exception as exc:
+            print(f"⚠️ Execution daily baseline save failed: {exc}", flush=True)
+    return clean
+
+
+def _ensure_execution_daily_baseline(
+    current_equity: float,
+    trade_store: RedisTradeStore | None = None,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Persist live execution Daily DD baseline per UTC day.
+
+    - reference_portfolio still shows current OKX equity.
+    - start_of_day_balance for Daily DD uses adjusted_start_balance.
+    - position sizing uses adjusted_start_balance, not every floating equity move.
+    - Large balance jumps are treated as external cashflow and folded into the
+      baseline, so deposits/withdrawals update both Daily DD baseline and sizing.
+    """
+    now = now or datetime.now(timezone.utc)
+    today = _execution_today_key(now)
+    equity = _safe_float(current_equity, 0.0)
+    if equity <= 0:
+        return {
+            "date": today,
+            "start_balance": 0.0,
+            "adjusted_start_balance": 0.0,
+            "current_balance": 0.0,
+            "external_cashflow_net": 0.0,
+            "reason": "current_equity_unavailable",
+        }
+
+    row = _load_execution_daily_balance_row(trade_store, today)
+    if not row:
+        row = {
+            "date": today,
+            "start_balance": equity,
+            "adjusted_start_balance": equity,
+            "current_balance": equity,
+            "last_equity": equity,
+            "external_cashflow_net": 0.0,
+            "external_deposits": 0.0,
+            "external_withdrawals": 0.0,
+            "cashflow_events": [],
+            "created_at": now.isoformat(),
+            "reason": "new_utc_day_baseline_from_okx_equity",
+        }
+        print(f"📅 EXECUTION_DAILY_BASELINE | new_day | date={today} | start={equity:.4f}", flush=True)
+        return _save_execution_daily_balance_row(trade_store, today, row)
+
+    start_balance = _safe_float(row.get("start_balance"), equity)
+    if start_balance <= 0:
+        start_balance = equity
+    external_net = _safe_float(row.get("external_cashflow_net"), 0.0)
+    deposits = _safe_float(row.get("external_deposits"), 0.0)
+    withdrawals = _safe_float(row.get("external_withdrawals"), 0.0)
+    last_equity = _safe_float(row.get("last_equity") or row.get("current_balance"), equity)
+    threshold = _execution_cashflow_threshold(last_equity, settings)
+    delta = equity - last_equity
+
+    if last_equity > 0 and abs(delta) >= threshold:
+        event_type = "deposit" if delta > 0 else "withdrawal"
+        external_net += delta
+        if delta > 0:
+            deposits += delta
+        else:
+            withdrawals += abs(delta)
+        events = list(row.get("cashflow_events") or [])
+        events.append({
+            "ts": now.isoformat(),
+            "type": event_type,
+            "amount": round(delta, 8),
+            "previous_equity": round(last_equity, 8),
+            "current_equity": round(equity, 8),
+            "threshold": round(threshold, 8),
+        })
+        row["cashflow_events"] = events[-20:]
+        print(
+            f"💸 EXECUTION_CASHFLOW_ADJUST | {event_type} | amount={delta:+.4f} | "
+            f"start={start_balance:.4f} | external_net={external_net:+.4f} | threshold={threshold:.4f}",
+            flush=True,
+        )
+
+    adjusted_start = max(0.0, start_balance + external_net)
+    row.update({
+        "date": today,
+        "start_balance": start_balance,
+        "adjusted_start_balance": adjusted_start,
+        "current_balance": equity,
+        "last_equity": equity,
+        "external_cashflow_net": external_net,
+        "external_deposits": deposits,
+        "external_withdrawals": withdrawals,
+        "cashflow_threshold_usdt": threshold,
+        "reason": "daily_baseline_adjusted_for_external_cashflow" if abs(external_net) > 0 else "daily_baseline_from_okx_equity",
+    })
+    return _save_execution_daily_balance_row(trade_store, today, row)
+
+
+def _execution_daily_sizing_balance_from_runtime(current_equity: float, settings: Settings | None = None) -> tuple[float, dict]:
+    """Return today's execution sizing balance from the daily baseline cache.
+
+    This is used by actual OKX order sizing, where trade_store is not available.
+    run_once() calls _ensure_execution_daily_baseline() before dispatch, so the
+    runtime cache normally contains today's adjusted_start_balance. If not, we
+    fall back to current OKX equity safely.
+    """
+    equity = _safe_float(current_equity, 0.0)
+    today = _execution_today_key()
+    row = _load_execution_daily_balance_row(None, today)
+    sizing_balance = _safe_float(row.get("adjusted_start_balance") or row.get("start_balance"), 0.0)
+    if sizing_balance <= 0:
+        sizing_balance = equity
+    return max(0.0, sizing_balance), row
+
+
 def _resolve_portfolio_state_inputs(
     okx_client: OKXTradeClient | None,
     settings: Settings,
+    trade_store: RedisTradeStore | None = None,
 ) -> dict:
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     reference_balance = _safe_float((sizing or {}).get("reference_balance_usdt"), 0.0)
@@ -656,11 +862,51 @@ def _resolve_portfolio_state_inputs(
     reference_balance = max(reference_balance, 0.0)
     leverage = max(1, int(getattr(settings, "default_leverage", 1) or 1))
 
+    execution_daily = {}
+    start_of_day_balance = reference_balance
+    if live_okx_mode and reference_balance > 0:
+        execution_daily = _ensure_execution_daily_baseline(
+            reference_balance,
+            trade_store=trade_store,
+            settings=settings,
+        )
+        start_of_day_balance = _safe_float(
+            execution_daily.get("adjusted_start_balance") or execution_daily.get("start_balance"),
+            reference_balance,
+        )
+        if start_of_day_balance <= 0:
+            start_of_day_balance = reference_balance
+
+        # Position sizing is intentionally stable during the day.
+        # It follows the daily adjusted baseline, so normal floating PnL does not
+        # resize trades every scan; external deposits/withdrawals update it.
+        daily_sizing_balance = start_of_day_balance
+        margin_per_trade = _compute_margin_from_reference(daily_sizing_balance, settings)
+        if margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
+            margin_per_trade = 0.0
+        elif reference_balance > 0 and margin_per_trade > reference_balance:
+            margin_per_trade = 0.0
+            sizing["reason"] = "live_okx_balance_below_daily_sizing_margin"
+    else:
+        daily_sizing_balance = reference_balance
+
     return {
+        # Current OKX equity: shown as the real wallet value.
         "reference_portfolio": reference_balance,
-        "start_of_day_balance": reference_balance,
+        # Daily DD baseline: stable per UTC day, adjusted for large external cashflow.
+        "start_of_day_balance": start_of_day_balance,
+        # Position sizing balance: stable intraday; updates on new day/cashflow/manual resume.
+        "execution_sizing_balance": daily_sizing_balance,
         "margin_per_trade": margin_per_trade,
         "leverage": leverage,
+        "execution_daily_baseline": execution_daily,
+        "execution_daily_start_balance": _safe_float(execution_daily.get("start_balance"), start_of_day_balance),
+        "execution_adjusted_start_balance": _safe_float(execution_daily.get("adjusted_start_balance"), start_of_day_balance),
+        "execution_daily_sizing_balance": _safe_float(daily_sizing_balance, 0.0),
+        "execution_external_cashflow_usdt": _safe_float(execution_daily.get("external_cashflow_net"), 0.0),
+        "execution_external_deposits_usdt": _safe_float(execution_daily.get("external_deposits"), 0.0),
+        "execution_external_withdrawals_usdt": _safe_float(execution_daily.get("external_withdrawals"), 0.0),
+        "execution_daily_baseline_date": str(execution_daily.get("date") or ""),
     }
 
 
@@ -1212,7 +1458,7 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     result["trades"] = list(trades or [])
     if stats:
         result["exchange_reconcile_stats"] = stats
-    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
+    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings, trade_store=trade_store)
     result["portfolio_state_inputs"] = portfolio_state_inputs
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
     reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
@@ -3295,7 +3541,7 @@ def run_once(
         )
     else:
         simulation_daily_balance_snapshot = None
-        portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings)
+        portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, settings, trade_store=trade_store)
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
@@ -6122,7 +6368,7 @@ def _refresh_execution_reports_from_redis(
     result["execution_results"] = refreshed_checks
     if reconcile_stats:
         result["exchange_reconcile_stats"] = reconcile_stats
-    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings)
+    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
     result["portfolio_state_inputs"] = portfolio_state_inputs
     kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
     reports = build_report_bundle(refreshed_trades, refreshed_checks, list(result.get("signal_items", []) or []), **kwargs)
