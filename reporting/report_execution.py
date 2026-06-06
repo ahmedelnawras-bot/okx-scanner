@@ -218,5 +218,5 @@ def build_execution_report(
             lines.append(f"• {reason}: {count}")
         lines.append("📌 هذه الأسباب تخص فترة التقرير، وليست بالضرورة الحالة الحالية للصفقات المفتوحة الآن.")
 
-    lines.extend([SEP, "💡 إدارة الصفقات: Normal/Strong/Block 40/40/20 | Recovery 50/25/25"])
+    lines.extend([SEP, "💡 إدارة الصفقات: Normal/Strong/Block 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
