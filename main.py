@@ -147,6 +147,15 @@ EXECUTION_CASHFLOW_MIN_ABS_USDT = 5.0
 EXECUTION_CASHFLOW_MIN_PCT = 10.0
 _EXECUTION_DAILY_RUNTIME_STATE: dict[str, dict] = {}
 
+# OKX recovery grace:
+# If this worker has just received OKX success for a symbol, give immediate
+# Redis registration a short window before classifying the same live position
+# as RECOVERED_FROM_OKX on the next scan. The live OKX guards still count the
+# position, so this does not weaken slot/same-symbol protection.
+OKX_RECOVERY_GRACE_SECONDS: int = 120
+_OKX_RECENT_BOT_OPENED_SYMBOLS: dict[str, float] = {}
+
+
 
 # Loss Streak Guard: pause new execution after repeated SL hits before TP1.
 LOSS_STREAK_NO_TP1_LIMIT = 5
@@ -1048,6 +1057,47 @@ def _normalize_okx_inst_id(value: object) -> str:
     return text
 
 
+def _purge_recent_bot_okx_order_marks(now_ts: float | None = None) -> None:
+    now_ts = float(now_ts or time.time())
+    expired = [
+        symbol for symbol, expires_at in list(_OKX_RECENT_BOT_OPENED_SYMBOLS.items())
+        if float(expires_at or 0.0) <= now_ts
+    ]
+    for symbol in expired:
+        _OKX_RECENT_BOT_OPENED_SYMBOLS.pop(symbol, None)
+
+
+def _mark_recent_bot_okx_order(symbol: object, reason: str = "okx_order_success") -> None:
+    """Remember symbols this worker just opened on OKX.
+
+    This marker is deliberately short-lived and classification-only:
+    - Recovery may delay labeling a position as RECOVERED_FROM_OKX.
+    - OKX live guards still read positions directly from OKX and remain strict.
+    """
+    inst_id = _normalize_okx_inst_id(symbol)
+    if not inst_id:
+        return
+    now_ts = time.time()
+    _purge_recent_bot_okx_order_marks(now_ts)
+    ttl = max(5, int(OKX_RECOVERY_GRACE_SECONDS or 120))
+    _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = now_ts + ttl
+    print(
+        f"OKX_RECOVERY_GRACE_MARK | {inst_id} | ttl={ttl}s | reason={reason}",
+        flush=True,
+    )
+
+
+def _recent_bot_okx_order_grace_remaining(symbol: object) -> int:
+    inst_id = _normalize_okx_inst_id(symbol)
+    if not inst_id:
+        return 0
+    now_ts = time.time()
+    _purge_recent_bot_okx_order_marks(now_ts)
+    expires_at = float(_OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id, 0.0) or 0.0)
+    remaining = int(max(0.0, expires_at - now_ts))
+    return remaining
+
+
 def _row_inst_id(row: dict) -> str:
     return _normalize_okx_inst_id((row or {}).get("instId"))
 
@@ -1290,8 +1340,10 @@ def _recover_missing_execution_trades_from_okx_positions(
         "enabled": False,
         "changed": False,
         "imported": 0,
+        "grace_skipped": 0,
         "reason": "not_live_okx_mode",
         "symbols": [],
+        "grace_symbols": [],
     }
     if not _is_live_okx_execution_mode(settings, okx_client):
         return list(trades or []), stats
@@ -1323,6 +1375,18 @@ def _recover_missing_execution_trades_from_okx_positions(
             continue
         if inst_id in represented:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
+            continue
+        grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
+        if grace_remaining > 0:
+            imported_symbols_marker = stats.setdefault("grace_symbols", [])
+            if isinstance(imported_symbols_marker, list):
+                imported_symbols_marker.append(inst_id)
+            stats["grace_skipped"] = int(stats.get("grace_skipped", 0) or 0) + 1
+            print(
+                f"OKX_POSITION_RECOVERY_GRACE | {inst_id} | "
+                f"remaining={grace_remaining}s | reason=recent_bot_okx_order",
+                flush=True,
+            )
             continue
         trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
@@ -5355,6 +5419,10 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
                 exchange_order_ok = bool(managed_order_result.get("ok"))
                 if exchange_order_ok:
+                    _mark_recent_bot_okx_order(
+                        getattr(signal, "symbol", ""),
+                        reason="managed_order_ok_before_immediate_registration",
+                    )
                     _register_exchange_trade_immediately(
                         result,
                         item,
