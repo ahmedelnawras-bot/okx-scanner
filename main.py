@@ -3108,10 +3108,11 @@ def run_once(
         setattr(candidate_trade, "telegram_announced", False)
         setattr(candidate_trade, "announced_to_telegram", False)
 
-        # Only already-open trades should consume slots in trading mode.
-        # Same-scan provisional reservation is kept for simulation only,
-        # because simulation activates immediately inside this same cycle.
-        reserve_same_scan_slot = bool(simulation_mode_active and consumes_live_slot)
+        # ✅ FIX: الـ slot بيتحجز في نفس الـ scan في simulation وexecution
+        # في simulation: بيفتح trade فعلي جوه الـ scan
+        # في execution: بس بيحجز الـ slot عشان باقي الـ pairs في نفس الـ scan
+        #               يشوفوا الـ slot محجوز ومش يتجاوزوا الـ max_positions
+        reserve_same_scan_slot = consumes_live_slot
 
         eligible_for_activation = consumes_live_slot and not _has_active_same_symbol(
             [*gate_base_trades, *local_gate_trades],
