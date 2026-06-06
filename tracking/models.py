@@ -87,6 +87,9 @@ class TrackedTrade:
     pnl_pct: float = 0.0
     realized_pnl_pct: float = 0.0
     runner_pnl_pct: float = 0.0
+
+    runner_target_price: float = 0.0
+    runner_target_hit_at: datetime | None = None
     closed_portion_pct: float = 0.0
     highest_price: float = 0.0
     max_favorable_pct: float = 0.0
