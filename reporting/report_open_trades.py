@@ -118,5 +118,5 @@ def build_open_trades_report(
 
     append_trade_cards(lines, "📈 <b>Open Winners — Top 5</b>", winners, limit=5)
     append_trade_cards(lines, "📉 <b>Open Losers — Top 5</b>", losers, limit=5)
-    lines.extend([SEP, "💡 يعتمد على نظام إدارة 40/40/20"])
+    lines.extend([SEP, "💡 يعتمد على نظام إدارة Normal/Strong/Block 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
