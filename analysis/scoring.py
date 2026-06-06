@@ -939,6 +939,7 @@ def _infer_setup(
     if (
         "rs_btc" in pair_tags
         and "continuation" in pair_tags
+        and market_mode in {MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG}
     ):
 
         return (
