@@ -149,6 +149,11 @@ def build_portfolio_state_from_trades(
     leverage: int = DEFAULT_LEVERAGE,
     start_of_day_balance: float | None = None,
     day_started_at: datetime | None = None,
+    # ✅ manual DD override — بيتبعت من main.py لما المستخدم يعمل manual resume
+    # بيضمن إن الـ DD يتحسب من الرصيد الحقيقي وقت الـ resume مش من أول اليوم
+    manual_daily_dd_override: bool = False,
+    manual_daily_dd_baseline: float | None = None,
+    manual_resume_at: str | None = None,
 ) -> PortfolioState:
     """بيبني PortfolioState من الـ trades الحالية.
 
@@ -156,17 +161,27 @@ def build_portfolio_state_from_trades(
     - realized_pnl من الصفقات المغلقة
     - unrealized_pnl من الصفقات المفتوحة
     - TP2 تعتبر صفقة مغلقة
+
+    لو manual_daily_dd_override=True:
+    - بيستخدم manual_daily_dd_baseline كـ start_of_day_balance
+    - بيضمن صح حساب الـ DD بعد manual resume في نص اليوم
     """
     now = datetime.now(timezone.utc)
     realized = 0.0
     unrealized = 0.0
     opened_today = 0
 
-    actual_start_of_day_balance = float(
-        start_of_day_balance
-        if start_of_day_balance is not None
-        else reference_portfolio
-    )
+    # ✅ manual DD override logic
+    # لو المستخدم عمل manual resume، نستخدم الـ baseline المحفوظ
+    # عشان الـ DD يتحسب من الرصيد الحقيقي مش من أول اليوم
+    if manual_daily_dd_override and manual_daily_dd_baseline and float(manual_daily_dd_baseline) > 0:
+        actual_start_of_day_balance = float(manual_daily_dd_baseline)
+    else:
+        actual_start_of_day_balance = float(
+            start_of_day_balance
+            if start_of_day_balance is not None
+            else reference_portfolio
+        )
 
     actual_day_started_at = (
         day_started_at.astimezone(timezone.utc)
