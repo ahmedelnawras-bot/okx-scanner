@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
 
@@ -137,16 +138,22 @@ class OKXTradeClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ts = self._timestamp()
+        method_u = method.upper()
         body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
-        url = f"{self.base_url}{path}"
+
+        # OKX signs the exact request path. For signed GET requests with
+        # query parameters, the query string must be included in the
+        # prehash path, otherwise OKX returns: code=50113 / "Invalid Sign".
+        query_string = urlencode(params or {}) if params else ""
+        request_path = f"{path}?{query_string}" if query_string else path
+        url = f"{self.base_url}{request_path}"
 
         try:
             response = requests.request(
-                method=method.upper(),
+                method=method_u,
                 url=url,
-                params=params,
                 data=body if payload is not None else None,
-                headers=self._headers(ts, method.upper(), path, body),
+                headers=self._headers(ts, method_u, request_path, body),
                 timeout=self.timeout,
             )
             try:
