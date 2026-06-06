@@ -1387,6 +1387,48 @@ def _is_open_execution_trade_for_reconcile(trade) -> bool:
     )
 
 
+def _estimate_reconcile_close_raw_pnl_pct(trade) -> float:
+    """Best-effort raw PnL% when an OKX live position disappears.
+
+    Manual OKX closes do not always pass through the lifecycle TP/SL handlers,
+    so realized_pnl_pct can still be zero even after TP1/TP2 was reached.
+    This helper preserves report analytics by converting the last known trade
+    state into a raw realized percentage. report_format later applies leverage.
+    """
+    realized = _safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)
+    if abs(realized) > 1e-12:
+        return realized
+
+    current_raw = _safe_float(getattr(trade, "pnl_pct", 0.0), 0.0)
+    entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+    tp1 = _safe_float(getattr(trade, "tp1", 0.0), 0.0)
+    tp2 = _safe_float(getattr(trade, "tp2", 0.0), 0.0)
+
+    def _raw_move(price: float) -> float:
+        if entry > 0 and price > 0:
+            return ((price - entry) / entry) * 100.0
+        return 0.0
+
+    tp1_raw = _raw_move(tp1)
+    tp2_raw = _raw_move(tp2)
+    tp1_close = max(0.0, min(100.0, _safe_float(getattr(trade, "tp1_close_pct", 30.0), 30.0)))
+    tp2_close = max(0.0, min(100.0, _safe_float(getattr(trade, "tp2_close_pct", 50.0), 50.0)))
+    runner_close = max(0.0, min(100.0, _safe_float(getattr(trade, "runner_close_pct", 20.0), 20.0)))
+
+    if bool(getattr(trade, "tp2_hit", False)):
+        return (
+            tp1_raw * (tp1_close / 100.0)
+            + tp2_raw * (tp2_close / 100.0)
+            + current_raw * (runner_close / 100.0)
+        )
+
+    if bool(getattr(trade, "tp1_hit", False)):
+        remaining = max(0.0, 100.0 - tp1_close)
+        return tp1_raw * (tp1_close / 100.0) + current_raw * (remaining / 100.0)
+
+    return current_raw
+
+
 def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position_not_live"):
     """Preserve execution report history when OKX position disappears.
 
@@ -1398,12 +1440,22 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
     now = datetime.now(timezone.utc)
     try:
         status = str(getattr(trade, "status", "") or "").strip().lower()
+        realized = _estimate_reconcile_close_raw_pnl_pct(trade)
+
+        # Keep TP flags as-is; only fill realized PnL if lifecycle did not.
+        if abs(_safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)) <= 1e-12:
+            setattr(trade, "realized_pnl_pct", realized)
+        setattr(trade, "manual_close_estimated_pnl_pct", realized)
+
         if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
-            pnl = _safe_float(getattr(trade, "pnl_pct", 0.0), 0.0)
-            realized = _safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)
-            effective = realized if abs(realized) > 0 else pnl
-            status = "closed_win" if effective >= 0 else "closed_loss"
+            if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
+                status = "closed_win"
+            elif realized < 0:
+                status = "closed_loss"
+            else:
+                status = "breakeven_after_tp1" if bool(getattr(trade, "tp1_hit", False)) else "closed"
             setattr(trade, "status", status)
+
         setattr(trade, "is_closed", True)
         setattr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
         setattr(trade, "updated_at", now)
@@ -1412,8 +1464,14 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
         setattr(trade, "same_symbol_block_exempt", True)
         setattr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
         setattr(trade, "exchange_close_reason", reason)
-    except Exception:
-        pass
+        print(
+            f"OKX_RECONCILE_CLOSED | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"status={status} | realized_raw={realized:+.4f}% | "
+            f"tp1={bool(getattr(trade, 'tp1_hit', False))} | tp2={bool(getattr(trade, 'tp2_hit', False))} | reason={reason}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"⚠️ OKX_RECONCILE_CLOSE_FAILED | {getattr(trade, 'symbol', '-') or '-'} | {exc}", flush=True)
     return trade
 
 
@@ -3821,6 +3879,9 @@ def run_once(
             [*gate_base_trades, *local_gate_trades],
             candidate_trade,
         )
+        activation_block_reason = ""
+        if consumes_live_slot and not eligible_for_activation:
+            activation_block_reason = "same_symbol_or_slot_gate_blocked"
 
         if eligible_for_activation and reserve_same_scan_slot:
             path = str(exec_result.get("path") or "general")
@@ -3830,12 +3891,14 @@ def run_once(
                 if slot_counts["block_exception"] > effective_max_block_positions:
                     slot_counts["block_exception"] -= 1
                     eligible_for_activation = False
+                    activation_block_reason = "block_slots_reached_same_scan"
             elif path == "recovery":
                 slot_counts["recovery"] = slot_counts.get("recovery", 0) + 1
                 # ✅ FIX: تأكد إن الـ slot مش بيتجاوز الحد بعد الإضافة
                 if slot_counts["recovery"] > effective_max_recovery_positions:
                     slot_counts["recovery"] -= 1
                     eligible_for_activation = False
+                    activation_block_reason = "recovery_slots_reached_same_scan"
                 else:
                     recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
                     if state.mode == MODE_RECOVERY_LONG:
@@ -3846,6 +3909,7 @@ def run_once(
                 if slot_counts["general"] > effective_max_positions:
                     slot_counts["general"] -= 1
                     eligible_for_activation = False
+                    activation_block_reason = "general_slots_reached_same_scan"
 
             # Reserve this trade for same-scan gating only in simulation mode.
             local_gate_trades.append(candidate_trade)
@@ -3875,6 +3939,7 @@ def run_once(
             "message": build_signal_message(signal, exec_result),
             "candidate_trade": candidate_trade,
             "eligible_for_activation": eligible_for_activation,
+            "activation_block_reason": activation_block_reason,
             "telegram_announced": False,
             "exchange_required": False,
             "exchange_order_ok": False,
@@ -4254,8 +4319,10 @@ def _register_exchange_trade_immediately(
     exec_result = item.get("execution") or {}
     if str(exec_result.get("status") or "").strip().lower() != "accepted_preview":
         return False
-    if not bool(item.get("eligible_for_activation")):
-        return False
+    # If OKX already accepted the order, tracking must be persisted even if a
+    # stale UI/slot flag says eligible_for_activation=False. Otherwise the bot
+    # can open a real position and fail to record it. Pre-order eligibility is
+    # enforced in _dispatch_signals before sending any OKX order.
     if not bool((managed_order_result or {}).get("ok")):
         return False
 
@@ -4723,6 +4790,28 @@ def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) ->
     _safe_set_trade_attr(trade, "runner_requires_trailing_after_tp2", bool(managed_order_result.get("requires_runner_trailing")))
     _safe_set_trade_attr(trade, "managed_trade_plan", plan)
 
+    # Report-card diagnostics: actual leverage/margin used by the exchange path.
+    used_margin = _safe_float(managed_order_result.get("used_margin_usdt"), 0.0)
+    if used_margin > 0:
+        _safe_set_trade_attr(trade, "used_margin_usdt", used_margin)
+        _safe_set_trade_attr(trade, "margin_usdt", used_margin)
+        _safe_set_trade_attr(trade, "allocated_margin_usdt", used_margin)
+
+    actual_leverage = _safe_float(
+        managed_order_result.get("effective_leverage")
+        or managed_order_result.get("actual_leverage")
+        or managed_order_result.get("requested_leverage"),
+        0.0,
+    )
+    if actual_leverage > 0:
+        _safe_set_trade_attr(trade, "effective_leverage", actual_leverage)
+        _safe_set_trade_attr(trade, "actual_leverage", actual_leverage)
+
+    td_mode = str(managed_order_result.get("td_mode") or "").strip()
+    if td_mode:
+        _safe_set_trade_attr(trade, "td_mode", td_mode)
+        _safe_set_trade_attr(trade, "margin_mode", td_mode)
+
 
 
 def _execute_managed_okx_order(
@@ -5165,7 +5254,43 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 f"— Redis is OFF, execution blocked to prevent untracked positions.",
                 flush=True,
             )
-        exchange_order_ok = True
+
+        # Final pre-order activation guard.
+        # accepted_preview can still have eligible_for_activation=False after
+        # same-scan slot/same-symbol gates. In that case we must NOT send a real
+        # OKX order, because _register_exchange_trade_immediately intentionally
+        # registers only real exchange fills. This prevents live positions that
+        # are opened but not tracked in Redis/reports.
+        if exchange_required and not bool(item.get("eligible_for_activation")):
+            reason = str(item.get("activation_block_reason") or "not_eligible_for_activation")
+            managed_order_result = {
+                "ok": False,
+                "entry": {
+                    "ok": False,
+                    "simulated": False,
+                    "reason": reason,
+                },
+                "reason": reason,
+                "tp_split": None,
+                "plan": {},
+                "sizing": {},
+                "sl_attached": False,
+                "tp_orders_ok": False,
+                "requires_runner_trailing": False,
+            }
+            exchange_order_ok = False
+            exchange_required = False
+            item["exchange_required"] = False
+            item["exchange_order_ok"] = False
+            item["exchange_order_result"] = managed_order_result
+            item["register_as_open_trade"] = False
+            item["announcement_status"] = "activation_blocked_before_okx_order"
+            print(
+                f"🛑 OKX_PRE_ORDER_BLOCK | {getattr(signal, 'symbol', '-')} | reason={reason}",
+                flush=True,
+            )
+        else:
+            exchange_order_ok = True
 
         if simulation_mode_active:
             text = _simulation_signal_badge(text)
