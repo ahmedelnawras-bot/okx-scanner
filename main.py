@@ -3762,13 +3762,32 @@ def _signal_fingerprint_ttl(exec_result: dict | None) -> int:
 
 
 def _build_signal_fingerprint(signal, exec_result: dict) -> str:
-    # ✅ FIX: Recovery mode له bucket منفصل عشان الـ dedup يكون أقوى
-    risk_mode = str((exec_result or {}).get("risk_mode") or "").strip().lower()
+    """Build dedup key without mixing Simulation / Trading / Scan.
+
+    Surgical fix:
+    - Old key was only SYMBOL|LONG|status_bucket.
+    - A Simulation alert could therefore suppress a later real Trading alert
+      for the same symbol/status for the full TTL.
+    - Runtime mode is now part of the fingerprint, so execution and simulation
+      dedup buckets are fully separated.
+    """
+    exec_result = exec_result or {}
+    runtime_mode = str(exec_result.get("runtime_mode") or "unknown").strip().lower()
+    risk_mode = str(exec_result.get("risk_mode") or "").strip().lower()
+
+    if runtime_mode not in {"scan", "trading", "simulation"}:
+        runtime_mode = "unknown"
+
     mode_suffix = ":recovery" if risk_mode == "recovery_long" else ""
+    status_bucket = _signal_status_bucket(
+        exec_result.get("status") if isinstance(exec_result, dict) else None
+    )
+
     return "|".join([
+        runtime_mode,
         str(getattr(signal, "symbol", "")).upper(),
         "LONG",
-        _signal_status_bucket(exec_result.get("status") if isinstance(exec_result, dict) else None) + mode_suffix,
+        status_bucket + mode_suffix,
     ])
 
 
@@ -4229,13 +4248,24 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             item["announcement_status"] = "filtered_signal_mode"
             continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
+        dedup_ttl = _signal_fingerprint_ttl(exec_result)
         if _is_duplicate_signal_fingerprint(
             fingerprint,
             sent_fingerprints,
             trade_store,
-            ttl_seconds=_signal_fingerprint_ttl(exec_result),
+            ttl_seconds=dedup_ttl,
         ):
             item["announcement_status"] = "deduplicated"
+            item["dedup_fingerprint"] = fingerprint
+            item["dedup_ttl_seconds"] = dedup_ttl
+            print(
+                f"DEDUP_SKIP | {getattr(signal, 'symbol', '-')} | "
+                f"status={exec_status} | "
+                f"runtime={(exec_result or {}).get('runtime_mode')} | "
+                f"risk_mode={(exec_result or {}).get('risk_mode')} | "
+                f"ttl={dedup_ttl}s | fp={fingerprint}",
+                flush=True,
+            )
             continue
 
         text = item["message"]
