@@ -153,7 +153,10 @@ _EXECUTION_DAILY_RUNTIME_STATE: dict[str, dict] = {}
 # as RECOVERED_FROM_OKX on the next scan. The live OKX guards still count the
 # position, so this does not weaken slot/same-symbol protection.
 OKX_RECOVERY_GRACE_SECONDS: int = 120
-_OKX_RECENT_BOT_OPENED_SYMBOLS: dict[str, float] = {}
+# Keep setup metadata longer than the grace window so delayed recovery can
+# rebuild the trade with its real SL/TP instead of conservative placeholders.
+OKX_RECOVERY_META_SECONDS: int = 15 * 60
+_OKX_RECENT_BOT_OPENED_SYMBOLS: dict[str, dict | float] = {}
 
 
 
@@ -1057,32 +1060,79 @@ def _normalize_okx_inst_id(value: object) -> str:
     return text
 
 
+def _okx_recent_mark_expiry(mark: object, key: str = "grace_until") -> float:
+    if isinstance(mark, dict):
+        return _safe_float(mark.get(key), 0.0)
+    return _safe_float(mark, 0.0)
+
+
 def _purge_recent_bot_okx_order_marks(now_ts: float | None = None) -> None:
     now_ts = float(now_ts or time.time())
-    expired = [
-        symbol for symbol, expires_at in list(_OKX_RECENT_BOT_OPENED_SYMBOLS.items())
-        if float(expires_at or 0.0) <= now_ts
-    ]
+    expired = []
+    for symbol, mark in list(_OKX_RECENT_BOT_OPENED_SYMBOLS.items()):
+        meta_until = _okx_recent_mark_expiry(mark, "meta_until")
+        grace_until = _okx_recent_mark_expiry(mark, "grace_until")
+        expires_at = meta_until or grace_until
+        if expires_at <= now_ts:
+            expired.append(symbol)
     for symbol in expired:
         _OKX_RECENT_BOT_OPENED_SYMBOLS.pop(symbol, None)
 
 
-def _mark_recent_bot_okx_order(symbol: object, reason: str = "okx_order_success") -> None:
+def _extract_signal_trade_setup(signal=None, managed_order_result: dict | None = None, trade=None) -> dict:
+    managed_order_result = managed_order_result or {}
+    sizing = managed_order_result.get("sizing") or {}
+    return {
+        "entry": _safe_float(getattr(signal, "entry", 0.0) if signal is not None else getattr(trade, "entry", 0.0), 0.0),
+        "sl": _safe_float(getattr(signal, "sl", 0.0) if signal is not None else getattr(trade, "sl", 0.0), 0.0),
+        "tp1": _safe_float(getattr(signal, "tp1", 0.0) if signal is not None else getattr(trade, "tp1", 0.0), 0.0),
+        "tp2": _safe_float(getattr(signal, "tp2", 0.0) if signal is not None else getattr(trade, "tp2", 0.0), 0.0),
+        "margin": _safe_float(
+            managed_order_result.get("used_margin_usdt")
+            or sizing.get("margin_usdt")
+            or getattr(trade, "used_margin_usdt", 0.0),
+            0.0,
+        ),
+        "leverage": _safe_float(
+            managed_order_result.get("effective_leverage")
+            or managed_order_result.get("actual_leverage")
+            or managed_order_result.get("requested_leverage")
+            or getattr(trade, "effective_leverage", 0.0),
+            0.0,
+        ),
+        "td_mode": str(managed_order_result.get("td_mode") or getattr(trade, "td_mode", "") or "").strip(),
+    }
+
+
+def _mark_recent_bot_okx_order(
+    symbol: object,
+    reason: str = "okx_order_success",
+    signal=None,
+    managed_order_result: dict | None = None,
+    trade=None,
+) -> None:
     """Remember symbols this worker just opened on OKX.
 
-    This marker is deliberately short-lived and classification-only:
-    - Recovery may delay labeling a position as RECOVERED_FROM_OKX.
-    - OKX live guards still read positions directly from OKX and remain strict.
+    The grace window only delays RECOVERED_FROM_OKX classification. The metadata
+    window lasts longer so delayed recovery can keep Entry/SL/TP from the order.
     """
     inst_id = _normalize_okx_inst_id(symbol)
     if not inst_id:
         return
     now_ts = time.time()
     _purge_recent_bot_okx_order_marks(now_ts)
-    ttl = max(5, int(OKX_RECOVERY_GRACE_SECONDS or 120))
-    _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = now_ts + ttl
+    grace_ttl = max(5, int(OKX_RECOVERY_GRACE_SECONDS or 120))
+    meta_ttl = max(grace_ttl, int(OKX_RECOVERY_META_SECONDS or (15 * 60)))
+    setup = _extract_signal_trade_setup(signal=signal, managed_order_result=managed_order_result, trade=trade)
+    _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = {
+        "grace_until": now_ts + grace_ttl,
+        "meta_until": now_ts + meta_ttl,
+        "reason": str(reason or "okx_order_success"),
+        "symbol": inst_id,
+        **setup,
+    }
     print(
-        f"OKX_RECOVERY_GRACE_MARK | {inst_id} | ttl={ttl}s | reason={reason}",
+        f"OKX_RECOVERY_GRACE_MARK | {inst_id} | ttl={grace_ttl}s | meta_ttl={meta_ttl}s | reason={reason}",
         flush=True,
     )
 
@@ -1093,9 +1143,23 @@ def _recent_bot_okx_order_grace_remaining(symbol: object) -> int:
         return 0
     now_ts = time.time()
     _purge_recent_bot_okx_order_marks(now_ts)
-    expires_at = float(_OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id, 0.0) or 0.0)
-    remaining = int(max(0.0, expires_at - now_ts))
-    return remaining
+    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id, 0.0)
+    expires_at = _okx_recent_mark_expiry(mark, "grace_until")
+    return int(max(0.0, expires_at - now_ts))
+
+
+def _recent_bot_okx_order_metadata(symbol: object) -> dict:
+    inst_id = _normalize_okx_inst_id(symbol)
+    if not inst_id:
+        return {}
+    now_ts = time.time()
+    _purge_recent_bot_okx_order_marks(now_ts)
+    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
+    if not isinstance(mark, dict):
+        return {}
+    if _safe_float(mark.get("meta_until"), 0.0) <= now_ts:
+        return {}
+    return dict(mark)
 
 
 def _row_inst_id(row: dict) -> str:
@@ -1262,8 +1326,12 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     if not inst_id:
         return None
 
+    recovery_meta = _recent_bot_okx_order_metadata(inst_id)
     entry = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
     current = _position_row_price(row, "markPx", "last", "lastPx", "idxPx") or entry
+    cached_entry = _safe_float(recovery_meta.get("entry"), 0.0)
+    if entry <= 0 and cached_entry > 0:
+        entry = cached_entry
     if entry <= 0:
         entry = current
     if entry <= 0:
@@ -1271,17 +1339,24 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
 
     now = datetime.now(timezone.utc)
     margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+    if margin <= 0:
+        margin = _safe_float(recovery_meta.get("margin"), 0.0)
     notional = _row_float(row, "notionalUsd", "notional")
     leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
+    if leverage <= 0:
+        leverage = _safe_float(recovery_meta.get("leverage"), 0.0)
+    cached_sl = _safe_float(recovery_meta.get("sl"), 0.0)
+    cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0)
+    cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0)
     pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
     trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
 
     trade = TrackedTrade(
         symbol=inst_id,
         entry=float(entry),
-        sl=0.0,
-        tp1=float(entry) * 999.0,
-        tp2=float(entry) * 999.0,
+        sl=float(cached_sl) if cached_sl > 0 else 0.0,
+        tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
+        tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
         setup_type="okx_recovered_position",
         market_mode="RECOVERED_FROM_OKX",
         score=0.0,
@@ -1322,6 +1397,14 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
         _safe_set_trade_attr(trade, "position_notional_usdt", notional)
     if leverage > 0:
         _safe_set_trade_attr(trade, "effective_leverage", leverage)
+        _safe_set_trade_attr(trade, "actual_leverage", leverage)
+    meta_td_mode = str(recovery_meta.get("td_mode") or "").strip()
+    if meta_td_mode:
+        _safe_set_trade_attr(trade, "td_mode", meta_td_mode)
+        _safe_set_trade_attr(trade, "margin_mode", meta_td_mode)
+    if recovery_meta:
+        _safe_set_trade_attr(trade, "recovery_metadata_used", True)
+        _safe_set_trade_attr(trade, "recovery_metadata_reason", recovery_meta.get("reason"))
     return trade
 
 
@@ -3597,6 +3680,207 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     outputs["/simulation_wallet"] = _simulation_header(_simulation_wallet_menu_text())
     return outputs
 
+
+def _trade_identity_key(trade) -> str:
+    trade_id = str(getattr(trade, "trade_id", "") or "").strip()
+    if trade_id:
+        return "id:" + trade_id
+    return "sym:" + _normalize_okx_inst_id(getattr(trade, "symbol", ""))
+
+
+def _trade_active_sl_value(trade) -> float:
+    values = [
+        _safe_float(getattr(trade, "live_stop_loss_px", 0.0), 0.0),
+        _safe_float(getattr(trade, "protected_sl", 0.0), 0.0),
+        _safe_float(getattr(trade, "sl", 0.0), 0.0),
+    ]
+    return max([v for v in values if v > 0] or [0.0])
+
+
+def _execution_lifecycle_snapshot(trades: list) -> dict:
+    out = {}
+    for trade in trades or []:
+        if not bool(getattr(trade, "execution_trade", False)):
+            continue
+        key = _trade_identity_key(trade)
+        if not key or key == "sym:":
+            continue
+        out[key] = {
+            "tp1_hit": bool(getattr(trade, "tp1_hit", False)),
+            "tp2_hit": bool(getattr(trade, "tp2_hit", False)),
+            "runner_active": bool(getattr(trade, "runner_active", False) or getattr(trade, "protected_runner", False)),
+            "is_closed": bool(_is_trade_closed(trade) or getattr(trade, "closed_at", None)),
+            "status": str(getattr(trade, "status", "") or "").strip().lower(),
+            "active_sl": _trade_active_sl_value(trade),
+        }
+    return out
+
+
+def _trade_margin_for_notice(trade) -> float:
+    for attr in ("used_margin_usdt", "margin_usdt", "allocated_margin_usdt", "simulation_margin_usdt"):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _trade_leverage_for_notice(trade) -> float:
+    for attr in ("effective_leverage", "actual_leverage", "exchange_leverage", "leverage"):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _trade_impact_for_notice(trade) -> float:
+    margin = _trade_margin_for_notice(trade)
+    try:
+        pct = _report_trade_effective_pnl(trade)
+    except Exception:
+        pct = _trade_effective_pnl_pct(trade)
+    return _money_from_pct(pct, margin=margin)
+
+
+def _fmt_notice_price(value: object) -> str:
+    number = _safe_float(value, 0.0)
+    if number <= 0:
+        return "-"
+    if number >= 100:
+        return f"{number:.2f}"
+    if number >= 1:
+        return f"{number:.4f}"
+    return f"{number:.8f}".rstrip("0").rstrip(".")
+
+
+def _format_trade_lifecycle_notice(trade, event: str, old_sl: float = 0.0, new_sl: float = 0.0, reason: str = "") -> str:
+    symbol = str(getattr(trade, "symbol", "-") or "-")
+    lev = _trade_leverage_for_notice(trade)
+    margin = _trade_margin_for_notice(trade)
+    impact = _trade_impact_for_notice(trade)
+    try:
+        pnl_pct = _report_trade_effective_pnl(trade)
+    except Exception:
+        pnl_pct = _trade_effective_pnl_pct(trade)
+    lev_text = f"{lev:.0f}x" if lev > 0 else "-x"
+    header_map = {
+        "tp1": "🎯 <b>TP1 HIT</b>",
+        "tp2": "🏁 <b>TP2 HIT</b>",
+        "runner": "🏃 <b>Runner 20% Active</b>",
+        "sl_hit": "🛑 <b>SL HIT</b>",
+        "sl_update": "🛡 <b>SL UPDATED</b>",
+    }
+    lines = [
+        header_map.get(event, "📌 <b>Trade Update</b>"),
+        f"💎 <b>{symbol}</b>",
+        f"⚙️ {lev_text} | Margin {margin:.2f}$ | Impact {impact:+.2f}$",
+    ]
+    if event == "tp1":
+        lines += [
+            f"📍 Entry: {_fmt_notice_price(getattr(trade, 'entry', 0.0))}",
+            f"🎯 TP1: {_fmt_notice_price(getattr(trade, 'tp1', 0.0))}",
+            f"💰 Closed: {_safe_float(getattr(trade, 'tp1_close_pct', 30.0), 30.0):.0f}%",
+            f"📊 PnL: {pnl_pct:+.2f}%",
+        ]
+    elif event == "tp2":
+        closed_total = _safe_float(getattr(trade, "closed_portion_pct", 80.0), 80.0)
+        lines += [
+            f"🎯 TP2: {_fmt_notice_price(getattr(trade, 'tp2', 0.0))}",
+            f"💰 Closed Total: {closed_total:.0f}%",
+            "🏃 Runner: 20%",
+            f"🛡 Protected SL: {_fmt_notice_price(_trade_active_sl_value(trade))}",
+        ]
+    elif event == "runner":
+        lines += [
+            "Remaining: 20%",
+            f"🛡 Protected SL: {_fmt_notice_price(_trade_active_sl_value(trade))}",
+            "📈 Trailing: ON",
+        ]
+    elif event == "sl_hit":
+        lines += [
+            f"📍 Entry: {_fmt_notice_price(getattr(trade, 'entry', 0.0))}",
+            f"🛡 SL: {_fmt_notice_price(_trade_active_sl_value(trade) or getattr(trade, 'sl', 0.0))}",
+            f"📊 Result: {pnl_pct:+.2f}%",
+            f"📌 Reason: {reason or str(getattr(trade, 'status', '-') or '-')}",
+        ]
+    elif event == "sl_update":
+        sync = str(getattr(trade, "exchange_sync_state", "") or "-")
+        lines += [
+            f"Old SL: {_fmt_notice_price(old_sl)}",
+            f"New SL: {_fmt_notice_price(new_sl)}",
+            f"📌 Reason: {reason or 'strategy protection'}",
+            f"✅ OKX Sync: {sync}",
+        ]
+    return "\n".join(lines)
+
+
+def _sl_update_reason(trade, protection_level: int = 0) -> str:
+    status = str(getattr(trade, "status", "") or "").lower()
+    if bool(getattr(trade, "tp2_hit", False)):
+        return "TP2 runner protection"
+    if int(protection_level or 0) >= 2 or bool(getattr(trade, "protected_on_block", False)):
+        return f"Market protection level {int(protection_level or getattr(trade, 'protection_level', 0) or 0)}"
+    if "runner" in status or bool(getattr(trade, "trailing_active", False)):
+        return "Runner trailing stop"
+    return "SL protection sync"
+
+
+def _collect_execution_lifecycle_notifications(before: dict, trades: list, protection_level: int = 0) -> list[dict]:
+    notifications = []
+    closed_sl_statuses = {"closed_loss", "breakeven_after_tp1", "trailing_hit", "protected_entry_exit", "stopped"}
+    for trade in trades or []:
+        if not bool(getattr(trade, "execution_trade", False)):
+            continue
+        key = _trade_identity_key(trade)
+        prev = before.get(key)
+        if not prev:
+            continue
+        status = str(getattr(trade, "status", "") or "").strip().lower()
+        now_closed = bool(_is_trade_closed(trade) or getattr(trade, "closed_at", None))
+        events = []
+        if bool(getattr(trade, "tp1_hit", False)) and not prev.get("tp1_hit") and not bool(getattr(trade, "tp1_telegram_sent", False)):
+            events.append(("tp1", _format_trade_lifecycle_notice(trade, "tp1"), "tp1_telegram_sent"))
+        if bool(getattr(trade, "tp2_hit", False)) and not prev.get("tp2_hit") and not bool(getattr(trade, "tp2_telegram_sent", False)):
+            events.append(("tp2", _format_trade_lifecycle_notice(trade, "tp2"), "tp2_telegram_sent"))
+        runner_now = bool(getattr(trade, "runner_active", False) or getattr(trade, "protected_runner", False))
+        if runner_now and not prev.get("runner_active") and not bool(getattr(trade, "runner_telegram_sent", False)):
+            events.append(("runner", _format_trade_lifecycle_notice(trade, "runner"), "runner_telegram_sent"))
+        if now_closed and not prev.get("is_closed") and status in closed_sl_statuses and not bool(getattr(trade, "sl_hit_telegram_sent", False)):
+            reason = str(getattr(trade, "exchange_sync_state", "") or status)
+            events.append(("sl_hit", _format_trade_lifecycle_notice(trade, "sl_hit", reason=reason), "sl_hit_telegram_sent"))
+
+        old_sl = _safe_float(prev.get("active_sl"), 0.0)
+        new_sl = _trade_active_sl_value(trade)
+        last_notified_sl = _safe_float(getattr(trade, "last_notified_sl", 0.0), 0.0)
+        moved_up = new_sl > 0 and (old_sl <= 0 or new_sl > old_sl + max(abs(old_sl) * 0.0005, 1e-12))
+        not_already = last_notified_sl <= 0 or abs(new_sl - last_notified_sl) > max(abs(last_notified_sl) * 0.0005, 1e-12)
+        if moved_up and not_already and not now_closed:
+            reason = _sl_update_reason(trade, protection_level=protection_level)
+            events.append(("sl_update", _format_trade_lifecycle_notice(trade, "sl_update", old_sl=old_sl, new_sl=new_sl, reason=reason), "last_notified_sl"))
+
+        for event, message, flag in events:
+            if flag == "last_notified_sl":
+                _safe_set_trade_attr(trade, "last_notified_sl", new_sl)
+                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", datetime.now(timezone.utc))
+            else:
+                _safe_set_trade_attr(trade, flag, True)
+                _safe_set_trade_attr(trade, flag + "_at", datetime.now(timezone.utc))
+            notifications.append({"symbol": str(getattr(trade, "symbol", "") or ""), "event": event, "message": message})
+    return notifications
+
+
+def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_store: RedisTradeStore | None = None) -> None:
+    for item in list((result or {}).get("lifecycle_notifications", []) or []):
+        message = str((item or {}).get("message") or "").strip()
+        if not message:
+            continue
+        send_result = _send_text(sender, message)
+        if not (isinstance(send_result, dict) and send_result.get("ok")):
+            time.sleep(1.0)
+            send_result = _send_text(sender, message)
+            if not (isinstance(send_result, dict) and send_result.get("ok")):
+                print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
+        _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+
 def run_once(
     previous_state: MarketModeState | None = None,
     settings: Settings | None = None,
@@ -3617,6 +3901,7 @@ def run_once(
 
     initial_protection = block_protection_status(state)
     initial_price_map = _build_live_price_map(tickers, fallback_pairs=ranked_pairs)
+    lifecycle_notifications: list[dict] = []
 
     # ✅ FIX: cache الـ price_map — fallback لو fetch فشل في scan تاني
     global _CACHED_PRICE_MAP, _CACHED_PRICE_MAP_TS
@@ -3663,6 +3948,7 @@ def run_once(
         okx_recovery_stats = {"enabled": False, "changed": False, "imported": 0, "reason": "simulation_mode"}
 
     if persisted_trades:
+        _before_lifecycle = _execution_lifecycle_snapshot(persisted_trades)
         persisted_trades = update_open_trades(
             persisted_trades,
             initial_price_map,
@@ -3670,6 +3956,13 @@ def run_once(
             okx_client=okx_client if exchange_reconcile_enabled else None,
             sync_exchange=exchange_reconcile_enabled,
             sync_exchange_stop=exchange_stop_sync_enabled,
+        )
+        lifecycle_notifications.extend(
+            _collect_execution_lifecycle_notifications(
+                _before_lifecycle,
+                persisted_trades,
+                protection_level=initial_protection.get("level", 0),
+            )
         )
 
     if simulation_trades:
@@ -4050,6 +4343,7 @@ def run_once(
         )
     )
 
+    _before_lifecycle = _execution_lifecycle_snapshot(persisted_trades)
     trades = update_open_trades(
         list(persisted_trades),
         price_map,
@@ -4057,6 +4351,13 @@ def run_once(
         okx_client=okx_client if exchange_reconcile_enabled else None,
         sync_exchange=exchange_reconcile_enabled,
         sync_exchange_stop=_final_exchange_stop_sync,
+    )
+    lifecycle_notifications.extend(
+        _collect_execution_lifecycle_notifications(
+            _before_lifecycle,
+            trades,
+            protection_level=protection.get("level", 0),
+        )
     )
 
     simulation_trades = update_open_trades(
@@ -4200,6 +4501,7 @@ def run_once(
         "trades": trades,
         "command_outputs": command_outputs,
         "exchange_reconcile_stats": exchange_reconcile_stats,
+        "lifecycle_notifications": lifecycle_notifications,
         "simulation_command_outputs": {},
         **reports,
     }
@@ -5422,6 +5724,9 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                     _mark_recent_bot_okx_order(
                         getattr(signal, "symbol", ""),
                         reason="managed_order_ok_before_immediate_registration",
+                        signal=signal,
+                        managed_order_result=managed_order_result,
+                        trade=item.get("candidate_trade"),
                     )
                     _register_exchange_trade_immediately(
                         result,
@@ -5451,6 +5756,22 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         track_source = "simulation" if simulation_mode_active else ("execution" if exchange_required else "auto")
         send_result = _send_text(sender, text, reply_markup=_build_runtime_track_buttons(signal, track_source))
         send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
+        if not send_ok and exchange_required and exchange_order_ok:
+            try:
+                time.sleep(2.0)
+                send_result = _send_text(sender, text, reply_markup=_build_runtime_track_buttons(signal, track_source))
+                send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
+                if not send_ok:
+                    print(
+                        f"⚠️ TELEGRAM_SEND_FAILED | {getattr(signal, 'symbol', '-')} | "
+                        "trade registered in Redis but notification failed",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    f"⚠️ TELEGRAM_SEND_RETRY_EXCEPTION | {getattr(signal, 'symbol', '-')} | {exc}",
+                    flush=True,
+                )
         _telegram_send_pause(
             TELEGRAM_EXECUTION_SEND_GAP_SECONDS if is_execution else TELEGRAM_NORMAL_SEND_GAP_SECONDS
         )
@@ -7854,6 +8175,7 @@ def live_worker() -> None:
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings)
                 _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
+                _send_lifecycle_notifications(sender, result, trade_store=trade_store)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
 
             _run_ai_export(result, settings)
