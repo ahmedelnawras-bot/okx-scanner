@@ -95,11 +95,12 @@ BLOCK_REMINDER_THRESHOLDS = [(5, 1), (10, 2), (15, 3)]
 GENERAL_MODE_REMINDER_MINUTES = 30
 
 # Symbol-level duplicate suppression before live.
-# Keep actual execution alerts visible, but stop repeating the same coin
-# every scan when nothing materially changed.
+# Trading mode should stay as visible as Simulation, with only a short
+# same-symbol cooldown to avoid repeating the same coin every scan.
 SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS = 45 * 60
 SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
+SYMBOL_TRADING_SAME_SYMBOL_DEDUP_TTL_SECONDS = 5 * 60
 
 # Low Balance Mode
 # لو الرصيد أقل من الحد → allocation أكبر وعدد slots أقل.
@@ -3748,14 +3749,23 @@ def _signal_status_bucket(exec_status: str | None) -> str:
 
 
 def _signal_fingerprint_ttl(exec_result: dict | None) -> int:
-    status = str((exec_result or {}).get("status") or "").strip().lower()
+    exec_result = exec_result or {}
+    status = str(exec_result.get("status") or "").strip().lower()
+    runtime_mode = str(exec_result.get("runtime_mode") or "").strip().lower()
+    risk_mode = str(exec_result.get("risk_mode") or "").strip().lower()
+
+    # Trading visibility rule:
+    # Keep execution-mode Telegram behavior close to Simulation.
+    # The only suppression in Trading is a short 5-minute same-symbol cooldown.
+    if runtime_mode == "trading":
+        return SYMBOL_TRADING_SAME_SYMBOL_DEDUP_TTL_SECONDS
+
     if status == "accepted_preview":
         return SYMBOL_EXECUTION_DEDUP_TTL_SECONDS
     if status == "pending_pullback_preview":
         return SYMBOL_PULLBACK_DEDUP_TTL_SECONDS
+
     # ✅ FIX: Recovery mode signals → TTL أطول لمنع الـ spam
-    risk_mode = str((exec_result or {}).get("risk_mode") or "").strip().lower()
-    runtime_mode = str((exec_result or {}).get("runtime_mode") or "").strip().lower()
     if risk_mode == "recovery_long" or runtime_mode == "recovery":
         return SYMBOL_PULLBACK_DEDUP_TTL_SECONDS  # 60 دقيقة بدل 45
     return SYMBOL_OBSERVATION_DEDUP_TTL_SECONDS
@@ -3764,12 +3774,12 @@ def _signal_fingerprint_ttl(exec_result: dict | None) -> int:
 def _build_signal_fingerprint(signal, exec_result: dict) -> str:
     """Build dedup key without mixing Simulation / Trading / Scan.
 
-    Surgical fix:
-    - Old key was only SYMBOL|LONG|status_bucket.
-    - A Simulation alert could therefore suppress a later real Trading alert
-      for the same symbol/status for the full TTL.
-    - Runtime mode is now part of the fingerprint, so execution and simulation
-      dedup buckets are fully separated.
+    Trading-specific behavior:
+    - Trading uses runtime + symbol only.
+    - This means messages behave like Simulation, except the same coin is not
+      repeated more than once every 5 minutes.
+    - Same-symbol open guards still decide whether a trade can actually open;
+      dedup is only Telegram/noise protection.
     """
     exec_result = exec_result or {}
     runtime_mode = str(exec_result.get("runtime_mode") or "unknown").strip().lower()
@@ -3778,6 +3788,14 @@ def _build_signal_fingerprint(signal, exec_result: dict) -> str:
     if runtime_mode not in {"scan", "trading", "simulation"}:
         runtime_mode = "unknown"
 
+    symbol = str(getattr(signal, "symbol", "")).upper()
+
+    # In Trading, only protect the same coin for 5 minutes, regardless of
+    # accepted/rejected/reason. This mirrors Simulation visibility while
+    # preventing same-symbol Telegram spam every scan.
+    if runtime_mode == "trading":
+        return "|".join([runtime_mode, symbol, "LONG", "same_symbol_5m"])
+
     mode_suffix = ":recovery" if risk_mode == "recovery_long" else ""
     status_bucket = _signal_status_bucket(
         exec_result.get("status") if isinstance(exec_result, dict) else None
@@ -3785,11 +3803,10 @@ def _build_signal_fingerprint(signal, exec_result: dict) -> str:
 
     return "|".join([
         runtime_mode,
-        str(getattr(signal, "symbol", "")).upper(),
+        symbol,
         "LONG",
         status_bucket + mode_suffix,
     ])
-
 
 def _iter_signal_items_for_dispatch(result: dict) -> list[dict]:
     items = list(result.get("signal_items", []) or [])
