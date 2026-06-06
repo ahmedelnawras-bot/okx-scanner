@@ -693,8 +693,25 @@ def _trade_symbol_inst_id(trade) -> str:
     return str(getattr(trade, "symbol", "") or "").strip().upper()
 
 
+def _normalize_okx_inst_id(value: object) -> str:
+    """Normalize OKX symbols so BASEDUSDT / BASED-USDT-SWAP compare safely."""
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    compact = text.replace("-", "")
+    if compact.endswith("USDT") and not text.endswith("-USDT-SWAP"):
+        base = compact[:-4]
+        if base:
+            return f"{base}-USDT-SWAP"
+    if compact.endswith("USDTSWAP") and not text.endswith("-USDT-SWAP"):
+        base = compact[:-8]
+        if base:
+            return f"{base}-USDT-SWAP"
+    return text
+
+
 def _row_inst_id(row: dict) -> str:
-    return str((row or {}).get("instId") or "").strip().upper()
+    return _normalize_okx_inst_id((row or {}).get("instId"))
 
 
 def _row_float(row: dict, *keys: str) -> float:
@@ -756,15 +773,31 @@ def _extract_pending_okx_order_inst_ids(pending_result: dict | None) -> set[str]
     return pending
 
 
-def _fetch_live_okx_position_inst_ids(okx_client: OKXTradeClient | None) -> set[str]:
+def _fetch_live_okx_position_inst_ids_strict(okx_client: OKXTradeClient | None) -> tuple[bool, set[str], str]:
+    """Fetch live OKX positions, fail-closed for execution guards.
+
+    If we cannot read OKX positions, live execution must be blocked. Returning an
+    empty set on API failure is unsafe because the bot may think there are no
+    positions and open duplicate symbols / extra slots.
+    """
     if okx_client is None or not hasattr(okx_client, "get_positions"):
-        return set()
+        return False, set(), "okx_client_missing_get_positions"
     try:
         positions_result = okx_client.get_positions(inst_type="SWAP") or {}
     except Exception as exc:
         print(f"⚠️ OKX position fetch failed: {exc}", flush=True)
-        return set()
-    return _extract_live_okx_position_inst_ids(positions_result)
+        return False, set(), f"okx_positions_fetch_exception:{exc}"
+    if not _okx_result_is_ok(positions_result):
+        reason = str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")
+        return False, set(), reason
+    return True, _extract_live_okx_position_inst_ids(positions_result), "ok"
+
+
+def _fetch_live_okx_position_inst_ids(okx_client: OKXTradeClient | None) -> set[str]:
+    ok, live, reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+    if not ok:
+        print(f"⚠️ OKX live positions unavailable: {reason}", flush=True)
+    return live
 
 
 def _is_open_execution_trade_for_reconcile(trade) -> bool:
@@ -3707,7 +3740,10 @@ def _okx_symbol_blocks_reentry(
     if not symbol:
         return False, "missing_symbol"
 
-    live_symbols = _fetch_live_okx_position_inst_ids(okx_client)
+    symbol = _normalize_okx_inst_id(symbol)
+    ok, live_symbols, live_reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+    if not ok:
+        return True, f"okx_positions_unavailable_fail_closed:{live_reason}"
     if symbol not in live_symbols:
         return False, "not_live_on_okx"
 
@@ -4506,13 +4542,33 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             text = _simulation_signal_badge(text)
 
         if exchange_required:
-            # Last live-exchange guard: prevent duplicates before TP2, but allow
-            # same-symbol re-entry after TP2 even when a runner is still live.
-            _okx_blocks, _okx_block_reason = _okx_symbol_blocks_reentry(
-                okx_client,
-                getattr(signal, "symbol", ""),
-                tracked_trades=list(result.get("trades", []) or []),
-            )
+            # Final fail-closed live guard immediately before sending any OKX order.
+            # It protects against stale Redis/report state and against positions opened
+            # earlier in the same scan/deploy that are not yet reflected in reports.
+            _live_ok, _live_symbols, _live_reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+            _candidate_symbol_norm = _normalize_okx_inst_id(getattr(signal, "symbol", ""))
+            _tracked_trades_now = list(result.get("trades", []) or [])
+            _ref_balance_now = _safe_float(((result or {}).get("portfolio_state_inputs") or {}).get("reference_portfolio"), 0.0)
+            _alloc_now, _max_live_positions_now = _risk_sizing_constants(settings, reference_balance=_ref_balance_now)
+            _max_live_positions_now = max(1, int(_max_live_positions_now or getattr(settings, "max_execution_positions", 1) or 1))
+
+            _okx_blocks = False
+            _okx_block_reason = "ok"
+            if not _live_ok:
+                _okx_blocks = True
+                _okx_block_reason = f"okx_positions_unavailable_fail_closed:{_live_reason}"
+            elif len(_live_symbols) >= _max_live_positions_now and _candidate_symbol_norm not in _live_symbols:
+                _okx_blocks = True
+                _okx_block_reason = f"live_okx_max_positions_reached:{len(_live_symbols)}/{_max_live_positions_now}"
+            else:
+                # Last live-exchange same-symbol guard: prevent duplicates before TP2,
+                # while still allowing the project-designed TP2 re-entry unlock.
+                _okx_blocks, _okx_block_reason = _okx_symbol_blocks_reentry(
+                    okx_client,
+                    _candidate_symbol_norm,
+                    tracked_trades=_tracked_trades_now,
+                )
+
             if _okx_blocks:
                 managed_order_result = {
                     "ok": False,
@@ -4533,7 +4589,7 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                 item["eligible_for_activation"] = False
                 item["register_as_open_trade"] = False
                 print(
-                    f"🛑 OKX_DUPLICATE_SYMBOL_BLOCK | {getattr(signal, 'symbol', '-')} | reason={_okx_block_reason}",
+                    f"🛑 OKX_LIVE_GUARD_BLOCK | {getattr(signal, 'symbol', '-')} | reason={_okx_block_reason} | live={','.join(sorted(_live_symbols)) if '_live_symbols' in locals() else '-'}",
                     flush=True,
                 )
             else:
