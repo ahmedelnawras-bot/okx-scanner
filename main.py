@@ -831,6 +831,35 @@ def _execution_daily_sizing_balance_from_runtime(current_equity: float, settings
     return max(0.0, sizing_balance), row
 
 
+
+
+def _portfolio_state_kwargs(inputs: dict | None) -> dict:
+    """Filter runtime diagnostics before calling risk.portfolio_state.
+
+    _resolve_portfolio_state_inputs() carries extra execution-only diagnostics
+    such as execution_sizing_balance / execution_daily_baseline for reports and
+    logging. risk.portfolio_state.build_portfolio_state_from_trades() accepts
+    only accounting inputs, so passing the full dict breaks the worker with:
+    unexpected keyword argument 'execution_sizing_balance'.
+    """
+    source = dict(inputs or {})
+    try:
+        import inspect
+        params = inspect.signature(build_portfolio_state_from_trades).parameters
+        allowed = {name for name in params if name != "trades"}
+    except Exception:
+        allowed = {
+            "reference_portfolio",
+            "margin_per_trade",
+            "leverage",
+            "start_of_day_balance",
+            "day_started_at",
+            "manual_daily_dd_override",
+            "manual_daily_dd_baseline",
+            "manual_resume_at",
+        }
+    return {key: value for key, value in source.items() if key in allowed}
+
 def _resolve_portfolio_state_inputs(
     okx_client: OKXTradeClient | None,
     settings: Settings,
@@ -1468,7 +1497,7 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result["command_outputs"] = build_command_outputs(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result.update(reports)
-    portfolio_state = build_portfolio_state_from_trades(result["trades"], **portfolio_state_inputs)
+    portfolio_state = build_portfolio_state_from_trades(result["trades"], **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
@@ -2049,7 +2078,7 @@ def _confirm_manual_resume_trading(
         result["portfolio_state_inputs"] = inputs
         try:
             trades_for_dd = result.get("simulation_trades") if _is_simulation_mode(settings) else result.get("trades")
-            portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **inputs)
+            portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **_portfolio_state_kwargs(inputs))
             result["portfolio_state"] = portfolio_state
             result["drawdown_status"] = evaluate_drawdown(portfolio_state)
             result["drawdown_report"] = build_drawdown_report(portfolio_state)
@@ -3554,7 +3583,7 @@ def run_once(
     # - Trading/execution evaluates live execution trades.
     # This keeps DD protection independent between simulation and execution.
     dd_base_trades = simulation_trades if simulation_mode_active else persisted_trades
-    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     drawdown_status = evaluate_drawdown(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
@@ -3961,7 +3990,7 @@ def run_once(
     # Final Daily DD snapshot must also follow the active runtime bucket.
     # Without this, simulation DD would be calculated from execution trades.
     dd_base_trades = simulation_trades if simulation_mode_active else trades
-    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     drawdown_status = evaluate_drawdown(portfolio_state)
     drawdown_report = build_drawdown_report(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
@@ -4112,7 +4141,7 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
         execution_trades=trades,
         simulation_trades=list(result.get("simulation_trades", []) or []),
     )
-    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **portfolio_state_inputs)
+    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
@@ -6407,7 +6436,7 @@ def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisT
     result.update(reports)
 
     portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **portfolio_state_inputs)
+    portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
@@ -6552,7 +6581,7 @@ def _handle_admin_clean_command(
             result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
             result.update(reports)
             portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-            portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **portfolio_state_inputs)
+            portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
             result["portfolio_state"] = portfolio_state
             result["drawdown_status"] = evaluate_drawdown(portfolio_state)
             result["drawdown_report"] = build_drawdown_report(portfolio_state)
