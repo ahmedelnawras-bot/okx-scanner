@@ -4786,7 +4786,7 @@ _CACHED_PRICE_MAP_TTL_SECONDS: float = 60.0  # صالح دقيقة واحدة ك
 # Cache آخر رصيد OKX صحيح — يُستخدم كـ fallback لو fetch فشل
 _CACHED_OKX_BALANCE: float = 0.0
 _CACHED_OKX_BALANCE_TS: float = 0.0
-_CACHED_OKX_BALANCE_TTL_SECONDS: float = 300.0  # 5 دقايق
+_CACHED_OKX_BALANCE_TTL_SECONDS: float = 60.0   # دقيقة — يتحدث فوراً بعد تغيير المود
 _CACHED_OKX_BALANCE_LOCK = threading.Lock()  # ✅ thread-safe cache access
 
 
@@ -5723,6 +5723,15 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         desired_mode = data.split(":", 1)[1].strip().lower()
         runtime_settings = settings or get_settings()
         applied = _set_runtime_signal_delivery_mode(runtime_settings, desired_mode)
+
+        # ✅ FIX: invalidate OKX balance cache فوراً عند التحويل لـ trading
+        # عشان الـ mood والـ status يقروا الرصيد الحقيقي من OKX مش القديم
+        if applied and desired_mode == "trading":
+            global _CACHED_OKX_BALANCE, _CACHED_OKX_BALANCE_TS
+            with _CACHED_OKX_BALANCE_LOCK:
+                _CACHED_OKX_BALANCE = 0.0
+                _CACHED_OKX_BALANCE_TS = 0.0
+
         mode_text = _signal_delivery_mode_label(runtime_settings)
         prefix = "✅" if applied else "⚠️"
         _send_text(
