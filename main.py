@@ -1094,21 +1094,25 @@ def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int 
 
 
 def _resolve_okx_td_mode(settings: Settings | None = None) -> str:
-    """Resolve OKX tdMode from settings/env with a safe default.
-
-    Old builds hardcoded isolated. This keeps isolated as default but allows
-    Railway OKX_TD_MODE or settings.okx_td_mode/td_mode to control execution.
-    Position reading remains unfiltered and sees both cross + isolated.
-    """
-    raw = ""
+    """Resolve OKX tdMode with isolated as the live-execution safety default."""
+    env_raw = str(os.getenv("OKX_TD_MODE") or os.getenv("TD_MODE") or "").strip().lower()
+    settings_raw = ""
     try:
-        raw = str(getattr(settings, "okx_td_mode", "") or getattr(settings, "td_mode", "") or "").strip().lower()
+        settings_raw = str(getattr(settings, "okx_td_mode", "") or getattr(settings, "td_mode", "") or "").strip().lower()
     except Exception:
-        raw = ""
-    raw = raw or str(os.getenv("OKX_TD_MODE") or os.getenv("TD_MODE") or "isolated").strip().lower()
+        settings_raw = ""
+
+    raw = env_raw or settings_raw or "isolated"
     if raw not in {"isolated", "cross"}:
         print(f"⚠️ OKX_TD_MODE invalid '{raw}' — using isolated", flush=True)
         return "isolated"
+
+    if raw == "cross":
+        allow_cross = str(os.getenv("ALLOW_OKX_CROSS_MARGIN") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_cross:
+            print("⚠️ OKX_TD_MODE resolved cross — forcing isolated (set ALLOW_OKX_CROSS_MARGIN=true to override)", flush=True)
+            return "isolated"
+
     return raw
 
 
