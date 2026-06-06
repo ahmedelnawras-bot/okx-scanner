@@ -495,6 +495,49 @@ class OKXTradeClient:
         response = self._request("GET", path)
         return response
 
+    def get_positions(
+        self,
+        *,
+        inst_type: str = "SWAP",
+        inst_id: str | None = None,
+        pos_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read current OKX account positions.
+
+        This is a read-only helper used by main.py for live execution guards,
+        position recovery, slot protection and execution reports. It supports
+        both the normalized shape used by this client ({ok, rows, row}) and the
+        raw OKX response nested under `response`, so existing callers remain
+        backward-compatible.
+        """
+        guard = self._read_guard_error()
+        if guard:
+            return guard
+
+        path = "/api/v5/account/positions"
+        params: dict[str, Any] = {}
+        if inst_type:
+            params["instType"] = str(inst_type).upper()
+        if inst_id:
+            params["instId"] = str(inst_id)
+        if pos_id:
+            params["posId"] = str(pos_id)
+
+        response = self._request("GET", path, params=params)
+        result = self._normalize_query_response(response, query_kind="positions", params=params)
+        result["positions"] = result.get("rows") or []
+        return result
+
+    def list_positions(
+        self,
+        *,
+        inst_type: str = "SWAP",
+        inst_id: str | None = None,
+        pos_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible alias for get_positions()."""
+        return self.get_positions(inst_type=inst_type, inst_id=inst_id, pos_id=pos_id)
+
     def place_market_order(
         self,
         inst_id: str,
