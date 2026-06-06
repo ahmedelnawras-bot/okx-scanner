@@ -705,13 +705,36 @@ def _row_float(row: dict, *keys: str) -> float:
     return 0.0
 
 
+def _okx_result_rows(payload: dict | None) -> list[dict]:
+    """Return OKX rows from either our normalized client shape or raw OKX shape.
+
+    Some client helpers return {ok, rows}, while raw OKX responses use {code, data}.
+    Execution safety must support both, otherwise the bot can think OKX has
+    zero live positions and open duplicate symbols.
+    """
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("rows")
+    if rows is None:
+        rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _okx_result_is_ok(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if "ok" in payload:
+        return bool(payload.get("ok"))
+    return str(payload.get("code", "")) == "0"
+
+
 def _extract_live_okx_position_inst_ids(positions_result: dict | None) -> set[str]:
-    if not isinstance(positions_result, dict) or not positions_result.get("ok"):
+    if not _okx_result_is_ok(positions_result):
         return set()
     live: set[str] = set()
-    for row in positions_result.get("rows") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in _okx_result_rows(positions_result):
         inst_id = _row_inst_id(row)
         if not inst_id:
             continue
@@ -722,17 +745,26 @@ def _extract_live_okx_position_inst_ids(positions_result: dict | None) -> set[st
 
 
 def _extract_pending_okx_order_inst_ids(pending_result: dict | None) -> set[str]:
-    if not isinstance(pending_result, dict) or not pending_result.get("ok"):
+    if not _okx_result_is_ok(pending_result):
         return set()
     pending: set[str] = set()
-    for row in pending_result.get("rows") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in _okx_result_rows(pending_result):
         inst_id = _row_inst_id(row)
         state = str(row.get("state") or row.get("ordState") or "").lower()
         if inst_id and state not in {"filled", "canceled", "mmp_canceled"}:
             pending.add(inst_id)
     return pending
+
+
+def _fetch_live_okx_position_inst_ids(okx_client: OKXTradeClient | None) -> set[str]:
+    if okx_client is None or not hasattr(okx_client, "get_positions"):
+        return set()
+    try:
+        positions_result = okx_client.get_positions(inst_type="SWAP") or {}
+    except Exception as exc:
+        print(f"⚠️ OKX position fetch failed: {exc}", flush=True)
+        return set()
+    return _extract_live_okx_position_inst_ids(positions_result)
 
 
 def _is_open_execution_trade_for_reconcile(trade) -> bool:
@@ -1196,22 +1228,26 @@ def _is_trade_closed(trade) -> bool:
 
 
 def _is_counted_open_trade(trade) -> bool:
+    # Design rule: TP2 releases the slot even if a runner is still open.
+    # The runner is managed as residual profit, not as a full active entry slot.
+    if bool(getattr(trade, "tp2_hit", False)):
+        return False
     counted = getattr(trade, "counts_as_active_slot", None)
     if counted is not None:
         return bool(counted)
-    if bool(getattr(trade, "tp2_hit", False)):
-        return False
     return bool(not _is_trade_closed(trade) and not getattr(trade, "slot_exempt", False))
 
 
 def _blocks_same_symbol_reentry(trade) -> bool:
+    # Design rule: after TP2, the same symbol is allowed to re-enter even if
+    # a runner/protected runner is still live on OKX.
     if bool(getattr(trade, "same_symbol_block_exempt", False)):
+        return False
+    if bool(getattr(trade, "tp2_hit", False)):
         return False
     blocks = getattr(trade, "blocks_same_symbol_reentry", None)
     if blocks is not None:
         return bool(blocks)
-    if bool(getattr(trade, "tp2_hit", False)):
-        return False
     return _is_counted_open_trade(trade)
 
 
@@ -2955,18 +2991,25 @@ def run_once(
     ):
         try:
             _okx_pos_response = okx_client.get_positions(inst_type="SWAP") or {}
-            _okx_open_count = len([
-                p for p in (_okx_pos_response.get("data") or [])
-                if float(p.get("pos", 0) or 0) != 0
-            ])
+            _okx_live_symbols = _extract_live_okx_position_inst_ids(_okx_pos_response)
+            _okx_open_count = len(_okx_live_symbols)
             if _okx_open_count > 0:
-                # نحترم الـ effective_max_positions المحسوب صح
-                slot_counts["general"] = min(_okx_open_count, effective_max_positions)
+                # OKX is the hard source of truth for live slot protection.
+                # Keep tracked Redis count, but never let slots be lower than live OKX positions.
+                previous_general = int(slot_counts.get("general", 0) or 0)
+                slot_counts["general"] = min(max(previous_general, _okx_open_count), effective_max_positions)
+                if exchange_reconcile_stats is not None:
+                    exchange_reconcile_stats.update({
+                        "okx_gate_guard_live_positions": _okx_open_count,
+                        "okx_gate_guard_symbols": sorted(_okx_live_symbols)[:20],
+                        "tracking_mismatch": _okx_open_count > previous_general,
+                    })
                 print(
                     f"🛡 OKX_GATE_GUARD | "
-                    f"OKX positions={_okx_open_count} | "
+                    f"OKX positions={_okx_open_count} | tracked_general={previous_general} | "
                     f"max_allowed={'LOW='+str(effective_max_positions) if _low_balance_mode else 'NORMAL='+str(effective_max_positions)} | "
-                    f"slot_counts[general] set to {slot_counts['general']}",
+                    f"slot_counts[general] set to {slot_counts['general']} | "
+                    f"symbols={','.join(sorted(_okx_live_symbols))}",
                     flush=True,
                 )
         except Exception as _exc:
@@ -3531,6 +3574,156 @@ def _activate_announced_trade(
 
 
 
+
+
+def _register_exchange_trade_immediately(
+    result: dict,
+    item: dict,
+    managed_order_result: dict | None,
+    trade_store: RedisTradeStore | None = None,
+) -> bool:
+    """Persist a live OKX trade immediately after exchange success.
+
+    This decouples execution tracking from Telegram delivery. If OKX fills but
+    Telegram fails, the trade still exists in Redis/reports and blocks duplicate
+    same-symbol entries in later scans.
+    """
+    if not isinstance(result, dict) or not isinstance(item, dict):
+        return False
+    exec_result = item.get("execution") or {}
+    if str(exec_result.get("status") or "").strip().lower() != "accepted_preview":
+        return False
+    if not bool(item.get("eligible_for_activation")):
+        return False
+    if not bool((managed_order_result or {}).get("ok")):
+        return False
+
+    candidate_trade = item.get("candidate_trade")
+    if candidate_trade is None:
+        return False
+
+    _attach_exchange_state_to_trade(candidate_trade, managed_order_result)
+    now = datetime.now(timezone.utc)
+    _safe_set_trade_attr(candidate_trade, "execution_trade", True)
+    _safe_set_trade_attr(candidate_trade, "tracking_bucket", "execution")
+    _safe_set_trade_attr(candidate_trade, "trade_source", "execution")
+    _safe_set_trade_attr(candidate_trade, "exchange_sync_state", "okx_order_submitted")
+    _safe_set_trade_attr(candidate_trade, "exchange_order_ok", True)
+    _safe_set_trade_attr(candidate_trade, "opened_at", getattr(candidate_trade, "opened_at", None) or now)
+    _safe_set_trade_attr(candidate_trade, "updated_at", now)
+    _safe_set_trade_attr(candidate_trade, "closed_at", None)
+    _safe_set_trade_attr(candidate_trade, "status", str(getattr(candidate_trade, "status", "") or "open"))
+    _safe_set_trade_attr(candidate_trade, "slot_exempt", False)
+    _safe_set_trade_attr(candidate_trade, "same_symbol_block_exempt", False)
+    _safe_set_trade_attr(candidate_trade, "blocks_same_symbol_reentry", True)
+
+    used_margin = _safe_float((managed_order_result or {}).get("used_margin_usdt"), 0.0)
+    if used_margin > 0:
+        _safe_set_trade_attr(candidate_trade, "used_margin_usdt", used_margin)
+        _safe_set_trade_attr(candidate_trade, "margin_usdt", used_margin)
+
+    trades = list(result.get("trades", []) or [])
+    trade_id = str(getattr(candidate_trade, "trade_id", "") or "")
+    symbol = str(getattr(candidate_trade, "symbol", "") or "").upper()
+    updated_existing = False
+
+    for idx, trade in enumerate(trades):
+        existing_id = str(getattr(trade, "trade_id", "") or "")
+        existing_symbol = str(getattr(trade, "symbol", "") or "").upper()
+        if (trade_id and existing_id == trade_id) or (symbol and existing_symbol == symbol and _blocks_same_symbol_reentry(trade)):
+            trades[idx] = candidate_trade
+            updated_existing = True
+            break
+
+    if not updated_existing:
+        trades.append(candidate_trade)
+
+    result["trades"] = trades
+    item["register_as_open_trade"] = True
+    item["exchange_order_ok"] = True
+    item["exchange_order_result"] = managed_order_result
+    item["announcement_status"] = "registered_after_okx_success"
+
+    try:
+        _refresh_runtime_result_outputs(result, trade_store=trade_store)
+    except Exception as exc:
+        print(f"🚨 Immediate trade registration refresh failed: {exc}", flush=True)
+        if trade_store:
+            try:
+                trade_store.save_trades(trades)
+            except Exception as save_exc:
+                print(f"🚨 Immediate trade registration Redis save failed: {save_exc}", flush=True)
+                return False
+    print(
+        f"✅ TRACK_TRADE_IMMEDIATE | {symbol or '-'} | "
+        f"id={trade_id or '-'} | margin={used_margin:.4f}",
+        flush=True,
+    )
+    return True
+
+
+def _has_tracked_tp2_release_for_symbol(trades: list, symbol: str) -> bool:
+    """Return True when the tracked strategy state says TP2 already released this symbol.
+
+    This intentionally allows a new entry while an OKX runner is still open,
+    because the project design treats TP2 as the re-entry unlock point.
+    """
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return False
+    for trade in trades or []:
+        if str(getattr(trade, "symbol", "") or "").strip().upper() != symbol:
+            continue
+        if bool(getattr(trade, "tp2_hit", False)):
+            return True
+    return False
+
+
+def _has_tracked_pre_tp2_block_for_symbol(trades: list, symbol: str) -> bool:
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return False
+    for trade in trades or []:
+        if str(getattr(trade, "symbol", "") or "").strip().upper() != symbol:
+            continue
+        if _blocks_same_symbol_reentry(trade):
+            return True
+    return False
+
+
+def _okx_symbol_blocks_reentry(
+    okx_client: OKXTradeClient | None,
+    symbol: str,
+    tracked_trades: list | None = None,
+) -> tuple[bool, str]:
+    """Live OKX same-symbol guard with TP2 re-entry unlock.
+
+    Blocks when OKX has a live position and the tracked trade has not reached TP2.
+    Allows when the only known tracked state for that symbol has TP2 hit, even
+    if the residual runner is still live on OKX.
+    If OKX has a live position but tracking is missing, block safely.
+    """
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return False, "missing_symbol"
+
+    live_symbols = _fetch_live_okx_position_inst_ids(okx_client)
+    if symbol not in live_symbols:
+        return False, "not_live_on_okx"
+
+    trades = list(tracked_trades or [])
+    if _has_tracked_pre_tp2_block_for_symbol(trades, symbol):
+        return True, "live_on_okx_pre_tp2_tracked"
+    if _has_tracked_tp2_release_for_symbol(trades, symbol):
+        return False, "live_runner_after_tp2_allowed"
+    return True, "live_on_okx_tracking_missing_or_not_tp2"
+
+
+def _okx_symbol_already_live(okx_client: OKXTradeClient | None, symbol: str) -> bool:
+    # Backward-compatible wrapper for any older call sites.
+    blocked, _reason = _okx_symbol_blocks_reentry(okx_client, symbol, tracked_trades=None)
+    return blocked
+
 def _prepare_simulated_trade(candidate_trade, exec_result: dict | None = None, settings: Settings | None = None, balance: float = SIMULATION_START_BALANCE_USDT):
     """Mark a candidate trade as an opened virtual simulation trade.
 
@@ -4014,19 +4207,22 @@ def _execute_managed_okx_order(
                     tp_split_result = {"ok": False, "reason": "empty_tp_response"}
                 elif isinstance(tp_response, dict):
                     ok_flag = bool(tp_response.get("ok"))
-                    data = tp_response.get("data")
+                    # place_reduce_only_tp_split returns {ok, tp1, tp2, ...}; it does not return raw data.
+                    # Treat tp1/tp2 success as the source of truth.
+                    tp1_ok = bool((tp_response.get("tp1") or {}).get("ok"))
+                    tp2_ok = bool((tp_response.get("tp2") or {}).get("ok"))
                     if not ok_flag:
                         print(f"❌ TP rejected by OKX: {tp_response}", flush=True)
                         tp_split_result = tp_response
-                    elif not data:
-                        print("❌ TP response missing data", flush=True)
+                    elif not (tp1_ok and tp2_ok):
+                        print(f"⚠️ TP response accepted but partial status unclear: {tp_response}", flush=True)
                         tp_split_result = {
                             **tp_response,
-                            "ok": False,
-                            "reason": "missing_tp_data",
+                            "ok": bool(ok_flag),
+                            "reason": tp_response.get("reason") or "tp_split_placed_partial_status_unverified",
                         }
                     else:
-                        print(f"✅ TP placed successfully: {data}", flush=True)
+                        print(f"✅ TP placed successfully: tp1={tp_response.get('tp1_size')} tp2={tp_response.get('tp2_size')}", flush=True)
                         tp_split_result = tp_response
                 else:
                     print(f"⚠️ Unexpected TP response format: {tp_response}", flush=True)
@@ -4310,8 +4506,51 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             text = _simulation_signal_badge(text)
 
         if exchange_required:
-            managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
-            exchange_order_ok = bool(managed_order_result.get("ok"))
+            # Last live-exchange guard: prevent duplicates before TP2, but allow
+            # same-symbol re-entry after TP2 even when a runner is still live.
+            _okx_blocks, _okx_block_reason = _okx_symbol_blocks_reentry(
+                okx_client,
+                getattr(signal, "symbol", ""),
+                tracked_trades=list(result.get("trades", []) or []),
+            )
+            if _okx_blocks:
+                managed_order_result = {
+                    "ok": False,
+                    "entry": {
+                        "ok": False,
+                        "simulated": False,
+                        "reason": _okx_block_reason,
+                    },
+                    "reason": _okx_block_reason,
+                    "tp_split": None,
+                    "plan": {},
+                    "sizing": {},
+                    "sl_attached": False,
+                    "tp_orders_ok": False,
+                    "requires_runner_trailing": False,
+                }
+                exchange_order_ok = False
+                item["eligible_for_activation"] = False
+                item["register_as_open_trade"] = False
+                print(
+                    f"🛑 OKX_DUPLICATE_SYMBOL_BLOCK | {getattr(signal, 'symbol', '-')} | reason={_okx_block_reason}",
+                    flush=True,
+                )
+            else:
+                if _okx_block_reason == "live_runner_after_tp2_allowed":
+                    print(
+                        f"✅ OKX_TP2_REENTRY_ALLOWED | {getattr(signal, 'symbol', '-')} | runner_live=True",
+                        flush=True,
+                    )
+                managed_order_result = _execute_managed_okx_order(okx_client, signal, settings)
+                exchange_order_ok = bool(managed_order_result.get("ok"))
+                if exchange_order_ok:
+                    _register_exchange_trade_immediately(
+                        result,
+                        item,
+                        managed_order_result,
+                        trade_store=trade_store,
+                    )
             text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
         elif simulation_mode_active and can_place_order:
             text += "\n\n" + "\n".join([
