@@ -1018,6 +1018,8 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
     hourly_ma5_pressure = bool(getattr(snapshot, "hourly_ma5_pressure", False))
     btc_1h_ma5_gap_pct = float(getattr(snapshot, "btc_1h_ma5_gap_pct", 0.0) or 0.0)
     hourly_ma_guard = "pressure" if hourly_ma5_pressure else "clear"
+    dom_change = getattr(snapshot, "btc_dominance_change_1h", None)
+    dom_unknown = bool(getattr(snapshot, "btc_dominance_unknown", False) or dom_change is None)
     return {
         "mode": state.mode,
         "strong_coins": strong_coins,
@@ -1029,6 +1031,8 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
         "btc_1h_ma5": float(getattr(snapshot, "btc_1h_ma5", 0.0) or 0.0),
         "btc_1h_ma5_gap_pct": btc_1h_ma5_gap_pct,
         "hourly_ma_guard": hourly_ma_guard,
+        "btc_dominance_change_1h": dom_change,
+        "btc_dominance_unknown": dom_unknown,
         "sample_size": int(getattr(snapshot, "market_guard_valid_count", 0) or getattr(snapshot, "market_guard_sample_size", 200) or 200),
         "market_mix": f"Strong Coins: {strong_coins} | Red Ratio: {red_ratio_pct:.0f}% | Avg 15m Move: {avg15m:.2f}%",
         "market_state": f"strong_coins={strong_coins} | avg15m={avg15m:.2f}% | red_ratio={red_ratio_pct:.0f}% | 1h_ma5={hourly_ma_guard}",
