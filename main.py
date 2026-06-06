@@ -749,6 +749,62 @@ def _okx_result_is_ok(payload: dict | None) -> bool:
     return str(payload.get("code", "")) == "0"
 
 
+def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int = 8) -> None:
+    """Print compact OKX positions diagnostics without exposing secrets.
+
+    This is intentionally log-only. It does not change trading decisions.
+    It tells us whether OKX returned positions, what margin mode they are in,
+    and why recovery/import might still be zero.
+    """
+    try:
+        ok = _okx_result_is_ok(payload)
+        response = (payload or {}).get("response") if isinstance(payload, dict) else None
+        if not isinstance(response, dict):
+            response = payload if isinstance(payload, dict) else {}
+        code = str(response.get("code") or (payload or {}).get("code") or "") if isinstance(payload, dict) else ""
+        msg = str(response.get("msg") or (payload or {}).get("reason") or (payload or {}).get("msg") or "") if isinstance(payload, dict) else ""
+        rows = _okx_result_rows(payload)
+        print(
+            f"OKX_POSITIONS_DEBUG | {label} | ok={ok} | code={code or '-'} | rows={len(rows)} | msg={msg[:140] or '-'}",
+            flush=True,
+        )
+        for row in rows[:max(1, int(max_rows or 8))]:
+            inst_id = _row_inst_id(row)
+            pos = _row_float(row, "pos", "availPos")
+            notional = _row_float(row, "notionalUsd", "notional")
+            margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+            avg = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+            mark = _position_row_price(row, "markPx", "last", "lastPx", "idxPx")
+            print(
+                "OKX_POS_ROW | "
+                f"{label} | instId={inst_id or '-'} | pos={pos} | notional={notional} | margin={margin} | "
+                f"avgPx={avg} | markPx={mark} | mgnMode={row.get('mgnMode') or '-'} | "
+                f"posSide={row.get('posSide') or '-'}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"OKX_POSITIONS_DEBUG | {label} | log_failed={exc}", flush=True)
+
+
+def _resolve_okx_td_mode(settings: Settings | None = None) -> str:
+    """Resolve OKX tdMode from settings/env with a safe default.
+
+    Old builds hardcoded isolated. This keeps isolated as default but allows
+    Railway OKX_TD_MODE or settings.okx_td_mode/td_mode to control execution.
+    Position reading remains unfiltered and sees both cross + isolated.
+    """
+    raw = ""
+    try:
+        raw = str(getattr(settings, "okx_td_mode", "") or getattr(settings, "td_mode", "") or "").strip().lower()
+    except Exception:
+        raw = ""
+    raw = raw or str(os.getenv("OKX_TD_MODE") or os.getenv("TD_MODE") or "isolated").strip().lower()
+    if raw not in {"isolated", "cross"}:
+        print(f"⚠️ OKX_TD_MODE invalid '{raw}' — using isolated", flush=True)
+        return "isolated"
+    return raw
+
+
 def _extract_live_okx_position_inst_ids(positions_result: dict | None) -> set[str]:
     if not _okx_result_is_ok(positions_result):
         return set()
@@ -904,10 +960,14 @@ def _recover_missing_execution_trades_from_okx_positions(
         positions_result = okx_client.get_positions(inst_type="SWAP") if hasattr(okx_client, "get_positions") else None
     except Exception as exc:
         stats.update({"enabled": True, "reason": f"positions_fetch_failed:{exc}"})
+        print(f"OKX_POSITION_RECOVERY | fetch_failed={exc}", flush=True)
         return list(trades or []), stats
+
+    _okx_positions_debug_log("recovery", positions_result)
 
     if not _okx_result_is_ok(positions_result):
         stats.update({"enabled": True, "reason": str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")})
+        print(f"OKX_POSITION_RECOVERY | not_ok | reason={stats.get('reason')}", flush=True)
         return list(trades or []), stats
 
     recovered = list(trades or [])
@@ -922,9 +982,11 @@ def _recover_missing_execution_trades_from_okx_positions(
         if abs(pos_size) <= 0:
             continue
         if inst_id in represented:
+            print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
             continue
         trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
+            print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
         recovered.append(trade)
         represented.add(inst_id)
@@ -940,6 +1002,11 @@ def _recover_missing_execution_trades_from_okx_positions(
     if imported_symbols:
         print(
             f"♻️ OKX_POSITION_RECOVERY | imported={len(imported_symbols)} | symbols={','.join(imported_symbols)}",
+            flush=True,
+        )
+    else:
+        print(
+            f"OKX_POSITION_RECOVERY | imported=0 | rows={len(_okx_result_rows(positions_result))} | represented={len(represented)} | reason=ok",
             flush=True,
         )
     return recovered, stats
@@ -959,6 +1026,7 @@ def _fetch_live_okx_position_inst_ids_strict(okx_client: OKXTradeClient | None) 
     except Exception as exc:
         print(f"⚠️ OKX position fetch failed: {exc}", flush=True)
         return False, set(), f"okx_positions_fetch_exception:{exc}"
+    _okx_positions_debug_log("strict_guard", positions_result, max_rows=6)
     if not _okx_result_is_ok(positions_result):
         reason = str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")
         return False, set(), reason
@@ -3241,6 +3309,7 @@ def run_once(
     ):
         try:
             _okx_pos_response = okx_client.get_positions(inst_type="SWAP") or {}
+            _okx_positions_debug_log("gate_guard", _okx_pos_response, max_rows=6)
             _okx_live_symbols = _extract_live_okx_position_inst_ids(_okx_pos_response)
             _okx_open_count = len(_okx_live_symbols)
             if _okx_open_count > 0:
@@ -4329,7 +4398,8 @@ def _execute_managed_okx_order(
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0)
 
-    TD_MODE = "isolated"
+    TD_MODE = _resolve_okx_td_mode(settings)
+    print(f"OKX_TD_MODE_ACTIVE | {TD_MODE}", flush=True)
 
     live_okx_mode = bool(
         okx_client is not None
