@@ -2944,6 +2944,33 @@ def run_once(
     _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
     effective_max_positions = LOW_BALANCE_MAX_SLOTS if _low_balance_mode else settings.max_execution_positions
 
+    # ✅ OKX GATE GUARD: لو execution mode والـ Redis فاضي (أول scan بعد التحويل)
+    # اسأل OKX مباشرة عن الـ open positions عشان الـ slot_counts يكون صح
+    # مهم: بنستخدم effective_max_positions المحسوب صح (low balance أو normal)
+    if (
+        not simulation_mode_active
+        and slot_counts.get("general", 0) == 0
+        and okx_client is not None
+    ):
+        try:
+            _okx_pos_response = okx_client.get_positions(inst_type="SWAP") or {}
+            _okx_open_count = len([
+                p for p in (_okx_pos_response.get("data") or [])
+                if float(p.get("pos", 0) or 0) != 0
+            ])
+            if _okx_open_count > 0:
+                # نحترم الـ effective_max_positions المحسوب صح
+                slot_counts["general"] = min(_okx_open_count, effective_max_positions)
+                print(
+                    f"🛡 OKX_GATE_GUARD | "
+                    f"OKX positions={_okx_open_count} | "
+                    f"max_allowed={'LOW='+str(effective_max_positions) if _low_balance_mode else 'NORMAL='+str(effective_max_positions)} | "
+                    f"slot_counts[general] set to {slot_counts['general']}",
+                    flush=True,
+                )
+        except Exception as _exc:
+            print(f"⚠️ OKX_GATE_GUARD | failed to fetch positions: {_exc}", flush=True)
+
     # Block Exception و Recovery slots — ديناميكية حسب الرصيد
     # رصيد ≥ $109 → كل مود عنده 3 slots منفصلة
     # رصيد < $109 → كل مود عنده slot واحد فقط
@@ -5725,7 +5752,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         applied = _set_runtime_signal_delivery_mode(runtime_settings, desired_mode)
 
         # ✅ FIX: invalidate OKX balance cache فوراً عند التحويل لـ trading
-        # عشان الـ mood والـ status يقروا الرصيد الحقيقي من OKX مش القديم
+        # عشان الـ effective_reference_balance يتحسب صح من أول scan
+        # وبالتالي الـ low_balance_mode والـ max_positions يتحددوا صح
         if applied and desired_mode == "trading":
             global _CACHED_OKX_BALANCE, _CACHED_OKX_BALANCE_TS
             with _CACHED_OKX_BALANCE_LOCK:
