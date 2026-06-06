@@ -157,6 +157,18 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
         trade.protected_reason = "market_mode_block_longs"
         buffered_entry = trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0)
         if trade.tp2_hit:
+        runner_target = float(getattr(trade, "runner_target_price", 0.0) or 0.0)
+        if runner_target > float(trade.tp2) and current_price >= runner_target:
+            trade.closed_portion_pct = 100.0
+            trade.realized_pnl_pct += _pnl_pct(trade.entry, runner_target) * (runner_close_pct / 100.0)
+            trade.runner_pnl_pct = 0.0
+            trade.runner_active = False
+            trade.protected_runner = False
+            _safe_setattr(trade, "exchange_sync_state", "runner_target_hit")
+            _safe_setattr(trade, "runner_target_hit_at", now)
+            return _mark_closed(trade, "runner_target_hit")
+
+if trade.tp2_hit:
             if not trade.trailing_tightened:
                 _stamp_once(trade, "trailing_tightened_at")
             trade.trailing_tightened = True
