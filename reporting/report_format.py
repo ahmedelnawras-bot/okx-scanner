@@ -111,6 +111,47 @@ def trade_money_pnl(
     )
 
 
+def trade_actual_leverage(t: TrackedTrade) -> float:
+    """Return the actual/effective leverage saved on the trade, if available."""
+
+    for attr in (
+        "effective_leverage",
+        "actual_leverage",
+        "exchange_leverage",
+        "leverage",
+        "requested_leverage",
+    ):
+        try:
+            value = float(getattr(t, attr, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 0:
+            return value
+
+    return 0.0
+
+
+def trade_actuals_line(
+    t: TrackedTrade,
+    *,
+    fallback_margin: float = DEFAULT_MARGIN_PER_TRADE,
+) -> str:
+    """Compact per-trade live/execution metrics for Telegram cards.
+
+    Shows:
+    - actual/effective leverage when known,
+    - the trade's stored margin,
+    - USD wallet impact using the same effective PnL as the report.
+    """
+
+    leverage = trade_actual_leverage(t)
+    margin = trade_margin_usdt(t, fallback=fallback_margin)
+    impact = trade_money_pnl(t, fallback_margin=fallback_margin)
+
+    leverage_label = f"{leverage:.0f}x" if leverage > 0 else "-x"
+    return f"⚙️ {leverage_label} | Margin {margin:.2f}$ | Impact {impact:+.2f}$"
+
+
 def color_signed(value: float, unit: str = "%") -> str:
     icon = "🟢" if value >= 0 else "🔴"
     return f"{icon} {value:+.2f}{unit}"
@@ -400,6 +441,8 @@ def trade_card_lines(
         f"🧭 {trade_mode_label(t)} | "
         f"⭐ {float(t.score or 0):.2f}"
         f"{extra_text}",
+
+        trade_actuals_line(t),
 
         # =================================================
         # Actual Entry Price
