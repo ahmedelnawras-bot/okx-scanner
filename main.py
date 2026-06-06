@@ -47,6 +47,7 @@ from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
 from tracking.trade_registry import register_trade
 from tracking.open_trades_updater import update_open_trades
 from tracking.persistence import RedisTradeStore, trade_to_dict, trade_from_dict
+from tracking.models import TrackedTrade
 from reporting.report_router import build_report_bundle, build_command_outputs
 from reporting.report_format import trade_effective_pnl as _report_trade_effective_pnl
 from reporting.report_simulation import build_simulation_command_outputs as build_simulation_report_command_outputs
@@ -691,7 +692,7 @@ def _is_live_okx_execution_mode(settings: Settings, okx_client: OKXTradeClient |
 
 
 def _trade_symbol_inst_id(trade) -> str:
-    return str(getattr(trade, "symbol", "") or "").strip().upper()
+    return _normalize_okx_inst_id(getattr(trade, "symbol", ""))
 
 
 def _normalize_okx_inst_id(value: object) -> str:
@@ -772,6 +773,176 @@ def _extract_pending_okx_order_inst_ids(pending_result: dict | None) -> set[str]
         if inst_id and state not in {"filled", "canceled", "mmp_canceled"}:
             pending.add(inst_id)
     return pending
+
+
+def _tracked_live_symbol_set(trades: list) -> set[str]:
+    """Symbols already represented by an active execution TrackedTrade.
+
+    TP2 runners are intentionally still represented here. They do not consume
+    normal slots or block re-entry, but they must not be imported again from
+    OKX as a second recovered trade.
+    """
+    out: set[str] = set()
+    for trade in trades or []:
+        if not getattr(trade, "execution_trade", False):
+            continue
+        status = str(getattr(trade, "status", "") or "").strip().lower()
+        if bool(getattr(trade, "is_closed", False)) or status in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+            continue
+        inst_id = _trade_symbol_inst_id(trade)
+        if inst_id:
+            out.add(inst_id)
+    return out
+
+
+def _position_row_price(row: dict, *keys: str) -> float:
+    for key in keys:
+        value = _safe_float((row or {}).get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None):
+    """Build a conservative TrackedTrade for a live OKX position missing from Redis.
+
+    This is a recovery layer, not a strategy entry. It exists so execution reports,
+    slots, same-symbol protection, Daily DD and Loss-Streak protection have a
+    live state to work with after Redis/report loss or redeploy. We do not invent
+    TP/SL order ids; if they are unknown, lifecycle price TP detection is disabled
+    by placing TP levels far away.
+    """
+    inst_id = _row_inst_id(row)
+    if not inst_id:
+        return None
+
+    entry = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+    current = _position_row_price(row, "markPx", "last", "lastPx", "idxPx") or entry
+    if entry <= 0:
+        entry = current
+    if entry <= 0:
+        return None
+
+    now = datetime.now(timezone.utc)
+    margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+    notional = _row_float(row, "notionalUsd", "notional")
+    leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
+    pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
+    trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
+
+    trade = TrackedTrade(
+        symbol=inst_id,
+        entry=float(entry),
+        sl=0.0,
+        tp1=float(entry) * 999.0,
+        tp2=float(entry) * 999.0,
+        setup_type="okx_recovered_position",
+        market_mode="RECOVERED_FROM_OKX",
+        score=0.0,
+        trade_id=trade_id,
+    )
+    _safe_set_trade_attr(trade, "trade_source", "execution")
+    _safe_set_trade_attr(trade, "tracking_bucket", "execution")
+    _safe_set_trade_attr(trade, "execution_trade", True)
+    _safe_set_trade_attr(trade, "execution_checked", True)
+    _safe_set_trade_attr(trade, "execution_status", "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "execution_reason", "okx_position_recovery")
+    _safe_set_trade_attr(trade, "execution_path", "general")
+    _safe_set_trade_attr(trade, "exchange_order_ok", True)
+    _safe_set_trade_attr(trade, "exchange_order_reason", "recovered_from_okx_live_position")
+    _safe_set_trade_attr(trade, "exchange_sync_state", "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "last_exchange_sync_at", now)
+    _safe_set_trade_attr(trade, "opened_at", now)
+    _safe_set_trade_attr(trade, "updated_at", now)
+    _safe_set_trade_attr(trade, "status", "open")
+    _safe_set_trade_attr(trade, "current_price", float(current or entry))
+    _safe_set_trade_attr(trade, "highest_price", float(max(entry, current or entry)))
+    _safe_set_trade_attr(trade, "pnl_pct", float(pnl_pct))
+    _safe_set_trade_attr(trade, "max_favorable_pct", max(0.0, float(pnl_pct)))
+    _safe_set_trade_attr(trade, "max_adverse_pct", min(0.0, float(pnl_pct)))
+    _safe_set_trade_attr(trade, "slot_exempt", False)
+    _safe_set_trade_attr(trade, "daily_open_risk_exempt", False)
+    _safe_set_trade_attr(trade, "same_symbol_block_exempt", False)
+    _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", True)
+    _safe_set_trade_attr(trade, "target_model", "recovered_okx_position")
+    _safe_set_trade_attr(trade, "tp1_close_pct", 30.0)
+    _safe_set_trade_attr(trade, "tp2_close_pct", 50.0)
+    _safe_set_trade_attr(trade, "runner_close_pct", 20.0)
+    if margin > 0:
+        _safe_set_trade_attr(trade, "used_margin_usdt", margin)
+        _safe_set_trade_attr(trade, "margin_usdt", margin)
+        _safe_set_trade_attr(trade, "allocated_margin_usdt", margin)
+    if notional > 0:
+        _safe_set_trade_attr(trade, "position_notional_usdt", notional)
+    if leverage > 0:
+        _safe_set_trade_attr(trade, "effective_leverage", leverage)
+    return trade
+
+
+def _recover_missing_execution_trades_from_okx_positions(
+    trades: list,
+    okx_client: OKXTradeClient | None,
+    settings: Settings,
+) -> tuple[list, dict]:
+    """Import live OKX positions missing from Redis as conservative execution trades.
+
+    This keeps Simulation isolated: it only runs in live OKX execution mode. The
+    imported records are intentionally conservative: they consume slots and block
+    same-symbol re-entry before TP2, but they do not invent TP/SL fills.
+    """
+    stats = {
+        "enabled": False,
+        "changed": False,
+        "imported": 0,
+        "reason": "not_live_okx_mode",
+        "symbols": [],
+    }
+    if not _is_live_okx_execution_mode(settings, okx_client):
+        return list(trades or []), stats
+
+    try:
+        positions_result = okx_client.get_positions(inst_type="SWAP") if hasattr(okx_client, "get_positions") else None
+    except Exception as exc:
+        stats.update({"enabled": True, "reason": f"positions_fetch_failed:{exc}"})
+        return list(trades or []), stats
+
+    if not _okx_result_is_ok(positions_result):
+        stats.update({"enabled": True, "reason": str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")})
+        return list(trades or []), stats
+
+    recovered = list(trades or [])
+    represented = _tracked_live_symbol_set(recovered)
+    imported_symbols: list[str] = []
+
+    for row in _okx_result_rows(positions_result):
+        inst_id = _row_inst_id(row)
+        if not inst_id:
+            continue
+        pos_size = _row_float(row, "pos", "availPos", "notionalUsd", "imr", "margin")
+        if abs(pos_size) <= 0:
+            continue
+        if inst_id in represented:
+            continue
+        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+        if trade is None:
+            continue
+        recovered.append(trade)
+        represented.add(inst_id)
+        imported_symbols.append(inst_id)
+
+    stats.update({
+        "enabled": True,
+        "changed": bool(imported_symbols),
+        "imported": len(imported_symbols),
+        "reason": "ok",
+        "symbols": imported_symbols[:20],
+    })
+    if imported_symbols:
+        print(
+            f"♻️ OKX_POSITION_RECOVERY | imported={len(imported_symbols)} | symbols={','.join(imported_symbols)}",
+            flush=True,
+        )
+    return recovered, stats
 
 
 def _fetch_live_okx_position_inst_ids_strict(okx_client: OKXTradeClient | None) -> tuple[bool, set[str], str]:
@@ -2947,6 +3118,20 @@ def run_once(
             trade_store.save_trades(persisted_trades)
     else:
         exchange_reconcile_stats = {"enabled": False, "changed": False, "removed": 0, "reason": "no_trades"}
+
+    if not simulation_mode_active:
+        persisted_trades, okx_recovery_stats = _recover_missing_execution_trades_from_okx_positions(
+            persisted_trades,
+            okx_client,
+            settings,
+        )
+        if okx_recovery_stats.get("changed") and trade_store:
+            trade_store.save_trades(persisted_trades)
+        if isinstance(exchange_reconcile_stats, dict):
+            exchange_reconcile_stats["okx_position_recovery"] = okx_recovery_stats
+    else:
+        okx_recovery_stats = {"enabled": False, "changed": False, "imported": 0, "reason": "simulation_mode"}
+
     if persisted_trades:
         persisted_trades = update_open_trades(
             persisted_trades,
