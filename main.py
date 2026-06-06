@@ -19,6 +19,7 @@ import re
 import threading
 import time
 import traceback
+from types import SimpleNamespace
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -807,22 +808,52 @@ def _is_open_execution_trade_for_reconcile(trade) -> bool:
     )
 
 
+def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position_not_live"):
+    """Preserve execution report history when OKX position disappears.
+
+    Old behavior deleted the tracked trade from Redis when OKX no longer had a
+    live position/order. That made /report_execution lose closed trades, WinRate,
+    TP/SL stats and Realized PnL. In live mode a missing OKX position usually
+    means the trade has finished on the exchange, so keep it as a closed record.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        status = str(getattr(trade, "status", "") or "").strip().lower()
+        if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+            pnl = _safe_float(getattr(trade, "pnl_pct", 0.0), 0.0)
+            realized = _safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)
+            effective = realized if abs(realized) > 0 else pnl
+            status = "closed_win" if effective >= 0 else "closed_loss"
+            setattr(trade, "status", status)
+        setattr(trade, "is_closed", True)
+        setattr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
+        setattr(trade, "updated_at", now)
+        setattr(trade, "slot_exempt", True)
+        setattr(trade, "blocks_same_symbol_reentry", False)
+        setattr(trade, "same_symbol_block_exempt", True)
+        setattr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
+        setattr(trade, "exchange_close_reason", reason)
+    except Exception:
+        pass
+    return trade
+
+
 def _reconcile_execution_trades_with_okx(
     trades: list,
     okx_client: OKXTradeClient | None,
     settings: Settings,
 ) -> tuple[list, dict]:
-    """Remove ghost execution tracked trades when OKX has no live position/order.
+    """Reconcile execution trades against OKX without deleting report history.
 
-    In live mode, OKX is the source of truth. Redis may still contain execution
-    tracked trades from old paper/simulation runs or from report resets. Those
-    trades must not occupy slots or appear in /report_execution when the exchange
-    has no matching live position or pending order.
+    OKX is still the live source of truth for slots and duplicate protection.
+    But when an already tracked execution trade disappears from OKX, do not
+    drop it from Redis. Mark it closed and let persistence move it to history.
     """
     stats = {
         "enabled": False,
         "changed": False,
         "removed": 0,
+        "closed_by_reconcile": 0,
         "kept": len(trades or []),
         "reason": "not_live_okx_mode",
     }
@@ -835,7 +866,7 @@ def _reconcile_execution_trades_with_okx(
         stats["reason"] = f"positions_fetch_failed:{exc}"
         return list(trades or []), stats
 
-    if not isinstance(positions_result, dict) or not positions_result.get("ok"):
+    if not _okx_result_is_ok(positions_result):
         stats["reason"] = str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")
         return list(trades or []), stats
 
@@ -849,25 +880,26 @@ def _reconcile_execution_trades_with_okx(
     protected_inst_ids = live_inst_ids | pending_inst_ids
 
     kept = []
-    removed = 0
-    removed_symbols = []
+    closed_count = 0
+    closed_symbols = []
     for trade in list(trades or []):
         if _is_open_execution_trade_for_reconcile(trade):
             inst_id = _trade_symbol_inst_id(trade)
             if inst_id and inst_id not in protected_inst_ids:
-                removed += 1
-                removed_symbols.append(inst_id)
-                continue
+                trade = _mark_execution_trade_closed_by_reconcile(trade, reason="okx_position_and_orders_missing")
+                closed_count += 1
+                closed_symbols.append(inst_id)
         kept.append(trade)
 
     stats.update({
         "enabled": True,
-        "changed": removed > 0,
-        "removed": removed,
+        "changed": closed_count > 0,
+        "removed": 0,
+        "closed_by_reconcile": closed_count,
         "kept": len(kept),
         "live_positions": len(live_inst_ids),
         "pending_orders": len(pending_inst_ids),
-        "removed_symbols": removed_symbols[:20],
+        "closed_symbols": closed_symbols[:20],
         "reason": "ok",
     })
     return kept, stats
@@ -5728,6 +5760,50 @@ def _format_reset_reports_done(stats: dict, title: str) -> str:
     return "\n".join(lines)
 
 
+def _refresh_execution_reports_from_redis(
+    result: dict | None,
+    trade_store: RedisTradeStore | None = None,
+    settings: Settings | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> None:
+    """Force /report_execution to use the latest Redis state, not stale scan output."""
+    if not isinstance(result, dict):
+        return
+    runtime_settings = settings or get_settings()
+    refreshed_trades = list(result.get("trades", []) or [])
+    refreshed_checks = list(result.get("execution_results", []) or [])
+    if trade_store:
+        try:
+            refreshed_trades = trade_store.load_trades() or refreshed_trades
+        except Exception as exc:
+            print(f"⚠️ execution report redis trade refresh failed: {exc}", flush=True)
+        try:
+            refreshed_checks = trade_store.load_execution_checks(limit=500) or refreshed_checks
+        except Exception as exc:
+            print(f"⚠️ execution report redis checks refresh failed: {exc}", flush=True)
+
+    reconcile_stats = None
+    if trade_store and _is_live_okx_execution_mode(runtime_settings, okx_client):
+        try:
+            reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(refreshed_trades, okx_client, runtime_settings)
+            if reconcile_stats.get("changed"):
+                trade_store.save_trades(reconciled)
+            refreshed_trades = reconciled
+        except Exception as exc:
+            print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
+
+    result["trades"] = refreshed_trades
+    result["execution_results"] = refreshed_checks
+    if reconcile_stats:
+        result["exchange_reconcile_stats"] = reconcile_stats
+    portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings)
+    result["portfolio_state_inputs"] = portfolio_state_inputs
+    kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
+    reports = build_report_bundle(refreshed_trades, refreshed_checks, list(result.get("signal_items", []) or []), **kwargs)
+    result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, list(result.get("signal_items", []) or []), **kwargs)
+    result.update(reports)
+
+
 def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
     if not isinstance(result, dict):
         return
@@ -6206,6 +6282,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         if command == "/okx_status":
             _send_text(sender, _build_okx_status_panel(runtime_settings, okx_client=okx_client))
             return
+        if command.startswith("/report_execution"):
+            _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=runtime_settings, okx_client=okx_client)
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
             simulation_outputs.get(command)
@@ -6346,6 +6424,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         except Exception as exc:
             print(f"⚠️ command exchange reconcile failed: {exc}", flush=True)
 
+    # Keep execution reports fresh at command time.
+    _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
         offset = int(update.get("update_id", 0)) + 1
@@ -6591,6 +6671,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_text(sender, reply, reply_markup=_build_okx_control_keyboard(settings))
                 continue
             else:
+                if command.startswith("/report_execution"):
+                    _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
+                    command_outputs = result.get("command_outputs", {})
                 simulation_outputs = _build_simulation_command_outputs(result)
                 reply = (
                     simulation_outputs.get(command)
