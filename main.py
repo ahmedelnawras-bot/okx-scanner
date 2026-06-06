@@ -1357,8 +1357,8 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
         sl=float(cached_sl) if cached_sl > 0 else 0.0,
         tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
         tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
-        setup_type="okx_recovered_position",
-        market_mode="RECOVERED_FROM_OKX",
+        setup_type="bot_order_restored_position" if recovery_meta else "okx_recovered_position",
+        market_mode="BOT_ORDER_RESTORED" if recovery_meta else "RECOVERED_FROM_OKX",
         score=0.0,
         trade_id=trade_id,
     )
@@ -1366,12 +1366,12 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "tracking_bucket", "execution")
     _safe_set_trade_attr(trade, "execution_trade", True)
     _safe_set_trade_attr(trade, "execution_checked", True)
-    _safe_set_trade_attr(trade, "execution_status", "recovered_live_okx_position")
-    _safe_set_trade_attr(trade, "execution_reason", "okx_position_recovery")
+    _safe_set_trade_attr(trade, "execution_status", "bot_order_restored_from_okx" if recovery_meta else "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "execution_reason", "recent_bot_order_metadata_recovery" if recovery_meta else "okx_position_recovery")
     _safe_set_trade_attr(trade, "execution_path", "general")
     _safe_set_trade_attr(trade, "exchange_order_ok", True)
-    _safe_set_trade_attr(trade, "exchange_order_reason", "recovered_from_okx_live_position")
-    _safe_set_trade_attr(trade, "exchange_sync_state", "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "exchange_order_reason", "bot_order_restored_from_recent_metadata" if recovery_meta else "recovered_from_okx_live_position")
+    _safe_set_trade_attr(trade, "exchange_sync_state", "bot_order_restored_from_okx" if recovery_meta else "recovered_live_okx_position")
     _safe_set_trade_attr(trade, "last_exchange_sync_at", now)
     _safe_set_trade_attr(trade, "opened_at", now)
     _safe_set_trade_attr(trade, "updated_at", now)
@@ -1385,7 +1385,7 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "daily_open_risk_exempt", False)
     _safe_set_trade_attr(trade, "same_symbol_block_exempt", False)
     _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", True)
-    _safe_set_trade_attr(trade, "target_model", "recovered_okx_position")
+    _safe_set_trade_attr(trade, "target_model", "bot_order_restored" if recovery_meta else "recovered_okx_position")
     _safe_set_trade_attr(trade, "tp1_close_pct", 30.0)
     _safe_set_trade_attr(trade, "tp2_close_pct", 50.0)
     _safe_set_trade_attr(trade, "runner_close_pct", 20.0)
@@ -1405,6 +1405,11 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     if recovery_meta:
         _safe_set_trade_attr(trade, "recovery_metadata_used", True)
         _safe_set_trade_attr(trade, "recovery_metadata_reason", recovery_meta.get("reason"))
+        print(
+            f"♻️ BOT_ORDER_RESTORED_FROM_OKX | {inst_id} | "
+            f"sl={cached_sl or 0.0} | tp1={cached_tp1 or 0.0} | tp2={cached_tp2 or 0.0}",
+            flush=True,
+        )
     return trade
 
 
@@ -4668,6 +4673,106 @@ def _activate_announced_trade(
 
 
 
+
+def _trade_matches_identity(trade, trade_id: str = "", symbol: str = "") -> bool:
+    """Return True when a stored trade is the same execution position."""
+    try:
+        wanted_id = str(trade_id or "").strip()
+        wanted_symbol = _normalize_okx_inst_id(symbol)
+        existing_id = str(getattr(trade, "trade_id", "") or "").strip()
+        existing_symbol = _normalize_okx_inst_id(getattr(trade, "symbol", ""))
+        if wanted_id and existing_id and wanted_id == existing_id:
+            return True
+        if wanted_symbol and existing_symbol and wanted_symbol == existing_symbol:
+            return bool(getattr(trade, "execution_trade", False)) and not bool(getattr(trade, "is_closed", False))
+    except Exception:
+        return False
+    return False
+
+
+def _merge_trade_into_list(trades: list, candidate_trade) -> tuple[list, bool]:
+    """Merge candidate trade into a list by trade_id first, then live symbol."""
+    merged = list(trades or [])
+    trade_id = str(getattr(candidate_trade, "trade_id", "") or "").strip()
+    symbol = _normalize_okx_inst_id(getattr(candidate_trade, "symbol", ""))
+    for idx, trade in enumerate(merged):
+        if _trade_matches_identity(trade, trade_id=trade_id, symbol=symbol):
+            merged[idx] = candidate_trade
+            return merged, False
+    merged.append(candidate_trade)
+    return merged, True
+
+
+def _trade_exists_in_loaded_trades(trades: list, candidate_trade) -> bool:
+    trade_id = str(getattr(candidate_trade, "trade_id", "") or "").strip()
+    symbol = _normalize_okx_inst_id(getattr(candidate_trade, "symbol", ""))
+    return any(_trade_matches_identity(t, trade_id=trade_id, symbol=symbol) for t in (trades or []))
+
+
+def _verify_or_force_persist_exchange_trade(
+    candidate_trade,
+    result: dict,
+    trade_store: RedisTradeStore | None,
+    max_attempts: int = 3,
+) -> bool:
+    """Verify Redis contains the trade immediately after OKX success.
+
+    If the normal refresh/save path did not persist the new live trade, force a
+    merge-save using a fresh Redis load. This closes the dangerous gap where OKX
+    opens a real position but the next scan imports it as RECOVERED_FROM_OKX.
+    """
+    symbol = _normalize_okx_inst_id(getattr(candidate_trade, "symbol", ""))
+    trade_id = str(getattr(candidate_trade, "trade_id", "") or "").strip()
+    if not trade_store or not getattr(trade_store, "enabled", False):
+        print(f"⚠️ TRACK_TRADE_VERIFY_SKIPPED | {symbol or '-'} | reason=redis_unavailable", flush=True)
+        return False
+
+    for attempt in range(1, max(1, int(max_attempts or 3)) + 1):
+        try:
+            loaded = list(trade_store.load_trades() or [])
+            if _trade_exists_in_loaded_trades(loaded, candidate_trade):
+                print(
+                    f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | attempt={attempt}",
+                    flush=True,
+                )
+                return True
+
+            merged, added = _merge_trade_into_list(loaded, candidate_trade)
+            trade_store.save_trades(merged)
+            if isinstance(result, dict):
+                result["trades"] = merged
+            print(
+                f"🧷 TRACK_TRADE_FORCE_PERSIST | {symbol or '-'} | id={trade_id or '-'} | "
+                f"attempt={attempt} | added={added}",
+                flush=True,
+            )
+            loaded_after = list(trade_store.load_trades() or [])
+            if _trade_exists_in_loaded_trades(loaded_after, candidate_trade):
+                if isinstance(result, dict):
+                    result["trades"] = loaded_after
+                print(
+                    f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | after_force=1",
+                    flush=True,
+                )
+                return True
+        except Exception as exc:
+            print(
+                f"🚨 TRACK_TRADE_VERIFY_FAILED | {symbol or '-'} | id={trade_id or '-'} | "
+                f"attempt={attempt} | error={exc}",
+                flush=True,
+            )
+            try:
+                time.sleep(0.35 * attempt)
+            except Exception:
+                pass
+
+    print(
+        f"🚨 TRACK_TRADE_UNVERIFIED_AFTER_OKX_SUCCESS | {symbol or '-'} | id={trade_id or '-'} | "
+        "position may be recovered later from OKX",
+        flush=True,
+    )
+    return False
+
 def _register_exchange_trade_immediately(
     result: dict,
     item: dict,
@@ -4748,9 +4853,15 @@ def _register_exchange_trade_immediately(
             except Exception as save_exc:
                 print(f"🚨 Immediate trade registration Redis save failed: {save_exc}", flush=True)
                 return False
+    verified = _verify_or_force_persist_exchange_trade(
+        candidate_trade,
+        result,
+        trade_store,
+    )
+    item["immediate_persist_verified"] = bool(verified)
     print(
         f"✅ TRACK_TRADE_IMMEDIATE | {symbol or '-'} | "
-        f"id={trade_id or '-'} | margin={used_margin:.4f}",
+        f"id={trade_id or '-'} | margin={used_margin:.4f} | verified={bool(verified)}",
         flush=True,
     )
     return True
