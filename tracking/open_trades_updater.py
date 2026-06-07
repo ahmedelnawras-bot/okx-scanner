@@ -203,9 +203,91 @@ def _sync_stop_loss_to_exchange(trade: TrackedTrade, okx_client: Any) -> Tracked
     return trade
 
 
+def _is_recovered_trade(trade: TrackedTrade) -> bool:
+    """Return True for trades imported from OKX without original order IDs."""
+    market_mode = str(getattr(trade, "market_mode", "") or "").upper()
+    setup_type = str(getattr(trade, "setup_type", "") or "").lower()
+    exchange_sync = str(getattr(trade, "exchange_sync_state", "") or "").lower()
+    return bool(
+        "RECOVERED" in market_mode
+        or "RESTORED" in market_mode
+        or "recovered" in setup_type
+        or "restored" in setup_type
+        or "recovered" in exchange_sync
+        or "restored" in exchange_sync
+    )
+
+
+def _sync_recovered_trade_from_position(trade: TrackedTrade, okx_client: Any) -> TrackedTrade:
+    """Sync price + margin for recovered/restored trades that have no order IDs.
+
+    These trades were imported from live OKX positions so they have no
+    entry_order_id. We sync directly from the positions endpoint instead.
+    """
+    inst_id = str(getattr(trade, "symbol", "") or "")
+    if not inst_id or okx_client is None:
+        return trade
+
+    try:
+        positions_result = _call_if_exists(okx_client, "get_positions", inst_type="SWAP") or {}
+        rows = positions_result.get("rows") or positions_result.get("data") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_inst = str(row.get("instId") or "").strip().upper()
+            if row_inst != inst_id.upper():
+                continue
+
+            # سعر الـ mark الحالي
+            for px_key in ("markPx", "last", "lastPx", "idxPx"):
+                mark_px = _safe_float(row.get(px_key), 0.0)
+                if mark_px > 0:
+                    _safe_setattr(trade, "current_price", mark_px)
+                    break
+
+            # entry price من OKX
+            for avg_key in ("avgPx", "avgPxUsd", "openAvgPx"):
+                avg_px = _safe_float(row.get(avg_key), 0.0)
+                if avg_px > 0:
+                    _safe_setattr(trade, "entry", avg_px)
+                    break
+
+            # margin الحالي
+            for margin_key in ("margin", "imr", "initialMargin", "marginUsd"):
+                margin = _safe_float(row.get(margin_key), 0.0)
+                if margin > 0:
+                    _safe_setattr(trade, "used_margin_usdt", margin)
+                    _safe_setattr(trade, "margin_usdt", margin)
+                    break
+
+            # leverage
+            lever = _safe_float(row.get("lever") or row.get("leverage"), 0.0)
+            if lever > 0:
+                _safe_setattr(trade, "effective_leverage", lever)
+
+            _safe_setattr(trade, "exchange_sync_state", "position_synced")
+            _safe_setattr(trade, "last_exchange_sync_at", datetime.now(timezone.utc))
+            print(
+                f"RECOVERED_TRADE_SYNC | {inst_id} | "
+                f"markPx={getattr(trade, 'current_price', 0)} | "
+                f"entry={getattr(trade, 'entry', 0)}",
+                flush=True,
+            )
+            break
+    except Exception as exc:
+        print(f"⚠️ RECOVERED_TRADE_SYNC_FAILED | {inst_id} | {exc}", flush=True)
+
+    return trade
+
+
 def _sync_trade_with_exchange(trade: TrackedTrade, okx_client: Any) -> TrackedTrade:
     if okx_client is None:
         return trade
+
+    # ✅ FIX: الـ recovered/restored trades مش عندهم entry_order_id
+    # بنسنحهم من الـ positions endpoint مباشرة بدل ما نتجاهلهم
+    if _is_recovered_trade(trade):
+        return _sync_recovered_trade_from_position(trade, okx_client)
 
     trade = _sync_entry_fill_state(trade, okx_client)
     trade = _sync_tp_order_state(trade, okx_client)
