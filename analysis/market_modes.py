@@ -82,6 +82,16 @@ RECOVERY_TO_STRONG_AVG = -0.45
 RECOVERY_TO_STRONG_BTC = -0.35
 RECOVERY_TO_STRONG_MIN_STRONG_COINS = 4
 
+# Recovery should be a short-lived rebound edge, not a broad "strong market" label.
+# These guards prevent Recovery from staying active when the market is merely
+# pressured/stabilizing; that case should downgrade to STRONG_LONG_ONLY.
+RECOVERY_ENTRY_MAX_DOMINANCE_RISE = 0.20
+RECOVERY_CONTINUE_MAX_DOMINANCE_RISE = 0.25
+RECOVERY_CONTINUE_RED_RATIO = 0.58
+RECOVERY_CONTINUE_AVG = -0.35
+RECOVERY_CONTINUE_BTC = -0.30
+RECOVERY_CONTINUE_MIN_STRONG_COINS = 6
+
 
 MODE_DECISION_DEBUG = os.getenv("MODE_DECISION_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
 
@@ -192,6 +202,8 @@ def _is_recovery_ready(snapshot: MarketSnapshot) -> bool:
         and avg > RECOVERY_READY_AVG               # -0.30
         and btc > RECOVERY_READY_BTC               # -0.25
         and strong >= 8
+        and not _has_hourly_ma5_pressure(snapshot)
+        and float(getattr(snapshot, "btc_dominance_change_1h", 0.0) or 0.0) <= RECOVERY_ENTRY_MAX_DOMINANCE_RISE
     )
     return strong_rebound
 
@@ -219,8 +231,43 @@ def _is_recovery_to_strong_ready(snapshot: MarketSnapshot) -> bool:
         and btc >= RECOVERY_TO_STRONG_BTC
         and strong >= RECOVERY_TO_STRONG_MIN_STRONG_COINS
     )
-    recovery_edge_fading = bool(not snapshot.fast_rebound or snapshot.breadth_improving or snapshot.btc_reclaim)
+    # Previous logic used OR and therefore treated almost every improving scan
+    # as "edge fading". Fading means the full rebound trio is no longer present.
+    recovery_edge_fading = not (
+        bool(snapshot.fast_rebound)
+        and bool(snapshot.btc_reclaim)
+        and bool(snapshot.breadth_improving)
+    )
     return bool(pressure_but_stable and recovery_edge_fading)
+
+
+def _is_recovery_edge_still_valid(snapshot: MarketSnapshot, flags: dict | None = None) -> bool:
+    """Return True only while the rebound edge still deserves RECOVERY.
+
+    If this returns False and the market is not healthy enough for NORMAL, the
+    mode should downgrade to STRONG_LONG_ONLY. This keeps 90 minutes as a max
+    cap, not as an implicit holding period.
+    """
+    flags = flags or {}
+    red_ratio, avg, btc, strong = _values(snapshot)
+    dom_change = float(getattr(snapshot, "btc_dominance_change_1h", 0.0) or 0.0)
+    if flags.get("real_block") or _recovery_hard_fail(snapshot) or _recovery_soft_fail(snapshot):
+        return False
+    if _has_hourly_ma5_pressure(snapshot):
+        return False
+    if dom_change > RECOVERY_CONTINUE_MAX_DOMINANCE_RISE:
+        return False
+
+    strict_ready = bool(flags.get("recovery_ready") or _is_recovery_ready(snapshot))
+    softer_continue = bool(
+        snapshot.fast_rebound
+        and (snapshot.btc_reclaim or snapshot.breadth_improving)
+        and red_ratio <= RECOVERY_CONTINUE_RED_RATIO
+        and avg >= RECOVERY_CONTINUE_AVG
+        and btc >= RECOVERY_CONTINUE_BTC
+        and strong >= RECOVERY_CONTINUE_MIN_STRONG_COINS
+    )
+    return bool(strict_ready or softer_continue)
 
 
 def _risk_flags(snapshot: MarketSnapshot) -> dict:
@@ -400,9 +447,9 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         # 90 minutes is only the maximum cap. Every scan can exit earlier:
         # - hard deterioration -> BLOCK
         # - fully healthy market -> NORMAL after confirmation
-        # - rebound edge faded but market is still pressured/stabilizing -> STRONG
+        # - rebound edge faded / market merely stabilizing -> STRONG
         recovery_expired = _recovery_window_expired(previous, now)
-        recovery_edge_still_valid = bool(flags["recovery_ready"] and not _recovery_soft_fail(snapshot))
+        recovery_edge_still_valid = _is_recovery_edge_still_valid(snapshot, flags)
 
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
@@ -412,12 +459,9 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
             # Max window انتهى: ارجع للتقييم السوقي الحالي بدل تثبيت RECOVERY.
             # لو السوق لسه حساس يبقى STRONG، ولو آمن تمامًا يبقى NORMAL.
             candidate_mode = MODE_STRONG_LONG_ONLY if flags["weak_breadth"] or raw == MODE_STRONG_LONG_ONLY else MODE_NORMAL_LONG
-        elif not recovery_edge_still_valid and (
-            flags["recovery_to_strong_ready"]
-            or flags["weak_breadth"]
-            or _recovery_soft_fail(snapshot)
-            or raw == MODE_STRONG_LONG_ONLY
-        ):
+        elif not recovery_edge_still_valid:
+            # The rebound edge faded. Do NOT keep Recovery just because the
+            # market is no longer crashing; this is exactly STRONG territory.
             candidate_mode = MODE_STRONG_LONG_ONLY
         else:
             candidate_mode = MODE_RECOVERY_LONG
