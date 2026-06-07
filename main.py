@@ -2846,6 +2846,40 @@ def _drawdown_protection_message_ar(drawdown_status) -> str:
     ).strip()
 
 
+
+def _protection_scope_from_result(result: dict | None) -> str:
+    """Best-effort display scope for protection notices.
+
+    Display-only helper. It does not affect execution, sizing, cooldowns,
+    drawdown levels, or any trade decision. The caller should pass
+    result["protection_scope"] when available.
+    """
+    result = result or {}
+    scope = str(result.get("protection_scope") or "").strip().lower()
+    if scope in {"simulation", "execution"}:
+        return scope
+    state = result.get("protection_state") or {}
+    if isinstance(state, dict):
+        scope = str(state.get("scope") or "").strip().lower()
+        if scope in {"simulation", "execution"}:
+            return scope
+    return "execution"
+
+
+def _protection_scope_label_ar(scope: object) -> str:
+    scope_text = str(scope or "execution").strip().lower()
+    if scope_text == "simulation":
+        return "المحاكاة"
+    return "التنفيذ الحقيقي"
+
+
+def _protection_scope_action_ar(scope: object) -> str:
+    scope_text = str(scope or "execution").strip().lower()
+    if scope_text == "simulation":
+        return "صفقات المحاكاة"
+    return "الصفقات الحقيقية"
+
+
 def _block_mode_protection_message_ar(result: dict | None) -> str:
     """Human-readable Arabic message for market BLOCK reminder protection."""
     result = result or {}
@@ -2907,7 +2941,7 @@ def _append_protection_notice(message: str, result: dict | None) -> str:
     if not notice:
         return str(message or "").strip()
     base = str(message or "").strip()
-    if "🛡️ <b>تنبيه الحماية</b>" in base:
+    if "🛡️ <b>تنبيه الحماية" in base:
         return base
     return (base + "\n\n" + notice).strip()
 
@@ -4824,6 +4858,7 @@ def run_once(
         "drawdown_status": drawdown_status,
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
+        "protection_scope": protection_scope,
         "portfolio_state_inputs": portfolio_state_inputs,
         "trades": trades,
         "simulation_trades": simulation_trades,
@@ -4862,6 +4897,7 @@ def run_once(
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
+        "protection_scope": protection_scope,
         "active_protections": protection_summary.get("active_protections", []),
         "protection_status": protection_summary,
         "risk_protection_summary": protection_summary,
@@ -8615,6 +8651,10 @@ def _maybe_send_protection_activation_alert(
     if not isinstance(tracker, dict):
         return
 
+    scope = _protection_scope(settings) if settings is not None else _protection_scope_from_result(result)
+    scope_label = _protection_scope_label_ar(scope)
+    scope_action = _protection_scope_action_ar(scope)
+
     alerts: list[tuple[str, str]] = []
 
     loss_guard = result.get("loss_streak_guard") or {}
@@ -8667,6 +8707,14 @@ def _maybe_send_protection_activation_alert(
         expired_sent = set(expired_sent or [])
         tracker["protection_expiry_sent"] = expired_sent
 
+    sent_at = tracker.setdefault("protection_alert_sent_at", {})
+    if not isinstance(sent_at, dict):
+        sent_at = {}
+        tracker["protection_alert_sent_at"] = sent_at
+
+    min_visible_seconds = 90
+    now_ts = time.time()
+
     # Allow a fresh alert next time after a protection fully disappears or changes level,
     # and send one clear standalone expiry/resume message.
     for old_key in list(sent_keys):
@@ -8695,6 +8743,7 @@ def _maybe_send_protection_activation_alert(
             continue
         _send_text(sender, message)
         sent_keys.add(key)
+        sent_at[key] = now_ts
         _telegram_send_pause(TELEGRAM_NORMAL_SEND_GAP_SECONDS)
 
 def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict, settings: Settings | None = None) -> None:
