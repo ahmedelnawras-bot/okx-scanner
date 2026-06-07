@@ -2655,6 +2655,23 @@ def _hard_execution_protection_rejection(drawdown_status=None, loss_streak_guard
     return None
 
 
+
+def _has_active_hard_protection(result: dict | None) -> bool:
+    """Whether true danger protections are currently blocking all execution."""
+    result = result or {}
+    return bool(_hard_execution_protection_rejection(
+        result.get("drawdown_status"),
+        result.get("loss_streak_guard"),
+    ))
+
+
+def _is_hard_protection_pause(exec_result: dict | None) -> bool:
+    exec_result = exec_result or {}
+    return bool(
+        str(exec_result.get("status") or "").strip().lower() == "protection_pause"
+        and (bool(exec_result.get("hard_protection")) or bool(exec_result.get("no_exceptions")))
+    )
+
 def _active_protections_snapshot(result: dict | None) -> list[dict]:
     """Compact machine-readable protection list for reports and AI exports."""
     result = result or {}
@@ -5777,6 +5794,14 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         exec_status = str(exec_result.get("status") or "")
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         can_place_order = exec_status == "accepted_preview"
+        if _is_hard_protection_pause(exec_result):
+            item["announcement_status"] = "hard_protection_suppressed"
+            print(
+                f"HARD_PROTECTION_SIGNAL_SKIP | {getattr(signal, 'symbol', '-')} | "
+                f"reason={(exec_result or {}).get('reason') or (exec_result or {}).get('raw_reason') or '-'}",
+                flush=True,
+            )
+            continue
         if not _should_dispatch_signal_item(item, settings):
             item["announcement_status"] = "filtered_signal_mode"
             continue
@@ -8378,9 +8403,10 @@ def live_worker() -> None:
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
+                    hard_protection_active = _has_active_hard_protection(result)
                     if mode_changed_in_scan and result.get("mode_transition_message"):
                         _send_text(sender, result.get("mode_transition_message", ""))
-                    else:
+                    elif not hard_protection_active:
                         _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings)
