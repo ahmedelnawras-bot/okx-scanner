@@ -22,7 +22,6 @@ import traceback
 from types import SimpleNamespace
 import requests
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
 
 from utils.config import get_settings, Settings
 from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG, MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE, MAX_RECOVERY_TRADES_PER_CYCLE
@@ -490,22 +489,6 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
     general_used = int(counts.get("general", 0) or 0)
     block_used = int(counts.get("block_exception", 0) or 0)
     recovery_used = int(counts.get("recovery", 0) or 0)
-    reconcile_stats = dict(result.get("exchange_reconcile_stats") or {}) if isinstance(result, dict) else {}
-    live_okx_positions = 0
-    live_okx_symbols = []
-    if context == "execution":
-        live_okx_positions = int(
-            reconcile_stats.get("okx_tracking_live_positions")
-            or reconcile_stats.get("okx_gate_guard_live_positions")
-            or reconcile_stats.get("live_positions")
-            or 0
-        )
-        live_okx_symbols = list(
-            reconcile_stats.get("okx_tracking_live_symbols")
-            or reconcile_stats.get("okx_gate_guard_symbols")
-            or []
-        )
-    tracked_general = int(general_used)
     return {
         "context": context,
         "low_balance": low_balance,
@@ -517,10 +500,6 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
         "recovery_limit": recovery_limit,
         "total_used": general_used + block_used + recovery_used,
         "total_limit": general_limit + block_limit + recovery_limit,
-        "tracked_general": tracked_general,
-        "live_okx_positions": live_okx_positions,
-        "live_okx_symbols": live_okx_symbols[:20],
-        "tracking_mismatch": bool(context == "execution" and live_okx_positions > tracked_general),
     }
 
 def _format_risk_profile_block(profile: dict | None, title: str = "🧮 Risk Profile") -> str:
@@ -1183,54 +1162,6 @@ def _recent_bot_okx_order_metadata(symbol: object) -> dict:
     return dict(mark)
 
 
-def _mark_force_recover_okx_symbol(symbol: object, reason: str = "track_trade_unverified_after_okx_success") -> None:
-    """Force next-scan OKX recovery for a symbol if immediate persistence failed."""
-    inst_id = _normalize_okx_inst_id(symbol)
-    if not inst_id:
-        return
-    now_ts = time.time()
-    _purge_recent_bot_okx_order_marks(now_ts)
-    grace_ttl = max(5, int(OKX_RECOVERY_GRACE_SECONDS or 120))
-    meta_ttl = max(grace_ttl, int(OKX_RECOVERY_META_SECONDS or (15 * 60)))
-    existing = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
-    mark = dict(existing) if isinstance(existing, dict) else {"symbol": inst_id}
-    mark["grace_until"] = max(_safe_float(mark.get("grace_until"), 0.0), now_ts + grace_ttl)
-    mark["meta_until"] = max(_safe_float(mark.get("meta_until"), 0.0), now_ts + meta_ttl)
-    mark["force_recover"] = True
-    mark["force_recover_reason"] = str(reason or "track_trade_unverified_after_okx_success")
-    mark["force_recover_marked_at"] = datetime.now(timezone.utc).isoformat()
-    _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = mark
-    print(f"OKX_FORCE_RECOVER_MARK | {inst_id} | reason={mark['force_recover_reason']}", flush=True)
-
-
-def _has_force_recover_okx_symbol(symbol: object) -> bool:
-    inst_id = _normalize_okx_inst_id(symbol)
-    if not inst_id:
-        return False
-    now_ts = time.time()
-    _purge_recent_bot_okx_order_marks(now_ts)
-    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
-    return bool(isinstance(mark, dict) and mark.get("force_recover"))
-
-
-def _clear_force_recover_okx_symbol(symbol: object) -> None:
-    inst_id = _normalize_okx_inst_id(symbol)
-    if not inst_id:
-        return
-    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
-    if not isinstance(mark, dict) or not mark.get("force_recover"):
-        return
-    mark = dict(mark)
-    mark.pop("force_recover", None)
-    mark.pop("force_recover_reason", None)
-    mark.pop("force_recover_marked_at", None)
-    if mark:
-        _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = mark
-    else:
-        _OKX_RECENT_BOT_OPENED_SYMBOLS.pop(inst_id, None)
-    print(f"OKX_FORCE_RECOVER_CLEAR | {inst_id}", flush=True)
-
-
 def _row_inst_id(row: dict) -> str:
     return _normalize_okx_inst_id((row or {}).get("instId"))
 
@@ -1486,7 +1417,6 @@ def _recover_missing_execution_trades_from_okx_positions(
     trades: list,
     okx_client: OKXTradeClient | None,
     settings: Settings,
-    trade_store: RedisTradeStore | None = None,
 ) -> tuple[list, dict]:
     """Import live OKX positions missing from Redis as conservative execution trades.
 
@@ -1535,8 +1465,7 @@ def _recover_missing_execution_trades_from_okx_positions(
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
             continue
         grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
-        force_recover = _has_force_recover_okx_symbol(inst_id)
-        if grace_remaining > 0 and not force_recover:
+        if grace_remaining > 0:
             imported_symbols_marker = stats.setdefault("grace_symbols", [])
             if isinstance(imported_symbols_marker, list):
                 imported_symbols_marker.append(inst_id)
@@ -1547,36 +1476,11 @@ def _recover_missing_execution_trades_from_okx_positions(
                 flush=True,
             )
             continue
-        if force_recover:
-            print(f"OKX_POSITION_RECOVERY_FORCE | {inst_id} | reason=marked_unverified_after_okx_success", flush=True)
-
-        # Fresh Redis check before classifying a live OKX position as recovered.
-        # This avoids BOT_ORDER_RESTORED / RECOVERED_FROM_OKX when the trade was
-        # registered after the initial persisted_trades snapshot but before this
-        # recovery loop runs.
-        if trade_store and getattr(trade_store, "enabled", False):
-            try:
-                fresh_trades = trade_store.load_trades() or []
-            except Exception as exc:
-                fresh_trades = []
-                print(f"⚠️ OKX_POSITION_RECOVERY_FRESH_LOAD_FAILED | {inst_id} | {exc}", flush=True)
-            if fresh_trades:
-                fresh_represented = _tracked_live_symbol_set(fresh_trades)
-                if inst_id in fresh_represented:
-                    print(
-                        f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=fresh_redis_already_represented",
-                        flush=True,
-                    )
-                    _clear_force_recover_okx_symbol(inst_id)
-                    represented.add(inst_id)
-                    continue
-
         trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
         recovered.append(trade)
-        _clear_force_recover_okx_symbol(inst_id)
         represented.add(inst_id)
         imported_symbols.append(inst_id)
 
@@ -1692,8 +1596,8 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
 
         # Keep TP flags as-is; only fill realized PnL if lifecycle did not.
         if abs(_safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)) <= 1e-12:
-            _safe_set_trade_attr(trade, "realized_pnl_pct", realized)
-        _safe_set_trade_attr(trade, "manual_close_estimated_pnl_pct", realized)
+            setattr(trade, "realized_pnl_pct", realized)
+        setattr(trade, "manual_close_estimated_pnl_pct", realized)
 
         if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
             if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
@@ -1702,16 +1606,16 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
                 status = "closed_loss"
             else:
                 status = "breakeven_after_tp1" if bool(getattr(trade, "tp1_hit", False)) else "closed"
-            _safe_set_trade_attr(trade, "status", status)
+            setattr(trade, "status", status)
 
-        _safe_set_trade_attr(trade, "is_closed", True)
-        _safe_set_trade_attr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
-        _safe_set_trade_attr(trade, "updated_at", now)
-        _safe_set_trade_attr(trade, "slot_exempt", True)
-        _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", False)
-        _safe_set_trade_attr(trade, "same_symbol_block_exempt", True)
-        _safe_set_trade_attr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
-        _safe_set_trade_attr(trade, "exchange_close_reason", reason)
+        setattr(trade, "is_closed", True)
+        setattr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
+        setattr(trade, "updated_at", now)
+        setattr(trade, "slot_exempt", True)
+        setattr(trade, "blocks_same_symbol_reentry", False)
+        setattr(trade, "same_symbol_block_exempt", True)
+        setattr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
+        setattr(trade, "exchange_close_reason", reason)
         print(
             f"OKX_RECONCILE_CLOSED | {getattr(trade, 'symbol', '-') or '-'} | "
             f"status={status} | realized_raw={realized:+.4f}% | "
@@ -2305,31 +2209,13 @@ def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_sta
     return inputs
 
 
-def _current_equity_for_manual_resume(
-    result: dict | None,
-    settings: Settings,
-    portfolio_state_inputs: dict | None = None,
-    okx_client: OKXTradeClient | None = None,
-) -> float:
+def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
     result = result or {}
     if _is_simulation_mode(settings):
         wallet = result.get("simulation_wallet") or {}
         equity = _safe_float(wallet.get("equity"), 0.0)
         if equity > 0:
             return equity
-
-    # In live execution mode, manual resume must use the current OKX equity
-    # at confirmation time, not a stale scan snapshot/fallback baseline.
-    if _is_live_okx_execution_mode(settings, okx_client):
-        try:
-            balance_response = okx_client.get_balance() if okx_client is not None else None
-        except Exception as exc:
-            balance_response = None
-            print(f"⚠️ manual resume live OKX balance fetch failed: {exc}", flush=True)
-        live_equity = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
-        if live_equity > 0:
-            return live_equity
-
     portfolio_state = result.get("portfolio_state")
     for attr in ("current_equity", "equity", "balance", "portfolio_value", "current_balance"):
         try:
@@ -2346,13 +2232,9 @@ def _current_equity_for_manual_resume(
     return 0.0
 
 
-def _build_manual_resume_preview(
-    result: dict | None,
-    settings: Settings,
-    okx_client: OKXTradeClient | None = None,
-) -> str:
+def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
     scope = _protection_scope(settings)
-    equity = _current_equity_for_manual_resume(result, settings, okx_client=okx_client)
+    equity = _current_equity_for_manual_resume(result, settings)
     loss_guard = (result or {}).get("loss_streak_guard") or {}
     drawdown = (result or {}).get("drawdown_status")
     dd_line = "غير متاح"
@@ -2384,11 +2266,10 @@ def _confirm_manual_resume_trading(
     result: dict | None,
     settings: Settings,
     trade_store: RedisTradeStore | None = None,
-    okx_client: OKXTradeClient | None = None,
 ) -> str:
     scope = _protection_scope(settings)
     now = datetime.now(timezone.utc)
-    equity = _current_equity_for_manual_resume(result, settings, okx_client=okx_client)
+    equity = _current_equity_for_manual_resume(result, settings)
     state = _load_protection_state(trade_store, scope)
     state.update({
         "manual_override": True,
@@ -2751,23 +2632,6 @@ def _hard_execution_protection_rejection(drawdown_status=None, loss_streak_guard
 
     return None
 
-
-
-def _has_active_hard_protection(result: dict | None) -> bool:
-    """Whether true danger protections are currently blocking all execution."""
-    result = result or {}
-    return bool(_hard_execution_protection_rejection(
-        result.get("drawdown_status"),
-        result.get("loss_streak_guard"),
-    ))
-
-
-def _is_hard_protection_pause(exec_result: dict | None) -> bool:
-    exec_result = exec_result or {}
-    return bool(
-        str(exec_result.get("status") or "").strip().lower() == "protection_pause"
-        and (bool(exec_result.get("hard_protection")) or bool(exec_result.get("no_exceptions")))
-    )
 
 def _active_protections_snapshot(result: dict | None) -> list[dict]:
     """Compact machine-readable protection list for reports and AI exports."""
@@ -4022,51 +3886,6 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
                 print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
 
-
-def _diagnose_okx_tracking_mismatch(
-    trades: list,
-    okx_client: OKXTradeClient | None,
-    settings: Settings,
-    exchange_reconcile_stats: dict | None = None,
-) -> dict:
-    stats = dict(exchange_reconcile_stats or {})
-    tracked_symbols = sorted(_tracked_live_symbol_set(trades))
-    tracked_general = int(_execution_slot_counts(trades).get("general", 0) or 0)
-    if not _is_live_okx_execution_mode(settings, okx_client):
-        stats.update({
-            "okx_tracking_checked": False,
-            "okx_tracking_tracked_general": tracked_general,
-            "okx_tracking_tracked_symbols": tracked_symbols[:20],
-        })
-        return stats
-    ok, live_symbols, reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
-    live_sorted = sorted(live_symbols)
-    missing_symbols = [symbol for symbol in live_sorted if symbol not in set(tracked_symbols)]
-    stats.update({
-        "okx_tracking_checked": ok,
-        "okx_tracking_reason": reason,
-        "okx_tracking_live_positions": len(live_sorted),
-        "okx_tracking_live_symbols": live_sorted[:20],
-        "okx_tracking_tracked_general": tracked_general,
-        "okx_tracking_tracked_symbols": tracked_symbols[:20],
-        "okx_tracking_missing_symbols": missing_symbols[:20],
-        "tracking_mismatch": len(missing_symbols) > 0,
-    })
-    if ok and missing_symbols:
-        print(
-            f"OKX_TRACKING_MISMATCH | live={len(live_sorted)} | tracked={tracked_general} | missing={','.join(missing_symbols[:20])}",
-            flush=True,
-        )
-    elif ok:
-        print(
-            f"OKX_TRACKING_MATCH | live={len(live_sorted)} | tracked={tracked_general}",
-            flush=True,
-        )
-    else:
-        print(f"OKX_TRACKING_MISMATCH_CHECK_FAILED | reason={reason}", flush=True)
-    return stats
-
-
 def run_once(
     previous_state: MarketModeState | None = None,
     settings: Settings | None = None,
@@ -4125,7 +3944,6 @@ def run_once(
             persisted_trades,
             okx_client,
             settings,
-            trade_store=trade_store,
         )
         if okx_recovery_stats.get("changed") and trade_store:
             trade_store.save_trades(persisted_trades)
@@ -4588,13 +4406,6 @@ def run_once(
         if not snapshot_write_result.get("ok"):
             print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
 
-    exchange_reconcile_stats = _diagnose_okx_tracking_mismatch(
-        trades,
-        okx_client,
-        settings,
-        exchange_reconcile_stats=exchange_reconcile_stats if isinstance(exchange_reconcile_stats, dict) else None,
-    )
-
     mode_context = _build_mode_context(state, snapshot, protection)
     protection_scope = _protection_scope(settings)
     protection_state = _load_protection_state(trade_store, protection_scope)
@@ -4946,7 +4757,6 @@ def _verify_or_force_persist_exchange_trade(
         try:
             loaded = list(trade_store.load_trades() or [])
             if _trade_exists_in_loaded_trades(loaded, candidate_trade):
-                _clear_force_recover_okx_symbol(symbol)
                 print(
                     f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | attempt={attempt}",
                     flush=True,
@@ -4966,7 +4776,6 @@ def _verify_or_force_persist_exchange_trade(
             if _trade_exists_in_loaded_trades(loaded_after, candidate_trade):
                 if isinstance(result, dict):
                     result["trades"] = loaded_after
-                _clear_force_recover_okx_symbol(symbol)
                 print(
                     f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | after_force=1",
                     flush=True,
@@ -4983,7 +4792,6 @@ def _verify_or_force_persist_exchange_trade(
             except Exception:
                 pass
 
-    _mark_force_recover_okx_symbol(symbol)
     print(
         f"🚨 TRACK_TRADE_UNVERIFIED_AFTER_OKX_SUCCESS | {symbol or '-'} | id={trade_id or '-'} | "
         "position may be recovered later from OKX",
@@ -5448,27 +5256,6 @@ def _safe_set_trade_attr(trade, name: str, value) -> None:
         pass
 
 
-def _json_safe_trade_value(value):
-    """Convert nested exchange payloads into JSON-safe values for Redis persistence.
-
-    The tracked trade may store diagnostic payloads from OKX. Those payloads can
-    contain Decimal objects, which break Redis JSON serialization during
-    save_trades(). Keep the structure, but normalize Decimal recursively.
-    """
-    if isinstance(value, Decimal):
-        try:
-            return float(value)
-        except Exception:
-            return str(value)
-    if isinstance(value, dict):
-        return {str(k): _json_safe_trade_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe_trade_value(v) for v in value]
-    if isinstance(value, set):
-        return [_json_safe_trade_value(v) for v in sorted(value, key=lambda x: str(x))]
-    return value
-
-
 def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) -> None:
     if trade is None or not isinstance(managed_order_result, dict):
         return
@@ -5483,18 +5270,18 @@ def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) ->
     _safe_set_trade_attr(trade, "exchange_order_reason", entry.get("reason"))
     _safe_set_trade_attr(trade, "entry_order_id", entry.get("order_id"))
     _safe_set_trade_attr(trade, "entry_client_order_id", entry.get("client_order_id"))
-    _safe_set_trade_attr(trade, "entry_order_payload", _json_safe_trade_value(entry.get("payload")))
+    _safe_set_trade_attr(trade, "entry_order_payload", entry.get("payload"))
     _safe_set_trade_attr(trade, "sl_attached_on_entry", bool(managed_order_result.get("sl_attached")))
-    _safe_set_trade_attr(trade, "sl_attached_payload", _json_safe_trade_value((entry.get("payload") or {}).get("attachAlgoOrds")))
+    _safe_set_trade_attr(trade, "sl_attached_payload", (entry.get("payload") or {}).get("attachAlgoOrds"))
     _safe_set_trade_attr(trade, "tp_split_ok", tp_split.get("ok"))
     _safe_set_trade_attr(trade, "tp_split_reason", tp_split.get("reason"))
     _safe_set_trade_attr(trade, "tp1_order_id", tp1.get("order_id"))
     _safe_set_trade_attr(trade, "tp2_order_id", tp2.get("order_id"))
     _safe_set_trade_attr(trade, "tp1_client_order_id", tp1.get("client_order_id"))
     _safe_set_trade_attr(trade, "tp2_client_order_id", tp2.get("client_order_id"))
-    _safe_set_trade_attr(trade, "runner_expected_size", _json_safe_trade_value((plan.get("runner") or {}).get("size")))
+    _safe_set_trade_attr(trade, "runner_expected_size", (plan.get("runner") or {}).get("size"))
     _safe_set_trade_attr(trade, "runner_requires_trailing_after_tp2", bool(managed_order_result.get("requires_runner_trailing")))
-    _safe_set_trade_attr(trade, "managed_trade_plan", _json_safe_trade_value(plan))
+    _safe_set_trade_attr(trade, "managed_trade_plan", plan)
 
     # Report-card diagnostics: actual leverage/margin used by the exchange path.
     used_margin = _safe_float(managed_order_result.get("used_margin_usdt"), 0.0)
@@ -5967,14 +5754,6 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         exec_status = str(exec_result.get("status") or "")
         is_execution = exec_status in {"accepted_preview", "pending_pullback_preview"}
         can_place_order = exec_status == "accepted_preview"
-        if _is_hard_protection_pause(exec_result):
-            item["announcement_status"] = "hard_protection_suppressed"
-            print(
-                f"HARD_PROTECTION_SIGNAL_SKIP | {getattr(signal, 'symbol', '-')} | "
-                f"reason={(exec_result or {}).get('reason') or (exec_result or {}).get('raw_reason') or '-'}",
-                flush=True,
-            )
-            continue
         if not _should_dispatch_signal_item(item, settings):
             item["announcement_status"] = "filtered_signal_mode"
             continue
@@ -6199,18 +5978,37 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             except Exception:
                 pass
 
-        if send_ok and is_execution:
+        if is_execution:
             if simulation_mode_active and can_place_order:
-                _activate_simulated_trade(result, item, trade_store=trade_store, settings=settings)
+                if send_ok:
+                    _activate_simulated_trade(result, item, trade_store=trade_store, settings=settings)
                 continue
             if exchange_required and not exchange_order_ok:
                 item["announcement_status"] = "exchange_failed"
                 _attach_exchange_state_to_trade(item.get("candidate_trade"), managed_order_result)
                 continue
-            try:
-                _activate_announced_trade(result, item, trade_store=trade_store)
-            except Exception as exc:
-                print(f"❌ Trade registration failed: {exc}", flush=True)
+            # ✅ FIX: لو OKX نجح → نسجل الـ trade في التقارير بغض النظر عن Telegram
+            # _register_exchange_trade_immediately() حفظت في Redis بالفعل
+            # _activate_announced_trade() بتحدث result["trades"] والتقارير في الـ memory
+            if exchange_required and exchange_order_ok:
+                try:
+                    _activate_announced_trade(result, item, trade_store=trade_store)
+                except Exception as exc:
+                    print(f"❌ Trade registration failed: {exc}", flush=True)
+                if not send_ok:
+                    item["announcement_status"] = "registered_telegram_failed"
+                    print(
+                        f"⚠️ OKX_TRADE_REGISTERED_TELEGRAM_FAILED | {getattr(signal, 'symbol', '-')} | "
+                        "trade in Redis + reports but Telegram notification failed",
+                        flush=True,
+                    )
+            elif send_ok:
+                try:
+                    _activate_announced_trade(result, item, trade_store=trade_store)
+                except Exception as exc:
+                    print(f"❌ Trade registration failed: {exc}", flush=True)
+            else:
+                item["announcement_status"] = "send_failed"
         else:
             item["announcement_status"] = "sent" if send_ok else "send_failed"
 
@@ -7450,13 +7248,12 @@ def _handle_admin_clean_command(
     trade_store: RedisTradeStore | None,
     result: dict | None = None,
     settings: Settings | None = None,
-    okx_client: OKXTradeClient | None = None,
 ) -> str | None:
     runtime_settings = settings or get_settings()
     if command in {"/resume_trading", "/resume_protection", "/resume_daily_dd"}:
-        return _build_manual_resume_preview(result, runtime_settings, okx_client=okx_client)
+        return _build_manual_resume_preview(result, runtime_settings)
     if command in {"/confirm_resume_trading", "/confirm_resume_protection", "/confirm_resume_daily_dd"}:
-        return _confirm_manual_resume_trading(result, runtime_settings, trade_store, okx_client=okx_client)
+        return _confirm_manual_resume_trading(result, runtime_settings, trade_store)
 
     reset_preview_commands = {
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
@@ -7803,7 +7600,6 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             trade_store,
             result=result,
             settings=runtime_settings,
-            okx_client=okx_client,
         )
         if admin_reply is not None:
             _send_text(sender, admin_reply, reply_markup=_build_bot_modes_keyboard(runtime_settings))
@@ -8012,7 +7808,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
-            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings, okx_client=okx_client)
+            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
                 continue
@@ -8578,10 +8374,9 @@ def live_worker() -> None:
             if sender.enabled and settings.telegram_enabled:
                 if settings.send_mode_status_each_scan:
                     mode_changed_in_scan = previous_scan_mode is not None and state.mode != previous_scan_mode
-                    hard_protection_active = _has_active_hard_protection(result)
                     if mode_changed_in_scan and result.get("mode_transition_message"):
                         _send_text(sender, result.get("mode_transition_message", ""))
-                    elif not hard_protection_active:
+                    else:
                         _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
                 _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings)
