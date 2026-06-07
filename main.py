@@ -1517,6 +1517,186 @@ def _recover_missing_execution_trades_from_okx_positions(
     return recovered, stats
 
 
+def _repair_execution_trades_from_live_okx_positions(
+    trades: list,
+    okx_client: OKXTradeClient | None,
+    settings: Settings,
+) -> tuple[list, dict]:
+    """Hard repair report/runtime trade records from live OKX positions.
+
+    This is stronger than import-only recovery. Import-only recovery skips a
+    symbol when any active tracked trade already represents it. That is safe for
+    trading protection, but it can leave /status and /report_execution wrong if
+    the existing Redis record is corrupted, closed, slot-exempt, missing
+    execution_trade=True, or otherwise invisible to the report filters.
+
+    For every live OKX SWAP position:
+    - repair an existing same-symbol trade in-place when present;
+    - otherwise append a conservative RECOVERED_FROM_OKX trade;
+    - force the record to be report-visible and slot-counted.
+
+    Trading decisions still use OKX guards separately. This function is for
+    status/report synchronization only.
+    """
+    stats = {
+        "enabled": False,
+        "changed": False,
+        "repaired": 0,
+        "imported": 0,
+        "symbols": [],
+        "reason": "not_live_okx_mode",
+    }
+    repaired = list(trades or [])
+    if not _is_live_okx_execution_mode(settings, okx_client):
+        return repaired, stats
+
+    try:
+        positions_result = okx_client.get_positions(inst_type="SWAP") if hasattr(okx_client, "get_positions") else None
+    except Exception as exc:
+        stats.update({"enabled": True, "reason": f"positions_fetch_failed:{exc}"})
+        print(f"OKX_POSITION_REPAIR | fetch_failed={exc}", flush=True)
+        return repaired, stats
+
+    _okx_positions_debug_log("report_repair", positions_result)
+
+    if not _okx_result_is_ok(positions_result):
+        stats.update({
+            "enabled": True,
+            "reason": str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok"),
+        })
+        print(f"OKX_POSITION_REPAIR | not_ok | reason={stats.get('reason')}", flush=True)
+        return repaired, stats
+
+    def _same_symbol(trade, inst_id: str) -> bool:
+        try:
+            return _trade_symbol_inst_id(trade) == inst_id
+        except Exception:
+            return False
+
+    changed_symbols: list[str] = []
+
+    for row in _okx_result_rows(positions_result):
+        inst_id = _row_inst_id(row)
+        if not inst_id:
+            continue
+        pos_size = _row_float(row, "pos", "availPos", "notionalUsd", "imr", "margin")
+        if abs(pos_size) <= 0:
+            continue
+
+        entry = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+        current = _position_row_price(row, "markPx", "last", "lastPx", "idxPx") or entry
+        margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+        notional = _row_float(row, "notionalUsd", "notional")
+        leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
+        pnl_pct = ((current - entry) / entry) * 100.0 if entry > 0 and current > 0 else 0.0
+
+        # Prefer repairing an existing same-symbol record, even if it is closed
+        # or malformed, so Redis does not accumulate duplicate recovered trades.
+        target = None
+        for trade in repaired:
+            if _same_symbol(trade, inst_id):
+                target = trade
+                break
+
+        imported = False
+        if target is None:
+            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+            if target is None:
+                print(f"OKX_POSITION_REPAIR_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
+                continue
+            repaired.append(target)
+            imported = True
+
+        now = datetime.now(timezone.utc)
+        before_state = {
+            "execution_trade": bool(getattr(target, "execution_trade", False)),
+            "status": str(getattr(target, "status", "") or ""),
+            "is_closed": bool(getattr(target, "is_closed", False)),
+            "slot_exempt": bool(getattr(target, "slot_exempt", False)),
+            "symbol": str(getattr(target, "symbol", "") or ""),
+        }
+
+        _safe_set_trade_attr(target, "symbol", inst_id)
+        _safe_set_trade_attr(target, "trade_source", "execution")
+        _safe_set_trade_attr(target, "tracking_bucket", "execution")
+        _safe_set_trade_attr(target, "execution_trade", True)
+        _safe_set_trade_attr(target, "execution_checked", True)
+        _safe_set_trade_attr(target, "execution_status", str(getattr(target, "execution_status", "") or "live_okx_position_repaired"))
+        _safe_set_trade_attr(target, "exchange_order_ok", True)
+        _safe_set_trade_attr(target, "exchange_order_reason", str(getattr(target, "exchange_order_reason", "") or "live_okx_position_repair"))
+        _safe_set_trade_attr(target, "exchange_sync_state", "live_okx_position_repaired")
+        _safe_set_trade_attr(target, "last_exchange_sync_at", now)
+        _safe_set_trade_attr(target, "updated_at", now)
+        _safe_set_trade_attr(target, "status", "open")
+        _safe_set_trade_attr(target, "is_closed", False)
+        _safe_set_trade_attr(target, "closed_at", None)
+        _safe_set_trade_attr(target, "slot_exempt", False)
+        _safe_set_trade_attr(target, "daily_open_risk_exempt", False)
+        _safe_set_trade_attr(target, "same_symbol_block_exempt", False)
+        _safe_set_trade_attr(target, "blocks_same_symbol_reentry", True)
+        _safe_set_trade_attr(target, "counts_as_active_slot", True)
+        _safe_set_trade_attr(target, "execution_path", str(getattr(target, "execution_path", "") or "general"))
+        _safe_set_trade_attr(target, "market_mode", str(getattr(target, "market_mode", "") or "RECOVERED_FROM_OKX"))
+        _safe_set_trade_attr(target, "setup_type", str(getattr(target, "setup_type", "") or "okx_recovered_position"))
+        if entry > 0:
+            _safe_set_trade_attr(target, "entry", float(entry))
+        if current > 0:
+            _safe_set_trade_attr(target, "current_price", float(current))
+            _safe_set_trade_attr(target, "highest_price", max(_safe_float(getattr(target, "highest_price", 0.0), 0.0), float(current)))
+        _safe_set_trade_attr(target, "pnl_pct", float(pnl_pct))
+        _safe_set_trade_attr(target, "max_favorable_pct", max(_safe_float(getattr(target, "max_favorable_pct", 0.0), 0.0), float(pnl_pct)))
+        _safe_set_trade_attr(target, "max_adverse_pct", min(_safe_float(getattr(target, "max_adverse_pct", 0.0), 0.0), float(pnl_pct)))
+        if margin > 0:
+            _safe_set_trade_attr(target, "used_margin_usdt", margin)
+            _safe_set_trade_attr(target, "margin_usdt", margin)
+            _safe_set_trade_attr(target, "allocated_margin_usdt", margin)
+        if notional > 0:
+            _safe_set_trade_attr(target, "position_notional_usdt", notional)
+        if leverage > 0:
+            _safe_set_trade_attr(target, "effective_leverage", leverage)
+            _safe_set_trade_attr(target, "actual_leverage", leverage)
+        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and entry > 0:
+            _safe_set_trade_attr(target, "tp1", float(entry) * 999.0)
+        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and entry > 0:
+            _safe_set_trade_attr(target, "tp2", float(entry) * 999.0)
+
+        after_state = {
+            "execution_trade": bool(getattr(target, "execution_trade", False)),
+            "status": str(getattr(target, "status", "") or ""),
+            "is_closed": bool(getattr(target, "is_closed", False)),
+            "slot_exempt": bool(getattr(target, "slot_exempt", False)),
+            "symbol": str(getattr(target, "symbol", "") or ""),
+        }
+
+        stats["imported"] = int(stats.get("imported", 0) or 0) + (1 if imported else 0)
+        if imported or before_state != after_state:
+            stats["repaired"] = int(stats.get("repaired", 0) or 0) + (0 if imported else 1)
+            changed_symbols.append(inst_id)
+            print(
+                f"OKX_POSITION_REPAIR | {inst_id} | imported={imported} | "
+                f"status={before_state.get('status')}->{after_state.get('status')} | "
+                f"exec={before_state.get('execution_trade')}->{after_state.get('execution_trade')} | "
+                f"closed={before_state.get('is_closed')}->{after_state.get('is_closed')} | "
+                f"slot_exempt={before_state.get('slot_exempt')}->{after_state.get('slot_exempt')}",
+                flush=True,
+            )
+
+    stats.update({
+        "enabled": True,
+        "changed": bool(changed_symbols or int(stats.get("imported", 0) or 0)),
+        "symbols": changed_symbols[:20],
+        "reason": "ok",
+    })
+    print(
+        "EXEC_REPORT_HARD_REPAIR | "
+        f"repaired={int(stats.get('repaired', 0) or 0)} | "
+        f"imported={int(stats.get('imported', 0) or 0)} | "
+        f"symbols={','.join(stats.get('symbols', []) or []) or '-'}",
+        flush=True,
+    )
+    return repaired, stats
+
+
 def _fetch_live_okx_position_inst_ids_strict(okx_client: OKXTradeClient | None) -> tuple[bool, set[str], str]:
     """Fetch live OKX positions, fail-closed for execution guards.
 
@@ -3960,10 +4140,23 @@ def run_once(
         )
         if okx_recovery_stats.get("changed") and trade_store:
             trade_store.save_trades(persisted_trades)
+        try:
+            persisted_trades, okx_repair_stats = _repair_execution_trades_from_live_okx_positions(
+                persisted_trades,
+                okx_client,
+                settings,
+            )
+            if okx_repair_stats.get("changed") and trade_store:
+                trade_store.save_trades(persisted_trades)
+        except Exception as exc:
+            okx_repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"scan_repair_failed:{exc}"}
+            print(f"⚠️ OKX_POSITION_REPAIR_SCAN_FAILED | {exc}", flush=True)
         if isinstance(exchange_reconcile_stats, dict):
             exchange_reconcile_stats["okx_position_recovery"] = okx_recovery_stats
+            exchange_reconcile_stats["okx_position_repair"] = okx_repair_stats
     else:
         okx_recovery_stats = {"enabled": False, "changed": False, "imported": 0, "reason": "simulation_mode"}
+        okx_repair_stats = {"enabled": False, "changed": False, "repaired": 0, "imported": 0, "reason": "simulation_mode"}
 
     if persisted_trades:
         _before_lifecycle = _execution_lifecycle_snapshot(persisted_trades)
@@ -7172,6 +7365,21 @@ def _refresh_execution_reports_from_redis(
             recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
             print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
 
+        try:
+            repaired, repair_stats = _repair_execution_trades_from_live_okx_positions(
+                refreshed_trades,
+                okx_client,
+                runtime_settings,
+            )
+            if repair_stats.get("changed") and trade_store:
+                trade_store.save_trades(repaired)
+            refreshed_trades = repaired
+            result["okx_position_repair_stats"] = repair_stats
+        except Exception as exc:
+            repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"hard_repair_failed:{exc}"}
+            result["okx_position_repair_stats"] = repair_stats
+            print(f"⚠️ execution report OKX hard repair failed: {exc}", flush=True)
+
     result["trades"] = refreshed_trades
     result["execution_results"] = refreshed_checks
     if reconcile_stats:
@@ -7180,6 +7388,8 @@ def _refresh_execution_reports_from_redis(
         result["okx_position_recovery_stats"] = recovery_stats
         exchange_stats = dict(result.get("exchange_reconcile_stats") or {})
         exchange_stats["okx_position_recovery"] = recovery_stats
+        if result.get("okx_position_repair_stats"):
+            exchange_stats["okx_position_repair"] = result.get("okx_position_repair_stats")
         result["exchange_reconcile_stats"] = exchange_stats
 
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
