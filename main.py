@@ -158,8 +158,6 @@ OKX_RECOVERY_GRACE_SECONDS: int = 120
 # rebuild the trade with its real SL/TP instead of conservative placeholders.
 OKX_RECOVERY_META_SECONDS: int = 15 * 60
 _OKX_RECENT_BOT_OPENED_SYMBOLS: dict[str, dict | float] = {}
-OKX_FORCE_RECOVER_TTL_SECONDS: int = 15 * 60
-_OKX_FORCE_RECOVER_SYMBOLS: dict[str, dict | float] = {}
 
 
 
@@ -492,6 +490,22 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
     general_used = int(counts.get("general", 0) or 0)
     block_used = int(counts.get("block_exception", 0) or 0)
     recovery_used = int(counts.get("recovery", 0) or 0)
+    reconcile_stats = dict(result.get("exchange_reconcile_stats") or {}) if isinstance(result, dict) else {}
+    live_okx_positions = 0
+    live_okx_symbols = []
+    if context == "execution":
+        live_okx_positions = int(
+            reconcile_stats.get("okx_tracking_live_positions")
+            or reconcile_stats.get("okx_gate_guard_live_positions")
+            or reconcile_stats.get("live_positions")
+            or 0
+        )
+        live_okx_symbols = list(
+            reconcile_stats.get("okx_tracking_live_symbols")
+            or reconcile_stats.get("okx_gate_guard_symbols")
+            or []
+        )
+    tracked_general = int(general_used)
     return {
         "context": context,
         "low_balance": low_balance,
@@ -503,6 +517,10 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
         "recovery_limit": recovery_limit,
         "total_used": general_used + block_used + recovery_used,
         "total_limit": general_limit + block_limit + recovery_limit,
+        "tracked_general": tracked_general,
+        "live_okx_positions": live_okx_positions,
+        "live_okx_symbols": live_okx_symbols[:20],
+        "tracking_mismatch": bool(context == "execution" and live_okx_positions > tracked_general),
     }
 
 def _format_risk_profile_block(profile: dict | None, title: str = "🧮 Risk Profile") -> str:
@@ -1165,52 +1183,52 @@ def _recent_bot_okx_order_metadata(symbol: object) -> dict:
     return dict(mark)
 
 
-def _okx_force_recover_expiry(mark: object, key: str = "expires_at") -> float:
-    if isinstance(mark, dict):
-        return _safe_float(mark.get(key), 0.0)
-    return _safe_float(mark, 0.0)
-
-
-def _purge_force_recover_marks(now_ts: float | None = None) -> None:
-    now_ts = float(now_ts or time.time())
-    expired = []
-    for symbol, mark in list(_OKX_FORCE_RECOVER_SYMBOLS.items()):
-        if _okx_force_recover_expiry(mark) <= now_ts:
-            expired.append(symbol)
-    for symbol in expired:
-        _OKX_FORCE_RECOVER_SYMBOLS.pop(symbol, None)
-
-
-def _mark_force_recover_symbol(symbol: object, reason: str = "unverified_after_okx_success", ttl_seconds: int | None = None) -> None:
+def _mark_force_recover_okx_symbol(symbol: object, reason: str = "track_trade_unverified_after_okx_success") -> None:
+    """Force next-scan OKX recovery for a symbol if immediate persistence failed."""
     inst_id = _normalize_okx_inst_id(symbol)
     if not inst_id:
         return
     now_ts = time.time()
-    _purge_force_recover_marks(now_ts)
-    ttl = max(60, int(ttl_seconds or OKX_FORCE_RECOVER_TTL_SECONDS or (15 * 60)))
-    _OKX_FORCE_RECOVER_SYMBOLS[inst_id] = {
-        "expires_at": now_ts + ttl,
-        "reason": str(reason or "unverified_after_okx_success"),
-        "symbol": inst_id,
-        "marked_at": datetime.now(timezone.utc).isoformat(),
-    }
-    print(f"OKX_FORCE_RECOVER_MARK | {inst_id} | ttl={ttl}s | reason={reason}", flush=True)
+    _purge_recent_bot_okx_order_marks(now_ts)
+    grace_ttl = max(5, int(OKX_RECOVERY_GRACE_SECONDS or 120))
+    meta_ttl = max(grace_ttl, int(OKX_RECOVERY_META_SECONDS or (15 * 60)))
+    existing = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
+    mark = dict(existing) if isinstance(existing, dict) else {"symbol": inst_id}
+    mark["grace_until"] = max(_safe_float(mark.get("grace_until"), 0.0), now_ts + grace_ttl)
+    mark["meta_until"] = max(_safe_float(mark.get("meta_until"), 0.0), now_ts + meta_ttl)
+    mark["force_recover"] = True
+    mark["force_recover_reason"] = str(reason or "track_trade_unverified_after_okx_success")
+    mark["force_recover_marked_at"] = datetime.now(timezone.utc).isoformat()
+    _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = mark
+    print(f"OKX_FORCE_RECOVER_MARK | {inst_id} | reason={mark['force_recover_reason']}", flush=True)
 
 
-def _clear_force_recover_symbol(symbol: object) -> None:
-    inst_id = _normalize_okx_inst_id(symbol)
-    if not inst_id:
-        return
-    _OKX_FORCE_RECOVER_SYMBOLS.pop(inst_id, None)
-
-
-def _force_recover_symbol_active(symbol: object) -> bool:
+def _has_force_recover_okx_symbol(symbol: object) -> bool:
     inst_id = _normalize_okx_inst_id(symbol)
     if not inst_id:
         return False
     now_ts = time.time()
-    _purge_force_recover_marks(now_ts)
-    return inst_id in _OKX_FORCE_RECOVER_SYMBOLS
+    _purge_recent_bot_okx_order_marks(now_ts)
+    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
+    return bool(isinstance(mark, dict) and mark.get("force_recover"))
+
+
+def _clear_force_recover_okx_symbol(symbol: object) -> None:
+    inst_id = _normalize_okx_inst_id(symbol)
+    if not inst_id:
+        return
+    mark = _OKX_RECENT_BOT_OPENED_SYMBOLS.get(inst_id)
+    if not isinstance(mark, dict) or not mark.get("force_recover"):
+        return
+    mark = dict(mark)
+    mark.pop("force_recover", None)
+    mark.pop("force_recover_reason", None)
+    mark.pop("force_recover_marked_at", None)
+    if mark:
+        _OKX_RECENT_BOT_OPENED_SYMBOLS[inst_id] = mark
+    else:
+        _OKX_RECENT_BOT_OPENED_SYMBOLS.pop(inst_id, None)
+    print(f"OKX_FORCE_RECOVER_CLEAR | {inst_id}", flush=True)
 
 
 def _row_inst_id(row: dict) -> str:
@@ -1354,19 +1372,6 @@ def _tracked_live_symbol_set(trades: list) -> set[str]:
         if inst_id:
             out.add(inst_id)
     return out
-
-
-def _log_okx_tracking_mismatch(label: str, okx_symbols: set[str] | None, tracked_trades: list | None) -> list[str]:
-    live_symbols = {s for s in (okx_symbols or set()) if str(s or "").strip()}
-    tracked_symbols = _tracked_live_symbol_set(list(tracked_trades or []))
-    missing = sorted(live_symbols - tracked_symbols)
-    if missing:
-        print(
-            f"OKX_TRACKING_MISMATCH | {label} | okx_live={len(live_symbols)} | tracked={len(tracked_symbols)} | "
-            f"missing={','.join(missing[:20])}",
-            flush=True,
-        )
-    return missing
 
 
 def _position_row_price(row: dict, *keys: str) -> float:
@@ -1526,15 +1531,11 @@ def _recover_missing_execution_trades_from_okx_positions(
         pos_size = _row_float(row, "pos", "availPos", "notionalUsd", "imr", "margin")
         if abs(pos_size) <= 0:
             continue
-        force_recover = _force_recover_symbol_active(inst_id)
         if inst_id in represented:
-            if force_recover:
-                _clear_force_recover_symbol(inst_id)
-                print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented_force_mark_cleared", flush=True)
-            else:
-                print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
+            print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
             continue
         grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
+        force_recover = _has_force_recover_okx_symbol(inst_id)
         if grace_remaining > 0 and not force_recover:
             imported_symbols_marker = stats.setdefault("grace_symbols", [])
             if isinstance(imported_symbols_marker, list):
@@ -1546,6 +1547,8 @@ def _recover_missing_execution_trades_from_okx_positions(
                 flush=True,
             )
             continue
+        if force_recover:
+            print(f"OKX_POSITION_RECOVERY_FORCE | {inst_id} | reason=marked_unverified_after_okx_success", flush=True)
 
         # Fresh Redis check before classifying a live OKX position as recovered.
         # This avoids BOT_ORDER_RESTORED / RECOVERED_FROM_OKX when the trade was
@@ -1560,11 +1563,11 @@ def _recover_missing_execution_trades_from_okx_positions(
             if fresh_trades:
                 fresh_represented = _tracked_live_symbol_set(fresh_trades)
                 if inst_id in fresh_represented:
-                    _clear_force_recover_symbol(inst_id)
                     print(
                         f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=fresh_redis_already_represented",
                         flush=True,
                     )
+                    _clear_force_recover_okx_symbol(inst_id)
                     represented.add(inst_id)
                     continue
 
@@ -1573,9 +1576,9 @@ def _recover_missing_execution_trades_from_okx_positions(
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
         recovered.append(trade)
+        _clear_force_recover_okx_symbol(inst_id)
         represented.add(inst_id)
         imported_symbols.append(inst_id)
-        _clear_force_recover_symbol(inst_id)
 
     stats.update({
         "enabled": True,
@@ -4019,6 +4022,51 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
                 print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
 
+
+def _diagnose_okx_tracking_mismatch(
+    trades: list,
+    okx_client: OKXTradeClient | None,
+    settings: Settings,
+    exchange_reconcile_stats: dict | None = None,
+) -> dict:
+    stats = dict(exchange_reconcile_stats or {})
+    tracked_symbols = sorted(_tracked_live_symbol_set(trades))
+    tracked_general = int(_execution_slot_counts(trades).get("general", 0) or 0)
+    if not _is_live_okx_execution_mode(settings, okx_client):
+        stats.update({
+            "okx_tracking_checked": False,
+            "okx_tracking_tracked_general": tracked_general,
+            "okx_tracking_tracked_symbols": tracked_symbols[:20],
+        })
+        return stats
+    ok, live_symbols, reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+    live_sorted = sorted(live_symbols)
+    missing_symbols = [symbol for symbol in live_sorted if symbol not in set(tracked_symbols)]
+    stats.update({
+        "okx_tracking_checked": ok,
+        "okx_tracking_reason": reason,
+        "okx_tracking_live_positions": len(live_sorted),
+        "okx_tracking_live_symbols": live_sorted[:20],
+        "okx_tracking_tracked_general": tracked_general,
+        "okx_tracking_tracked_symbols": tracked_symbols[:20],
+        "okx_tracking_missing_symbols": missing_symbols[:20],
+        "tracking_mismatch": len(missing_symbols) > 0,
+    })
+    if ok and missing_symbols:
+        print(
+            f"OKX_TRACKING_MISMATCH | live={len(live_sorted)} | tracked={tracked_general} | missing={','.join(missing_symbols[:20])}",
+            flush=True,
+        )
+    elif ok:
+        print(
+            f"OKX_TRACKING_MATCH | live={len(live_sorted)} | tracked={tracked_general}",
+            flush=True,
+        )
+    else:
+        print(f"OKX_TRACKING_MISMATCH_CHECK_FAILED | reason={reason}", flush=True)
+    return stats
+
+
 def run_once(
     previous_state: MarketModeState | None = None,
     settings: Settings | None = None,
@@ -4083,14 +4131,6 @@ def run_once(
             trade_store.save_trades(persisted_trades)
         if isinstance(exchange_reconcile_stats, dict):
             exchange_reconcile_stats["okx_position_recovery"] = okx_recovery_stats
-            if exchange_reconcile_stats.get("okx_gate_guard_symbols"):
-                missing_after_recovery = _log_okx_tracking_mismatch(
-                    "after_recovery",
-                    set(exchange_reconcile_stats.get("okx_gate_guard_symbols") or []),
-                    persisted_trades,
-                )
-                if missing_after_recovery:
-                    exchange_reconcile_stats["okx_tracking_missing_symbols_after_recovery"] = missing_after_recovery[:20]
     else:
         okx_recovery_stats = {"enabled": False, "changed": False, "imported": 0, "reason": "simulation_mode"}
 
@@ -4233,9 +4273,6 @@ def run_once(
                     f"symbols={','.join(sorted(_okx_live_symbols))}",
                     flush=True,
                 )
-                _missing_okx_symbols = _log_okx_tracking_mismatch("gate_guard", _okx_live_symbols, gate_base_trades)
-                if _missing_okx_symbols and exchange_reconcile_stats is not None:
-                    exchange_reconcile_stats["okx_tracking_missing_symbols"] = _missing_okx_symbols[:20]
         except Exception as _exc:
             print(f"⚠️ OKX_GATE_GUARD | failed to fetch positions: {_exc}", flush=True)
 
@@ -4550,6 +4587,13 @@ def run_once(
         snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings, redis_client=_snapshot_redis_client(trade_store))
         if not snapshot_write_result.get("ok"):
             print(f"⚠️ Technical snapshot write failed: {snapshot_write_result}", flush=True)
+
+    exchange_reconcile_stats = _diagnose_okx_tracking_mismatch(
+        trades,
+        okx_client,
+        settings,
+        exchange_reconcile_stats=exchange_reconcile_stats if isinstance(exchange_reconcile_stats, dict) else None,
+    )
 
     mode_context = _build_mode_context(state, snapshot, protection)
     protection_scope = _protection_scope(settings)
@@ -4902,11 +4946,11 @@ def _verify_or_force_persist_exchange_trade(
         try:
             loaded = list(trade_store.load_trades() or [])
             if _trade_exists_in_loaded_trades(loaded, candidate_trade):
+                _clear_force_recover_okx_symbol(symbol)
                 print(
                     f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | attempt={attempt}",
                     flush=True,
                 )
-                _clear_force_recover_symbol(symbol)
                 return True
 
             merged, added = _merge_trade_into_list(loaded, candidate_trade)
@@ -4922,11 +4966,11 @@ def _verify_or_force_persist_exchange_trade(
             if _trade_exists_in_loaded_trades(loaded_after, candidate_trade):
                 if isinstance(result, dict):
                     result["trades"] = loaded_after
+                _clear_force_recover_okx_symbol(symbol)
                 print(
                     f"✅ TRACK_TRADE_VERIFIED | {symbol or '-'} | id={trade_id or '-'} | after_force=1",
                     flush=True,
                 )
-                _clear_force_recover_symbol(symbol)
                 return True
         except Exception as exc:
             print(
@@ -4939,7 +4983,7 @@ def _verify_or_force_persist_exchange_trade(
             except Exception:
                 pass
 
-    _mark_force_recover_symbol(symbol, reason="unverified_after_okx_success")
+    _mark_force_recover_okx_symbol(symbol)
     print(
         f"🚨 TRACK_TRADE_UNVERIFIED_AFTER_OKX_SUCCESS | {symbol or '-'} | id={trade_id or '-'} | "
         "position may be recovered later from OKX",
