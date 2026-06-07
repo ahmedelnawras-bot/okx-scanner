@@ -150,22 +150,55 @@ def _sync_live_stop_snapshot(trade: TrackedTrade, okx_client: Any) -> TrackedTra
     if not isinstance(snapshot, dict):
         return trade
 
-    current_sl = _safe_float(snapshot.get("slTriggerPx") or snapshot.get("trigger_px"), 0.0)
+    # okx_trade_client.get_attached_stop_from_order returns a normalized
+    # current_sl_trigger_px + attach_algo dict. Keep backward compatibility
+    # with older direct shapes too.
+    attach_algo = snapshot.get("attach_algo") if isinstance(snapshot.get("attach_algo"), dict) else {}
+    current_sl = _safe_float(
+        snapshot.get("current_sl_trigger_px")
+        or snapshot.get("slTriggerPx")
+        or snapshot.get("trigger_px")
+        or attach_algo.get("slTriggerPx")
+        or attach_algo.get("newSlTriggerPx"),
+        0.0,
+    )
     if current_sl > 0:
         _safe_setattr(trade, "live_stop_loss_px", current_sl)
         _safe_setattr(trade, "last_exchange_sync_at", datetime.now(timezone.utc))
 
-    attach_algo_id = snapshot.get("attachAlgoId") or snapshot.get("algoId")
+    attach_algo_id = (
+        snapshot.get("attachAlgoId")
+        or snapshot.get("algoId")
+        or attach_algo.get("attachAlgoId")
+        or attach_algo.get("algoId")
+    )
     if attach_algo_id:
         _safe_setattr(trade, "sl_attach_algo_id", str(attach_algo_id))
 
+    attach_algo_cl_ord_id = (
+        snapshot.get("attachAlgoClOrdId")
+        or snapshot.get("algoClOrdId")
+        or attach_algo.get("attachAlgoClOrdId")
+        or attach_algo.get("algoClOrdId")
+    )
+    if attach_algo_cl_ord_id:
+        _safe_setattr(trade, "sl_attach_algo_cl_ord_id", str(attach_algo_cl_ord_id))
+
     return trade
+
+
+def _stop_sync_td_mode(trade: TrackedTrade) -> str:
+    for attr in ("td_mode", "margin_mode", "okx_td_mode"):
+        value = str(getattr(trade, attr, "") or "").strip().lower()
+        if value in {"isolated", "cross"}:
+            return value
+    return "isolated"
 
 
 def _sync_stop_loss_to_exchange(trade: TrackedTrade, okx_client: Any) -> TrackedTrade:
     inst_id = str(getattr(trade, "symbol", "") or "")
     ord_id, _ = _entry_identifiers(trade)
-    if not inst_id or not ord_id:
+    if not inst_id:
         return trade
 
     desired_sl = max(
@@ -179,24 +212,61 @@ def _sync_stop_loss_to_exchange(trade: TrackedTrade, okx_client: Any) -> Tracked
     if live_sl > 0 and desired_sl <= live_sl + 1e-12:
         return trade
 
-    amend_result = _call_if_exists(
-        okx_client,
-        "sync_attached_stop_loss",
-        inst_id=inst_id,
-        ord_id=ord_id,
-        desired_sl_trigger_px=desired_sl,
-        current_sl_trigger_px=live_sl if live_sl > 0 else None,
-        attach_algo_id=str(getattr(trade, "sl_attach_algo_id", "") or "") or None,
-    )
+    # Prefer the stronger helper when available. It amends the attached SL first,
+    # then recreates an independent reduce-only conditional SL if OKX says the
+    # old attached order/algo is filled, canceled, missing, or no longer amendable.
+    if callable(getattr(okx_client, "sync_or_recreate_stop_loss", None)):
+        amend_result = _call_if_exists(
+            okx_client,
+            "sync_or_recreate_stop_loss",
+            inst_id=inst_id,
+            ord_id=ord_id or None,
+            desired_sl_trigger_px=desired_sl,
+            current_sl_trigger_px=live_sl if live_sl > 0 else None,
+            attach_algo_id=str(getattr(trade, "sl_attach_algo_id", "") or "") or None,
+            attach_algo_cl_ord_id=str(getattr(trade, "sl_attach_algo_cl_ord_id", "") or "") or None,
+            existing_stop_algo_id=str(getattr(trade, "live_stop_loss_algo_id", "") or "") or None,
+            existing_stop_algo_cl_ord_id=str(getattr(trade, "live_stop_loss_algo_cl_ord_id", "") or "") or None,
+            td_mode=_stop_sync_td_mode(trade),
+            pos_side=str(getattr(trade, "pos_side", "") or "long"),
+            tag="slprotect",
+        )
+    else:
+        if not ord_id:
+            return trade
+        amend_result = _call_if_exists(
+            okx_client,
+            "sync_attached_stop_loss",
+            inst_id=inst_id,
+            ord_id=ord_id,
+            desired_sl_trigger_px=desired_sl,
+            current_sl_trigger_px=live_sl if live_sl > 0 else None,
+            attach_algo_id=str(getattr(trade, "sl_attach_algo_id", "") or "") or None,
+        )
+
     if not isinstance(amend_result, dict):
         return trade
 
     _safe_setattr(trade, "sl_sync_result", amend_result)
     _safe_setattr(trade, "last_exchange_sync_at", datetime.now(timezone.utc))
 
+    action = str(amend_result.get("action") or "").strip().lower()
     if bool(amend_result.get("ok")):
         _safe_setattr(trade, "live_stop_loss_px", desired_sl)
-        _safe_setattr(trade, "exchange_sync_state", "sl_synced")
+        algo_id = amend_result.get("algo_id") or amend_result.get("attach_algo_id")
+        algo_cl = amend_result.get("algo_client_order_id") or amend_result.get("attach_algo_cl_ord_id")
+        if algo_id:
+            _safe_setattr(trade, "live_stop_loss_algo_id", str(algo_id))
+            if action == "recreated":
+                _safe_setattr(trade, "sl_attach_algo_id", str(algo_id))
+        if algo_cl:
+            _safe_setattr(trade, "live_stop_loss_algo_cl_ord_id", str(algo_cl))
+        if action == "recreated":
+            _safe_setattr(trade, "exchange_sync_state", "sl_recreated_after_amend_failed")
+        elif action == "skipped":
+            _safe_setattr(trade, "exchange_sync_state", "sl_sync_skipped_no_upgrade")
+        else:
+            _safe_setattr(trade, "exchange_sync_state", "sl_synced")
     elif amend_result.get("reason"):
         _safe_setattr(trade, "exchange_sync_state", f"sl_sync_failed:{amend_result.get('reason')}")
 
