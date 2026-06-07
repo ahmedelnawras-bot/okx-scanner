@@ -4674,29 +4674,56 @@ def _activate_announced_trade(
 
 
 
-def _trade_matches_identity(trade, trade_id: str = "", symbol: str = "") -> bool:
-    """Return True when a stored trade is the same execution position."""
+def _trade_exchange_identity(trade) -> tuple[str, str]:
+    """Return strong exchange identity for a tracked trade.
+
+    trade_id is the primary identity. For live execution trades, entry order/client
+    order ids are the only acceptable fallback. Symbol alone is intentionally NOT
+    an identity because the strategy allows re-entry on the same symbol after TP2.
+    """
+    try:
+        trade_id = str(getattr(trade, "trade_id", "") or "").strip()
+        order_id = str(getattr(trade, "entry_order_id", "") or "").strip()
+        client_order_id = str(getattr(trade, "entry_client_order_id", "") or "").strip()
+        order_identity = order_id or client_order_id
+        return trade_id, order_identity
+    except Exception:
+        return "", ""
+
+
+def _trade_matches_identity(trade, candidate_trade=None, trade_id: str = "", symbol: str = "") -> bool:
+    """Return True only for the same execution trade, never symbol-only.
+
+    This prevents false verification when an older runner/open trade exists on
+    the same symbol and the bot is allowed to open a fresh re-entry after TP2.
+    """
     try:
         wanted_id = str(trade_id or "").strip()
-        wanted_symbol = _normalize_okx_inst_id(symbol)
-        existing_id = str(getattr(trade, "trade_id", "") or "").strip()
-        existing_symbol = _normalize_okx_inst_id(getattr(trade, "symbol", ""))
-        if wanted_id and existing_id and wanted_id == existing_id:
-            return True
-        if wanted_symbol and existing_symbol and wanted_symbol == existing_symbol:
-            return bool(getattr(trade, "execution_trade", False)) and not bool(getattr(trade, "is_closed", False))
+        wanted_order_identity = ""
+        if candidate_trade is not None:
+            wanted_id = wanted_id or str(getattr(candidate_trade, "trade_id", "") or "").strip()
+            wanted_order_identity = (
+                str(getattr(candidate_trade, "entry_order_id", "") or "").strip()
+                or str(getattr(candidate_trade, "entry_client_order_id", "") or "").strip()
+            )
+
+        existing_id, existing_order_identity = _trade_exchange_identity(trade)
+
+        if wanted_id and existing_id:
+            return wanted_id == existing_id
+        if wanted_order_identity and existing_order_identity:
+            return wanted_order_identity == existing_order_identity
     except Exception:
         return False
     return False
 
 
 def _merge_trade_into_list(trades: list, candidate_trade) -> tuple[list, bool]:
-    """Merge candidate trade into a list by trade_id first, then live symbol."""
+    """Merge candidate trade only by strong identity, never by symbol-only."""
     merged = list(trades or [])
     trade_id = str(getattr(candidate_trade, "trade_id", "") or "").strip()
-    symbol = _normalize_okx_inst_id(getattr(candidate_trade, "symbol", ""))
     for idx, trade in enumerate(merged):
-        if _trade_matches_identity(trade, trade_id=trade_id, symbol=symbol):
+        if _trade_matches_identity(trade, candidate_trade=candidate_trade, trade_id=trade_id):
             merged[idx] = candidate_trade
             return merged, False
     merged.append(candidate_trade)
@@ -4705,8 +4732,7 @@ def _merge_trade_into_list(trades: list, candidate_trade) -> tuple[list, bool]:
 
 def _trade_exists_in_loaded_trades(trades: list, candidate_trade) -> bool:
     trade_id = str(getattr(candidate_trade, "trade_id", "") or "").strip()
-    symbol = _normalize_okx_inst_id(getattr(candidate_trade, "symbol", ""))
-    return any(_trade_matches_identity(t, trade_id=trade_id, symbol=symbol) for t in (trades or []))
+    return any(_trade_matches_identity(t, candidate_trade=candidate_trade, trade_id=trade_id) for t in (trades or []))
 
 
 def _verify_or_force_persist_exchange_trade(
@@ -4824,18 +4850,8 @@ def _register_exchange_trade_immediately(
     trades = list(result.get("trades", []) or [])
     trade_id = str(getattr(candidate_trade, "trade_id", "") or "")
     symbol = str(getattr(candidate_trade, "symbol", "") or "").upper()
-    updated_existing = False
-
-    for idx, trade in enumerate(trades):
-        existing_id = str(getattr(trade, "trade_id", "") or "")
-        existing_symbol = str(getattr(trade, "symbol", "") or "").upper()
-        if (trade_id and existing_id == trade_id) or (symbol and existing_symbol == symbol and _blocks_same_symbol_reentry(trade)):
-            trades[idx] = candidate_trade
-            updated_existing = True
-            break
-
-    if not updated_existing:
-        trades.append(candidate_trade)
+    trades, added_new_trade = _merge_trade_into_list(trades, candidate_trade)
+    updated_existing = not added_new_trade
 
     result["trades"] = trades
     item["register_as_open_trade"] = True
