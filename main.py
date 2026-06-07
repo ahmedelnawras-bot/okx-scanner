@@ -1417,6 +1417,7 @@ def _recover_missing_execution_trades_from_okx_positions(
     trades: list,
     okx_client: OKXTradeClient | None,
     settings: Settings,
+    trade_store: RedisTradeStore | None = None,
 ) -> tuple[list, dict]:
     """Import live OKX positions missing from Redis as conservative execution trades.
 
@@ -1476,6 +1477,27 @@ def _recover_missing_execution_trades_from_okx_positions(
                 flush=True,
             )
             continue
+
+        # Fresh Redis check before classifying a live OKX position as recovered.
+        # This avoids BOT_ORDER_RESTORED / RECOVERED_FROM_OKX when the trade was
+        # registered after the initial persisted_trades snapshot but before this
+        # recovery loop runs.
+        if trade_store and getattr(trade_store, "enabled", False):
+            try:
+                fresh_trades = trade_store.load_trades() or []
+            except Exception as exc:
+                fresh_trades = []
+                print(f"⚠️ OKX_POSITION_RECOVERY_FRESH_LOAD_FAILED | {inst_id} | {exc}", flush=True)
+            if fresh_trades:
+                fresh_represented = _tracked_live_symbol_set(fresh_trades)
+                if inst_id in fresh_represented:
+                    print(
+                        f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=fresh_redis_already_represented",
+                        flush=True,
+                    )
+                    represented.add(inst_id)
+                    continue
+
         trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
@@ -3944,6 +3966,7 @@ def run_once(
             persisted_trades,
             okx_client,
             settings,
+            trade_store=trade_store,
         )
         if okx_recovery_stats.get("changed") and trade_store:
             trade_store.save_trades(persisted_trades)
