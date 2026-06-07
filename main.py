@@ -2231,13 +2231,31 @@ def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_sta
     return inputs
 
 
-def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
+def _current_equity_for_manual_resume(
+    result: dict | None,
+    settings: Settings,
+    portfolio_state_inputs: dict | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> float:
     result = result or {}
     if _is_simulation_mode(settings):
         wallet = result.get("simulation_wallet") or {}
         equity = _safe_float(wallet.get("equity"), 0.0)
         if equity > 0:
             return equity
+
+    # In live execution mode, manual resume must use the current OKX equity
+    # at confirmation time, not a stale scan snapshot/fallback baseline.
+    if _is_live_okx_execution_mode(settings, okx_client):
+        try:
+            balance_response = okx_client.get_balance() if okx_client is not None else None
+        except Exception as exc:
+            balance_response = None
+            print(f"⚠️ manual resume live OKX balance fetch failed: {exc}", flush=True)
+        live_equity = _extract_okx_reference_balance_usdt(balance_response if isinstance(balance_response, dict) else None)
+        if live_equity > 0:
+            return live_equity
+
     portfolio_state = result.get("portfolio_state")
     for attr in ("current_equity", "equity", "balance", "portfolio_value", "current_balance"):
         try:
@@ -2254,9 +2272,13 @@ def _current_equity_for_manual_resume(result: dict | None, settings: Settings, p
     return 0.0
 
 
-def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
+def _build_manual_resume_preview(
+    result: dict | None,
+    settings: Settings,
+    okx_client: OKXTradeClient | None = None,
+) -> str:
     scope = _protection_scope(settings)
-    equity = _current_equity_for_manual_resume(result, settings)
+    equity = _current_equity_for_manual_resume(result, settings, okx_client=okx_client)
     loss_guard = (result or {}).get("loss_streak_guard") or {}
     drawdown = (result or {}).get("drawdown_status")
     dd_line = "غير متاح"
@@ -2288,10 +2310,11 @@ def _confirm_manual_resume_trading(
     result: dict | None,
     settings: Settings,
     trade_store: RedisTradeStore | None = None,
+    okx_client: OKXTradeClient | None = None,
 ) -> str:
     scope = _protection_scope(settings)
     now = datetime.now(timezone.utc)
-    equity = _current_equity_for_manual_resume(result, settings)
+    equity = _current_equity_for_manual_resume(result, settings, okx_client=okx_client)
     state = _load_protection_state(trade_store, scope)
     state.update({
         "manual_override": True,
@@ -7277,12 +7300,13 @@ def _handle_admin_clean_command(
     trade_store: RedisTradeStore | None,
     result: dict | None = None,
     settings: Settings | None = None,
+    okx_client: OKXTradeClient | None = None,
 ) -> str | None:
     runtime_settings = settings or get_settings()
     if command in {"/resume_trading", "/resume_protection", "/resume_daily_dd"}:
-        return _build_manual_resume_preview(result, runtime_settings)
+        return _build_manual_resume_preview(result, runtime_settings, okx_client=okx_client)
     if command in {"/confirm_resume_trading", "/confirm_resume_protection", "/confirm_resume_daily_dd"}:
-        return _confirm_manual_resume_trading(result, runtime_settings, trade_store)
+        return _confirm_manual_resume_trading(result, runtime_settings, trade_store, okx_client=okx_client)
 
     reset_preview_commands = {
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
@@ -7629,6 +7653,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             trade_store,
             result=result,
             settings=runtime_settings,
+            okx_client=okx_client,
         )
         if admin_reply is not None:
             _send_text(sender, admin_reply, reply_markup=_build_bot_modes_keyboard(runtime_settings))
@@ -7837,7 +7862,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
-            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
+            clean_reply = _handle_admin_clean_command(command, trade_store, result, settings, okx_client=okx_client)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
                 continue
