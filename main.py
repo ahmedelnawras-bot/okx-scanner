@@ -1297,7 +1297,7 @@ def _tracked_live_symbol_set(trades: list) -> set[str]:
         if not getattr(trade, "execution_trade", False):
             continue
         status = str(getattr(trade, "status", "") or "").strip().lower()
-        if bool(getattr(trade, "is_closed", False)) or status in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+        if bool(getattr(trade, "is_closed", False)) or status in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
             continue
         inst_id = _trade_symbol_inst_id(trade)
         if inst_id:
@@ -1530,20 +1530,20 @@ def _repair_execution_trades_from_live_okx_positions(
     the existing Redis record is corrupted, closed, slot-exempt, missing
     execution_trade=True, or otherwise invisible to the report filters.
 
-    For every live OKX SWAP position:
-    - repair an existing same-symbol trade in-place when present;
-    - otherwise append a conservative RECOVERED_FROM_OKX trade;
-    - force the record to be report-visible and slot-counted.
-
-    Trading decisions still use OKX guards separately. This function is for
-    status/report synchronization only.
+    Surgical add-on:
+    - after repairing/importing the live OKX position, close stale same-symbol
+      duplicate records that are still marked open in Redis/report;
+    - keep TP2 protected runners, because they are intentionally slot-exempt
+      and same-symbol re-entry is allowed after TP2.
     """
     stats = {
         "enabled": False,
         "changed": False,
         "repaired": 0,
         "imported": 0,
+        "dedup_closed": 0,
         "symbols": [],
+        "dedup_symbols": [],
         "reason": "not_live_okx_mode",
     }
     repaired = list(trades or [])
@@ -1573,7 +1573,130 @@ def _repair_execution_trades_from_live_okx_positions(
         except Exception:
             return False
 
+    def _active_execution_record(trade) -> bool:
+        status = str(getattr(trade, "status", "") or "").strip().lower()
+        if not bool(getattr(trade, "execution_trade", False)):
+            return False
+        if bool(getattr(trade, "is_closed", False)) or getattr(trade, "closed_at", None):
+            return False
+        if status in {
+            "closed",
+            "closed_win",
+            "closed_loss",
+            "breakeven_after_tp1",
+            "trailing_hit",
+            "expired",
+            "duplicate_closed_by_okx_repair",
+        }:
+            return False
+        return True
+
+    def _is_tp2_runner_record(trade) -> bool:
+        return bool(
+            getattr(trade, "tp2_hit", False)
+            and (
+                getattr(trade, "runner_active", False)
+                or getattr(trade, "protected_runner", False)
+                or getattr(trade, "slot_exempt", False)
+                or getattr(trade, "same_symbol_block_exempt", False)
+            )
+        )
+
+    def _long_plan_invalid_for_live_position(trade) -> bool:
+        """Detect obviously stale/corrupted long records.
+
+        For a live long position:
+        - TP1 should not be below entry.
+        - TP2 should not be below TP1.
+        - SL should normally be below entry, unless protected_sl/live SL has
+          already moved to breakeven/TP1 after TP1/TP2.
+        """
+        entry_px = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+        tp1_px = _safe_float(getattr(trade, "tp1", 0.0), 0.0)
+        tp2_px = _safe_float(getattr(trade, "tp2", 0.0), 0.0)
+        sl_px = _safe_float(getattr(trade, "sl", 0.0), 0.0)
+        protected_sl_px = _safe_float(getattr(trade, "protected_sl", 0.0), 0.0)
+        live_sl_px = _safe_float(getattr(trade, "live_stop_loss_px", 0.0), 0.0)
+
+        if entry_px <= 0:
+            return False
+
+        tolerance = max(abs(entry_px) * 0.0001, 1e-12)
+        if tp1_px > 0 and tp1_px < entry_px - tolerance:
+            return True
+        if tp1_px > 0 and tp2_px > 0 and tp2_px < tp1_px - tolerance:
+            return True
+
+        # A base SL above entry before TP1 is suspicious, but protected/live SL
+        # may legitimately be above entry after TP1/TP2. Do not close those.
+        if (
+            sl_px > entry_px + tolerance
+            and protected_sl_px <= 0
+            and live_sl_px <= 0
+            and not bool(getattr(trade, "tp1_hit", False))
+            and not bool(getattr(trade, "tp2_hit", False))
+        ):
+            return True
+
+        return False
+
+    def _repair_preference_score(trade, row: dict, inst_id: str) -> float:
+        """Choose the best Redis record to represent the single live OKX position."""
+        score = 0.0
+        if not _same_symbol(trade, inst_id):
+            return -1_000_000.0
+        if _active_execution_record(trade):
+            score += 100.0
+        if _is_tp2_runner_record(trade):
+            # Keep TP2 runners, but do not let them become the primary record
+            # for a fresh non-TP2 live OKX position if another active record exists.
+            score -= 40.0
+        if _long_plan_invalid_for_live_position(trade):
+            score -= 300.0
+        sync_state = str(getattr(trade, "exchange_sync_state", "") or "").lower()
+        market_mode = str(getattr(trade, "market_mode", "") or "").upper()
+        setup_type = str(getattr(trade, "setup_type", "") or "").lower()
+        if "live_okx_position_repaired" in sync_state:
+            score += 80.0
+        if "bot_order_restored" in sync_state or "BOT_ORDER_RESTORED" in market_mode or "bot_order_restored" in setup_type:
+            score += 70.0
+        if "recovered" in sync_state or "RECOVERED" in market_mode or "recovered" in setup_type:
+            score += 40.0
+        if getattr(trade, "entry_order_id", None) or getattr(trade, "entry_client_order_id", None):
+            score += 20.0
+
+        row_entry = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+        entry_px = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+        if row_entry > 0 and entry_px > 0:
+            rel_diff = abs(entry_px - row_entry) / row_entry
+            score += max(0.0, 30.0 - rel_diff * 1000.0)
+        return score
+
+    def _close_duplicate_record(trade, inst_id: str, reason: str) -> None:
+        now = datetime.now(timezone.utc)
+        realized = _estimate_reconcile_close_raw_pnl_pct(trade)
+        if abs(_safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)) <= 1e-12:
+            _safe_set_trade_attr(trade, "realized_pnl_pct", realized)
+        _safe_set_trade_attr(trade, "manual_close_estimated_pnl_pct", realized)
+        _safe_set_trade_attr(trade, "status", "duplicate_closed_by_okx_repair")
+        _safe_set_trade_attr(trade, "is_closed", True)
+        _safe_set_trade_attr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
+        _safe_set_trade_attr(trade, "updated_at", now)
+        _safe_set_trade_attr(trade, "slot_exempt", True)
+        _safe_set_trade_attr(trade, "daily_open_risk_exempt", True)
+        _safe_set_trade_attr(trade, "same_symbol_block_exempt", True)
+        _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", False)
+        _safe_set_trade_attr(trade, "counts_as_active_slot", False)
+        _safe_set_trade_attr(trade, "exchange_sync_state", "duplicate_closed_by_okx_repair")
+        _safe_set_trade_attr(trade, "exchange_close_reason", reason)
+        print(
+            f"OKX_POSITION_REPAIR_DEDUP_CLOSE | {inst_id} | "
+            f"trade_id={getattr(trade, 'trade_id', '-') or '-'} | reason={reason} | realized_raw={realized:+.4f}%",
+            flush=True,
+        )
+
     changed_symbols: list[str] = []
+    primary_by_inst_id: dict[str, object] = {}
 
     for row in _okx_result_rows(positions_result):
         inst_id = _row_inst_id(row)
@@ -1590,13 +1713,16 @@ def _repair_execution_trades_from_live_okx_positions(
         leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
         pnl_pct = ((current - entry) / entry) * 100.0 if entry > 0 and current > 0 else 0.0
 
-        # Prefer repairing an existing same-symbol record, even if it is closed
-        # or malformed, so Redis does not accumulate duplicate recovered trades.
+        # Prefer the best same-symbol record instead of the first one.
+        # The previous first-match behavior could keep a stale Redis record open
+        # and leave the fresh restored OKX record duplicated in reports.
+        same_symbol_records = [trade for trade in repaired if _same_symbol(trade, inst_id)]
         target = None
-        for trade in repaired:
-            if _same_symbol(trade, inst_id):
-                target = trade
-                break
+        if same_symbol_records:
+            target = max(
+                same_symbol_records,
+                key=lambda trade: _repair_preference_score(trade, row, inst_id),
+            )
 
         imported = False
         if target is None:
@@ -1607,6 +1733,8 @@ def _repair_execution_trades_from_live_okx_positions(
             repaired.append(target)
             imported = True
 
+        primary_by_inst_id[inst_id] = target
+
         now = datetime.now(timezone.utc)
         before_state = {
             "execution_trade": bool(getattr(target, "execution_trade", False)),
@@ -1614,6 +1742,7 @@ def _repair_execution_trades_from_live_okx_positions(
             "is_closed": bool(getattr(target, "is_closed", False)),
             "slot_exempt": bool(getattr(target, "slot_exempt", False)),
             "symbol": str(getattr(target, "symbol", "") or ""),
+            "tp2_hit": bool(getattr(target, "tp2_hit", False)),
         }
 
         _safe_set_trade_attr(target, "symbol", inst_id)
@@ -1627,14 +1756,25 @@ def _repair_execution_trades_from_live_okx_positions(
         _safe_set_trade_attr(target, "exchange_sync_state", "live_okx_position_repaired")
         _safe_set_trade_attr(target, "last_exchange_sync_at", now)
         _safe_set_trade_attr(target, "updated_at", now)
-        _safe_set_trade_attr(target, "status", "open")
+        _safe_set_trade_attr(target, "status", "runner" if bool(getattr(target, "tp2_hit", False)) else "open")
         _safe_set_trade_attr(target, "is_closed", False)
         _safe_set_trade_attr(target, "closed_at", None)
-        _safe_set_trade_attr(target, "slot_exempt", False)
-        _safe_set_trade_attr(target, "daily_open_risk_exempt", False)
-        _safe_set_trade_attr(target, "same_symbol_block_exempt", False)
-        _safe_set_trade_attr(target, "blocks_same_symbol_reentry", True)
-        _safe_set_trade_attr(target, "counts_as_active_slot", True)
+
+        if bool(getattr(target, "tp2_hit", False)):
+            # TP2 runner remains visible, but must not consume a slot or block re-entry.
+            _safe_set_trade_attr(target, "slot_exempt", True)
+            _safe_set_trade_attr(target, "daily_open_risk_exempt", True)
+            _safe_set_trade_attr(target, "same_symbol_block_exempt", True)
+            _safe_set_trade_attr(target, "blocks_same_symbol_reentry", False)
+            _safe_set_trade_attr(target, "counts_as_active_slot", False)
+            _safe_set_trade_attr(target, "slot_exempt_reason", str(getattr(target, "slot_exempt_reason", "") or "tp2_protected_runner"))
+        else:
+            _safe_set_trade_attr(target, "slot_exempt", False)
+            _safe_set_trade_attr(target, "daily_open_risk_exempt", False)
+            _safe_set_trade_attr(target, "same_symbol_block_exempt", False)
+            _safe_set_trade_attr(target, "blocks_same_symbol_reentry", True)
+            _safe_set_trade_attr(target, "counts_as_active_slot", True)
+
         _safe_set_trade_attr(target, "execution_path", str(getattr(target, "execution_path", "") or "general"))
         _safe_set_trade_attr(target, "market_mode", str(getattr(target, "market_mode", "") or "RECOVERED_FROM_OKX"))
         _safe_set_trade_attr(target, "setup_type", str(getattr(target, "setup_type", "") or "okx_recovered_position"))
@@ -1666,6 +1806,7 @@ def _repair_execution_trades_from_live_okx_positions(
             "is_closed": bool(getattr(target, "is_closed", False)),
             "slot_exempt": bool(getattr(target, "slot_exempt", False)),
             "symbol": str(getattr(target, "symbol", "") or ""),
+            "tp2_hit": bool(getattr(target, "tp2_hit", False)),
         }
 
         stats["imported"] = int(stats.get("imported", 0) or 0) + (1 if imported else 0)
@@ -1677,20 +1818,55 @@ def _repair_execution_trades_from_live_okx_positions(
                 f"status={before_state.get('status')}->{after_state.get('status')} | "
                 f"exec={before_state.get('execution_trade')}->{after_state.get('execution_trade')} | "
                 f"closed={before_state.get('is_closed')}->{after_state.get('is_closed')} | "
-                f"slot_exempt={before_state.get('slot_exempt')}->{after_state.get('slot_exempt')}",
+                f"slot_exempt={before_state.get('slot_exempt')}->{after_state.get('slot_exempt')} | "
+                f"tp2={before_state.get('tp2_hit')}->{after_state.get('tp2_hit')}",
                 flush=True,
             )
 
+    # Close stale duplicate non-TP2 same-symbol records.
+    # OKX net-position mode normally exposes one live position per symbol; the
+    # bot may still have stale Redis duplicates after deploy/recovery. Keep:
+    # - the selected primary record for the live position;
+    # - any TP2 protected runner records, because those are intentionally
+    #   slot-exempt and same-symbol re-entry is allowed after TP2.
+    for inst_id, primary in list(primary_by_inst_id.items()):
+        for trade in list(repaired):
+            if trade is primary:
+                continue
+            if not _same_symbol(trade, inst_id):
+                continue
+            if not _active_execution_record(trade):
+                continue
+            if _is_tp2_runner_record(trade):
+                continue
+
+            reason = "same_symbol_duplicate_closed_by_okx_repair"
+            if _long_plan_invalid_for_live_position(trade):
+                reason = "invalid_long_plan_duplicate_closed_by_okx_repair"
+
+            _close_duplicate_record(trade, inst_id, reason)
+            stats["dedup_closed"] = int(stats.get("dedup_closed", 0) or 0) + 1
+            dedup_symbols = stats.setdefault("dedup_symbols", [])
+            if isinstance(dedup_symbols, list):
+                dedup_symbols.append(inst_id)
+            changed_symbols.append(inst_id)
+
     stats.update({
         "enabled": True,
-        "changed": bool(changed_symbols or int(stats.get("imported", 0) or 0)),
-        "symbols": changed_symbols[:20],
+        "changed": bool(
+            changed_symbols
+            or int(stats.get("imported", 0) or 0)
+            or int(stats.get("dedup_closed", 0) or 0)
+        ),
+        "symbols": list(dict.fromkeys(changed_symbols))[:20],
+        "dedup_symbols": list(dict.fromkeys(stats.get("dedup_symbols", []) or []))[:20],
         "reason": "ok",
     })
     print(
         "EXEC_REPORT_HARD_REPAIR | "
         f"repaired={int(stats.get('repaired', 0) or 0)} | "
         f"imported={int(stats.get('imported', 0) or 0)} | "
+        f"dedup_closed={int(stats.get('dedup_closed', 0) or 0)} | "
         f"symbols={','.join(stats.get('symbols', []) or []) or '-'}",
         flush=True,
     )
@@ -1792,7 +1968,7 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
             setattr(trade, "realized_pnl_pct", realized)
         setattr(trade, "manual_close_estimated_pnl_pct", realized)
 
-        if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+        if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
             if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
                 status = "closed_win"
             elif realized < 0:
@@ -3120,7 +3296,7 @@ def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
                 setattr(trade, "trade_source", "simulation")
                 setattr(trade, "tracking_bucket", "execution")
                 setattr(trade, "execution_trade", True)
-                if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
+                if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
                     setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
                 trades.append(trade)
     except Exception as exc:
