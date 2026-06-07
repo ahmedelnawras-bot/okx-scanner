@@ -1417,12 +1417,18 @@ def _recover_missing_execution_trades_from_okx_positions(
     trades: list,
     okx_client: OKXTradeClient | None,
     settings: Settings,
+    *,
+    force_import_recent: bool = False,
 ) -> tuple[list, dict]:
     """Import live OKX positions missing from Redis as conservative execution trades.
 
     This keeps Simulation isolated: it only runs in live OKX execution mode. The
     imported records are intentionally conservative: they consume slots and block
     same-symbol re-entry before TP2, but they do not invent TP/SL fills.
+
+    force_import_recent=True is a report/status hard-recovery path: it bypasses
+    the short OKX_RECOVERY_GRACE window so stale runtime reports can be repaired
+    immediately from live OKX positions. The normal scan path keeps the grace.
     """
     stats = {
         "enabled": False,
@@ -1432,6 +1438,7 @@ def _recover_missing_execution_trades_from_okx_positions(
         "reason": "not_live_okx_mode",
         "symbols": [],
         "grace_symbols": [],
+        "force_import_recent": bool(force_import_recent),
     }
     if not _is_live_okx_execution_mode(settings, okx_client):
         return list(trades or []), stats
@@ -1465,7 +1472,7 @@ def _recover_missing_execution_trades_from_okx_positions(
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
             continue
         grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
-        if grace_remaining > 0:
+        if grace_remaining > 0 and not force_import_recent:
             imported_symbols_marker = stats.setdefault("grace_symbols", [])
             if isinstance(imported_symbols_marker, list):
                 imported_symbols_marker.append(inst_id)
@@ -1476,6 +1483,12 @@ def _recover_missing_execution_trades_from_okx_positions(
                 flush=True,
             )
             continue
+        if grace_remaining > 0 and force_import_recent:
+            print(
+                f"OKX_POSITION_RECOVERY_HARD_FORCE | {inst_id} | "
+                f"remaining={grace_remaining}s | reason=report_status_hard_recovery",
+                flush=True,
+            )
         trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
@@ -7091,43 +7104,123 @@ def _refresh_execution_reports_from_redis(
     settings: Settings | None = None,
     okx_client: OKXTradeClient | None = None,
 ) -> None:
-    """Force /report_execution to use the latest Redis state, not stale scan output."""
+    """Force execution reports/status to use Redis + live OKX, not stale scan output.
+
+    Hard refresh order:
+    1) Load latest execution trades/checks from Redis.
+    2) Reconcile tracked trades against OKX without deleting report history.
+    3) Hard-recover any live OKX position missing from the runtime/Redis payload.
+       This bypasses the short post-order grace window for reports/status only.
+    4) Save recovered trades, rebuild reports, portfolio, drawdown and guards.
+    """
     if not isinstance(result, dict):
         return
+
     runtime_settings = settings or get_settings()
     refreshed_trades = list(result.get("trades", []) or [])
     refreshed_checks = list(result.get("execution_results", []) or [])
+
     if trade_store:
         try:
-            refreshed_trades = trade_store.load_trades() or refreshed_trades
+            redis_trades = trade_store.load_trades() or []
+            if redis_trades:
+                refreshed_trades = redis_trades
         except Exception as exc:
             print(f"⚠️ execution report redis trade refresh failed: {exc}", flush=True)
         try:
-            refreshed_checks = trade_store.load_execution_checks(limit=500) or refreshed_checks
+            redis_checks = trade_store.load_execution_checks(limit=500) or []
+            if redis_checks:
+                refreshed_checks = redis_checks
         except Exception as exc:
             print(f"⚠️ execution report redis checks refresh failed: {exc}", flush=True)
 
     reconcile_stats = None
-    if trade_store and _is_live_okx_execution_mode(runtime_settings, okx_client):
+    recovery_stats = None
+    live_okx_mode = _is_live_okx_execution_mode(runtime_settings, okx_client)
+
+    if live_okx_mode:
         try:
-            reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(refreshed_trades, okx_client, runtime_settings)
-            if reconcile_stats.get("changed"):
+            reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(
+                refreshed_trades,
+                okx_client,
+                runtime_settings,
+            )
+            if reconcile_stats.get("changed") and trade_store:
                 trade_store.save_trades(reconciled)
             refreshed_trades = reconciled
         except Exception as exc:
             print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
 
+        try:
+            recovered, recovery_stats = _recover_missing_execution_trades_from_okx_positions(
+                refreshed_trades,
+                okx_client,
+                runtime_settings,
+                force_import_recent=True,
+            )
+            if recovery_stats.get("changed") and trade_store:
+                trade_store.save_trades(recovered)
+            refreshed_trades = recovered
+            print(
+                "EXEC_REPORT_HARD_RECOVERY | "
+                f"live_okx_mode={live_okx_mode} | "
+                f"imported={int((recovery_stats or {}).get('imported', 0) or 0)} | "
+                f"symbols={','.join((recovery_stats or {}).get('symbols', []) or []) or '-'}",
+                flush=True,
+            )
+        except Exception as exc:
+            recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
+            print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
+
     result["trades"] = refreshed_trades
     result["execution_results"] = refreshed_checks
     if reconcile_stats:
         result["exchange_reconcile_stats"] = reconcile_stats
+    if recovery_stats:
+        result["okx_position_recovery_stats"] = recovery_stats
+        exchange_stats = dict(result.get("exchange_reconcile_stats") or {})
+        exchange_stats["okx_position_recovery"] = recovery_stats
+        result["exchange_reconcile_stats"] = exchange_stats
+
     portfolio_state_inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
+    protection_scope = _protection_scope(runtime_settings)
+    protection_state = _load_protection_state(trade_store, protection_scope)
+    portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     result["portfolio_state_inputs"] = portfolio_state_inputs
+    result["protection_state"] = protection_state
+
     kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
-    reports = build_report_bundle(refreshed_trades, refreshed_checks, list(result.get("signal_items", []) or []), **kwargs)
-    result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, list(result.get("signal_items", []) or []), **kwargs)
+    reports = build_report_bundle(
+        refreshed_trades,
+        refreshed_checks,
+        list(result.get("signal_items", []) or []),
+        **kwargs,
+    )
+    result["command_outputs"] = build_command_outputs(
+        refreshed_trades,
+        refreshed_checks,
+        list(result.get("signal_items", []) or []),
+        **kwargs,
+    )
     result.update(reports)
 
+    try:
+        portfolio_state = build_portfolio_state_from_trades(
+            refreshed_trades,
+            **_portfolio_state_kwargs(portfolio_state_inputs),
+        )
+        result["portfolio_state"] = portfolio_state
+        result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    except Exception as exc:
+        print(f"⚠️ execution report portfolio refresh failed: {exc}", flush=True)
+
+    try:
+        loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
+        result["loss_streak_guard"] = _build_loss_streak_guard(refreshed_trades, reset_at=loss_streak_reset_at)
+        result["risk_protection_summary"] = _risk_protection_summary(result)
+    except Exception as exc:
+        print(f"⚠️ execution report protection refresh failed: {exc}", flush=True)
 
 def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
     if not isinstance(result, dict):
@@ -7587,7 +7680,10 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         elif key == "admin":
             _send_text(sender, _build_admin_panel())
         elif key == "system_info":
-            _send_text(sender, _build_fast_status(result, settings or get_settings(), trade_store))
+            runtime_settings = settings or get_settings()
+            if not _is_simulation_mode(runtime_settings):
+                _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=runtime_settings, okx_client=okx_client)
+            _send_text(sender, _build_fast_status(result, runtime_settings, trade_store))
         else:
             sender.send_message("القسم غير متاح حاليًا.")
         return
@@ -7969,6 +8065,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 _send_ai_report_file(sender, command, today)
                 continue
             elif command == "/status":
+                if not _is_simulation_mode(settings):
+                    _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
                 reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
