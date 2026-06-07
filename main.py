@@ -5666,6 +5666,56 @@ def _track_candidates_for_source(result: dict, source: str, settings: Settings) 
         return execution_trades
     return [*execution_trades, *simulation_trades]
 
+
+
+def _rejection_telegram_sample_rate(exec_result: dict | None) -> float:
+    """Reduce noisy rejected-signal Telegram messages for selected reasons only.
+
+    All non-selected reasons remain 100% unchanged.
+    """
+    data = dict(exec_result or {})
+    reason = str(data.get("reason") or "").strip().lower()
+    raw_reason = str(data.get("raw_reason") or "").strip().lower()
+    rejection_category = str(data.get("rejection_category") or "").strip().lower()
+    status = str(data.get("status") or "").strip().lower()
+    haystack = " | ".join([reason, raw_reason, rejection_category, status])
+
+    if "rejected_quality" in haystack:
+        return 0.40
+    if "max_positions_reached" in haystack:
+        return 0.20
+    if "not_whitelisted" in haystack:
+        return 0.10
+    return 1.0
+
+
+def _should_send_rejection_telegram_message(signal, exec_result: dict | None) -> bool:
+    """Sample only selected low-priority rejection reasons.
+
+    Deterministic hashing keeps behavior stable without affecting other messages.
+    """
+    rate = float(_rejection_telegram_sample_rate(exec_result))
+    if rate >= 0.999:
+        return True
+    if rate <= 0:
+        return False
+
+    symbol = _normalize_okx_inst_id(getattr(signal, "symbol", "") if signal is not None else "")
+    data = dict(exec_result or {})
+    key = "|".join([
+        symbol,
+        str(data.get("status") or ""),
+        str(data.get("reason") or ""),
+        str(data.get("raw_reason") or ""),
+        str(data.get("rejection_category") or ""),
+        str(getattr(signal, "setup_type", "") if signal is not None else ""),
+        str(getattr(signal, "entry", "") if signal is not None else ""),
+    ])
+    import hashlib
+    bucket = int(hashlib.md5(key.encode("utf-8")).hexdigest()[:8], 16) % 100
+    return bucket < int(rate * 100)
+
+
 def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, sent_fingerprints: dict[str, float], okx_client: OKXTradeClient | None = None, trade_store: RedisTradeStore | None = None) -> None:
     for item in _iter_signal_items_for_dispatch(result):
         signal = item["signal"]
@@ -5690,6 +5740,16 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         can_place_order = exec_status == "accepted_preview"
         if not _should_dispatch_signal_item(item, settings):
             item["announcement_status"] = "filtered_signal_mode"
+            continue
+        if exec_status.startswith("rejected") and not _should_send_rejection_telegram_message(signal, exec_result):
+            item["announcement_status"] = "rejection_sampled_out"
+            print(
+                f"REJECTION_SAMPLE_SKIP | {getattr(signal, 'symbol', '-')} | "
+                f"reason={(exec_result or {}).get('reason') or (exec_result or {}).get('raw_reason') or '-'} | "
+                f"category={(exec_result or {}).get('rejection_category') or '-'} | "
+                f"rate={_rejection_telegram_sample_rate(exec_result):.2f}",
+                flush=True,
+            )
             continue
         fingerprint = _build_signal_fingerprint(signal, exec_result)
         dedup_ttl = _signal_fingerprint_ttl(exec_result)
