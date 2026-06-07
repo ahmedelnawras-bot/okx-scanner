@@ -319,6 +319,32 @@ def _recovery_soft_fail(snapshot: MarketSnapshot) -> bool:
     )
 
 
+def _recovery_age_minutes(state: MarketModeState, now: datetime) -> int:
+    """Age of the active recovery cycle.
+
+    RECOVERY_WINDOW_MINUTES is a maximum cap, not a forced holding period.
+    If recovery_cycle_started_at is missing for an old state, changed_at is the
+    safest fallback.
+    """
+    started = state.recovery_cycle_started_at or state.changed_at
+    if not isinstance(started, datetime):
+        return 0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return max(0, int((now - started).total_seconds() // 60))
+
+
+def _recovery_window_expired(state: MarketModeState, now: datetime) -> bool:
+    """Return True only after the configured max recovery window expires."""
+    try:
+        max_minutes = int(RECOVERY_WINDOW_MINUTES)
+    except Exception:
+        max_minutes = 90
+    if max_minutes <= 0:
+        return False
+    return _recovery_age_minutes(state, now) >= max_minutes
+
+
 def _base_mode(snapshot: MarketSnapshot) -> str:
     flags = _risk_flags(snapshot)
     if flags["fast_block_trigger"]:
@@ -370,10 +396,29 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
             candidate_mode = MODE_STRONG_LONG_ONLY
 
     elif previous.mode == MODE_RECOVERY_LONG:
+        # RECOVERY is an opportunistic rebound window, not a fixed 90-minute mode.
+        # 90 minutes is only the maximum cap. Every scan can exit earlier:
+        # - hard deterioration -> BLOCK
+        # - fully healthy market -> NORMAL after confirmation
+        # - rebound edge faded but market is still pressured/stabilizing -> STRONG
+        recovery_expired = _recovery_window_expired(previous, now)
+        recovery_edge_still_valid = bool(flags["recovery_ready"] and not _recovery_soft_fail(snapshot))
+
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
         elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
             candidate_mode = MODE_NORMAL_LONG
+        elif recovery_expired:
+            # Max window انتهى: ارجع للتقييم السوقي الحالي بدل تثبيت RECOVERY.
+            # لو السوق لسه حساس يبقى STRONG، ولو آمن تمامًا يبقى NORMAL.
+            candidate_mode = MODE_STRONG_LONG_ONLY if flags["weak_breadth"] or raw == MODE_STRONG_LONG_ONLY else MODE_NORMAL_LONG
+        elif not recovery_edge_still_valid and (
+            flags["recovery_to_strong_ready"]
+            or flags["weak_breadth"]
+            or _recovery_soft_fail(snapshot)
+            or raw == MODE_STRONG_LONG_ONLY
+        ):
+            candidate_mode = MODE_STRONG_LONG_ONLY
         else:
             candidate_mode = MODE_RECOVERY_LONG
 
@@ -396,6 +441,10 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
 
         if minutes_in_mode < required_cooldown:
             if previous.mode == MODE_BLOCK_LONGS and candidate_mode in (MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG):
+                pass
+            elif previous.mode == MODE_RECOVERY_LONG and candidate_mode == MODE_STRONG_LONG_ONLY:
+                # Recovery -> Strong is a safety downgrade, not a bullish upgrade.
+                # Do not hold stale Recovery just because the generic cooldown is active.
                 pass
             elif candidate_mode == MODE_BLOCK_LONGS and (flags["real_block"] or previous.mode == MODE_RECOVERY_LONG):
                 pass
