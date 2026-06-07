@@ -1518,3 +1518,264 @@ class OKXTradeClient:
             "attach_algo_cl_ord_id": observed_attach_algo_cl_ord_id,
             "amend": amend,
         }
+
+
+    @staticmethod
+    def _stop_loss_recreate_needed(reason: Any, payload: dict[str, Any] | None = None) -> bool:
+        """Return True when an attached-SL amend failed because the old order/algo is no longer amendable."""
+        parts = [str(reason or "")]
+        if isinstance(payload, dict):
+            parts.append(str(payload.get("reason") or ""))
+            response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+            parts.append(str(response.get("msg") or ""))
+            for row in response.get("data") or []:
+                if isinstance(row, dict):
+                    parts.append(str(row.get("sMsg") or ""))
+                    parts.append(str(row.get("sCode") or ""))
+            amend = payload.get("amend") if isinstance(payload.get("amend"), dict) else {}
+            if amend:
+                parts.append(str(amend.get("reason") or ""))
+                amend_response = amend.get("response") if isinstance(amend.get("response"), dict) else {}
+                parts.append(str(amend_response.get("msg") or ""))
+                for row in amend_response.get("data") or []:
+                    if isinstance(row, dict):
+                        parts.append(str(row.get("sMsg") or ""))
+                        parts.append(str(row.get("sCode") or ""))
+        blob = " | ".join(parts).lower()
+        needles = (
+            "filled",
+            "canceled",
+            "cancelled",
+            "not found",
+            "not exist",
+            "does not exist",
+            "already been filled or canceled",
+            "order does not exist",
+            "algo_not_found",
+            "failed_to_read_current_sl",
+            "missing_order_identifier",
+            "51603",
+            "51001",
+            "51008",
+            "51149",
+        )
+        return any(token in blob for token in needles)
+
+    def _live_position_size_for_stop_loss(
+        self,
+        inst_id: str,
+        *,
+        pos_side: str = "long",
+        inst_type: str = "SWAP",
+    ) -> dict[str, Any]:
+        """Read current OKX position size and normalize it to instrument lot size for reduce-only stops."""
+        positions = self.get_positions(inst_type=inst_type, inst_id=inst_id)
+        if not positions.get("ok"):
+            return {
+                "ok": False,
+                "reason": positions.get("reason") or "positions_fetch_failed",
+                "positions": positions,
+            }
+
+        wanted_side = str(pos_side or "long").strip().lower()
+        selected = None
+        for row in positions.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("instId") or "").strip().upper() != str(inst_id or "").strip().upper():
+                continue
+            row_side = str(row.get("posSide") or "").strip().lower()
+            if wanted_side and row_side and row_side != wanted_side:
+                continue
+            raw_pos = self._to_decimal(row.get("availPos") or row.get("pos") or "0", "0")
+            if abs(raw_pos) > 0:
+                selected = dict(row)
+                break
+
+        if not selected:
+            return {"ok": False, "reason": "live_position_not_found", "positions": positions}
+
+        raw_size = abs(self._to_decimal(selected.get("availPos") or selected.get("pos") or "0", "0"))
+        specs = self.get_instrument_specs(inst_id)
+        lot_sz = self._to_decimal((specs.get("lot_sz") if isinstance(specs, dict) else "") or "0", "0")
+        step = lot_sz if lot_sz > 0 else Decimal("0.000001")
+        normalized = self._floor_to_step(raw_size, step)
+        if normalized <= 0:
+            return {
+                "ok": False,
+                "reason": "position_size_zero_after_lot_rounding",
+                "row": selected,
+                "instrument_specs": specs,
+            }
+        return {
+            "ok": True,
+            "reason": "ok",
+            "inst_id": inst_id,
+            "size": self._decimal_to_str(normalized),
+            "raw_size": self._decimal_to_str(raw_size),
+            "row": selected,
+            "instrument_specs": specs,
+        }
+
+    def place_reduce_only_stop_loss(
+        self,
+        inst_id: str,
+        sl_trigger_px: float,
+        *,
+        sz: str | None = None,
+        td_mode: str = "isolated",
+        pos_side: str = "long",
+        side: str = "sell",
+        sl_ord_px: str = "-1",
+        algo_cl_ord_id: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an independent reduce-only conditional SL for an existing long position."""
+        guard = self._trade_guard_error()
+        if guard:
+            return guard
+
+        trigger = float(sl_trigger_px)
+        if trigger <= 0:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "invalid_sl_trigger_px",
+            }
+
+        size_source = {"ok": True, "size": str(sz or "").strip(), "reason": "provided_size"}
+        if not size_source["size"] or self._safe_float(size_source["size"], 0.0) <= 0:
+            size_source = self._live_position_size_for_stop_loss(inst_id, pos_side=pos_side)
+            if not size_source.get("ok"):
+                return {
+                    "ok": False,
+                    "simulated": self.credentials.simulated,
+                    "reason": size_source.get("reason") or "position_size_unavailable",
+                    "size_source": size_source,
+                }
+
+        path = "/api/v5/trade/order-algo"
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": str(td_mode or "isolated"),
+            "side": str(side or "sell"),
+            "ordType": "conditional",
+            "sz": str(size_source.get("size") or sz),
+            "slTriggerPx": f"{trigger:.10f}".rstrip("0").rstrip("."),
+            "slOrdPx": str(sl_ord_px),
+            "reduceOnly": "true",
+        }
+        if pos_side:
+            payload["posSide"] = str(pos_side)
+        if algo_cl_ord_id:
+            payload["algoClOrdId"] = str(algo_cl_ord_id)[:32]
+        if tag:
+            payload["tag"] = str(tag)[:16]
+
+        response = self._request("POST", path, payload=payload)
+        result = self._normalize_trade_response(response, payload, id_key="algoId", response_kind="stop_loss_algo")
+        result["action"] = "created" if result.get("ok") else "create_failed"
+        result["desired_sl_trigger_px"] = trigger
+        result["size_source"] = size_source
+        return result
+
+    def sync_or_recreate_stop_loss(
+        self,
+        inst_id: str,
+        desired_sl_trigger_px: float,
+        *,
+        ord_id: str | None = None,
+        current_sl_trigger_px: float | None = None,
+        attach_algo_id: str | None = None,
+        attach_algo_cl_ord_id: str | None = None,
+        existing_stop_algo_id: str | None = None,
+        existing_stop_algo_cl_ord_id: str | None = None,
+        td_mode: str = "isolated",
+        pos_side: str = "long",
+        min_improvement_px: float = 0.0,
+        req_id: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Amend attached SL when possible; recreate a new reduce-only conditional SL when amend is impossible."""
+        desired = float(desired_sl_trigger_px)
+        if desired <= 0:
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": "invalid_desired_sl_trigger_px",
+            }
+
+        improvement_needed = float(min_improvement_px or 0.0)
+        if current_sl_trigger_px and current_sl_trigger_px > 0 and desired <= (float(current_sl_trigger_px) + improvement_needed):
+            return {
+                "ok": True,
+                "simulated": self.credentials.simulated,
+                "reason": "sl_sync_skipped_no_upgrade",
+                "action": "skipped",
+                "current_sl_trigger_px": float(current_sl_trigger_px),
+                "desired_sl_trigger_px": desired,
+                "attach_algo_id": attach_algo_id,
+                "attach_algo_cl_ord_id": attach_algo_cl_ord_id,
+                "algo_id": existing_stop_algo_id,
+                "algo_client_order_id": existing_stop_algo_cl_ord_id,
+            }
+
+        amend_result = None
+        if ord_id:
+            amend_result = self.sync_attached_stop_loss(
+                inst_id=inst_id,
+                ord_id=str(ord_id),
+                desired_sl_trigger_px=desired,
+                current_sl_trigger_px=current_sl_trigger_px,
+                attach_algo_id=attach_algo_id,
+                attach_algo_cl_ord_id=attach_algo_cl_ord_id,
+                min_improvement_px=min_improvement_px,
+                req_id=req_id,
+            )
+            if amend_result.get("ok"):
+                return amend_result
+
+        recreate_reason = (amend_result or {}).get("reason") or ("missing_entry_order_id" if not ord_id else "amend_failed")
+        if amend_result is not None and not self._stop_loss_recreate_needed(recreate_reason, amend_result):
+            return {
+                "ok": False,
+                "simulated": self.credentials.simulated,
+                "reason": recreate_reason,
+                "action": "failed",
+                "current_sl_trigger_px": current_sl_trigger_px,
+                "desired_sl_trigger_px": desired,
+                "amend": amend_result,
+                "recreate_attempted": False,
+            }
+
+        cancel_result = None
+        cancel_id = existing_stop_algo_id or attach_algo_id
+        if cancel_id:
+            cancel_result = self.cancel_algo_order(inst_id, str(cancel_id))
+
+        created = self.place_reduce_only_stop_loss(
+            inst_id=inst_id,
+            sl_trigger_px=desired,
+            td_mode=td_mode,
+            pos_side=pos_side,
+            algo_cl_ord_id=existing_stop_algo_cl_ord_id or attach_algo_cl_ord_id or self._client_id("slr"),
+            tag=tag,
+        )
+
+        return {
+            "ok": bool(created.get("ok")),
+            "simulated": self.credentials.simulated,
+            "reason": "sl_recreated_after_amend_failed" if created.get("ok") else (created.get("reason") or "sl_recreate_failed"),
+            "action": "recreated" if created.get("ok") else "recreate_failed",
+            "current_sl_trigger_px": current_sl_trigger_px,
+            "desired_sl_trigger_px": desired,
+            "attach_algo_id": attach_algo_id,
+            "attach_algo_cl_ord_id": attach_algo_cl_ord_id,
+            "algo_id": created.get("algo_id"),
+            "algo_client_order_id": created.get("algo_client_order_id"),
+            "amend": amend_result,
+            "cancel_previous": cancel_result,
+            "create": created,
+            "recreate_attempted": True,
+            "fallback_reason": recreate_reason,
+        }
