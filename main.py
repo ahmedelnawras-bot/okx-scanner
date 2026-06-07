@@ -22,6 +22,7 @@ import traceback
 from types import SimpleNamespace
 import requests
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 
 from utils.config import get_settings, Settings
 from utils.constants import MODE_NORMAL_LONG, MODE_STRONG_LONG_ONLY, MODE_BLOCK_LONGS, MODE_RECOVERY_LONG, MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE, MAX_RECOVERY_TRADES_PER_CYCLE
@@ -1618,8 +1619,8 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
 
         # Keep TP flags as-is; only fill realized PnL if lifecycle did not.
         if abs(_safe_float(getattr(trade, "realized_pnl_pct", 0.0), 0.0)) <= 1e-12:
-            setattr(trade, "realized_pnl_pct", realized)
-        setattr(trade, "manual_close_estimated_pnl_pct", realized)
+            _safe_set_trade_attr(trade, "realized_pnl_pct", realized)
+        _safe_set_trade_attr(trade, "manual_close_estimated_pnl_pct", realized)
 
         if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}:
             if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
@@ -1628,16 +1629,16 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
                 status = "closed_loss"
             else:
                 status = "breakeven_after_tp1" if bool(getattr(trade, "tp1_hit", False)) else "closed"
-            setattr(trade, "status", status)
+            _safe_set_trade_attr(trade, "status", status)
 
-        setattr(trade, "is_closed", True)
-        setattr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
-        setattr(trade, "updated_at", now)
-        setattr(trade, "slot_exempt", True)
-        setattr(trade, "blocks_same_symbol_reentry", False)
-        setattr(trade, "same_symbol_block_exempt", True)
-        setattr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
-        setattr(trade, "exchange_close_reason", reason)
+        _safe_set_trade_attr(trade, "is_closed", True)
+        _safe_set_trade_attr(trade, "closed_at", getattr(trade, "closed_at", None) or now)
+        _safe_set_trade_attr(trade, "updated_at", now)
+        _safe_set_trade_attr(trade, "slot_exempt", True)
+        _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", False)
+        _safe_set_trade_attr(trade, "same_symbol_block_exempt", True)
+        _safe_set_trade_attr(trade, "exchange_sync_state", "closed_by_okx_reconcile")
+        _safe_set_trade_attr(trade, "exchange_close_reason", reason)
         print(
             f"OKX_RECONCILE_CLOSED | {getattr(trade, 'symbol', '-') or '-'} | "
             f"status={status} | realized_raw={realized:+.4f}% | "
@@ -5319,6 +5320,27 @@ def _safe_set_trade_attr(trade, name: str, value) -> None:
         pass
 
 
+def _json_safe_trade_value(value):
+    """Convert nested exchange payloads into JSON-safe values for Redis persistence.
+
+    The tracked trade may store diagnostic payloads from OKX. Those payloads can
+    contain Decimal objects, which break Redis JSON serialization during
+    save_trades(). Keep the structure, but normalize Decimal recursively.
+    """
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe_trade_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_trade_value(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe_trade_value(v) for v in sorted(value, key=lambda x: str(x))]
+    return value
+
+
 def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) -> None:
     if trade is None or not isinstance(managed_order_result, dict):
         return
@@ -5333,18 +5355,18 @@ def _attach_exchange_state_to_trade(trade, managed_order_result: dict | None) ->
     _safe_set_trade_attr(trade, "exchange_order_reason", entry.get("reason"))
     _safe_set_trade_attr(trade, "entry_order_id", entry.get("order_id"))
     _safe_set_trade_attr(trade, "entry_client_order_id", entry.get("client_order_id"))
-    _safe_set_trade_attr(trade, "entry_order_payload", entry.get("payload"))
+    _safe_set_trade_attr(trade, "entry_order_payload", _json_safe_trade_value(entry.get("payload")))
     _safe_set_trade_attr(trade, "sl_attached_on_entry", bool(managed_order_result.get("sl_attached")))
-    _safe_set_trade_attr(trade, "sl_attached_payload", (entry.get("payload") or {}).get("attachAlgoOrds"))
+    _safe_set_trade_attr(trade, "sl_attached_payload", _json_safe_trade_value((entry.get("payload") or {}).get("attachAlgoOrds")))
     _safe_set_trade_attr(trade, "tp_split_ok", tp_split.get("ok"))
     _safe_set_trade_attr(trade, "tp_split_reason", tp_split.get("reason"))
     _safe_set_trade_attr(trade, "tp1_order_id", tp1.get("order_id"))
     _safe_set_trade_attr(trade, "tp2_order_id", tp2.get("order_id"))
     _safe_set_trade_attr(trade, "tp1_client_order_id", tp1.get("client_order_id"))
     _safe_set_trade_attr(trade, "tp2_client_order_id", tp2.get("client_order_id"))
-    _safe_set_trade_attr(trade, "runner_expected_size", (plan.get("runner") or {}).get("size"))
+    _safe_set_trade_attr(trade, "runner_expected_size", _json_safe_trade_value((plan.get("runner") or {}).get("size")))
     _safe_set_trade_attr(trade, "runner_requires_trailing_after_tp2", bool(managed_order_result.get("requires_runner_trailing")))
-    _safe_set_trade_attr(trade, "managed_trade_plan", plan)
+    _safe_set_trade_attr(trade, "managed_trade_plan", _json_safe_trade_value(plan))
 
     # Report-card diagnostics: actual leverage/margin used by the exchange path.
     used_margin = _safe_float(managed_order_result.get("used_margin_usdt"), 0.0)
