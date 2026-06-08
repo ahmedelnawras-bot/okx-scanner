@@ -2856,11 +2856,12 @@ def _inject_report_trade_current_prices(
 
     This is a report-text post processor only. It does not change PnL, TP/SL,
     lifecycle, scoring, slots, OKX execution, or saved trades. It enriches every
-    trade-card header produced by the shared report formatter, e.g.:
-      • <b>MEGA-USDT-SWAP</b> | 💱 Now: <code>0.0521</code> | +36.03% Floating PnL
+    trade-card header produced by the shared report formatter using a compact
+    inline format that does not wrap badly on Telegram mobile, e.g.:
+      • <b>MEGA-USDT-SWAP</b> @ <code>0.0521</code> | +36.03% Floating PnL
     """
     text = str(message or "")
-    if not text or "💱 Now:" in text:
+    if not text or "💱 Now:" in text or " @ <code>" in text:
         return text
 
     trades = _report_trade_list_for_command(result, settings, command=command)
@@ -2892,7 +2893,7 @@ def _inject_report_trade_current_prices(
             price_text = price_by_symbol.get(symbol)
             if price_text and line.lstrip().startswith("•"):
                 token = f"<b>{html_match.group(1)}</b>"
-                replacement = f"{token} | 💱 Now: <code>{price_text}</code>"
+                replacement = f"{token} @ <code>{price_text}</code>"
                 line = line.replace(token, replacement, 1)
             out_lines.append(line)
             continue
@@ -2903,7 +2904,7 @@ def _inject_report_trade_current_prices(
             price_text = price_by_symbol.get(symbol)
             if price_text:
                 prefix = plain_match.group(1) + plain_match.group(2)
-                line = prefix + f" | 💱 Now: {price_text}" + line[plain_match.end(2):]
+                line = prefix + f" @ {price_text}" + line[plain_match.end(2):]
         out_lines.append(line if line is not None else original)
 
     return "\n".join(out_lines)
@@ -7612,6 +7613,27 @@ def _send_ai_report_file(sender: TelegramSender, key: str, today: str) -> None:
         _send_text(sender, f"⚠️ فشل إرسال الملف:\n<code>{path}</code>\nError: {doc_result.get('error') or doc_result}")
 
 
+def _status_update_footer(result: dict | None = None) -> str:
+    """Small user-facing footer for /status freshness.
+
+    Display-only: it does not change runtime state, DD, reports, OKX orders,
+    slots, or any execution/simulation decisions. Internal timestamps remain
+    UTC; Telegram displays Egypt time with UTC for audit/debug.
+    """
+    result = result or {}
+    updated_at = datetime.now(timezone.utc).isoformat()
+    result["last_status_update_at"] = updated_at
+    lines = [
+        "━━━━━━━━━━━━",
+        "🕒 Status Updated: <code>" + _format_egypt_time(updated_at, include_utc=True) + "</code>",
+        "⏱ Data Age: <code>0s</code> | Source: <code>status</code>",
+    ]
+    market_at = result.get("market_snapshot_at") or result.get("last_market_scan_at") or ""
+    if market_at:
+        lines.append("🕒 Last Market Scan: <code>" + _format_egypt_time(market_at, include_utc=True) + "</code>")
+    return "\n".join(lines)
+
+
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
     _refresh_runtime_scope_state(result, settings, trade_store=trade_store)
     execution_results = result.get("execution_results", []) or []
@@ -7697,6 +7719,8 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         "",
         "🕹 Runtime Toggle: /okx_orders_on | /okx_orders_off",
         "✅ Managed OKX entry + SL + TP split enabled" if runtime.get("effective_orders_enabled") else "✅ Preview mode only — managed exchange placement paused",
+        "",
+        _status_update_footer(result),
     ])
 
 
