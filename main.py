@@ -2793,6 +2793,13 @@ def _minutes_until_utc_day_end(now: datetime | None = None) -> int:
     return max(0, int((end - now).total_seconds() // 60))
 
 
+
+def _runtime_scope_label_ar(settings: Settings | None = None) -> str:
+    try:
+        return "المحاكاة" if _is_simulation_mode(settings or get_settings()) else "التنفيذ الحقيقي"
+    except Exception:
+        return "التنفيذ الحقيقي"
+
 def _loss_streak_guard_message_ar(guard: dict | None) -> str:
     """Human-readable Arabic message for the 5-loss protection pause."""
     guard = dict(guard or {})
@@ -3000,6 +3007,129 @@ def _hard_execution_protection_rejection(drawdown_status=None, loss_streak_guard
         }
 
     return None
+
+
+def _scoped_hard_protection_rejection(
+    settings: Settings,
+    drawdown_status=None,
+    loss_streak_guard: dict | None = None,
+) -> dict | None:
+    """Scope hard protections to the active runtime bucket.
+
+    Simulation protection blocks virtual simulation openings only.
+    Execution protection blocks real OKX execution openings only.
+    The underlying DD / loss-streak calculations are unchanged.
+    """
+    row = _hard_execution_protection_rejection(drawdown_status, loss_streak_guard)
+    if not row:
+        return None
+
+    scoped = dict(row)
+    is_sim = _is_simulation_mode(settings)
+    scope = "simulation" if is_sim else "execution"
+    scoped["decision_scope"] = scope
+    scoped["runtime_mode"] = scope
+    scoped["protection_scope"] = scope
+    scoped["hard_protection"] = True
+    scoped["no_exceptions"] = True
+
+    if is_sim:
+        raw_reason = str(scoped.get("reason") or scoped.get("raw_reason") or "hard_simulation_protection_pause")
+        if "loss_streak" in raw_reason:
+            scoped["reason"] = "hard_simulation_loss_streak_pause_no_exceptions"
+        elif "daily_drawdown" in raw_reason or "drawdown" in raw_reason:
+            scoped["reason"] = "hard_simulation_daily_drawdown_pause_no_exceptions"
+        else:
+            scoped["reason"] = "hard_simulation_protection_pause_no_exceptions"
+        scoped["raw_reason"] = str(scoped.get("raw_reason") or raw_reason)
+        scoped["virtual_execution"] = True
+        scoped["live_execution"] = False
+        scoped["simulation_block_only"] = True
+        scoped["execution_block_only"] = False
+    else:
+        scoped["virtual_execution"] = False
+        scoped["live_execution"] = True
+        scoped["simulation_block_only"] = False
+        scoped["execution_block_only"] = True
+
+    return scoped
+
+
+def _build_simulation_portfolio_state_for_dd(
+    simulation_trades: list,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    daily_balance: dict | None = None,
+    portfolio_state_inputs: dict | None = None,
+):
+    """Build Simulation Daily-DD from the virtual wallet, not execution-style notional PnL.
+
+    The generic portfolio builder multiplies trade pnl_pct by margin * leverage.
+    Simulation wallet/account reports already store wallet impact on virtual
+    capital. Reusing the execution-style notional formula can explode DD values
+    when an old/corrupted simulation trade carries an abnormal pnl_pct. This
+    helper keeps Simulation protection tied to the virtual wallet equity only.
+    """
+    inputs = dict(portfolio_state_inputs or {})
+    if not inputs:
+        inputs = _resolve_simulation_portfolio_state_inputs(
+            list(simulation_trades or []),
+            settings,
+            trade_store=trade_store,
+            daily_balance=daily_balance,
+        )
+
+    wallet = _build_simulation_wallet_snapshot(list(simulation_trades or []))
+    row = dict(daily_balance or {})
+
+    start_balance = _safe_float(inputs.get("start_of_day_balance"), 0.0)
+    if start_balance <= 0:
+        start_balance = _safe_float(row.get("start_balance"), 0.0)
+    if start_balance <= 0:
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    if start_balance <= 0:
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    current_equity = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    if current_equity <= 0:
+        current_equity = _safe_float(row.get("current_balance") or row.get("end_balance"), 0.0)
+    if current_equity <= 0:
+        current_equity = _safe_float(wallet.get("equity"), start_balance)
+    # A virtual wallet should not create negative-infinite DD displays. If it
+    # ever goes below zero, cap the DD at a full wallet loss for protection.
+    current_equity = max(0.0, current_equity)
+
+    clean_inputs = dict(inputs)
+    clean_inputs["reference_portfolio"] = current_equity
+    clean_inputs["start_of_day_balance"] = start_balance
+
+    state = build_portfolio_state_from_trades([], **_portfolio_state_kwargs(clean_inputs))
+    try:
+        state.reference_portfolio = float(current_equity)
+        state.start_of_day_balance = round(float(start_balance), 4)
+        state.realized_pnl_usdt = 0.0
+        state.unrealized_pnl_usdt = round(float(current_equity) - float(start_balance), 4)
+        state.trades_opened_today = sum(
+            1 for trade in (simulation_trades or [])
+            if _same_utc_day(getattr(trade, "opened_at", None), getattr(state, "day_started_at", datetime.now(timezone.utc)))
+        )
+    except Exception as exc:
+        print(f"⚠️ SIM_DD_WALLET_STATE_PATCH_FAILED | {exc}", flush=True)
+
+    try:
+        dd_preview = float(getattr(state, "drawdown_pct", 0.0) or 0.0)
+        if dd_preview > 100.0:
+            # This should not happen after wallet clamping; keep a loud log and
+            # cap the displayed/protection value through current_equity=0.
+            state.unrealized_pnl_usdt = -abs(float(start_balance))
+            print(
+                f"⚠️ SIM_DD_SANITY_CAP | dd={dd_preview:.2f}% | start={start_balance:.4f} | equity={current_equity:.4f}",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+    return state
 
 
 def _active_protections_snapshot(result: dict | None) -> list[dict]:
@@ -4385,7 +4515,16 @@ def run_once(
     # - Trading/execution evaluates live execution trades.
     # This keeps DD protection independent between simulation and execution.
     dd_base_trades = simulation_trades if simulation_mode_active else persisted_trades
-    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
+    if simulation_mode_active:
+        portfolio_state = _build_simulation_portfolio_state_for_dd(
+            simulation_trades,
+            settings,
+            trade_store=trade_store,
+            daily_balance=simulation_daily_balance_snapshot,
+            portfolio_state_inputs=portfolio_state_inputs,
+        )
+    else:
+        portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     drawdown_status = evaluate_drawdown(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
@@ -4585,31 +4724,14 @@ def run_once(
         pre_protection_exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
         pre_protection_exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
 
-        hard_protection_rejection = _hard_execution_protection_rejection(drawdown_status, loss_streak_guard)
-        if hard_protection_rejection and simulation_mode_active:
-            # Simulation is a virtual evaluation lane. Its wallet/loss guards should
-            # be visible as advisory diagnostics, but they must not rewrite the
-            # actual candidate decision into an execution-style protection_pause.
-            # Otherwise Simulation stops showing which trades would be accepted by
-            # the strategy and looks like it borrowed the live trading gate.
-            exec_result = dict(pre_protection_exec_result)
-            exec_result["simulation_protection_advisory"] = True
-            exec_result["simulation_protection_reason"] = hard_protection_rejection.get("reason")
-            exec_result["simulation_protection_type"] = hard_protection_rejection.get("protection_type")
-            exec_result["simulation_protection_active"] = True
-            exec_result["virtual_execution"] = True
-            exec_result["live_execution"] = False
-            exec_result["decision_scope"] = "simulation"
-            exec_result["decision_engine"] = "process_trade_candidate_simulation_advisory"
-            exec_result["runtime_mode"] = "simulation"
-            exec_result["risk_mode"] = scan_mode
-        elif hard_protection_rejection:
+        hard_protection_rejection = _scoped_hard_protection_rejection(settings, drawdown_status, loss_streak_guard)
+        if hard_protection_rejection:
             exec_result = dict(hard_protection_rejection)
             exec_result["pre_protection_status"] = pre_protection_exec_result.get("status")
             exec_result["pre_protection_reason"] = pre_protection_exec_result.get("reason")
             exec_result["pre_protection_path"] = pre_protection_exec_result.get("path")
             exec_result["decision_engine"] = "hard_protection_after_candidate"
-            exec_result["runtime_mode"] = _get_signal_delivery_mode(settings)
+            exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
             exec_result["risk_mode"] = scan_mode
         else:
             exec_result = pre_protection_exec_result
@@ -4824,7 +4946,16 @@ def run_once(
     # Final Daily DD snapshot must also follow the active runtime bucket.
     # Without this, simulation DD would be calculated from execution trades.
     dd_base_trades = simulation_trades if simulation_mode_active else trades
-    portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
+    if simulation_mode_active:
+        portfolio_state = _build_simulation_portfolio_state_for_dd(
+            simulation_trades,
+            settings,
+            trade_store=trade_store,
+            daily_balance=simulation_daily_balance_snapshot,
+            portfolio_state_inputs=portfolio_state_inputs,
+        )
+    else:
+        portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
     drawdown_status = evaluate_drawdown(portfolio_state)
     drawdown_report = build_drawdown_report(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
@@ -6139,16 +6270,12 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
         # Final safety net: true danger protections have zero exceptions.
         # Even if a stale/older result item reached dispatch as accepted_preview,
         # convert it to protection_pause before any simulation fill or OKX order.
-        hard_protection_rejection = _hard_execution_protection_rejection(
+        hard_protection_rejection = _scoped_hard_protection_rejection(
+            settings,
             (result or {}).get("drawdown_status"),
             (result or {}).get("loss_streak_guard"),
         )
-        simulation_mode_active = _is_simulation_mode(settings)
-        if (
-            hard_protection_rejection
-            and not simulation_mode_active
-            and str((exec_result or {}).get("status") or "").strip().lower() in {"accepted_preview", "pending_pullback_preview"}
-        ):
+        if hard_protection_rejection and str((exec_result or {}).get("status") or "").strip().lower() in {"accepted_preview", "pending_pullback_preview"}:
             exec_result = dict(hard_protection_rejection)
             item["execution"] = exec_result
             item["message"] = build_signal_message(signal, exec_result)
@@ -8647,7 +8774,7 @@ def _maybe_send_protection_activation_alert(
         alerts.append((
             key,
             "\n".join([
-                "🛡️ <b>تم تفعيل الحماية الوقائية</b>",
+                f"🛡️ <b>تم تفعيل الحماية الوقائية — {_runtime_scope_label_ar(settings)}</b>",
                 _loss_streak_guard_message_ar(loss_guard),
                 "",
                 "سيستمر البوت في متابعة السوق، وسيُستأنف فتح الصفقات تلقائيًا بعد انتهاء فترة التهدئة.",
@@ -8666,7 +8793,8 @@ def _maybe_send_protection_activation_alert(
             dd_reason = "drawdown_protection"
             dd_pct = 0.0
         key = f"daily_drawdown:{dd_level}:{dd_reason}"
-        title = "🛡️ <b>تم تفعيل حماية السحب اليومي</b>" if dd_level < 3 else "🛑 <b>تم تفعيل الإيقاف اليومي الكامل</b>"
+        scope_label = _runtime_scope_label_ar(settings)
+        title = f"🛡️ <b>تم تفعيل حماية السحب اليومي — {scope_label}</b>" if dd_level < 3 else f"🛑 <b>تم تفعيل الإيقاف اليومي الكامل — {scope_label}</b>"
         alerts.append((
             key,
             "\n".join([
