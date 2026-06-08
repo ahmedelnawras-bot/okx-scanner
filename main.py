@@ -352,22 +352,21 @@ def _refresh_simulation_drawdown_in_result_if_needed(
     result: dict | None,
     trade_store: RedisTradeStore | None = None,
 ) -> None:
-    """Repair stale Simulation drawdown objects before display/alerts.
+    """Always refresh Simulation DD from the virtual wallet before display/alerts.
 
-    This is display/protection-state hygiene only. It does not change signal
-    scoring, OKX execution, or simulation fill rules.
+    This is Simulation-only hygiene. It does not change signal scoring, OKX
+    execution, TP/SL, recovery slots, or fill rules. The reason for always
+    refreshing is that an already-built result can carry a stale generic
+    drawdown_status object from older code paths.
     """
     if not isinstance(result, dict) or not _is_simulation_mode(settings):
         return
+
     current = result.get("drawdown_status")
     try:
-        current_pct = float(getattr(current, "drawdown_pct", 0.0) or 0.0) if current is not None else 0.0
-        current_reason = str(getattr(current, "reason", "") or "") if current is not None else ""
+        old_pct = float(getattr(current, "drawdown_pct", 0.0) or 0.0) if current is not None else 0.0
     except Exception:
-        current_pct = 0.0
-        current_reason = ""
-    if current is not None and current_pct <= 100.0 and current_reason == "simulation_wallet_daily_drawdown_guard":
-        return
+        old_pct = 0.0
 
     sim_trades = list(result.get("simulation_trades", []) or [])
     daily = result.get("simulation_daily_balance") or {}
@@ -391,11 +390,14 @@ def _refresh_simulation_drawdown_in_result_if_needed(
         result["drawdown_status"] = dd_status
         result["drawdown_report"] = _simulation_wallet_drawdown_report(portfolio_state, dd_status)
         print(
-            f"SIM_DD_STALE_REPAIRED | old_pct={current_pct:.2f} | new_pct={float(getattr(dd_status, 'drawdown_pct', 0.0) or 0.0):.2f}",
+            f"SIM_DD_REFRESH_FROM_WALLET | old_pct={old_pct:.2f} | "
+            f"new_pct={float(getattr(dd_status, 'drawdown_pct', 0.0) or 0.0):.2f} | "
+            f"start={float(getattr(dd_status, 'start_of_day_balance', 0.0) or 0.0):.2f} | "
+            f"equity={float(getattr(dd_status, 'current_equity', 0.0) or 0.0):.2f}",
             flush=True,
         )
     except Exception as exc:
-        print(f"⚠️ SIM_DD_STALE_REPAIR_FAILED | {exc}", flush=True)
+        print(f"⚠️ SIM_DD_REFRESH_FROM_WALLET_FAILED | {exc}", flush=True)
 
 
 def _risk_profile_snapshot(
@@ -3127,6 +3129,87 @@ def _scoped_hard_protection_rejection(
     return scoped
 
 
+def _simulation_wallet_equity_and_start(
+    simulation_trades: list,
+    daily_balance: dict | None = None,
+    portfolio_state_inputs: dict | None = None,
+) -> tuple[float, float, dict]:
+    """Resolve Simulation wallet equity/start safely.
+
+    Source of truth for Simulation DD is the virtual wallet, not the generic
+    execution-style portfolio builder. Redis daily rows and manual baseline are
+    used only when sane.
+    """
+    wallet = _build_simulation_wallet_snapshot(list(simulation_trades or []))
+    row = dict(daily_balance or {})
+    inputs = dict(portfolio_state_inputs or {})
+
+    wallet_equity = _safe_float(wallet.get("equity"), 0.0)
+    row_equity = _safe_float(row.get("current_balance") or row.get("end_balance"), 0.0)
+    input_equity = _safe_float(inputs.get("reference_portfolio"), 0.0)
+
+    # Prefer the freshly rebuilt virtual wallet. Old daily rows or generic
+    # portfolio inputs can be stale after deploys and can cause false 100% DD.
+    if wallet_equity > 0:
+        current_equity = wallet_equity
+        equity_source = "wallet"
+    elif row_equity > 0:
+        current_equity = row_equity
+        equity_source = "daily_row"
+    elif input_equity > 0:
+        current_equity = input_equity
+        equity_source = "inputs"
+    else:
+        current_equity = SIMULATION_START_BALANCE_USDT
+        equity_source = "fallback_start"
+
+    input_start = _safe_float(inputs.get("start_of_day_balance"), 0.0)
+    row_start = _safe_float(row.get("start_balance"), 0.0)
+    wallet_start = _safe_float(wallet.get("start_balance"), 0.0)
+
+    manual_override = bool(inputs.get("manual_daily_dd_override"))
+    if manual_override and input_start > 0:
+        start_balance = input_start
+        start_source = "manual_inputs"
+    elif row_start > 0:
+        start_balance = row_start
+        start_source = "daily_row"
+    elif wallet_start > 0:
+        start_balance = wallet_start
+        start_source = "wallet"
+    elif input_start > 0:
+        start_balance = input_start
+        start_source = "inputs"
+    else:
+        start_balance = SIMULATION_START_BALANCE_USDT
+        start_source = "fallback_start"
+
+    # Sanity guards for corrupted Redis/baseline rows. A start near zero or
+    # wildly above the live virtual equity should not hard-stop the simulation.
+    max_sane_start = max(SIMULATION_START_BALANCE_USDT * 5.0, current_equity * 5.0, 1.0)
+    if start_balance < 1.0 or start_balance > max_sane_start:
+        print(
+            f"⚠️ SIM_DD_BASELINE_SANITY_RESET | start={start_balance:.8f} | "
+            f"equity={current_equity:.4f} | fallback={SIMULATION_START_BALANCE_USDT:.2f}",
+            flush=True,
+        )
+        start_balance = SIMULATION_START_BALANCE_USDT
+        start_source = "sanity_fallback_start"
+
+    current_equity = max(0.0, float(current_equity or 0.0))
+    start_balance = max(1.0, float(start_balance or SIMULATION_START_BALANCE_USDT))
+    return current_equity, start_balance, {
+        "equity_source": equity_source,
+        "start_source": start_source,
+        "wallet_equity": wallet_equity,
+        "row_equity": row_equity,
+        "input_equity": input_equity,
+        "row_start": row_start,
+        "input_start": input_start,
+        "wallet_start": wallet_start,
+    }
+
+
 def _build_simulation_portfolio_state_for_dd(
     simulation_trades: list,
     settings: Settings,
@@ -3134,14 +3217,7 @@ def _build_simulation_portfolio_state_for_dd(
     daily_balance: dict | None = None,
     portfolio_state_inputs: dict | None = None,
 ):
-    """Build Simulation Daily-DD from the virtual wallet, not execution-style notional PnL.
-
-    The generic portfolio builder multiplies trade pnl_pct by margin * leverage.
-    Simulation wallet/account reports already store wallet impact on virtual
-    capital. Reusing the execution-style notional formula can explode DD values
-    when an old/corrupted simulation trade carries an abnormal pnl_pct. This
-    helper keeps Simulation protection tied to the virtual wallet equity only.
-    """
+    """Build Simulation Daily-DD state from virtual wallet equity only."""
     inputs = dict(portfolio_state_inputs or {})
     if not inputs:
         inputs = _resolve_simulation_portfolio_state_inputs(
@@ -3151,25 +3227,11 @@ def _build_simulation_portfolio_state_for_dd(
             daily_balance=daily_balance,
         )
 
-    wallet = _build_simulation_wallet_snapshot(list(simulation_trades or []))
-    row = dict(daily_balance or {})
-
-    start_balance = _safe_float(inputs.get("start_of_day_balance"), 0.0)
-    if start_balance <= 0:
-        start_balance = _safe_float(row.get("start_balance"), 0.0)
-    if start_balance <= 0:
-        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
-    if start_balance <= 0:
-        start_balance = SIMULATION_START_BALANCE_USDT
-
-    current_equity = _safe_float(inputs.get("reference_portfolio"), 0.0)
-    if current_equity <= 0:
-        current_equity = _safe_float(row.get("current_balance") or row.get("end_balance"), 0.0)
-    if current_equity <= 0:
-        current_equity = _safe_float(wallet.get("equity"), start_balance)
-    # A virtual wallet should not create negative-infinite DD displays. If it
-    # ever goes below zero, cap the DD at a full wallet loss for protection.
-    current_equity = max(0.0, current_equity)
+    current_equity, start_balance, source_info = _simulation_wallet_equity_and_start(
+        simulation_trades,
+        daily_balance=daily_balance,
+        portfolio_state_inputs=inputs,
+    )
 
     clean_inputs = dict(inputs)
     clean_inputs["reference_portfolio"] = current_equity
@@ -3181,6 +3243,7 @@ def _build_simulation_portfolio_state_for_dd(
         state.start_of_day_balance = round(float(start_balance), 4)
         state.realized_pnl_usdt = 0.0
         state.unrealized_pnl_usdt = round(float(current_equity) - float(start_balance), 4)
+        state.simulation_wallet_dd_source = source_info
         _day_ref = getattr(state, "day_started_at", datetime.now(timezone.utc))
         if isinstance(_day_ref, datetime) and _day_ref.tzinfo is None:
             _day_ref = _day_ref.replace(tzinfo=timezone.utc)
@@ -3202,21 +3265,7 @@ def _build_simulation_portfolio_state_for_dd(
     except Exception as exc:
         print(f"⚠️ SIM_DD_WALLET_STATE_PATCH_FAILED | {exc}", flush=True)
 
-    try:
-        dd_preview = float(getattr(state, "drawdown_pct", 0.0) or 0.0)
-        if dd_preview > 100.0:
-            # This should not happen after wallet clamping; keep a loud log and
-            # cap the displayed/protection value through current_equity=0.
-            state.unrealized_pnl_usdt = -abs(float(start_balance))
-            print(
-                f"⚠️ SIM_DD_SANITY_CAP | dd={dd_preview:.2f}% | start={start_balance:.4f} | equity={current_equity:.4f}",
-                flush=True,
-            )
-    except Exception:
-        pass
-
     return state
-
 
 
 def _simulation_wallet_drawdown_status(
@@ -3226,45 +3275,14 @@ def _simulation_wallet_drawdown_status(
     daily_balance: dict | None = None,
     portfolio_state_inputs: dict | None = None,
 ):
-    """Evaluate Simulation Daily-DD directly from virtual wallet equity.
+    """Evaluate Simulation Daily-DD directly from virtual wallet equity."""
+    current_equity, start_balance, source_info = _simulation_wallet_equity_and_start(
+        simulation_trades,
+        daily_balance=daily_balance,
+        portfolio_state_inputs=portfolio_state_inputs,
+    )
 
-    This is intentionally NOT based on execution-style trade notional PnL.
-    It is a protection/status object with the same attributes used by the rest
-    of main.py: allowed, level, drawdown_pct, reason and message_ar.
-    """
-    wallet = _build_simulation_wallet_snapshot(list(simulation_trades or []))
-    row = dict(daily_balance or {})
-    inputs = dict(portfolio_state_inputs or {})
-
-    current_equity = _safe_float(inputs.get("reference_portfolio"), 0.0)
-    if current_equity <= 0:
-        current_equity = _safe_float(wallet.get("equity"), 0.0)
-    if current_equity <= 0:
-        current_equity = _safe_float(row.get("current_balance") or row.get("end_balance"), 0.0)
-    if current_equity <= 0:
-        current_equity = SIMULATION_START_BALANCE_USDT
-
-    start_balance = _safe_float(inputs.get("start_of_day_balance"), 0.0)
-    if start_balance <= 0:
-        start_balance = _safe_float(row.get("start_balance"), 0.0)
-    if start_balance <= 0:
-        start_balance = _safe_float(wallet.get("start_balance"), 0.0)
-    if start_balance <= 0:
-        start_balance = SIMULATION_START_BALANCE_USDT
-
-    # Sanity guard: corrupted/near-zero baselines must never produce million-% DD.
-    # If the baseline is clearly unusable, fall back to the virtual experiment base.
-    if start_balance < 1.0:
-        print(
-            f"⚠️ SIM_DD_BASELINE_SANITY_RESET | start={start_balance:.8f} | equity={current_equity:.4f} | fallback={SIMULATION_START_BALANCE_USDT:.2f}",
-            flush=True,
-        )
-        start_balance = SIMULATION_START_BALANCE_USDT
-
-    if start_balance <= 0:
-        dd_pct = 0.0
-    else:
-        dd_pct = max(0.0, ((float(start_balance) - float(current_equity)) / float(start_balance)) * 100.0)
+    dd_pct = 0.0 if start_balance <= 0 else max(0.0, ((start_balance - current_equity) / start_balance) * 100.0)
     dd_pct = min(100.0, dd_pct)
 
     try:
@@ -3301,6 +3319,7 @@ def _simulation_wallet_drawdown_status(
         start_of_day_balance=float(start_balance),
         reason="simulation_wallet_daily_drawdown_guard",
         message_ar=message_ar,
+        source_info=source_info,
     )
 
 
@@ -5161,7 +5180,10 @@ def run_once(
     else:
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         drawdown_status = evaluate_drawdown(portfolio_state)
-    drawdown_report = build_drawdown_report(portfolio_state)
+    if simulation_mode_active:
+        drawdown_report = _simulation_wallet_drawdown_report(portfolio_state, drawdown_status)
+    else:
+        drawdown_report = build_drawdown_report(portfolio_state)
     loss_streak_base_trades = simulation_trades if simulation_mode_active else trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
     loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
