@@ -8976,6 +8976,7 @@ def _maybe_send_protection_activation_alert(
     result: dict | None,
     tracker: dict,
     settings: Settings | None = None,
+    trade_store: RedisTradeStore | None = None,
 ) -> None:
     """Send one standalone Telegram alert when a protection state becomes active.
 
@@ -9238,7 +9239,7 @@ def live_worker() -> None:
                     else:
                         _send_text(sender, _refresh_risk_block_in_mode_message(result.get("mode_message", ""), settings, result))
                 next_mode_guard_ts = time.time() + max(60, int(settings.market_mode_guard_interval_seconds))
-                _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings)
+                _maybe_send_protection_activation_alert(sender, result, reminder_tracker, settings=settings, trade_store=trade_store)
                 _maybe_send_mode_reminder(sender, result, reminder_tracker, settings=settings)
                 _send_lifecycle_notifications(sender, result, trade_store=trade_store)
                 _dispatch_signals(sender, result, settings, sent_fingerprints, okx_client if settings.execution_enabled else None, trade_store)
@@ -9263,7 +9264,7 @@ def live_worker() -> None:
                         if now_ts >= next_mode_guard_ts:
                             state = _run_market_mode_guard(sender, last_result, settings, state, reminder_tracker)
                             next_mode_guard_ts = now_ts + max(60, int(settings.market_mode_guard_interval_seconds))
-                        _maybe_send_protection_activation_alert(sender, last_result, reminder_tracker, settings=settings)
+                        _maybe_send_protection_activation_alert(sender, last_result, reminder_tracker, settings=settings, trade_store=trade_store)
                         _maybe_send_mode_reminder(sender, last_result, reminder_tracker, settings=settings)
                 except Exception as exc:
                     print(f"mode reminder error: {exc}", flush=True)
