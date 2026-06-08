@@ -8986,7 +8986,14 @@ def _maybe_send_protection_activation_alert(
     - avoids spam by remembering the last sent protection key in tracker
     """
     result = result or {}
-    _refresh_simulation_drawdown_in_result_if_needed(settings, result, trade_store=trade_store)
+    # Crash-safe: alert refresh is display-only. If an older caller does not
+    # pass trade_store, never crash the worker; use the current result snapshot.
+    _alert_trade_store = None
+    try:
+        _alert_trade_store = trade_store
+    except NameError:
+        _alert_trade_store = None
+    _refresh_simulation_drawdown_in_result_if_needed(settings, result, trade_store=_alert_trade_store)
     if not isinstance(tracker, dict):
         return
 
