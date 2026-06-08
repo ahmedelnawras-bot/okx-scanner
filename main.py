@@ -9330,17 +9330,29 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 sender.send_message(reply, reply_markup=_build_main_inline_keyboard_with_bot_modes(settings))
                 continue
 
+            # Report freshness / current-price enrichment must apply to Simulation reports too.
+            # Direct /report_simulation commands used to return here before the
+            # generic footer/current-price post-processor, while execution reports
+            # continued through the generic path.
+            if _report_command_wants_footer(command):
+                _refresh_track_trades_before_reply(result, settings, trade_store=trade_store, okx_client=okx_client)
             simulation_outputs = _build_simulation_command_outputs(result)
             if command in _SIM_WALLET_PERIOD_COMMANDS:
                 _key, title, days = _SIM_WALLET_PERIOD_COMMANDS[command]
-                _send_text(sender, simulation_outputs.get(command) or _simulation_header(_build_simulation_wallet_period_report(result, title, days)))
+                sim_reply = simulation_outputs.get(command) or _simulation_header(_build_simulation_wallet_period_report(result, title, days))
+                if _report_command_wants_footer(command):
+                    sim_reply = _append_report_update_footer(sim_reply, result, settings, command=command, source="simulation_report")
+                _send_text(sender, sim_reply)
                 for export in _build_simulation_wallet_export_files(result, title, days):
                     doc_result = sender.send_document(str(export.get("path")), caption=str(export.get("caption") or "Simulation Wallet Export"))
                     if not doc_result.get("ok"):
                         _send_text(sender, "⚠️ فشل إرسال ملف Wallet export. الملف جاهز على السيرفر:\n" + str(export.get("path")) + "\nError: " + str(doc_result.get("error") or doc_result))
                 continue
             if command in simulation_outputs:
-                _send_text(sender, simulation_outputs[command])
+                sim_reply = simulation_outputs[command]
+                if _report_command_wants_footer(command):
+                    sim_reply = _append_report_update_footer(sim_reply, result, settings, command=command, source="simulation_report")
+                _send_text(sender, sim_reply)
                 continue
             if command in ("/diagnostics_help", "/help_diagnostics"):
                 _send_text(sender, build_diagnostics_commands_help())
