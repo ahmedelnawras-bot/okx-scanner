@@ -2744,6 +2744,258 @@ def _format_age_short(seconds: int | None) -> str:
     return f"{hours}h {minutes % 60}m"
 
 
+def _egypt_display_tz():
+    """User-facing display timezone for Telegram timestamps.
+
+    Internal logs/JSON stay UTC. Telegram-facing report/mood footers are shown
+    in Egypt time, with UTC kept in the same line when useful for debugging.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Africa/Cairo")
+    except Exception:
+        return timezone(timedelta(hours=3))
+
+
+def _parse_any_datetime_utc(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        else:
+            text = str(value).strip().replace("Z", "+00:00")
+            if not text:
+                return None
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _format_egypt_time(value: object | None = None, *, include_utc: bool = True) -> str:
+    dt = _parse_any_datetime_utc(value) or datetime.now(timezone.utc)
+    local_dt = dt.astimezone(_egypt_display_tz())
+    local_text = local_dt.strftime("%Y-%m-%d %H:%M:%S Egypt")
+    if not include_utc:
+        return local_text
+    utc_text = dt.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+    return f"{local_text} | {utc_text}"
+
+
+
+def _report_price_value_for_trade(trade) -> float:
+    """Return the calculation/current price shown beside trade cards in reports.
+
+    For open trades this is the current live/last refreshed price used by the
+    lifecycle/report calculations. For closed trades, prefer the close/exit
+    price when available, then fall back to current_price. This is display-only.
+    """
+    for attr in (
+        "current_price",
+        "mark_price",
+        "last_price",
+        "close_price",
+        "exit_price",
+        "closed_price",
+    ):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if value > 0:
+            return value
+    return _safe_float(getattr(trade, "entry", 0.0), 0.0)
+
+
+def _format_report_trade_price(value: object) -> str:
+    number = _safe_float(value, 0.0)
+    if number <= 0:
+        return "-"
+    if number >= 100:
+        return f"{number:.2f}"
+    if number >= 1:
+        return f"{number:.4f}"
+    if number >= 0.01:
+        return f"{number:.6f}"
+    if number >= 0.0001:
+        return f"{number:.8f}".rstrip("0").rstrip(".")
+    if number >= 0.000001:
+        return f"{number:.10f}".rstrip("0").rstrip(".")
+    return f"{number:.12f}".rstrip("0").rstrip(".")
+
+
+def _report_trade_list_for_command(result: dict | None, settings: Settings, command: str = "") -> list:
+    """Select the trade bucket used by a report command.
+
+    Simulation report commands use simulation_trades. Execution reports use
+    trades. For generic report commands, follow the active runtime scope.
+    """
+    result = result or {}
+    cmd = str(command or "").strip().lower()
+    is_sim_report = (
+        cmd.startswith("/report_simulation")
+        or cmd.startswith("/simulation_wallet")
+        or cmd in _SIM_WALLET_PERIOD_COMMANDS
+    )
+    is_exec_report = cmd.startswith("/report_execution")
+    if is_sim_report:
+        return list(result.get("simulation_trades", []) or [])
+    if is_exec_report:
+        return list(result.get("trades", []) or [])
+    return list(result.get("simulation_trades", []) or []) if _is_simulation_mode(settings) else list(result.get("trades", []) or [])
+
+
+def _inject_report_trade_current_prices(
+    message: str,
+    result: dict | None,
+    settings: Settings,
+    *,
+    command: str = "",
+) -> str:
+    """Add the calculation/current price beside each trade symbol in reports.
+
+    This is a report-text post processor only. It does not change PnL, TP/SL,
+    lifecycle, scoring, slots, OKX execution, or saved trades. It enriches every
+    trade-card header produced by the shared report formatter, e.g.:
+      • <b>MEGA-USDT-SWAP</b> | 💱 Now: <code>0.0521</code> | +36.03% Floating PnL
+    """
+    text = str(message or "")
+    if not text or "💱 Now:" in text:
+        return text
+
+    trades = _report_trade_list_for_command(result, settings, command=command)
+    if not trades:
+        return text
+
+    price_by_symbol: dict[str, str] = {}
+    for trade in trades:
+        symbol = str(getattr(trade, "symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        price = _report_price_value_for_trade(trade)
+        if price > 0:
+            price_by_symbol[symbol] = _format_report_trade_price(price)
+
+    if not price_by_symbol:
+        return text
+
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        original = line
+        if "💱 Now:" in line:
+            out_lines.append(line)
+            continue
+
+        html_match = re.search(r"<b>([^<]+-USDT-SWAP)</b>", line)
+        if html_match:
+            symbol = str(html_match.group(1) or "").strip().upper()
+            price_text = price_by_symbol.get(symbol)
+            if price_text and line.lstrip().startswith("•"):
+                token = f"<b>{html_match.group(1)}</b>"
+                replacement = f"{token} | 💱 Now: <code>{price_text}</code>"
+                line = line.replace(token, replacement, 1)
+            out_lines.append(line)
+            continue
+
+        plain_match = re.search(r"^(\s*•\s*)([A-Z0-9]+-USDT-SWAP)(\s*\|\s*)", line)
+        if plain_match:
+            symbol = str(plain_match.group(2) or "").strip().upper()
+            price_text = price_by_symbol.get(symbol)
+            if price_text:
+                prefix = plain_match.group(1) + plain_match.group(2)
+                line = prefix + f" | 💱 Now: {price_text}" + line[plain_match.end(2):]
+        out_lines.append(line if line is not None else original)
+
+    return "\n".join(out_lines)
+
+def _open_trade_price_refresh_stats(trades: list | None) -> dict:
+    open_trades = [trade for trade in list(trades or []) if not _is_trade_closed(trade)]
+    total = len(open_trades)
+    stale = 0
+    refreshed = 0
+    last_dt: datetime | None = None
+    stale_symbols: list[str] = []
+    for trade in open_trades:
+        if bool(getattr(trade, "price_stale", False)):
+            stale += 1
+            stale_symbols.append(str(getattr(trade, "symbol", "-") or "-"))
+            continue
+        update_dt = _parse_any_datetime_utc(getattr(trade, "last_price_update_at", None))
+        if update_dt is not None:
+            refreshed += 1
+            if last_dt is None or update_dt > last_dt:
+                last_dt = update_dt
+    return {
+        "open": total,
+        "refreshed": refreshed,
+        "stale": stale,
+        "last_price_refresh_at": last_dt.isoformat() if last_dt else "",
+        "stale_symbols": stale_symbols[:8],
+    }
+
+
+def _report_command_wants_footer(command: str) -> bool:
+    value = str(command or "").strip().lower()
+    if not value.startswith("/"):
+        value = "/" + value
+    if value.startswith("/report_") or value in {"/report", "/simulation_wallet"}:
+        return True
+    if value.startswith("/simulation_wallet_"):
+        return True
+    if value in set(_SIM_WALLET_PERIOD_COMMANDS.keys()):
+        return True
+    return False
+
+
+def _append_report_update_footer(
+    message: str,
+    result: dict | None,
+    settings: Settings,
+    *,
+    command: str = "",
+    source: str = "fresh_report",
+) -> str:
+    base = str(message or "").strip()
+    if not base or "🕒 Report Updated:" in base:
+        return base
+    if base.startswith("الأمر غير متاح"):
+        return base
+
+    result = result or {}
+    base = _inject_report_trade_current_prices(base, result, settings, command=command)
+    command_text = str(command or "")
+    is_sim_report = (
+        command_text.startswith("/report_simulation")
+        or command_text in _SIM_WALLET_PERIOD_COMMANDS
+        or command_text.startswith("/simulation_wallet")
+    )
+    trades = list(result.get("simulation_trades", []) or []) if is_sim_report or _is_simulation_mode(settings) else list(result.get("trades", []) or [])
+    stats = _open_trade_price_refresh_stats(trades)
+    updated_at = datetime.now(timezone.utc).isoformat()
+    result["last_report_update_at"] = updated_at
+
+    if int(stats.get("open", 0) or 0) <= 0:
+        price_line = "🔄 Open Prices: <code>open=0</code>"
+    else:
+        price_line = (
+            f"🔄 Open Prices: <code>refreshed={int(stats.get('refreshed', 0) or 0)}/{int(stats.get('open', 0) or 0)}"
+            f" | stale={int(stats.get('stale', 0) or 0)}</code>"
+        )
+        last_price = str(stats.get("last_price_refresh_at") or "").strip()
+        if last_price:
+            price_line += "\n🕒 Last Open Price Refresh: <code>" + _format_egypt_time(last_price, include_utc=False) + "</code>"
+        if stats.get("stale_symbols"):
+            price_line += "\n⚠️ Stale Symbols: <code>" + ",".join(stats.get("stale_symbols") or []) + "</code>"
+
+    footer = "\n".join([
+        "━━━━━━━━━━━━",
+        "🕒 Report Updated: <code>" + _format_egypt_time(updated_at, include_utc=True) + "</code>",
+        "⏱ Data Age: <code>0s</code> | Source: <code>" + str(source or "fresh_report") + "</code>",
+        price_line,
+    ])
+    return (base + "\n\n" + footer).strip()
+
+
 def _append_market_snapshot_freshness(message: str, result: dict | None) -> str:
     base = str(message or "").strip()
     if "⏱ Snapshot Age:" in base:
@@ -2751,12 +3003,18 @@ def _append_market_snapshot_freshness(message: str, result: dict | None) -> str:
     result = result or {}
     age = _market_snapshot_age_seconds(result)
     source = str(result.get("market_snapshot_source") or "cached_scan").strip() or "cached_scan"
-    at = str(result.get("market_snapshot_at") or result.get("last_market_scan_at") or "-").strip()
+    at = result.get("market_snapshot_at") or result.get("last_market_scan_at") or ""
     stats = result.get("market_snapshot_stats") or {}
     stats_text = ""
     if isinstance(stats, dict) and stats:
         stats_text = f" | pairs={int(stats.get('ranked_pairs', 0) or 0)}"
-    return (base + "\n\n" + f"⏱ Snapshot Age: <code>{_format_age_short(age)}</code> | Source: <code>{source}</code>{stats_text}\nLast Market Scan: <code>{at}</code>").strip()
+    display_at = _format_egypt_time(at, include_utc=True) if at else "-"
+    return (
+        base
+        + "\n\n"
+        + f"⏱ Snapshot Age: <code>{_format_age_short(age)}</code> | Source: <code>{source}</code>{stats_text}\n"
+        + f"🕒 Last Market Scan: <code>{display_at}</code>"
+    ).strip()
 
 
 def _refresh_market_mode_snapshot_for_mood(
@@ -8843,6 +9101,8 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             return
         if command.startswith("/report_execution"):
             _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=runtime_settings, okx_client=okx_client)
+        if _report_command_wants_footer(command):
+            _refresh_track_trades_before_reply(result, runtime_settings, trade_store=trade_store, okx_client=okx_client)
         simulation_outputs = _build_simulation_command_outputs(result)
         reply = (
             simulation_outputs.get(command)
@@ -8857,6 +9117,9 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         )
         if _is_exec_report_cb and reply and not _is_simulation_mode(_cb_settings):
             reply = _build_execution_balance_header(result, _cb_settings) + "\n" + reply
+        if _report_command_wants_footer(command):
+            footer_source = "execution_report" if command.startswith("/report_execution") else ("simulation_report" if command.startswith("/report_simulation") or command.startswith("/simulation_wallet") or command in _SIM_WALLET_PERIOD_COMMANDS else "fresh_report")
+            reply = _append_report_update_footer(reply, result, _cb_settings, command=command, source=footer_source)
         _send_text(sender, reply)
         return
 
@@ -9245,6 +9508,8 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 if command.startswith("/report_execution"):
                     _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
                     command_outputs = result.get("command_outputs", {})
+                if _report_command_wants_footer(command):
+                    _refresh_track_trades_before_reply(result, settings, trade_store=trade_store, okx_client=okx_client)
                 simulation_outputs = _build_simulation_command_outputs(result)
                 reply = (
                     simulation_outputs.get(command)
@@ -9261,6 +9526,9 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 if _is_exec_report and reply and not _is_simulation_mode(settings):
                     balance_header = _build_execution_balance_header(result, settings)
                     reply = balance_header + "\n" + reply
+                if _report_command_wants_footer(command):
+                    footer_source = "execution_report" if command.startswith("/report_execution") else ("simulation_report" if command.startswith("/report_simulation") or command.startswith("/simulation_wallet") or command in _SIM_WALLET_PERIOD_COMMANDS else "fresh_report")
+                    reply = _append_report_update_footer(reply, result, settings, command=command, source=footer_source)
             _send_text(sender, reply)
     return offset
 
