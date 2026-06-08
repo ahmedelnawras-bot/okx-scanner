@@ -2846,40 +2846,6 @@ def _drawdown_protection_message_ar(drawdown_status) -> str:
     ).strip()
 
 
-
-def _protection_scope_from_result(result: dict | None) -> str:
-    """Best-effort display scope for protection notices.
-
-    Display-only helper. It does not affect execution, sizing, cooldowns,
-    drawdown levels, or any trade decision. The caller should pass
-    result["protection_scope"] when available.
-    """
-    result = result or {}
-    scope = str(result.get("protection_scope") or "").strip().lower()
-    if scope in {"simulation", "execution"}:
-        return scope
-    state = result.get("protection_state") or {}
-    if isinstance(state, dict):
-        scope = str(state.get("scope") or "").strip().lower()
-        if scope in {"simulation", "execution"}:
-            return scope
-    return "execution"
-
-
-def _protection_scope_label_ar(scope: object) -> str:
-    scope_text = str(scope or "execution").strip().lower()
-    if scope_text == "simulation":
-        return "المحاكاة"
-    return "التنفيذ الحقيقي"
-
-
-def _protection_scope_action_ar(scope: object) -> str:
-    scope_text = str(scope or "execution").strip().lower()
-    if scope_text == "simulation":
-        return "صفقات المحاكاة"
-    return "الصفقات الحقيقية"
-
-
 def _block_mode_protection_message_ar(result: dict | None) -> str:
     """Human-readable Arabic message for market BLOCK reminder protection."""
     result = result or {}
@@ -2941,7 +2907,7 @@ def _append_protection_notice(message: str, result: dict | None) -> str:
     if not notice:
         return str(message or "").strip()
     base = str(message or "").strip()
-    if "🛡️ <b>تنبيه الحماية" in base:
+    if "🛡️ <b>تنبيه الحماية</b>" in base:
         return base
     return (base + "\n\n" + notice).strip()
 
@@ -4620,13 +4586,30 @@ def run_once(
         pre_protection_exec_result["risk_mode"] = scan_mode  # ✅ للـ dedup في Recovery mode
 
         hard_protection_rejection = _hard_execution_protection_rejection(drawdown_status, loss_streak_guard)
-        if hard_protection_rejection:
+        if hard_protection_rejection and simulation_mode_active:
+            # Simulation is a virtual evaluation lane. Its wallet/loss guards should
+            # be visible as advisory diagnostics, but they must not rewrite the
+            # actual candidate decision into an execution-style protection_pause.
+            # Otherwise Simulation stops showing which trades would be accepted by
+            # the strategy and looks like it borrowed the live trading gate.
+            exec_result = dict(pre_protection_exec_result)
+            exec_result["simulation_protection_advisory"] = True
+            exec_result["simulation_protection_reason"] = hard_protection_rejection.get("reason")
+            exec_result["simulation_protection_type"] = hard_protection_rejection.get("protection_type")
+            exec_result["simulation_protection_active"] = True
+            exec_result["virtual_execution"] = True
+            exec_result["live_execution"] = False
+            exec_result["decision_scope"] = "simulation"
+            exec_result["decision_engine"] = "process_trade_candidate_simulation_advisory"
+            exec_result["runtime_mode"] = "simulation"
+            exec_result["risk_mode"] = scan_mode
+        elif hard_protection_rejection:
             exec_result = dict(hard_protection_rejection)
             exec_result["pre_protection_status"] = pre_protection_exec_result.get("status")
             exec_result["pre_protection_reason"] = pre_protection_exec_result.get("reason")
             exec_result["pre_protection_path"] = pre_protection_exec_result.get("path")
             exec_result["decision_engine"] = "hard_protection_after_candidate"
-            exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
+            exec_result["runtime_mode"] = _get_signal_delivery_mode(settings)
             exec_result["risk_mode"] = scan_mode
         else:
             exec_result = pre_protection_exec_result
@@ -4858,7 +4841,6 @@ def run_once(
         "drawdown_status": drawdown_status,
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
-        "protection_scope": protection_scope,
         "portfolio_state_inputs": portfolio_state_inputs,
         "trades": trades,
         "simulation_trades": simulation_trades,
@@ -4897,7 +4879,6 @@ def run_once(
         "drawdown_report": drawdown_report,
         "loss_streak_guard": loss_streak_guard,
         "protection_state": protection_state,
-        "protection_scope": protection_scope,
         "active_protections": protection_summary.get("active_protections", []),
         "protection_status": protection_summary,
         "risk_protection_summary": protection_summary,
@@ -6162,7 +6143,12 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
             (result or {}).get("drawdown_status"),
             (result or {}).get("loss_streak_guard"),
         )
-        if hard_protection_rejection and str((exec_result or {}).get("status") or "").strip().lower() in {"accepted_preview", "pending_pullback_preview"}:
+        simulation_mode_active = _is_simulation_mode(settings)
+        if (
+            hard_protection_rejection
+            and not simulation_mode_active
+            and str((exec_result or {}).get("status") or "").strip().lower() in {"accepted_preview", "pending_pullback_preview"}
+        ):
             exec_result = dict(hard_protection_rejection)
             item["execution"] = exec_result
             item["message"] = build_signal_message(signal, exec_result)
@@ -8651,10 +8637,6 @@ def _maybe_send_protection_activation_alert(
     if not isinstance(tracker, dict):
         return
 
-    scope = _protection_scope(settings) if settings is not None else _protection_scope_from_result(result)
-    scope_label = _protection_scope_label_ar(scope)
-    scope_action = _protection_scope_action_ar(scope)
-
     alerts: list[tuple[str, str]] = []
 
     loss_guard = result.get("loss_streak_guard") or {}
@@ -8707,14 +8689,6 @@ def _maybe_send_protection_activation_alert(
         expired_sent = set(expired_sent or [])
         tracker["protection_expiry_sent"] = expired_sent
 
-    sent_at = tracker.setdefault("protection_alert_sent_at", {})
-    if not isinstance(sent_at, dict):
-        sent_at = {}
-        tracker["protection_alert_sent_at"] = sent_at
-
-    min_visible_seconds = 90
-    now_ts = time.time()
-
     # Allow a fresh alert next time after a protection fully disappears or changes level,
     # and send one clear standalone expiry/resume message.
     for old_key in list(sent_keys):
@@ -8743,7 +8717,6 @@ def _maybe_send_protection_activation_alert(
             continue
         _send_text(sender, message)
         sent_keys.add(key)
-        sent_at[key] = now_ts
         _telegram_send_pause(TELEGRAM_NORMAL_SEND_GAP_SECONDS)
 
 def _maybe_send_mode_reminder(sender: TelegramSender, result: dict, tracker: dict, settings: Settings | None = None) -> None:
