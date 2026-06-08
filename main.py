@@ -400,6 +400,120 @@ def _refresh_simulation_drawdown_in_result_if_needed(
         print(f"⚠️ SIM_DD_REFRESH_FROM_WALLET_FAILED | {exc}", flush=True)
 
 
+
+
+def _refresh_runtime_scope_state(
+    result: dict | None,
+    settings: Settings | None = None,
+    trade_store: RedisTradeStore | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> None:
+    """Refresh runtime-owned protection state for the active scope only.
+
+    Ownership rule:
+    - Simulation mode owns portfolio_state/drawdown_status/loss_streak_guard
+      from simulation_trades + simulation virtual wallet.
+    - Execution mode owns them from execution trades + OKX/execution baseline.
+
+    This helper is intentionally not an entry/execution decision function. It
+    only repairs runtime display/protection objects after report refreshes or
+    command-time rebuilds so one scope cannot overwrite the other.
+    """
+    if not isinstance(result, dict):
+        return
+    runtime_settings = settings or get_settings()
+    protection_scope = _protection_scope(runtime_settings)
+    protection_state = _load_protection_state(trade_store, protection_scope)
+    result["protection_state"] = protection_state
+
+    if _is_simulation_mode(runtime_settings):
+        sim_trades = list(result.get("simulation_trades", []) or [])
+        if trade_store:
+            try:
+                loaded = _load_simulation_trades(trade_store)
+                if loaded or not sim_trades:
+                    sim_trades = loaded
+            except Exception as exc:
+                print(f"⚠️ runtime scope simulation trades refresh failed: {exc}", flush=True)
+        result["simulation_trades"] = sim_trades
+        result["simulation_wallet"] = _build_simulation_wallet_snapshot(sim_trades)
+        try:
+            daily_row = _ensure_simulation_daily_log(sim_trades, trade_store=trade_store, settings=runtime_settings)
+        except Exception as exc:
+            print(f"⚠️ runtime scope simulation daily refresh failed: {exc}", flush=True)
+            daily_row = result.get("simulation_daily_balance") or {}
+        result["simulation_daily_balance"] = daily_row
+        try:
+            result["simulation_daily_log"] = _load_simulation_daily_log(trade_store)
+        except Exception:
+            pass
+        try:
+            result["simulation_execution_results"] = _load_simulation_execution_checks(trade_store, limit=500) if trade_store else list(result.get("simulation_execution_results", []) or [])
+        except Exception:
+            pass
+
+        inputs = _resolve_simulation_portfolio_state_inputs(
+            sim_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            daily_balance=daily_row,
+        )
+        inputs = _apply_daily_dd_manual_baseline(inputs, protection_state)
+        result["portfolio_state_inputs"] = inputs
+        portfolio_state = _build_simulation_portfolio_state_for_dd(
+            sim_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            daily_balance=daily_row,
+            portfolio_state_inputs=inputs,
+        )
+        dd_status = _simulation_wallet_drawdown_status(
+            sim_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            daily_balance=daily_row,
+            portfolio_state_inputs=inputs,
+        )
+        result["portfolio_state"] = portfolio_state
+        result["drawdown_status"] = dd_status
+        result["drawdown_report"] = _simulation_wallet_drawdown_report(portfolio_state, dd_status)
+        result["loss_streak_guard"] = _build_loss_streak_guard(
+            sim_trades,
+            reset_at=_parse_protection_dt(protection_state.get("loss_streak_reset_at")),
+        )
+        result["runtime_scope"] = "simulation"
+        result["risk_protection_summary"] = _risk_protection_summary(result)
+        result["active_protections"] = result["risk_protection_summary"].get("active_protections", [])
+        print(
+            "RUNTIME_SCOPE_REFRESH | simulation | "
+            f"dd={float(getattr(dd_status, 'drawdown_pct', 0.0) or 0.0):.2f}% | "
+            f"level={int(getattr(dd_status, 'level', 0) or 0)} | "
+            f"wallet={_safe_float((result.get('simulation_wallet') or {}).get('equity'), 0.0):.2f}",
+            flush=True,
+        )
+        return
+
+    # Execution/trading scope.
+    exec_trades = list(result.get("trades", []) or [])
+    inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
+    inputs = _apply_daily_dd_manual_baseline(inputs, protection_state)
+    result["portfolio_state_inputs"] = inputs
+    try:
+        portfolio_state = build_portfolio_state_from_trades(exec_trades, **_portfolio_state_kwargs(inputs))
+        result["portfolio_state"] = portfolio_state
+        result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        result["drawdown_report"] = build_drawdown_report(portfolio_state)
+    except Exception as exc:
+        print(f"⚠️ runtime scope execution portfolio refresh failed: {exc}", flush=True)
+    result["loss_streak_guard"] = _build_loss_streak_guard(
+        exec_trades,
+        reset_at=_parse_protection_dt(protection_state.get("loss_streak_reset_at")),
+    )
+    result["runtime_scope"] = "execution"
+    result["risk_protection_summary"] = _risk_protection_summary(result)
+    result["active_protections"] = result["risk_protection_summary"].get("active_protections", [])
+
+
 def _risk_profile_snapshot(
     settings: Settings,
     result: dict | None = None,
@@ -6992,6 +7106,7 @@ def _send_ai_report_file(sender: TelegramSender, key: str, today: str) -> None:
 
 
 def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
+    _refresh_runtime_scope_state(result, settings, trade_store=trade_store)
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
@@ -7032,11 +7147,16 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
-    # UI-only status flag. Keep it local to avoid NameError in Telegram command polling.
+    # UI-only status flag, scoped by active runtime.
     drawdown_state = "halted" if (drawdown is not None and not bool(getattr(drawdown, "allowed", True))) else "active"
-    trading_state_line = "🛡️ Trading State: ACTIVE"
-    if drawdown_state == "halted":
-        trading_state_line = "🛡️ Trading State: HALTED | Reason: Daily DD"
+    if simulation_active:
+        trading_state_line = "🧪 Simulation State: ACTIVE"
+        if drawdown_state == "halted":
+            trading_state_line = "🧪 Simulation State: HALTED | Reason: Simulation Daily DD"
+    else:
+        trading_state_line = "🛡️ Trading State: ACTIVE"
+        if drawdown_state == "halted":
+            trading_state_line = "🛡️ Trading State: HALTED | Reason: Execution Daily DD"
 
     return "\n".join([
         "🟢 Bot Status",
@@ -7684,12 +7804,7 @@ def _reset_runtime_state_after_clean(result: dict, *, keep_mode_state: bool = Tr
     result["command_outputs"] = command_outputs
     result.update(reports)
 
-    portfolio_state = build_portfolio_state_from_trades(empty_trades)
-    drawdown_status = evaluate_drawdown(portfolio_state)
-    result["portfolio_state"] = portfolio_state
-    result["drawdown_status"] = drawdown_status
-    result["drawdown_report"] = build_drawdown_report(portfolio_state)
-    result["loss_streak_guard"] = _build_loss_streak_guard(empty_trades)
+    _refresh_runtime_scope_state(result, get_settings())
 
     if not keep_mode_state:
         result["mode"] = MODE_NORMAL_LONG
@@ -8003,6 +8118,12 @@ def _refresh_execution_reports_from_redis(
     except Exception as exc:
         print(f"⚠️ execution report protection refresh failed: {exc}", flush=True)
 
+    # Critical ownership repair: execution report refresh may be requested while
+    # the bot is in Simulation mode. In that case execution reports may update,
+    # but runtime DD/status/protection must remain owned by Simulation.
+    if _is_simulation_mode(runtime_settings):
+        _refresh_runtime_scope_state(result, runtime_settings, trade_store=trade_store, okx_client=okx_client)
+
 def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> None:
     if not isinstance(result, dict):
         return
@@ -8029,20 +8150,8 @@ def _refresh_runtime_after_report_reset(result: dict | None, trade_store: RedisT
     result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
     result.update(reports)
 
-    portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-    portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
-    result["portfolio_state"] = portfolio_state
-    result["drawdown_status"] = evaluate_drawdown(portfolio_state)
-    result["drawdown_report"] = build_drawdown_report(portfolio_state)
     runtime_settings = settings or get_settings()
-    result["loss_streak_guard"] = _build_loss_streak_guard(
-        _loss_streak_base_trades_for_runtime(
-            runtime_settings,
-            result,
-            execution_trades=refreshed_trades,
-            simulation_trades=refreshed_sim_trades,
-        )
-    )
+    _refresh_runtime_scope_state(result, runtime_settings, trade_store=trade_store)
 
 
 def _reset_reports_confirm(kind: str, trade_store: RedisTradeStore | None, result: dict | None = None) -> dict:
@@ -8174,21 +8283,8 @@ def _handle_admin_clean_command(
             result["current_execution_results"] = []
             result["command_outputs"] = build_command_outputs(refreshed_trades, refreshed_checks, [], **execution_report_kwargs)
             result.update(reports)
-            portfolio_state_inputs = dict(result.get("portfolio_state_inputs", {}) or {})
-            portfolio_state = build_portfolio_state_from_trades(refreshed_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
-            result["portfolio_state"] = portfolio_state
-            result["drawdown_status"] = evaluate_drawdown(portfolio_state)
-            result["drawdown_report"] = build_drawdown_report(portfolio_state)
             runtime_settings = settings or get_settings()
-            refreshed_sim_trades = _load_simulation_trades(trade_store) if trade_store else list(result.get("simulation_trades", []) or [])
-            result["loss_streak_guard"] = _build_loss_streak_guard(
-                _loss_streak_base_trades_for_runtime(
-                    runtime_settings,
-                    result,
-                    execution_trades=refreshed_trades,
-                    simulation_trades=refreshed_sim_trades,
-                )
-            )
+            _refresh_runtime_scope_state(result, runtime_settings, trade_store=trade_store)
         return _format_clean_result(stats, "🧹 Soft Clean Done")
     if command in {"/deep_clean", "/deep_clean_preview"}:
         stats = trade_store.clean_preview("deep") if trade_store else {"enabled": False}
@@ -8626,8 +8722,13 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
         except Exception as exc:
             print(f"⚠️ command exchange reconcile failed: {exc}", flush=True)
 
-    # Keep execution reports fresh at command time.
-    _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
+    # Keep runtime state owned by the active scope. Do not run execution report
+    # refresh globally in Simulation mode; execution reports are refreshed only
+    # when an execution report command explicitly asks for them.
+    if _is_simulation_mode(settings):
+        _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
+    else:
+        _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
     command_outputs = result.get("command_outputs", {})
     for update in updates.get("result", []):
         offset = int(update.get("update_id", 0)) + 1
@@ -8850,6 +8951,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                     _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
+                _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
                 reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
             elif command == "/help_execution":
                 reply = result.get("help_execution", "")
