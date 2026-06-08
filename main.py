@@ -124,6 +124,10 @@ TELEGRAM_EXECUTION_SEND_GAP_SECONDS = 0.35
 TELEGRAM_NORMAL_SEND_GAP_SECONDS = 0.85
 TELEGRAM_COMMAND_POLL_SLEEP_SECONDS = 0.5
 
+# Throttle noisy Simulation DD refresh logs.
+_SIM_DD_REFRESH_LOG_STATE: dict[str, object] = {"last_ts": 0.0, "signature": ""}
+_SIM_DD_REFRESH_LOG_INTERVAL_SECONDS = 300
+
 
 # Simulation Trading Mode
 # Mirror of trading mode execution decisions, but with internal virtual execution.
@@ -389,13 +393,31 @@ def _refresh_simulation_drawdown_in_result_if_needed(
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = dd_status
         result["drawdown_report"] = _simulation_wallet_drawdown_report(portfolio_state, dd_status)
-        print(
-            f"SIM_DD_REFRESH_FROM_WALLET | old_pct={old_pct:.2f} | "
-            f"new_pct={float(getattr(dd_status, 'drawdown_pct', 0.0) or 0.0):.2f} | "
-            f"start={float(getattr(dd_status, 'start_of_day_balance', 0.0) or 0.0):.2f} | "
-            f"equity={float(getattr(dd_status, 'current_equity', 0.0) or 0.0):.2f}",
-            flush=True,
-        )
+
+        # Log only meaningful Simulation DD repairs/changes. This helper is called
+        # by status/mood/risk-block refreshes, so unconditional logging floods Railway.
+        try:
+            new_pct = float(getattr(dd_status, "drawdown_pct", 0.0) or 0.0)
+            old_level = int(getattr(current, "level", 0) or 0) if current is not None else -1
+            new_level = int(getattr(dd_status, "level", 0) or 0)
+            start_balance = float(getattr(dd_status, "start_of_day_balance", 0.0) or 0.0)
+            current_equity = float(getattr(dd_status, "current_equity", 0.0) or 0.0)
+            signature = f"{old_pct:.2f}|{new_pct:.2f}|{old_level}|{new_level}|{start_balance:.2f}|{current_equity:.2f}"
+            now_ts = time.time()
+            last_ts = float(_SIM_DD_REFRESH_LOG_STATE.get("last_ts") or 0.0)
+            last_signature = str(_SIM_DD_REFRESH_LOG_STATE.get("signature") or "")
+            meaningful_change = abs(old_pct - new_pct) >= 0.25 or old_level != new_level or old_pct > 100.0
+            should_log = bool(meaningful_change and (signature != last_signature or (now_ts - last_ts) >= _SIM_DD_REFRESH_LOG_INTERVAL_SECONDS))
+            if should_log or bool(getattr(settings, "verbose_logs", False)):
+                print(
+                    f"SIM_DD_REFRESH_FROM_WALLET | old_pct={old_pct:.2f} | "
+                    f"new_pct={new_pct:.2f} | start={start_balance:.2f} | equity={current_equity:.2f}",
+                    flush=True,
+                )
+                _SIM_DD_REFRESH_LOG_STATE["last_ts"] = now_ts
+                _SIM_DD_REFRESH_LOG_STATE["signature"] = signature
+        except Exception:
+            pass
     except Exception as exc:
         print(f"⚠️ SIM_DD_REFRESH_FROM_WALLET_FAILED | {exc}", flush=True)
 
@@ -2292,6 +2314,118 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
     return price_map
 
 
+def _ensure_open_trade_prices_in_map(
+    price_map: dict | None,
+    trades: list | None,
+    settings: Settings,
+    *,
+    label: str = "runtime",
+) -> dict:
+    """Ensure every open tracked trade has a fresh price before lifecycle update.
+
+    update_open_trades() intentionally trusts the provided price_map. If an old
+    open trade's symbol is missing from the current scanner map, the updater
+    falls back to trade.current_price and TP/SL/PnL can look frozen for hours.
+
+    Surgical scope:
+    - only enriches the price map for already-open trades;
+    - does not change candidate selection, scoring, slots, OKX order placement,
+      recovery rules, or TP/SL formulas;
+    - fetches a 1m OKX candle/last close only for missing open-trade symbols.
+    """
+    out = dict(price_map or {})
+    if not trades:
+        return out
+
+    fetched = 0
+    missing: list[str] = []
+    for trade in list(trades or []):
+        try:
+            if _is_trade_closed(trade):
+                continue
+            symbol_raw = str(getattr(trade, "symbol", "") or "").strip()
+            inst_id = _normalize_okx_inst_id(symbol_raw)
+            if not inst_id:
+                continue
+
+            # Normalize equivalent keys already present in the scanner map.
+            existing = 0.0
+            for key in (symbol_raw, inst_id, inst_id.replace("-", "")):
+                existing = _safe_float(out.get(key), 0.0)
+                if existing > 0:
+                    break
+            if existing > 0:
+                out[inst_id] = existing
+                _safe_set_trade_attr(trade, "price_stale", False)
+                _safe_set_trade_attr(trade, "last_price_update_at", datetime.now(timezone.utc))
+                continue
+
+            price = 0.0
+            try:
+                rows = fetch_okx_candles(
+                    settings.okx_base_url,
+                    inst_id,
+                    bar="1m",
+                    limit=2,
+                    timeout=settings.request_timeout,
+                )
+                if isinstance(rows, list) and rows:
+                    # OKX returns latest first; close is index 4.
+                    row = rows[0]
+                    if isinstance(row, (list, tuple)) and len(row) >= 5:
+                        price = _safe_float(row[4], 0.0)
+            except Exception as exc:
+                print(f"⚠️ OPEN_TRADE_PRICE_FETCH_FAILED | {label} | {inst_id} | {exc}", flush=True)
+
+            if price > 0:
+                out[inst_id] = price
+                fetched += 1
+                _safe_set_trade_attr(trade, "price_stale", False)
+                _safe_set_trade_attr(trade, "last_price_update_at", datetime.now(timezone.utc))
+                print(f"OPEN_TRADE_PRICE_REFRESH | {label} | {inst_id} | price={price}", flush=True)
+            else:
+                missing.append(inst_id)
+                _safe_set_trade_attr(trade, "price_stale", True)
+                _safe_set_trade_attr(trade, "price_stale_reason", "missing_from_price_map_and_fetch_failed")
+                print(
+                    f"⚠️ OPEN_TRADE_PRICE_MISSING | {label} | {inst_id} | "
+                    f"last={_safe_float(getattr(trade, 'current_price', 0.0), 0.0)} | "
+                    f"entry={_safe_float(getattr(trade, 'entry', 0.0), 0.0)}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"⚠️ OPEN_TRADE_PRICE_REFRESH_ROW_FAILED | {label} | {exc}", flush=True)
+
+    if fetched or missing:
+        print(
+            f"OPEN_TRADE_PRICE_REFRESH_SUMMARY | {label} | fetched={fetched} | missing={len(missing)} | "
+            f"missing_symbols={','.join(missing[:10]) or '-'}",
+            flush=True,
+        )
+    return out
+
+
+def _ensure_trade_display_defaults(trades: list | None, settings: Settings, *, label: str = "runtime") -> list:
+    """Backfill display-only defaults for old simulation/execution records.
+
+    This fixes report lines like "⚙️ -x" when older simulation trades were saved
+    before leverage fields were persisted. It does not alter position sizing or
+    exchange state; it only fills missing attrs on already-created records.
+    """
+    default_lev = max(1, int(getattr(settings, "default_leverage", 1) or 1))
+    for trade in list(trades or []):
+        try:
+            for attr in ("effective_leverage", "actual_leverage", "leverage"):
+                if _safe_float(getattr(trade, attr, 0.0), 0.0) <= 0:
+                    _safe_set_trade_attr(trade, attr, default_lev)
+            if str(getattr(trade, "trade_source", "") or "").lower() == "simulation":
+                if _safe_float(getattr(trade, "simulation_leverage", 0.0), 0.0) <= 0:
+                    _safe_set_trade_attr(trade, "simulation_leverage", default_lev)
+        except Exception as exc:
+            print(f"⚠️ TRADE_DISPLAY_DEFAULTS_FAILED | {label} | {getattr(trade, 'symbol', '-') or '-'} | {exc}", flush=True)
+    return list(trades or [])
+
+
 
 
 def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "15m", limit: int = 10) -> list[dict]:
@@ -2529,6 +2663,9 @@ def _refresh_mode_outputs(result: dict, state: MarketModeState, snapshot: Market
     result["mode_context"] = _build_mode_context(state, snapshot, protection)
     result["mode_message"] = _build_mode_message(state, snapshot, protection, settings=settings, result=result)
     result["mode_transition_message"] = None
+    result["market_snapshot_at"] = datetime.now(timezone.utc).isoformat()
+    result["last_market_scan_at"] = result["market_snapshot_at"]
+    result["market_snapshot_source"] = "scan"
     result["block_alert_preview"] = (
         build_block_escalation_alert(
             state,
@@ -2572,6 +2709,97 @@ def _run_market_mode_guard(
     else:
         result["mode_transition_message"] = None
     return guarded_state
+
+
+
+def _market_snapshot_age_seconds(result: dict | None) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    value = result.get("market_snapshot_at") or result.get("last_market_scan_at")
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        else:
+            text = str(value).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()))
+    except Exception:
+        return None
+
+
+def _format_age_short(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h {minutes % 60}m"
+
+
+def _append_market_snapshot_freshness(message: str, result: dict | None) -> str:
+    base = str(message or "").strip()
+    if "⏱ Snapshot Age:" in base:
+        return base
+    result = result or {}
+    age = _market_snapshot_age_seconds(result)
+    source = str(result.get("market_snapshot_source") or "cached_scan").strip() or "cached_scan"
+    at = str(result.get("market_snapshot_at") or result.get("last_market_scan_at") or "-").strip()
+    stats = result.get("market_snapshot_stats") or {}
+    stats_text = ""
+    if isinstance(stats, dict) and stats:
+        stats_text = f" | pairs={int(stats.get('ranked_pairs', 0) or 0)}"
+    return (base + "\n\n" + f"⏱ Snapshot Age: <code>{_format_age_short(age)}</code> | Source: <code>{source}</code>{stats_text}\nLast Market Scan: <code>{at}</code>").strip()
+
+
+def _refresh_market_mode_snapshot_for_mood(
+    result: dict,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+) -> tuple[bool, str]:
+    """Recompute market mode now for /mood only.
+
+    This is display/runtime freshness only. It does not place orders and does
+    not call process_trade_candidate, OKX execution, lifecycle, or slot logic.
+    """
+    if not isinstance(result, dict):
+        return False, "runtime_result_missing"
+    try:
+        tickers = fetch_okx_tickers(settings.okx_base_url, settings.request_timeout, settings.offline_test_mode)
+        ranked_pairs = select_ranked_pairs(tickers, settings.scan_limit)
+        snapshot = _build_snapshot(ranked_pairs, settings)
+        previous_state = result.get("state") if isinstance(result.get("state"), MarketModeState) else None
+        state = decide_market_mode(snapshot, previous=previous_state)
+        protection = block_protection_status(state)
+        result["state"] = state
+        result["mode"] = state.mode
+        result["mode_context"] = _build_mode_context(state, snapshot, protection)
+        result["market_snapshot_at"] = datetime.now(timezone.utc).isoformat()
+        result["last_market_scan_at"] = result["market_snapshot_at"]
+        result["market_snapshot_source"] = "fresh_mood"
+        result["market_snapshot_stats"] = {
+            "ranked_pairs": len(ranked_pairs or []),
+            "tickers": len(tickers or []),
+            "sample_size": int(getattr(snapshot, "market_guard_valid_count", 0) or getattr(snapshot, "market_guard_sample_size", 0) or 0),
+        }
+        result["mode_message"] = _build_mode_message(state, snapshot, protection, settings=settings, result=result)
+        result["mode_transition_message"] = None
+        print(
+            "FRESH_MOOD_MARKET_SNAPSHOT | "
+            f"mode={state.mode} | ranked={len(ranked_pairs or [])} | tickers={len(tickers or [])}",
+            flush=True,
+        )
+        return True, "ok"
+    except Exception as exc:
+        print(f"⚠️ FRESH_MOOD_MARKET_SNAPSHOT_FAILED | {exc}", flush=True)
+        return False, str(exc)
 
 
 def prefilter_pair_before_candles(pair, current_mode: str) -> bool:
@@ -4739,6 +4967,15 @@ def run_once(
     elif _CACHED_PRICE_MAP and (_ptime.time() - _CACHED_PRICE_MAP_TS) < _CACHED_PRICE_MAP_TTL_SECONDS:
         print("⚠️ price_map empty — using cached fallback", flush=True)
         initial_price_map = dict(_CACHED_PRICE_MAP)
+
+    persisted_trades = _ensure_trade_display_defaults(persisted_trades, settings, label="initial_execution")
+    simulation_trades = _ensure_trade_display_defaults(simulation_trades, settings, label="initial_simulation")
+    initial_price_map = _ensure_open_trade_prices_in_map(
+        initial_price_map,
+        list(persisted_trades or []) + list(simulation_trades or []),
+        settings,
+        label="initial_lifecycle",
+    )
     exchange_reconcile_enabled = bool(
         okx_client is not None
         and getattr(okx_client, "configured", False)
@@ -5187,6 +5424,14 @@ def run_once(
     elif _CACHED_PRICE_MAP and (_ptime.time() - _CACHED_PRICE_MAP_TS) < _CACHED_PRICE_MAP_TTL_SECONDS:
         print("⚠️ final price_map empty — using cached fallback", flush=True)
         price_map = dict(_CACHED_PRICE_MAP)
+    persisted_trades = _ensure_trade_display_defaults(persisted_trades, settings, label="final_execution")
+    simulation_trades = _ensure_trade_display_defaults(simulation_trades, settings, label="final_simulation")
+    price_map = _ensure_open_trade_prices_in_map(
+        price_map,
+        list(persisted_trades or []) + list(simulation_trades or []),
+        settings,
+        label="final_lifecycle",
+    )
     protection = block_protection_status(state)
 
     # ✅ FIX: احسب exchange_stop_sync للـ final update بعد ما الصفقات اتفتحت في اللوب
@@ -5342,6 +5587,10 @@ def run_once(
         "menu": build_main_menu_layout(),
         "menu_keyboard": _build_main_inline_keyboard_with_bot_modes(settings),
         "mode_context": mode_context,
+        "market_snapshot_at": datetime.now(timezone.utc).isoformat(),
+        "last_market_scan_at": datetime.now(timezone.utc).isoformat(),
+        "market_snapshot_source": "scan",
+        "market_snapshot_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs), "tickers": len(tickers or [])},
         "scan_stats": {"ranked_pairs": len(ranked_pairs), "after_prefilter": len(filtered_pairs), "scanned_pairs": len(filtered_pairs)},
         "technical_snapshot_enabled": is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)),
         "technical_snapshot_written": len(technical_snapshot_records),
@@ -8338,7 +8587,19 @@ def _refresh_track_trades_before_reply(
         price_map = {}
 
     if not price_map:
+        price_map = {}
+
+    price_map = _ensure_open_trade_prices_in_map(
+        price_map,
+        list(trades or []) + list(simulation_trades or []),
+        settings,
+        label="track_refresh_readonly",
+    )
+    if not price_map:
         return
+
+    trades = _ensure_trade_display_defaults(trades, settings, label="track_execution")
+    simulation_trades = _ensure_trade_display_defaults(simulation_trades, settings, label="track_simulation")
 
     try:
         protection_level = int(block_protection_status(result.get("state")).get("level", 0) or 0) if result.get("state") else 0
@@ -8952,7 +9213,11 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
                 _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
+                fresh_ok, fresh_reason = _refresh_market_mode_snapshot_for_mood(result, settings, trade_store=trade_store)
                 reply = _refresh_risk_block_in_mode_message(result.get("mode_message", "No mode yet"), settings, result)
+                reply = _append_market_snapshot_freshness(reply, result)
+                if not fresh_ok:
+                    reply += "\n\n⚠️ Fresh mood refresh failed: <code>" + str(fresh_reason)[:160] + "</code>"
             elif command == "/help_execution":
                 reply = result.get("help_execution", "")
             elif command == "/help_normal":
