@@ -271,6 +271,106 @@ def calculate_context_component(candidate: Any, config: CapitalIntelligenceConfi
 
     return CapitalComponent("context_quality", round(_clamp(points, 0.0, config.context_max_points), 2), config.context_max_points, ",".join(reasons), {"turnover_usdt": turnover, "change_abs_pct": change, "btc_status": btc_status, "warnings_count": len(warnings)})
 
+def calculate_market_mode_component(candidate: Any, config: CapitalIntelligenceConfig = DEFAULT_CONFIG) -> CapitalComponent:
+    """Shadow-only market mode awareness.
+
+    The same setup does not deserve the same capital priority in every market.
+    This component reads the already-attached market_mode / mode metadata and
+    adjusts the advisory bid only. It does NOT alter entry validity, OKX
+    execution, TP/SL, slots, Recovery, BLOCK, or main.py.
+    """
+    meta = _get_meta(candidate)
+    mode = str(
+        getattr(candidate, "market_mode", "")
+        or meta.get("market_mode")
+        or meta.get("mode")
+        or ""
+    ).strip().lower()
+    setup_type = str(getattr(candidate, "setup_type", "") or meta.get("setup_type") or "").strip()
+    names = set(_setup_names(candidate))
+    flags = dict(meta.get("pa_score_flags") or {}) if isinstance(meta.get("pa_score_flags"), dict) else {}
+    change_abs = abs(_safe_float(meta.get("change_pct"), 0.0))
+    pa_score = _safe_float(meta.get("pa_score"), 0.0)
+    stability = _safe_float(meta.get("execution_stability"), 0.0)
+    nour_passed = bool(meta.get("nour_filter_passed"))
+    resistance_status = str(meta.get("resistance_4h_status") or "").strip().lower()
+    resistance_distance = _safe_float(meta.get("resistance_4h_distance_pct"), 0.0)
+
+    points = 2.5  # neutral midpoint on a 0..5 scale
+    reasons: list[str] = ["neutral_mode"]
+
+    is_strong = mode in {"strong_long_only", "mode_strong_long_only", "strong", "strong_long"}
+    is_normal = mode in {"normal_long", "mode_normal_long", "normal", "balanced"}
+    is_recovery = mode in {"recovery_long", "mode_recovery_long", "recovery"}
+    is_block = mode in {"block_longs", "mode_block_longs", "block", "risk_off"}
+
+    if is_strong:
+        points += 1.25
+        reasons.append("strong_market_tailwind")
+        if setup_type in {"higher_low_continuation", "wave_3", "retest_breakout_confirmed"}:
+            points += 0.75
+            reasons.append("strong_mode_structural_setup")
+        if "clean_higher_low_structure" in names or "breakout_pullback_acceptance" in names:
+            points += 0.50
+            reasons.append("strong_mode_clean_continuation")
+
+    elif is_recovery:
+        # Recovery mode rewards reclaim/sweep quality, not blind momentum.
+        points += 0.40
+        reasons.append("recovery_mode_selective")
+        if "sweep_reclaim_continuation" in names or bool(flags.get("sweep")):
+            points += 1.10
+            reasons.append("recovery_reclaim_setup")
+        if setup_type == "wave_3" and change_abs >= 3.5:
+            points -= 0.85
+            reasons.append("recovery_hot_wave3_penalty")
+
+    elif is_block:
+        # BLOCK does not ban here; it lowers capital priority unless the signal
+        # has real acceptance/reclaim evidence and stable execution context.
+        points -= 1.75
+        reasons.append("block_market_risk")
+        if bool(flags.get("acceptance")) and (nour_passed or stability >= 1.20):
+            points += 0.90
+            reasons.append("block_acceptance_exception_quality")
+        if resistance_status in {"very_near", "near"} or (0 < resistance_distance < 2.0):
+            points -= 0.75
+            reasons.append("block_near_resistance_penalty")
+        if change_abs >= 4.0:
+            points -= 0.75
+            reasons.append("block_hot_move_penalty")
+
+    elif is_normal:
+        points += 0.20
+        reasons.append("normal_market")
+        if setup_type == "higher_low_continuation" and pa_score >= 0.18:
+            points += 0.40
+            reasons.append("normal_higher_low_pa")
+
+    else:
+        reasons.append("mode_unknown_neutral")
+
+    max_points = _safe_float(getattr(config, "market_mode_max_points", 5.0), 5.0)
+    points = round(_clamp(points, 0.0, max_points), 2)
+    return CapitalComponent(
+        "market_mode_awareness",
+        points,
+        max_points,
+        ",".join(reasons),
+        {
+            "market_mode": mode or "unknown",
+            "setup_type": setup_type,
+            "setup_candidates": sorted(names),
+            "change_abs_pct": change_abs,
+            "pa_score": pa_score,
+            "execution_stability": stability,
+            "nour_passed": nour_passed,
+            "resistance_status": resistance_status,
+            "resistance_distance_pct": resistance_distance,
+        },
+    )
+
+
 def calculate_synergy_component(candidate: Any, config: CapitalIntelligenceConfig = DEFAULT_CONFIG) -> CapitalComponent:
     """Analytics-only setup synergy bonus.
 
@@ -383,6 +483,7 @@ def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DE
         calculate_nour_component(candidate, config),
         calculate_resistance_component(candidate, config),
         calculate_context_component(candidate, config),
+        calculate_market_mode_component(candidate, config),
         calculate_synergy_component(candidate, config),
     ]
     total = round(_clamp(sum(c.points for c in components), 0.0, 100.0), 2)
@@ -473,6 +574,7 @@ __all__ = [
     "rank_candidates",
     "annotate_candidates_shadow",
     "classify_bid",
+    "calculate_market_mode_component",
     "calculate_synergy_component",
     "CapitalIntelligenceConfig",
     "CapitalBid",
