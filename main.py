@@ -524,6 +524,17 @@ def _refresh_runtime_scope_state(
         portfolio_state = build_portfolio_state_from_trades(exec_trades, **_portfolio_state_kwargs(inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            inputs,
+            exec_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="runtime_scope",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     except Exception as exc:
         print(f"⚠️ runtime scope execution portfolio refresh failed: {exc}", flush=True)
@@ -1142,6 +1153,140 @@ def _resolve_portfolio_state_inputs(
     }
 
 
+
+
+def _execution_drawdown_pct_value(drawdown_status=None, portfolio_state=None) -> float:
+    try:
+        return float(getattr(drawdown_status, "drawdown_pct", 0.0) or 0.0)
+    except Exception:
+        pass
+    try:
+        return float(getattr(portfolio_state, "drawdown_pct", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _repair_execution_drawdown_sanity(
+    portfolio_state,
+    drawdown_status,
+    portfolio_state_inputs: dict | None,
+    trades: list | None,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    *,
+    label: str = "runtime",
+):
+    """Repair impossible execution Daily-DD readings from current OKX equity.
+
+    Execution-only hygiene. It does not touch simulation, OKX orders, TP/SL,
+    lifecycle, slots, scoring, or saved trades. It prevents corrupted execution
+    DD/baseline state from producing impossible values such as 1881566%.
+    """
+    try:
+        if _is_simulation_mode(settings):
+            return portfolio_state, drawdown_status, dict(portfolio_state_inputs or {})
+    except Exception:
+        return portfolio_state, drawdown_status, dict(portfolio_state_inputs or {})
+
+    inputs = dict(portfolio_state_inputs or {})
+    ref = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    start = _safe_float(inputs.get("start_of_day_balance"), 0.0)
+    dd_pct = _execution_drawdown_pct_value(drawdown_status, portfolio_state)
+    realized = _safe_float(getattr(portfolio_state, "realized_pnl_usdt", 0.0), 0.0)
+    unrealized = _safe_float(getattr(portfolio_state, "unrealized_pnl_usdt", 0.0), 0.0)
+    computed_equity = _safe_float(getattr(portfolio_state, "current_equity", 0.0), 0.0)
+
+    needs_repair = bool(
+        dd_pct > 100.0
+        or start < 0.01
+        or (ref > 0 and start > max(ref * 25.0, 10_000.0))
+        or (ref > 0 and computed_equity < -max(ref * 5.0, 100.0))
+    )
+    if not needs_repair:
+        return portfolio_state, drawdown_status, inputs
+
+    trade_pnl = realized + unrealized
+    repaired_start = ref - trade_pnl if ref > 0 else 0.0
+    used_flat_repair = False
+    if ref > 0:
+        if repaired_start <= 0 or repaired_start > max(ref * 10.0, 1000.0):
+            repaired_start = ref
+            used_flat_repair = True
+    else:
+        repaired_start = 0.0
+        used_flat_repair = True
+
+    if ref > 0 and repaired_start < 1.0:
+        repaired_start = ref
+        used_flat_repair = True
+
+    clean_inputs = dict(inputs)
+    clean_inputs["start_of_day_balance"] = float(repaired_start)
+    clean_inputs["execution_dd_sanity_repaired"] = True
+    clean_inputs["execution_dd_sanity_repair_reason"] = "impossible_execution_daily_dd"
+
+    try:
+        repaired_state = build_portfolio_state_from_trades(list(trades or []), **_portfolio_state_kwargs(clean_inputs))
+        if used_flat_repair:
+            try:
+                repaired_state.realized_pnl_usdt = 0.0
+                repaired_state.unrealized_pnl_usdt = 0.0
+                repaired_state.start_of_day_balance = round(float(ref or repaired_start or 0.0), 4)
+                repaired_state.reference_portfolio = float(ref or 0.0)
+            except Exception:
+                pass
+        repaired_dd = evaluate_drawdown(repaired_state)
+    except Exception as exc:
+        print(f"⚠️ EXEC_DD_SANITY_REPAIR_REBUILD_FAILED | {label} | {exc}", flush=True)
+        return portfolio_state, drawdown_status, inputs
+
+    repaired_pct = _execution_drawdown_pct_value(repaired_dd, repaired_state)
+    if repaired_pct > 100.0 and ref > 0:
+        try:
+            repaired_state.realized_pnl_usdt = 0.0
+            repaired_state.unrealized_pnl_usdt = 0.0
+            repaired_state.start_of_day_balance = round(float(ref), 4)
+            repaired_state.reference_portfolio = float(ref)
+            repaired_dd = evaluate_drawdown(repaired_state)
+            repaired_pct = _execution_drawdown_pct_value(repaired_dd, repaired_state)
+            clean_inputs["start_of_day_balance"] = float(ref)
+            used_flat_repair = True
+        except Exception:
+            pass
+
+    if ref > 0 and trade_store is not None:
+        try:
+            today = _execution_today_key()
+            row = _load_execution_daily_balance_row(trade_store, today)
+            row.update({
+                "date": today,
+                "start_balance": float(clean_inputs.get("start_of_day_balance") or ref),
+                "adjusted_start_balance": float(clean_inputs.get("start_of_day_balance") or ref),
+                "current_balance": float(ref),
+                "last_equity": float(ref),
+                "external_cashflow_net": 0.0,
+                "external_deposits": 0.0,
+                "external_withdrawals": 0.0,
+                "reason": "execution_dd_sanity_repair_from_okx_balance",
+                "sanity_repaired_at": datetime.now(timezone.utc).isoformat(),
+                "sanity_old_drawdown_pct": float(dd_pct or 0.0),
+                "sanity_old_start_balance": float(start or 0.0),
+                "sanity_old_computed_equity": float(computed_equity or 0.0),
+                "sanity_flat_repair": bool(used_flat_repair),
+            })
+            _save_execution_daily_balance_row(trade_store, today, row)
+        except Exception as exc:
+            print(f"⚠️ EXEC_DD_SANITY_REPAIR_SAVE_FAILED | {label} | {exc}", flush=True)
+
+    print(
+        "EXEC_DD_SANITY_REPAIR | "
+        f"{label} | old_pct={dd_pct:.2f} | new_pct={repaired_pct:.2f} | "
+        f"ref={ref:.4f} | old_start={start:.8f} | new_start={_safe_float(clean_inputs.get('start_of_day_balance'), 0.0):.4f} | "
+        f"old_equity={computed_equity:.4f} | flat={used_flat_repair}",
+        flush=True,
+    )
+    return repaired_state, repaired_dd, clean_inputs
+
 def _resolve_simulation_portfolio_state_inputs(
     simulation_trades: list,
     settings: Settings,
@@ -1390,6 +1535,55 @@ def _okx_result_is_ok(payload: dict | None) -> bool:
     return str(payload.get("code", "")) == "0"
 
 
+_RUNTIME_LOG_THROTTLE: dict[str, float] = {}
+_REPORT_OKX_HARD_REFRESH_THROTTLE: dict[str, float] = {}
+
+
+def _runtime_verbose_logs_enabled() -> bool:
+    return str(os.getenv("VERBOSE_LOGS") or os.getenv("OKX_VERBOSE_LOGS") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_throttled(key: str, message: str, *, every_seconds: int = 300, force: bool = False) -> None:
+    """Print noisy operational logs at most once per interval.
+
+    Keeps Railway responsive by preventing repeated OKX position/report repair
+    diagnostics from flooding stdout while preserving important first/error logs.
+    """
+    try:
+        if force or _runtime_verbose_logs_enabled():
+            print(message, flush=True)
+            return
+        now = time.monotonic()
+        last = float(_RUNTIME_LOG_THROTTLE.get(key, 0.0) or 0.0)
+        if now - last >= max(1, int(every_seconds or 300)):
+            _RUNTIME_LOG_THROTTLE[key] = now
+            print(message, flush=True)
+    except Exception:
+        try:
+            print(message, flush=True)
+        except Exception:
+            pass
+
+
+def _report_hard_okx_refresh_allowed(scope_key: str = "execution", *, every_seconds: int | None = None) -> bool:
+    """Throttle expensive report-only OKX hard reconcile/recovery/repair.
+
+    This affects report/status freshness only. It does NOT affect live execution
+    safety checks, order placement, TP/SL, or lifecycle updates.
+    """
+    try:
+        interval = int(every_seconds if every_seconds is not None else os.getenv("OKX_REPORT_HARD_REFRESH_SECONDS", "60"))
+    except Exception:
+        interval = 60
+    interval = max(10, interval)
+    now = time.monotonic()
+    last = float(_REPORT_OKX_HARD_REFRESH_THROTTLE.get(scope_key, 0.0) or 0.0)
+    if now - last >= interval:
+        _REPORT_OKX_HARD_REFRESH_THROTTLE[scope_key] = now
+        return True
+    return False
+
+
 def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int = 8) -> None:
     """Print compact OKX positions diagnostics without exposing secrets.
 
@@ -1405,26 +1599,29 @@ def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int 
         code = str(response.get("code") or (payload or {}).get("code") or "") if isinstance(payload, dict) else ""
         msg = str(response.get("msg") or (payload or {}).get("reason") or (payload or {}).get("msg") or "") if isinstance(payload, dict) else ""
         rows = _okx_result_rows(payload)
-        print(
+        _log_throttled(
+            f"okx_positions_debug:{label}",
             f"OKX_POSITIONS_DEBUG | {label} | ok={ok} | code={code or '-'} | rows={len(rows)} | msg={msg[:140] or '-'}",
-            flush=True,
+            every_seconds=300,
+            force=not ok,
         )
-        for row in rows[:max(1, int(max_rows or 8))]:
-            inst_id = _row_inst_id(row)
-            pos = _row_float(row, "pos", "availPos")
-            notional = _row_float(row, "notionalUsd", "notional")
-            margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
-            avg = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
-            mark = _position_row_price(row, "markPx", "last", "lastPx", "idxPx")
-            print(
-                "OKX_POS_ROW | "
-                f"{label} | instId={inst_id or '-'} | pos={pos} | notional={notional} | margin={margin} | "
-                f"avgPx={avg} | markPx={mark} | mgnMode={row.get('mgnMode') or '-'} | "
-                f"posSide={row.get('posSide') or '-'}",
-                flush=True,
-            )
+        if _runtime_verbose_logs_enabled():
+            for row in rows[:max(1, int(max_rows or 8))]:
+                inst_id = _row_inst_id(row)
+                pos = _row_float(row, "pos", "availPos")
+                notional = _row_float(row, "notionalUsd", "notional")
+                margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+                avg = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+                mark = _position_row_price(row, "markPx", "last", "lastPx", "idxPx")
+                print(
+                    "OKX_POS_ROW | "
+                    f"{label} | instId={inst_id or '-'} | pos={pos} | notional={notional} | margin={margin} | "
+                    f"avgPx={avg} | markPx={mark} | mgnMode={row.get('mgnMode') or '-'} | "
+                    f"posSide={row.get('posSide') or '-'}",
+                    flush=True,
+                )
     except Exception as exc:
-        print(f"OKX_POSITIONS_DEBUG | {label} | log_failed={exc}", flush=True)
+        _log_throttled(f"okx_positions_debug_failed:{label}", f"OKX_POSITIONS_DEBUG | {label} | log_failed={exc}", every_seconds=300, force=True)
 
 
 def _resolve_okx_td_mode(settings: Settings | None = None) -> str:
@@ -1660,7 +1857,7 @@ def _recover_missing_execution_trades_from_okx_positions(
         if abs(pos_size) <= 0:
             continue
         if inst_id in represented:
-            print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
+            _log_throttled(f"okx_recovery_skip_represented:{inst_id}", f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", every_seconds=300)
             continue
         grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
         if grace_remaining > 0 and not force_import_recent:
@@ -1701,9 +1898,10 @@ def _recover_missing_execution_trades_from_okx_positions(
             flush=True,
         )
     else:
-        print(
+        _log_throttled(
+            "okx_position_recovery_imported_zero",
             f"OKX_POSITION_RECOVERY | imported=0 | rows={len(_okx_result_rows(positions_result))} | represented={len(represented)} | reason=ok",
-            flush=True,
+            every_seconds=300,
         )
     return recovered, stats
 
@@ -2053,13 +2251,15 @@ def _repair_execution_trades_from_live_okx_positions(
         "dedup_symbols": list(dict.fromkeys(stats.get("dedup_symbols", []) or []))[:20],
         "reason": "ok",
     })
-    print(
+    _log_throttled(
+        "exec_report_hard_repair",
         "EXEC_REPORT_HARD_REPAIR | "
         f"repaired={int(stats.get('repaired', 0) or 0)} | "
         f"imported={int(stats.get('imported', 0) or 0)} | "
         f"dedup_closed={int(stats.get('dedup_closed', 0) or 0)} | "
         f"symbols={','.join(stats.get('symbols', []) or []) or '-'}",
-        flush=True,
+        every_seconds=300,
+        force=bool(stats.get("changed")),
     )
     return repaired, stats
 
@@ -2270,6 +2470,17 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     portfolio_state = build_portfolio_state_from_trades(result["trades"], **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+    portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+        portfolio_state,
+        result["drawdown_status"],
+        portfolio_state_inputs,
+        result["trades"],
+        settings,
+        trade_store=trade_store,
+        label="reconcile_report_rebuild",
+    )
+    result["portfolio_state"] = portfolio_state
+    result["portfolio_state_inputs"] = portfolio_state_inputs
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
     result["loss_streak_guard"] = _build_loss_streak_guard(
         _loss_streak_base_trades_for_runtime(settings, result, execution_trades=result["trades"])
@@ -3504,6 +3715,17 @@ def _confirm_manual_resume_trading(
                 portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **_portfolio_state_kwargs(inputs))
                 result["portfolio_state"] = portfolio_state
                 result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+                portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
+                    portfolio_state,
+                    result["drawdown_status"],
+                    inputs,
+                    list(trades_for_dd or []),
+                    settings,
+                    trade_store=trade_store,
+                    label="manual_resume",
+                )
+                result["portfolio_state"] = portfolio_state
+                result["portfolio_state_inputs"] = inputs
                 result["drawdown_report"] = build_drawdown_report(portfolio_state)
             base_trades = _loss_streak_base_trades_for_runtime(
                 settings,
@@ -5521,6 +5743,15 @@ def run_once(
     else:
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         drawdown_status = evaluate_drawdown(portfolio_state)
+        portfolio_state, drawdown_status, portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            drawdown_status,
+            portfolio_state_inputs,
+            dd_base_trades,
+            settings,
+            trade_store=trade_store,
+            label="run_once_dd",
+        )
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
     loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
@@ -5967,6 +6198,15 @@ def run_once(
     else:
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         drawdown_status = evaluate_drawdown(portfolio_state)
+        portfolio_state, drawdown_status, portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            drawdown_status,
+            portfolio_state_inputs,
+            dd_base_trades,
+            settings,
+            trade_store=trade_store,
+            label="run_once_dd",
+        )
     if simulation_mode_active:
         drawdown_report = _simulation_wallet_drawdown_report(portfolio_state, drawdown_status)
     else:
@@ -6147,6 +6387,17 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            portfolio_state_inputs,
+            dd_base_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="runtime_after_reset",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = portfolio_state_inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     result["loss_streak_guard"] = _build_loss_streak_guard(
         dd_base_trades,
@@ -8718,53 +8969,64 @@ def _refresh_execution_reports_from_redis(
     live_okx_mode = _is_live_okx_execution_mode(runtime_settings, okx_client)
 
     if live_okx_mode:
-        try:
-            reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
-            )
-            if reconcile_stats.get("changed") and trade_store:
-                trade_store.save_trades(reconciled)
-            refreshed_trades = reconciled
-        except Exception as exc:
-            print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
+        if _report_hard_okx_refresh_allowed("execution_report"):
+            try:
+                reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                )
+                if reconcile_stats.get("changed") and trade_store:
+                    trade_store.save_trades(reconciled)
+                refreshed_trades = reconciled
+            except Exception as exc:
+                print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
 
-        try:
-            recovered, recovery_stats = _recover_missing_execution_trades_from_okx_positions(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
-                force_import_recent=True,
-            )
-            if recovery_stats.get("changed") and trade_store:
-                trade_store.save_trades(recovered)
-            refreshed_trades = recovered
-            print(
-                "EXEC_REPORT_HARD_RECOVERY | "
-                f"live_okx_mode={live_okx_mode} | "
-                f"imported={int((recovery_stats or {}).get('imported', 0) or 0)} | "
-                f"symbols={','.join((recovery_stats or {}).get('symbols', []) or []) or '-'}",
-                flush=True,
-            )
-        except Exception as exc:
-            recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
-            print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
+            try:
+                recovered, recovery_stats = _recover_missing_execution_trades_from_okx_positions(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                    force_import_recent=True,
+                )
+                if recovery_stats.get("changed") and trade_store:
+                    trade_store.save_trades(recovered)
+                refreshed_trades = recovered
+                _log_throttled(
+                    "exec_report_hard_recovery",
+                    "EXEC_REPORT_HARD_RECOVERY | "
+                    f"live_okx_mode={live_okx_mode} | "
+                    f"imported={int((recovery_stats or {}).get('imported', 0) or 0)} | "
+                    f"symbols={','.join((recovery_stats or {}).get('symbols', []) or []) or '-'}",
+                    every_seconds=300,
+                    force=bool((recovery_stats or {}).get("changed")),
+                )
+            except Exception as exc:
+                recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
+                print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
 
-        try:
-            repaired, repair_stats = _repair_execution_trades_from_live_okx_positions(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
+            try:
+                repaired, repair_stats = _repair_execution_trades_from_live_okx_positions(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                )
+                if repair_stats.get("changed") and trade_store:
+                    trade_store.save_trades(repaired)
+                refreshed_trades = repaired
+                result["okx_position_repair_stats"] = repair_stats
+            except Exception as exc:
+                repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"hard_repair_failed:{exc}"}
+                result["okx_position_repair_stats"] = repair_stats
+                print(f"⚠️ execution report OKX hard repair failed: {exc}", flush=True)
+        else:
+            recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": "report_hard_okx_refresh_throttled"}
+            result["okx_position_recovery_stats"] = recovery_stats
+            _log_throttled(
+                "exec_report_hard_refresh_throttled",
+                "EXEC_REPORT_HARD_REFRESH_THROTTLED | reason=recent_hard_refresh | set OKX_REPORT_HARD_REFRESH_SECONDS to tune",
+                every_seconds=300,
             )
-            if repair_stats.get("changed") and trade_store:
-                trade_store.save_trades(repaired)
-            refreshed_trades = repaired
-            result["okx_position_repair_stats"] = repair_stats
-        except Exception as exc:
-            repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"hard_repair_failed:{exc}"}
-            result["okx_position_repair_stats"] = repair_stats
-            print(f"⚠️ execution report OKX hard repair failed: {exc}", flush=True)
 
     result["trades"] = refreshed_trades
     result["execution_results"] = refreshed_checks
@@ -8807,6 +9069,17 @@ def _refresh_execution_reports_from_redis(
         )
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            portfolio_state_inputs,
+            refreshed_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="execution_report_refresh",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = portfolio_state_inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     except Exception as exc:
         print(f"⚠️ execution report portfolio refresh failed: {exc}", flush=True)
