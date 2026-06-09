@@ -114,20 +114,42 @@ def calculate_mtf_component(candidate: Any, config: CapitalIntelligenceConfig = 
     mtf_confirmed = bool(meta.get("mtf_confirmed"))
     tags = set(str(x) for x in _as_list(getattr(candidate, "execution_setup_tags", []) or [])) | set(str(x) for x in _as_list(meta.get("pair_tags") or []))
 
+    # RS/BTC is confirmation-only in the current bot philosophy.
+    # It should not receive the same capital-priority weight as real MTF confirmation.
+    has_rs_confirmation = bool("rs_btc" in tags or "relative_strength_vs_btc" in tags)
+
     points = 0.0
     reason = "weak_or_unknown"
-    if mtf_confirmed or "rs_btc" in tags or "relative_strength_vs_btc" in tags:
-        points = 11.0
-        reason = "mtf_confirmed_or_rs"
+
+    if mtf_confirmed:
+        points = 12.0
+        reason = "mtf_confirmed"
+    elif has_rs_confirmation:
+        points = 4.0
+        reason = "rs_confirmation_only"
+
     if htf in {"bullish", "bullish bias", "reclaim bias"}:
-        points = max(points, 12.0 if htf == "bullish" else 9.0)
-        reason = htf.replace(" ", "_")
+        htf_points = 12.0 if htf == "bullish" else 9.0
+        if htf_points > points:
+            points = htf_points
+            reason = htf.replace(" ", "_")
+
     if setup_type in {"wave_3", "retest_breakout_confirmed", "higher_low_continuation"} and points < 8.0:
         points = 8.0
         reason = "structural_setup_proxy"
 
     points = _clamp(points, 0.0, config.mtf_max_points)
-    return CapitalComponent("mtf_strength", round(points, 2), config.mtf_max_points, reason, {"htf_confirmation": htf, "mtf_confirmed": mtf_confirmed})
+    return CapitalComponent(
+        "mtf_strength",
+        round(points, 2),
+        config.mtf_max_points,
+        reason,
+        {
+            "htf_confirmation": htf,
+            "mtf_confirmed": mtf_confirmed,
+            "rs_confirmation_only": has_rs_confirmation and not mtf_confirmed,
+        },
+    )
 
 
 def calculate_pa_component(candidate: Any, config: CapitalIntelligenceConfig = DEFAULT_CONFIG) -> CapitalComponent:
