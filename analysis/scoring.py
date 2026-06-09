@@ -61,18 +61,20 @@ WHITELIST_SETUPS = {
     "vwap_reclaim",
     "retest_breakout_confirmed",
     "wave_3",
-    "relative_strength_vs_btc",
+    # relative_strength_vs_btc is intentionally NOT an execution setup by itself.
+    # It remains a confirmation tag only when paired with a stronger structure.
 }
 
 ELITE_SETUPS = {
     "retest_breakout_confirmed",
     "wave_3",
-    "relative_strength_vs_btc",
+    "higher_low_continuation",
+    # relative_strength_vs_btc removed from elite standalone status.
 }
 
 BLOCK_EXCEPTION_SETUPS = {
-    "relative_strength_vs_btc",
     "retest_breakout_confirmed",
+    # relative_strength_vs_btc is confirmation-only, not a block exception by itself.
 }
 
 SMART_SL_MIN_PCT = 1.15
@@ -942,12 +944,15 @@ def _infer_setup(
         and market_mode in {MODE_STRONG_LONG_ONLY, MODE_RECOVERY_LONG}
     ):
 
+        # Surgical change: RS is no longer a standalone entry setup.
+        # Keep it as confirmation while routing the entry through a structural setup.
         return (
-            "relative_strength_vs_btc",
-            "market",
+            "higher_low_continuation",
+            "pullback",
             [
+                "higher_low_continuation",
                 "relative_strength_vs_btc",
-                "whitelist",
+                "rs_confirmation",
             ],
             warnings,
         )
