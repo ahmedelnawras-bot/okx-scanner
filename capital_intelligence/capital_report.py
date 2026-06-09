@@ -1,12 +1,27 @@
 """
-Capital Intelligence Layer - reporting v1
+Capital Intelligence Layer - reporting v2
 
 Builds compact text/JSON reports from CapitalAuctionResult.
 No trading side effects.
+
+V2 additions:
+- Preserves the public API from v1:
+  - build_capital_summary()
+  - build_capital_report_text()
+- Adds component averages so new intelligence layers are visible:
+  setup_synergy, market_mode_awareness, symbol_memory, etc.
+- Adds compact per-candidate drivers/reasons.
+- Adds A+/A quality ratio and a lightweight Capital Confidence label.
+
+Safety:
+- Reporting only.
+- Does not place orders.
+- Does not reject trades.
+- Does not change score, TP, SL, OKX, Recovery, BLOCK, or main.py.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 try:
@@ -15,44 +30,194 @@ except Exception:
     from capital_models import CapitalAuctionResult, CapitalBid
 
 
-def _fmt(value: float) -> str:
+def _fmt(value: object) -> str:
     try:
         return f"{float(value):.2f}"
     except Exception:
         return "0.00"
 
 
-def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int = 8) -> dict[str, Any]:
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _as_rows(result: CapitalAuctionResult | dict | None) -> list[dict[str, Any]]:
     if result is None:
-        return {"ok": False, "reason": "missing_result"}
+        return []
     if isinstance(result, dict):
         bids = result.get("bids") or []
-        rows = bids if isinstance(bids, list) else []
+        return [dict(row or {}) for row in bids if isinstance(row, dict)]
+    return [bid.to_dict() for bid in list(getattr(result, "bids", []) or [])]
+
+
+def _components(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = row.get("components") or []
+    if not isinstance(raw, list):
+        return []
+    return [dict(item or {}) for item in raw if isinstance(item, dict)]
+
+
+def _component_points(row: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for component in _components(row):
+        name = str(component.get("name") or "").strip()
+        if not name:
+            continue
+        out[name] = _safe_float(component.get("points"), 0.0)
+    return out
+
+
+def _component_reason(row: dict[str, Any], name: str) -> str:
+    for component in _components(row):
+        if str(component.get("name") or "") == name:
+            return str(component.get("reason") or "").strip()
+    return ""
+
+
+def _top_drivers(row: dict[str, Any], limit: int = 3) -> list[str]:
+    """Return compact positive drivers for a top candidate.
+
+    This makes the shadow report explain *why* the Capital Brain liked a trade
+    without dumping the full component tree.
+    """
+    components = _components(row)
+    drivers: list[tuple[float, str]] = []
+    for component in components:
+        name = str(component.get("name") or "").strip()
+        if not name:
+            continue
+        points = _safe_float(component.get("points"), 0.0)
+        max_points = max(1.0, _safe_float(component.get("max_points"), 1.0))
+        ratio = points / max_points
+        reason = str(component.get("reason") or "").strip()
+
+        # Prefer newer intelligence components even when their point cap is small.
+        priority_boost = 0.0
+        if name in {"setup_synergy", "market_mode_awareness", "symbol_memory"}:
+            priority_boost = 0.15
+        if ratio >= 0.70 or name in {"setup_synergy", "market_mode_awareness", "symbol_memory"}:
+            label = name.replace("_", " ")
+            if reason:
+                label = f"{label}: {reason[:36]}"
+            drivers.append((ratio + priority_boost, label))
+
+    drivers.sort(key=lambda item: item[0], reverse=True)
+    return [label for _, label in drivers[: max(1, int(limit or 3))]]
+
+
+def _capital_confidence(avg_bid: float, classes: dict[str, int], candidates: int) -> dict[str, Any]:
+    if candidates <= 0:
+        return {"score": 0.0, "label": "NONE", "a_or_better_ratio": 0.0}
+
+    a_plus = int(classes.get("A+", 0) or 0)
+    a_count = int(classes.get("A", 0) or 0)
+    b_count = int(classes.get("B", 0) or 0)
+    quality_ratio = (a_plus + a_count) / max(1, candidates)
+    investable_ratio = (a_plus + a_count + b_count) / max(1, candidates)
+
+    # Lightweight scan confidence: not an execution signal, only a report label.
+    score = (float(avg_bid) * 0.65) + (quality_ratio * 100.0 * 0.25) + (investable_ratio * 100.0 * 0.10)
+    score = round(max(0.0, min(100.0, score)), 2)
+
+    if score >= 80:
+        label = "HIGH"
+    elif score >= 65:
+        label = "GOOD"
+    elif score >= 50:
+        label = "MEDIUM"
     else:
-        rows = [bid.to_dict() for bid in result.bids]
+        label = "LOW"
+
+    return {
+        "score": score,
+        "label": label,
+        "a_or_better_ratio": round(quality_ratio * 100.0, 2),
+        "b_or_better_ratio": round(investable_ratio * 100.0, 2),
+    }
+
+
+def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int = 8) -> dict[str, Any]:
+    rows = _as_rows(result)
+    if result is None:
+        return {"ok": False, "reason": "missing_result"}
 
     if not rows:
-        return {"ok": True, "candidates": 0, "average_bid": 0.0, "classes": {}, "top": []}
+        return {
+            "ok": True,
+            "candidates": 0,
+            "average_bid": 0.0,
+            "classes": {},
+            "top": [],
+            "setup_summary": [],
+            "component_summary": [],
+            "a_plus_summary": {"count": 0, "avg_bid": 0.0, "top_setups": []},
+            "capital_confidence": {"score": 0.0, "label": "NONE", "a_or_better_ratio": 0.0},
+        }
 
-    total = sum(float(row.get("bid_score") or 0.0) for row in rows)
+    total = sum(_safe_float(row.get("bid_score"), 0.0) for row in rows)
     classes: dict[str, int] = defaultdict(int)
     setups: dict[str, list[float]] = defaultdict(list)
+    component_scores: dict[str, list[float]] = defaultdict(list)
+    a_plus_setups: Counter[str] = Counter()
+    a_plus_scores: list[float] = []
+
     for row in rows:
-        classes[str(row.get("trade_class") or "C")] += 1
-        setups[str(row.get("setup_type") or "unknown")].append(float(row.get("bid_score") or 0.0))
+        trade_class = str(row.get("trade_class") or "C")
+        setup = str(row.get("setup_type") or "unknown")
+        bid_score = _safe_float(row.get("bid_score"), 0.0)
+        classes[trade_class] += 1
+        setups[setup].append(bid_score)
+        if trade_class == "A+":
+            a_plus_setups[setup] += 1
+            a_plus_scores.append(bid_score)
+
+        for component in _components(row):
+            name = str(component.get("name") or "").strip()
+            if not name:
+                continue
+            component_scores[name].append(_safe_float(component.get("points"), 0.0))
 
     setup_summary = []
     for setup, scores in setups.items():
-        setup_summary.append({"setup_type": setup, "count": len(scores), "avg_bid": round(sum(scores) / max(1, len(scores)), 2)})
+        setup_summary.append({
+            "setup_type": setup,
+            "count": len(scores),
+            "avg_bid": round(sum(scores) / max(1, len(scores)), 2),
+        })
     setup_summary.sort(key=lambda item: (item["avg_bid"], item["count"]), reverse=True)
+
+    component_summary = []
+    for name, scores in component_scores.items():
+        component_summary.append({
+            "component": name,
+            "count": len(scores),
+            "avg_points": round(sum(scores) / max(1, len(scores)), 2),
+            "max_seen": round(max(scores or [0.0]), 2),
+        })
+    component_summary.sort(key=lambda item: (item["avg_points"], item["count"]), reverse=True)
+
+    avg_bid = round(total / max(1, len(rows)), 2)
+    confidence = _capital_confidence(avg_bid, dict(classes), len(rows))
 
     return {
         "ok": True,
         "candidates": len(rows),
-        "average_bid": round(total / max(1, len(rows)), 2),
+        "average_bid": avg_bid,
         "classes": dict(classes),
-        "top": rows[:max(1, int(top_n or 8))],
+        "top": rows[: max(1, int(top_n or 8))],
         "setup_summary": setup_summary,
+        "component_summary": component_summary,
+        "a_plus_summary": {
+            "count": len(a_plus_scores),
+            "avg_bid": round(sum(a_plus_scores) / max(1, len(a_plus_scores)), 2) if a_plus_scores else 0.0,
+            "top_setups": [{"setup_type": setup, "count": count} for setup, count in a_plus_setups.most_common(5)],
+        },
+        "capital_confidence": confidence,
     }
 
 
@@ -61,12 +226,14 @@ def build_capital_report_text(result: CapitalAuctionResult | dict | None, top_n:
     if not summary.get("ok"):
         return "🧠 Capital Intelligence\nNo capital intelligence result available."
 
+    confidence = dict(summary.get("capital_confidence") or {})
     lines = [
-        "🧠 Capital Intelligence — Shadow Report",
+        "🧠 Capital Intelligence — Shadow Report V2",
         "━━━━━━━━━━━━",
         f"Candidates: {int(summary.get('candidates', 0) or 0)}",
         f"Average Bid: {_fmt(summary.get('average_bid', 0.0))}",
         "Classes: " + ", ".join(f"{k}={v}" for k, v in sorted((summary.get("classes") or {}).items())) if summary.get("classes") else "Classes: -",
+        f"Confidence: {str(confidence.get('label') or 'NONE')} | Score {_fmt(confidence.get('score') or 0.0)} | A/A+ {_fmt(confidence.get('a_or_better_ratio') or 0.0)}%",
         "",
         "🏆 Top Candidates",
     ]
@@ -79,6 +246,53 @@ def build_capital_report_text(result: CapitalAuctionResult | dict | None, top_n:
         cls = str(row.get("trade_class") or "C")
         selected = "✅" if row.get("advisory_selected") else "⏳"
         lines.append(f"{rank}. {selected} {symbol} | {setup} | Bid {bid} | {cls}")
+
+        drivers = _top_drivers(row, limit=3)
+        if drivers:
+            lines.append("   ↳ " + " | ".join(drivers))
+
+    a_plus = dict(summary.get("a_plus_summary") or {})
+    if int(a_plus.get("count", 0) or 0) > 0:
+        lines.extend([
+            "",
+            "🌟 A+ Quality",
+            f"Count: {int(a_plus.get('count', 0) or 0)} | Avg Bid: {_fmt(a_plus.get('avg_bid') or 0.0)}",
+        ])
+        top_setups = a_plus.get("top_setups") or []
+        if top_setups:
+            lines.append("Drivers: " + ", ".join(f"{item.get('setup_type')}={item.get('count')}" for item in top_setups[:4]))
+
+    component_summary = summary.get("component_summary") or []
+    if component_summary:
+        lines.extend(["", "🧩 Component Averages"])
+        # Keep report compact but include the new intelligence components when present.
+        preferred_order = [
+            "setup_quality",
+            "setup_synergy",
+            "market_mode_awareness",
+            "symbol_memory",
+            "mtf_strength",
+            "price_action",
+            "nour_stability",
+            "resistance_distance",
+            "context_quality",
+        ]
+        by_name = {str(item.get("component")): item for item in component_summary}
+        shown = []
+        for name in preferred_order:
+            item = by_name.get(name)
+            if not item:
+                continue
+            lines.append(f"• {name}: avg {_fmt(item.get('avg_points') or 0.0)} | max {_fmt(item.get('max_seen') or 0.0)}")
+            shown.append(name)
+        for item in component_summary:
+            name = str(item.get("component") or "")
+            if name in shown:
+                continue
+            lines.append(f"• {name}: avg {_fmt(item.get('avg_points') or 0.0)} | max {_fmt(item.get('max_seen') or 0.0)}")
+            if len(shown) >= 8:
+                break
+            shown.append(name)
 
     setup_summary = summary.get("setup_summary") or []
     if setup_summary:
