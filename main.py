@@ -2573,6 +2573,190 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
     return price_map
 
 
+
+
+# =========================================================
+# Post-rejection tracking analytics (no trading side effects)
+# =========================================================
+POST_REJECTION_TRACKING_WINDOWS = (
+    (5, "price_after_5m_pct"),
+    (15, "price_after_15m_pct"),
+    (60, "price_after_1h_pct"),
+)
+
+
+def _is_rejection_exec_result(row: dict | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    return bool(status.startswith("rejected") or status == "candidate_only")
+
+
+def _post_rejection_dt(value: object) -> datetime | None:
+    try:
+        return _parse_any_datetime_utc(value)
+    except Exception:
+        pass
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _post_rejection_pct(entry_price: float, current_price: float) -> float:
+    entry = _safe_float(entry_price, 0.0)
+    current = _safe_float(current_price, 0.0)
+    if entry <= 0 or current <= 0:
+        return 0.0
+    return round(((current - entry) / entry) * 100.0, 4)
+
+
+def _ensure_post_rejection_seed(signal, exec_result: dict | None, *, now: datetime | None = None) -> dict:
+    """Seed rejection rows with stable tracking fields.
+
+    Analytics-only: does not alter execution decisions, slots, OKX orders,
+    lifecycle, or reports except JSON/export diagnostics.
+    """
+    row = dict(exec_result or {})
+    if not _is_rejection_exec_result(row):
+        return row
+    now = now or datetime.now(timezone.utc)
+    meta = getattr(signal, "meta", {}) or {}
+    symbol = str(getattr(signal, "symbol", "") or row.get("symbol") or "")
+    setup = str(getattr(signal, "setup_type", "") or row.get("setup_type") or "")
+    row.setdefault("record_type", "rejection")
+    row.setdefault("symbol", symbol)
+    row.setdefault("setup_type", setup)
+    row.setdefault("market_mode", str(getattr(signal, "market_mode", "") or row.get("market_mode") or ""))
+    row.setdefault("entry_price", _safe_float(getattr(signal, "entry", 0.0), 0.0))
+    row.setdefault("stop_loss", _safe_float(getattr(signal, "sl", 0.0), 0.0))
+    row.setdefault("tp1", _safe_float(getattr(signal, "tp1", 0.0), 0.0))
+    row.setdefault("tp2", _safe_float(getattr(signal, "tp2", 0.0), 0.0))
+    row.setdefault("score", _safe_float(getattr(signal, "score", 0.0), 0.0))
+    row.setdefault("boost_score", _safe_float(meta.get("boost_score"), 0.0))
+    row.setdefault("rejected_at", row.get("ts") or now.isoformat())
+    row.setdefault("post_rejection_tracking_enabled", True)
+    row.setdefault("post_rejection_tracking_status", "pending")
+    row.setdefault("post_rejection_tracking_model", "post_rejection_tracking_v1")
+    if not row.get("decision_trace_id"):
+        safe_ts = str(row.get("rejected_at") or now.isoformat()).replace(":", "").replace("-", "").replace("+", "Z").replace(".", "_")
+        safe_symbol = symbol.replace("/", "_").replace(":", "_") or "unknown"
+        safe_setup = setup.replace("/", "_").replace(":", "_") or "unknown"
+        row["decision_trace_id"] = f"scan_{safe_ts}_{safe_symbol}_{safe_setup}"
+    return row
+
+
+def _update_post_rejection_tracking_rows(execution_results: list[dict] | None, price_map: dict | None, *, now: datetime | None = None) -> tuple[list[dict], dict]:
+    """Update matured rejection rows from the latest available price_map.
+
+    This is deliberately conservative: it uses the current scan price as a
+    checkpoint for 5m/15m/1h fields when enough time has elapsed. It is not a
+    tick-by-tick MFE engine, but it makes rejected decisions measurable without
+    touching trading logic.
+    """
+    now = now or datetime.now(timezone.utc)
+    prices = dict(price_map or {})
+    updated: list[dict] = []
+    changed = 0
+    matured = 0
+    for source_row in list(execution_results or []):
+        row = dict(source_row or {})
+        if not _is_rejection_exec_result(row):
+            updated.append(row)
+            continue
+
+        row.setdefault("post_rejection_tracking_enabled", True)
+        row.setdefault("post_rejection_tracking_model", "post_rejection_tracking_v1")
+        rejected_at = _post_rejection_dt(row.get("rejected_at") or row.get("ts") or row.get("timestamp") or row.get("created_at"))
+        if rejected_at is None:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_timestamp")
+            updated.append(row)
+            continue
+
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_symbol")
+            updated.append(row)
+            continue
+
+        current_price = _safe_float(prices.get(symbol), 0.0)
+        if current_price <= 0:
+            norm_symbol = _normalize_okx_inst_id(symbol)
+            current_price = _safe_float(prices.get(norm_symbol), 0.0)
+        if current_price <= 0:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_price")
+            updated.append(row)
+            continue
+
+        entry = _safe_float(row.get("entry_price") or row.get("entry"), 0.0)
+        if entry <= 0:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_entry")
+            updated.append(row)
+            continue
+
+        elapsed_min = max(0.0, (now - rejected_at).total_seconds() / 60.0)
+        checkpoint_pct = _post_rejection_pct(entry, current_price)
+        row["post_rejection_last_checked_at"] = now.isoformat()
+        row["post_rejection_last_price"] = current_price
+        row["post_rejection_last_elapsed_minutes"] = round(elapsed_min, 2)
+        row.setdefault("max_pump_after_rejection_pct", max(0.0, checkpoint_pct))
+        row.setdefault("max_dump_after_rejection_pct", min(0.0, checkpoint_pct))
+        row["max_pump_after_rejection_pct"] = round(max(_safe_float(row.get("max_pump_after_rejection_pct"), 0.0), checkpoint_pct, 0.0), 4)
+        row["max_dump_after_rejection_pct"] = round(min(_safe_float(row.get("max_dump_after_rejection_pct"), 0.0), checkpoint_pct, 0.0), 4)
+
+        before = dict(row)
+        for minutes, field in POST_REJECTION_TRACKING_WINDOWS:
+            if elapsed_min >= minutes and field not in row:
+                row[field] = checkpoint_pct
+                matured += 1
+
+        tp1 = _safe_float(row.get("tp1"), 0.0)
+        tp2 = _safe_float(row.get("tp2"), 0.0)
+        sl = _safe_float(row.get("stop_loss") or row.get("sl"), 0.0)
+        if tp1 > 0:
+            row["would_hit_tp1"] = bool(row.get("would_hit_tp1") or current_price >= tp1)
+        if tp2 > 0:
+            row["would_hit_tp2"] = bool(row.get("would_hit_tp2") or current_price >= tp2)
+        if sl > 0:
+            row["would_hit_sl"] = bool(row.get("would_hit_sl") or current_price <= sl)
+
+        if row.get("would_hit_tp2") or row.get("would_hit_tp1"):
+            row["rejection_was_correct"] = False
+            row["rejection_verdict_reason"] = "missed_target_after_rejection"
+        elif row.get("would_hit_sl"):
+            row["rejection_was_correct"] = True
+            row["rejection_verdict_reason"] = "would_have_hit_sl_after_rejection"
+        elif elapsed_min >= 60 and "price_after_1h_pct" in row:
+            one_hour = _safe_float(row.get("price_after_1h_pct"), 0.0)
+            row["rejection_was_correct"] = bool(one_hour <= 0.0)
+            row["rejection_verdict_reason"] = "one_hour_negative_or_flat" if one_hour <= 0.0 else "one_hour_positive_missed_move"
+
+        if row.get("rejection_was_correct") is True:
+            row["post_rejection_tracking_status"] = "verdict_correct"
+        elif row.get("rejection_was_correct") is False:
+            row["post_rejection_tracking_status"] = "verdict_wrong"
+        elif elapsed_min >= 60:
+            row["post_rejection_tracking_status"] = "tracked_1h_unknown"
+        elif elapsed_min >= 15:
+            row["post_rejection_tracking_status"] = "tracked_15m_pending_1h"
+        elif elapsed_min >= 5:
+            row["post_rejection_tracking_status"] = "tracked_5m_pending"
+        else:
+            row["post_rejection_tracking_status"] = "pending"
+
+        if row != before:
+            changed += 1
+        updated.append(row)
+
+    return updated, {"changed": changed, "matured_fields": matured, "total": len(updated)}
+
+
 def _ensure_open_trade_prices_in_map(
     price_map: dict | None,
     trades: list | None,
@@ -6163,6 +6347,8 @@ def run_once(
             "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
             "simulation_mode": simulation_mode_active,
         })
+        exec_result = _ensure_post_rejection_seed(signal, exec_result)
+        signal_items[-1]["execution"] = exec_result
         current_execution_results.append(exec_result)
 
         if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)):
@@ -6198,6 +6384,17 @@ def run_once(
         settings,
         label="final_lifecycle",
     )
+    current_execution_results, _post_rej_current_stats = _update_post_rejection_tracking_rows(
+        current_execution_results,
+        price_map,
+    )
+    if _post_rej_current_stats.get("changed"):
+        print(
+            f"POST_REJECTION_TRACKING | current_updated={_post_rej_current_stats.get('changed')} | "
+            f"matured={_post_rej_current_stats.get('matured_fields')}",
+            flush=True,
+        )
+
     protection = block_protection_status(state)
 
     # ✅ FIX: احسب exchange_stop_sync للـ final update بعد ما الصفقات اتفتحت في اللوب
@@ -6258,10 +6455,27 @@ def run_once(
         else:
             trade_store.append_execution_checks(current_execution_results)
         execution_results_for_reports = trade_store.load_execution_checks(limit=500) or current_execution_results
+        execution_results_for_reports, _post_rej_report_stats = _update_post_rejection_tracking_rows(
+            execution_results_for_reports,
+            price_map,
+        )
+        if _post_rej_report_stats.get("changed") and hasattr(trade_store, "save_execution_checks"):
+            trade_store.save_execution_checks(execution_results_for_reports)
+            print(
+                f"POST_REJECTION_TRACKING | history_updated={_post_rej_report_stats.get('changed')} | "
+                f"matured={_post_rej_report_stats.get('matured_fields')}",
+                flush=True,
+            )
         simulation_execution_results_for_reports = _load_simulation_execution_checks(trade_store, limit=500)
+        simulation_execution_results_for_reports, _post_rej_sim_stats = _update_post_rejection_tracking_rows(
+            simulation_execution_results_for_reports,
+            price_map,
+        )
     else:
         execution_results_for_reports = current_execution_results
         simulation_execution_results_for_reports = current_execution_results if simulation_mode_active else []
+        execution_results_for_reports, _ = _update_post_rejection_tracking_rows(execution_results_for_reports, price_map)
+        simulation_execution_results_for_reports, _ = _update_post_rejection_tracking_rows(simulation_execution_results_for_reports, price_map)
 
     if technical_snapshot_records:
         snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings, redis_client=_snapshot_redis_client(trade_store))
