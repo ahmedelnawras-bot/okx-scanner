@@ -30,7 +30,7 @@ STRICT_WHITELIST = {
     "vwap_reclaim",
     "retest_breakout_confirmed",
     "wave_3",
-    "relative_strength_vs_btc",
+    # relative_strength_vs_btc removed: confirmation-only, not standalone execution.
 }
 
 NORMAL_LONG_EXTRA_WHITELIST = {
@@ -43,19 +43,20 @@ NORMAL_LONG_EXTRA_WHITELIST = {
 ELITE_TAGS = {
     "elite",
     "wave_3",
-    "relative_strength_vs_btc",
+    "higher_low_continuation",
     "retest_breakout_confirmed",
+    # relative_strength_vs_btc removed from standalone elite execution.
 }
 
 SETUP_WEIGHTS = {
     "vwap_reclaim": 3,
     "retest_breakout_confirmed": 3,
     "liquidity_sweep_reclaim": 2,
-    "relative_strength_vs_btc": 2,
+    "relative_strength_vs_btc": 1,  # confirmation-only weight
     "wave_3": 2,
     "support_bounce_confirmed": 2,
     "failed_breakdown_trap": 2,
-    "higher_low_continuation": 2,
+    "higher_low_continuation": 3,
 }
 
 
@@ -205,6 +206,31 @@ def _setup_weight(signal: SignalCandidate) -> int:
         pass
 
     return weight
+
+
+def _is_standalone_relative_strength_setup(signal: SignalCandidate) -> bool:
+    """Block RS-only entries while keeping RS as a confirmation tag.
+
+    Surgical scope:
+    - does not remove rs_btc tags from analytics;
+    - only blocks when the signal setup itself is relative_strength_vs_btc
+      and no stronger structural setup tag is present.
+    """
+    tags = _signal_tags(signal)
+    setup = _normalize_execution_tag(getattr(signal, "setup_type", ""))
+    structural_tags = {
+        "wave_3",
+        "retest_breakout_confirmed",
+        "higher_low_continuation",
+        "vwap_reclaim",
+        "support_bounce_confirmed",
+        "liquidity_sweep_reclaim",
+        "failed_breakdown_trap",
+    }
+    return bool(
+        setup == "relative_strength_vs_btc"
+        and not (tags & structural_tags)
+    )
 
 
 
@@ -1049,6 +1075,7 @@ def decide_execution_candidate(
 
     pa_gate = _pa_execution_gate(signal)
     market_context = _market_context_layer(signal)
+    standalone_rs_blocked = _is_standalone_relative_strength_setup(signal)
 
     print(
         f"PA_GATE | {signal.symbol} | score={pa_gate.get('pa_score')} | "
@@ -1070,6 +1097,34 @@ def decide_execution_candidate(
         signal.entry_timing == "pullback"
         and _execution_score(signal) < 7.3
     )
+
+    if standalone_rs_blocked:
+        return {
+            "allowed": False,
+            "path": "precision_filter",
+            "reason": "rs_standalone_disabled",
+            "complete_plan": complete_plan,
+            "strict_allowed": strict_allowed,
+            "normal_extra_allowed": normal_extra_allowed,
+            "elite_allowed": elite_allowed,
+            "recovery_allowed": recovery_allowed,
+            "pending_pullback": pending_pullback,
+            "near_resistance_warning": near_resistance_warning,
+            "pa_gate": pa_gate,
+            "pa_gate_passed": pa_gate.get("passed"),
+            "pa_score": pa_gate.get("pa_score"),
+            "market_context": market_context,
+            "market_context_status": market_context.get("status"),
+            "market_context_reason": market_context.get("reason"),
+            "weak_drift_passed": weak_drift_passed,
+            "weak_drift": get_weak_trend_drift_status(signal),
+            "recovery_quality_passed": recovery_quality_passed,
+            "recovery_quality": recovery_quality,
+            "nour_filter_name": None,
+            "nour_filter_passed": None,
+            "nour_filter_reason": None,
+            "rejection_category": "technical_filter",
+        }
 
     if late_risky:
         return {
