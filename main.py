@@ -152,12 +152,25 @@ SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
 SYMBOL_TRADING_SAME_SYMBOL_DEDUP_TTL_SECONDS = 5 * 60
 
-# Low Balance Mode
-# لو الرصيد أقل من الحد → allocation أكبر وعدد slots أقل.
-# Block Exception و Recovery استثناء — بيفضلوا على حدودهم الأصلية.
+# Balance-tier sizing for NORMAL entries only.
+# Block Exception و Recovery عندهم slots منفصلة خارج normal slots.
+# <109      → normal=3  | block=1 | recovery=1 | allocation=40%
+# 109-240   → normal=4  | block=1 | recovery=1 | allocation=40%
+# >=240     → normal=7  | block=3 | recovery=3 | allocation=30%
 LOW_BALANCE_THRESHOLD_USDT: float = 109.0
+MID_BALANCE_THRESHOLD_USDT: float = 240.0
 LOW_BALANCE_ALLOCATION_PCT: float = 40.0
+MID_BALANCE_ALLOCATION_PCT: float = 40.0
+MATURE_BALANCE_ALLOCATION_PCT: float = 30.0
 LOW_BALANCE_MAX_SLOTS: int = 3
+MID_BALANCE_MAX_SLOTS: int = 4
+MATURE_BALANCE_MAX_SLOTS: int = 7
+LOW_BALANCE_BLOCK_SLOTS: int = 1
+LOW_BALANCE_RECOVERY_SLOTS: int = 1
+MID_BALANCE_BLOCK_SLOTS: int = 1
+MID_BALANCE_RECOVERY_SLOTS: int = 1
+MATURE_BALANCE_BLOCK_SLOTS: int = 3
+MATURE_BALANCE_RECOVERY_SLOTS: int = 3
 
 # Live execution hard guard: never send OKX orders when planned margin is too small
 # to survive OKX lot/min-size normalization. This prevents normalized_size_zero
@@ -352,9 +365,44 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     return total
 
 
+def _balance_tier_limits(reference_balance: float = 0.0, settings: Settings | None = None) -> dict:
+    """Return balance-tier limits while keeping Block/Recovery outside normal slots."""
+    balance = _safe_float(reference_balance, 0.0)
+
+    if 0 < balance < LOW_BALANCE_THRESHOLD_USDT:
+        return {
+            "tier": "low_balance",
+            "label": f"<{LOW_BALANCE_THRESHOLD_USDT:.0f}",
+            "allocation_pct": LOW_BALANCE_ALLOCATION_PCT,
+            "normal_slots": LOW_BALANCE_MAX_SLOTS,
+            "block_slots": LOW_BALANCE_BLOCK_SLOTS,
+            "recovery_slots": LOW_BALANCE_RECOVERY_SLOTS,
+        }
+
+    if 0 < balance < MID_BALANCE_THRESHOLD_USDT:
+        return {
+            "tier": "mid_balance",
+            "label": f"{LOW_BALANCE_THRESHOLD_USDT:.0f}-{MID_BALANCE_THRESHOLD_USDT:.0f}",
+            "allocation_pct": MID_BALANCE_ALLOCATION_PCT,
+            "normal_slots": MID_BALANCE_MAX_SLOTS,
+            "block_slots": MID_BALANCE_BLOCK_SLOTS,
+            "recovery_slots": MID_BALANCE_RECOVERY_SLOTS,
+        }
+
+    mature_slots = max(1, int(getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS)) if settings is not None else MATURE_BALANCE_MAX_SLOTS
+    return {
+        "tier": "mature_balance",
+        "label": f">={MID_BALANCE_THRESHOLD_USDT:.0f}",
+        "allocation_pct": MATURE_BALANCE_ALLOCATION_PCT,
+        "normal_slots": mature_slots,
+        "block_slots": MATURE_BALANCE_BLOCK_SLOTS,
+        "recovery_slots": MATURE_BALANCE_RECOVERY_SLOTS,
+    }
+
+
 def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -> tuple[float, int]:
-    allocation_pct = 24.0
-    slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
+    allocation_pct = MATURE_BALANCE_ALLOCATION_PCT
+    slot_count = max(1, int(getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS))
 
     if risk_manager_module is not None:
         allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
@@ -363,11 +411,12 @@ def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -
             int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
         )
 
-    # Low Balance Mode — رصيد أقل من الحد → allocation أعلى وعدد slots أقل.
-    # Block Exception و Recovery استثناء ومش بيتأثروا هنا.
-    if 0 < float(reference_balance or 0.0) < LOW_BALANCE_THRESHOLD_USDT:
-        allocation_pct = LOW_BALANCE_ALLOCATION_PCT
-        slot_count = LOW_BALANCE_MAX_SLOTS
+    # Balance tiers apply only when a real reference balance is available.
+    # Block Exception و Recovery استثناء مستقلين ويتحسبوا في _balance_tier_limits.
+    if float(reference_balance or 0.0) > 0:
+        tier = _balance_tier_limits(reference_balance, settings)
+        allocation_pct = _safe_float(tier.get("allocation_pct"), allocation_pct)
+        slot_count = max(1, int(tier.get("normal_slots") or slot_count))
 
     return allocation_pct, slot_count
 
@@ -732,16 +781,18 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
     context = _risk_profile_context(settings, result)
     base_trades = list(result.get("simulation_trades", []) or []) if context == "simulation" else list(result.get("trades", []) or [])
     counts = _execution_slot_counts(base_trades)
-    low_balance = bool(0 < _safe_float(reference_balance, 0.0) < LOW_BALANCE_THRESHOLD_USDT)
-    general_limit = LOW_BALANCE_MAX_SLOTS if low_balance else max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
-    block_limit = 1 if low_balance else 3
-    recovery_limit = 1 if low_balance else 3
+    tier_limits = _balance_tier_limits(reference_balance, settings)
+    low_balance = str(tier_limits.get("tier") or "") == "low_balance"
+    general_limit = max(1, int(tier_limits.get("normal_slots") or getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS))
+    block_limit = max(0, int(tier_limits.get("block_slots") or 0))
+    recovery_limit = max(0, int(tier_limits.get("recovery_slots") or 0))
     general_used = int(counts.get("general", 0) or 0)
     block_used = int(counts.get("block_exception", 0) or 0)
     recovery_used = int(counts.get("recovery", 0) or 0)
     return {
         "context": context,
         "low_balance": low_balance,
+        "balance_tier": str(tier_limits.get("tier") or ""),
         "general_used": general_used,
         "general_limit": general_limit,
         "block_used": block_used,
@@ -6069,8 +6120,8 @@ def run_once(
     # على باقي الـ pairs في نفس الـ scan
     scan_mode = state.mode
 
-    # Low Balance Mode — لو الرصيد أقل من الحد، نغير الـ slots والـ margin.
-    # Block Exception و Recovery بيفضلوا على حدودهم الأصلية.
+    # Balance Tier Mode — يغير Normal slots/margin فقط.
+    # Block Exception و Recovery لهم slots منفصلة حسب tier الرصيد.
     if simulation_mode_active:
         _sim_wallet_balance = _safe_float(
             _build_simulation_wallet_snapshot(simulation_trades).get("equity"),
@@ -6082,8 +6133,11 @@ def run_once(
             portfolio_state_inputs.get("reference_portfolio"), 0.0
         )
 
-    _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
-    effective_max_positions = LOW_BALANCE_MAX_SLOTS if _low_balance_mode else settings.max_execution_positions
+    _balance_tier = _balance_tier_limits(_effective_reference_balance, settings)
+    _balance_tier_name = str(_balance_tier.get("tier") or "mature_balance")
+    _low_balance_mode = _balance_tier_name == "low_balance"
+    effective_max_positions = max(1, int(_balance_tier.get("normal_slots") or settings.max_execution_positions))
+    _effective_allocation_pct = _safe_float(_balance_tier.get("allocation_pct"), MATURE_BALANCE_ALLOCATION_PCT)
 
     # ✅ OKX GATE GUARD: لو execution mode والـ Redis فاضي (أول scan بعد التحويل)
     # اسأل OKX مباشرة عن الـ open positions عشان الـ slot_counts يكون صح
@@ -6112,7 +6166,7 @@ def run_once(
                 print(
                     f"🛡 OKX_GATE_GUARD | "
                     f"OKX positions={_okx_open_count} | tracked_general={previous_general} | "
-                    f"max_allowed={'LOW='+str(effective_max_positions) if _low_balance_mode else 'NORMAL='+str(effective_max_positions)} | "
+                    f"max_allowed={_balance_tier_name.upper()}={effective_max_positions} | "
                     f"slot_counts[general] set to {slot_counts['general']} | "
                     f"symbols={','.join(sorted(_okx_live_symbols))}",
                     flush=True,
@@ -6120,34 +6174,19 @@ def run_once(
         except Exception as _exc:
             print(f"⚠️ OKX_GATE_GUARD | failed to fetch positions: {_exc}", flush=True)
 
-    # Block Exception و Recovery slots — ديناميكية حسب الرصيد
-    # رصيد ≥ $109 → كل مود عنده 3 slots منفصلة
-    # رصيد < $109 → كل مود عنده slot واحد فقط
-    NORMAL_BLOCK_SLOTS = 3
-    NORMAL_RECOVERY_SLOTS = 3
-    LOW_BALANCE_BLOCK_SLOTS = 1
-    LOW_BALANCE_RECOVERY_SLOTS = 1
-
-    effective_max_block_positions = LOW_BALANCE_BLOCK_SLOTS if _low_balance_mode else NORMAL_BLOCK_SLOTS
-    effective_max_recovery_positions = LOW_BALANCE_RECOVERY_SLOTS if _low_balance_mode else NORMAL_RECOVERY_SLOTS
+    # Block Exception و Recovery slots — منفصلين عن Normal slots حسب tier الرصيد.
+    effective_max_block_positions = max(0, int(_balance_tier.get("block_slots") or 0))
+    effective_max_recovery_positions = max(0, int(_balance_tier.get("recovery_slots") or 0))
 
     # إعادة حساب recovery_remaining بالحد الجديد
     recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
 
-    if _low_balance_mode:
-        print(
-            f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
-            f"general={effective_max_positions} | block={effective_max_block_positions} | "
-            f"recovery={effective_max_recovery_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
-            flush=True,
-        )
-    else:
-        print(
-            f"✅ NORMAL_MODE | balance={_effective_reference_balance:.2f} | "
-            f"general={effective_max_positions} | block={effective_max_block_positions} | "
-            f"recovery={effective_max_recovery_positions} | alloc=24%",
-            flush=True,
-        )
+    print(
+        f"💼 BALANCE_TIER | tier={_balance_tier_name} | balance={_effective_reference_balance:.2f} | "
+        f"general={effective_max_positions} | block={effective_max_block_positions} | "
+        f"recovery={effective_max_recovery_positions} | alloc={_effective_allocation_pct:.2f}%",
+        flush=True,
+    )
 
     print(
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
@@ -8156,13 +8195,14 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
     """بلوك رصيد OKX يظهر في أعلى تقارير التنفيذ.
 
     بيأخذ البيانات من portfolio_state_inputs اللي بتجي من OKX balance
-    أو fallback وبيظهرها بشكل واضح مع Low Balance Mode لو مفعل.
+    أو fallback وبيظهرها بشكل واضح مع Balance Tier الحالي.
     """
     inputs = dict((result or {}).get("portfolio_state_inputs") or {})
     reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
     margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
-    low_balance = bool(0 < reference_balance < LOW_BALANCE_THRESHOLD_USDT)
+    tier_limits = _balance_tier_limits(reference_balance, settings)
+    tier_name = str(tier_limits.get("tier") or "mature_balance")
 
     lines = [
         "💼 <b>OKX Account — Execution Sizing</b>",
@@ -8171,8 +8211,11 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
         f"• Allocation: <b>{allocation_pct:.2f}%</b> / <b>{slot_count} slots</b>",
         f"• Planned Margin / Trade: <b>{margin_per_trade:,.2f} USDT</b>",
     ]
-    if low_balance:
-        lines.append(f"⚠️ <b>Low Balance Mode</b> — balance &lt; {LOW_BALANCE_THRESHOLD_USDT:.0f} USDT")
+    lines.append(
+        f"• Balance Tier: <b>{tier_name}</b> "
+        f"(Block <b>{int(tier_limits.get('block_slots') or 0)}</b> | "
+        f"Recovery <b>{int(tier_limits.get('recovery_slots') or 0)}</b>)"
+    )
     lines.append("━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -8450,7 +8493,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
         f"🧯 Manual Resume: {manual_resume_line}",
-        f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
+        f"💰 Balance Tier: {(lambda t: f'{t.get("tier")} — general={int(t.get("normal_slots") or 0)} | block={int(t.get("block_slots") or 0)} | recovery={int(t.get("recovery_slots") or 0)} | alloc={_safe_float(t.get("allocation_pct"), 0.0):.0f}%')(_balance_tier_limits(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0), settings))}",
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
