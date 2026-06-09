@@ -508,6 +508,188 @@ def _build_trade_context_meta(
     }
 
 
+
+
+def _build_analytics_setup_tags(
+    pair: PairCandidate,
+    setup_type: str,
+    entry_timing: str,
+    smart_evidence: dict | None = None,
+) -> dict:
+    """Build derived setup tags for analytics only.
+
+    IMPORTANT:
+    - Does NOT change setup_type.
+    - Does NOT change score / boost_score.
+    - Does NOT append to execution_setup_tags.
+    - Does NOT affect whitelist, execution gates, OKX, or lifecycle.
+    """
+
+    smart_evidence = smart_evidence or {}
+    pair_tags = set(getattr(pair, "tags", []) or [])
+    candles = list(getattr(pair, "recent_candles", []) or [])
+
+    derived: list[str] = []
+    details: dict[str, object] = {
+        "available": False,
+        "model": "analytics_derived_setups_v1",
+        "reason": "not_enough_valid_candles",
+    }
+
+    valid: list[dict[str, float]] = []
+    for candle in candles[-8:]:
+        if not isinstance(candle, dict):
+            continue
+        open_ = _safe_float(candle.get("open"), 0.0)
+        high = _safe_float(candle.get("high"), 0.0)
+        low = _safe_float(candle.get("low"), 0.0)
+        close = _safe_float(candle.get("close"), 0.0)
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            continue
+        if open_ <= 0:
+            open_ = close
+        range_pct = ((high - low) / close) * 100.0 if close > 0 else 0.0
+        body_pct = (abs(close - open_) / close) * 100.0 if close > 0 else 0.0
+        upper_wick_pct = ((high - max(open_, close)) / close) * 100.0 if close > 0 else 0.0
+        lower_wick_pct = ((min(open_, close) - low) / close) * 100.0 if close > 0 else 0.0
+        valid.append({
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "range_pct": range_pct,
+            "body_pct": body_pct,
+            "upper_wick_pct": max(0.0, upper_wick_pct),
+            "lower_wick_pct": max(0.0, lower_wick_pct),
+        })
+
+    if len(valid) < 4:
+        return {
+            "analytics_tags": [],
+            "derived_setups": [],
+            "analytics_setup_primary": "",
+            "analytics_setup_details": details,
+        }
+
+    last = valid[-1]
+    prev = valid[-2]
+    recent = valid[-4:]
+    prior = valid[:-1]
+    prev3 = valid[-4:-1]
+    avg_prev_range = sum(c["range_pct"] for c in prev3) / max(1, len(prev3))
+    avg_prior_range = sum(c["range_pct"] for c in prior) / max(1, len(prior))
+    recent_lows = [c["low"] for c in recent]
+    recent_highs = [c["high"] for c in recent]
+    last_close = last["close"]
+    previous_high = max(c["high"] for c in prev3)
+    previous_low = min(c["low"] for c in prev3)
+
+    expansion = bool(smart_evidence.get("displacement_hint"))
+    acceptance = bool(smart_evidence.get("auction_acceptance_hint"))
+    compression = bool(smart_evidence.get("compression_release_hint"))
+    sweep = bool(smart_evidence.get("sweep_reclaim_hint"))
+    failed_breakout = bool(smart_evidence.get("failed_breakout_risk"))
+    near_resistance = bool("near_resistance" in pair_tags)
+
+    # 1) Breakout -> controlled pullback/retest -> acceptance
+    breakout_pullback_acceptance = bool(
+        ("breakout" in pair_tags or setup_type in {"retest_breakout_confirmed", "wave_3"})
+        and (
+            entry_timing == "pullback"
+            or setup_type in {"retest_breakout_confirmed", "higher_low_continuation"}
+            or "continuation" in pair_tags
+        )
+        and last_close >= previous_low
+        and last_close <= previous_high * 1.012
+        and (acceptance or last["lower_wick_pct"] >= last["upper_wick_pct"] or last_close >= prev["close"])
+        and not failed_breakout
+    )
+
+    # 2) Compression then expansion/acceptance continuation
+    compression_release_continuation = bool(
+        compression
+        or (
+            avg_prior_range > 0
+            and avg_prev_range <= avg_prior_range * 0.85
+            and last["range_pct"] >= avg_prev_range * 1.25
+            and last_close >= prev["close"]
+            and ("continuation" in pair_tags or "breakout" in pair_tags or setup_type in {"wave_3", "higher_low_continuation"})
+        )
+    )
+
+    # 3) Sweep below local low then reclaim/close back into structure
+    sweep_reclaim_continuation = bool(
+        sweep
+        or (
+            last["low"] <= previous_low * 1.002
+            and last_close > previous_low
+            and last["lower_wick_pct"] >= max(last["body_pct"], last["upper_wick_pct"])
+            and not failed_breakout
+        )
+    )
+
+    # 4) Cleaner higher-low structure: rising lows + non-exhausted acceptance
+    clean_higher_low_structure = bool(
+        setup_type == "higher_low_continuation"
+        and recent_lows[-1] >= min(recent_lows[:-1])
+        and recent_lows[-1] >= recent_lows[-2] * 0.995
+        and last_close >= prev["close"] * 0.995
+        and not near_resistance
+        and not failed_breakout
+    )
+
+    # 5) Trend continuation after a pause: small pause, then renewed close strength
+    trend_continuation_after_pause = bool(
+        ("continuation" in pair_tags or setup_type in {"wave_3", "higher_low_continuation"})
+        and prev["range_pct"] <= avg_prior_range * 1.05
+        and last["range_pct"] >= max(0.01, avg_prev_range * 1.10)
+        and last_close >= prev["close"]
+        and not failed_breakout
+    )
+
+    candidates = [
+        ("breakout_pullback_acceptance", breakout_pullback_acceptance),
+        ("compression_release_continuation", compression_release_continuation),
+        ("sweep_reclaim_continuation", sweep_reclaim_continuation),
+        ("clean_higher_low_structure", clean_higher_low_structure),
+        ("trend_continuation_after_pause", trend_continuation_after_pause),
+    ]
+
+    for name, active in candidates:
+        if active and name not in derived:
+            derived.append(name)
+
+    details = {
+        "available": True,
+        "model": "analytics_derived_setups_v1",
+        "reason": "ok",
+        "base_setup_type": setup_type,
+        "entry_timing": entry_timing,
+        "matched_count": len(derived),
+        "last_range_pct": round(last["range_pct"], 4),
+        "avg_prev_range_pct": round(avg_prev_range, 4),
+        "avg_prior_range_pct": round(avg_prior_range, 4),
+        "last_lower_wick_pct": round(last["lower_wick_pct"], 4),
+        "last_upper_wick_pct": round(last["upper_wick_pct"], 4),
+        "previous_high": round(previous_high, 8),
+        "previous_low": round(previous_low, 8),
+        "smart_flags": {
+            "expansion": expansion,
+            "acceptance": acceptance,
+            "compression": compression,
+            "sweep": sweep,
+            "failed_breakout": failed_breakout,
+        },
+    }
+
+    return {
+        "analytics_tags": list(derived),
+        "derived_setups": list(derived),
+        "analytics_setup_primary": derived[0] if derived else "",
+        "analytics_setup_details": details,
+    }
+
+
 def _calculate_pa_score(
     smart_evidence: dict,
     market_mode: str,
@@ -1268,6 +1450,13 @@ def build_signal_candidate(
         smart_evidence=smart_evidence,
     )
 
+    analytics_setup_context = _build_analytics_setup_tags(
+        pair=pair,
+        setup_type=setup_type,
+        entry_timing=entry_timing,
+        smart_evidence=smart_evidence,
+    )
+
     btc_control_context = _build_btc_control_context(pair)
     resistance_4h_context = _build_4h_resistance_meta(pair)
 
@@ -1593,6 +1782,20 @@ def build_signal_candidate(
 
             "entry_context":
                 trade_context_meta.get("entry_context"),
+
+            # ✅ Analytics-only derived setups
+            # لا يتم إضافتها إلى execution_setup_tags حتى لا تؤثر على البوابات أو التنفيذ
+            "analytics_tags":
+                analytics_setup_context.get("analytics_tags", []),
+
+            "derived_setups":
+                analytics_setup_context.get("derived_setups", []),
+
+            "analytics_setup_primary":
+                analytics_setup_context.get("analytics_setup_primary", ""),
+
+            "analytics_setup_details":
+                analytics_setup_context.get("analytics_setup_details", {}),
 
             "btc_control":
                 btc_control_context,
