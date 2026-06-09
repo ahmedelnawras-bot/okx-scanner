@@ -45,7 +45,55 @@ except Exception:
 from risk.portfolio_state import build_portfolio_state_from_trades
 from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
 from tracking.trade_registry import register_trade
-from tracking.open_trades_updater import update_open_trades
+try:
+    from tracking.open_trades_updater import update_open_trades
+except Exception as _open_trades_updater_import_exc:
+    print(
+        f"⚠️ OPEN_TRADES_UPDATER_IMPORT_FAILED | using emergency fallback | {_open_trades_updater_import_exc}",
+        flush=True,
+    )
+
+    def update_open_trades(
+        trades,
+        price_map,
+        protection_level=0,
+        okx_client=None,
+        sync_exchange=False,
+        sync_exchange_stop=False,
+    ):
+        """Emergency fallback only used if tracking.open_trades_updater cannot import.
+
+        Keeps the bot bootable and updates lifecycle from exact price_map symbols.
+        Exchange reconciliation/SL write-back is intentionally disabled in fallback
+        to avoid accidental OKX writes when the real updater module is broken.
+        """
+        try:
+            from tracking.lifecycle import update_trade_with_price as _fallback_update_trade_with_price
+        except Exception as exc:
+            print(f"❌ OPEN_TRADES_UPDATER_FALLBACK_FAILED | lifecycle import | {exc}", flush=True)
+            return list(trades or [])
+
+        updated = []
+        for trade in trades or []:
+            try:
+                symbol = str(getattr(trade, "symbol", "") or "")
+                entry = float(getattr(trade, "entry", 0.0) or 0.0)
+                previous = float(getattr(trade, "current_price", 0.0) or entry)
+                current_price = float(price_map.get(symbol, previous or entry))
+                updated.append(
+                    _fallback_update_trade_with_price(
+                        trade,
+                        current_price,
+                        protection_level=protection_level,
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"⚠️ OPEN_TRADES_UPDATER_FALLBACK_TRADE_FAILED | {getattr(trade, 'symbol', '?')} | {exc}",
+                    flush=True,
+                )
+                updated.append(trade)
+        return updated
 from tracking.persistence import RedisTradeStore, trade_to_dict, trade_from_dict
 from tracking.models import TrackedTrade
 from reporting.report_router import build_report_bundle, build_command_outputs
@@ -2644,6 +2692,53 @@ def _ensure_trade_display_defaults(trades: list | None, settings: Settings, *, l
 
 
 
+
+_CANDLE_CONTEXT_CACHE: dict[tuple[str, str, int], tuple[float, list]] = {}
+_CANDLE_CONTEXT_CACHE_LOCK = threading.Lock()
+
+
+def _candle_context_cache_ttl(bar: str) -> int:
+    """TTL for scan-only candle context cache.
+
+    This reduces repeated OKX candle calls during scans/reports without changing
+    execution/order logic. Use VERBOSE_LOGS=ON to debug per-pair candle fetches.
+    """
+    normalized = str(bar or "").strip().lower()
+    env_key = "OKX_SCAN_CANDLE_CACHE_4H_SECONDS" if normalized in {"4h", "4H".lower()} else "OKX_SCAN_CANDLE_CACHE_15M_SECONDS"
+    default = 900 if normalized in {"4h"} else 180
+    try:
+        return max(30, int(os.getenv(env_key, str(default))))
+    except Exception:
+        return default
+
+
+def _fetch_okx_candles_cached(base_url: str, symbol: str, *, bar: str, limit: int, timeout: float):
+    key = (str(symbol or "").upper(), str(bar or ""), int(limit or 0))
+    ttl = _candle_context_cache_ttl(bar)
+    now = time.monotonic()
+    try:
+        with _CANDLE_CONTEXT_CACHE_LOCK:
+            cached = _CANDLE_CONTEXT_CACHE.get(key)
+            if cached and now - float(cached[0]) <= ttl:
+                return cached[1]
+    except Exception:
+        pass
+
+    rows = fetch_okx_candles(base_url, symbol, bar=bar, limit=limit, timeout=timeout)
+    try:
+        if isinstance(rows, list):
+            with _CANDLE_CONTEXT_CACHE_LOCK:
+                _CANDLE_CONTEXT_CACHE[key] = (now, rows)
+                # prevent unbounded growth; ranked universe is normally <=200.
+                if len(_CANDLE_CONTEXT_CACHE) > 800:
+                    oldest = sorted(_CANDLE_CONTEXT_CACHE.items(), key=lambda item: item[1][0])[:200]
+                    for old_key, _ in oldest:
+                        _CANDLE_CONTEXT_CACHE.pop(old_key, None)
+    except Exception:
+        pass
+    return rows
+
+
 def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "15m", limit: int = 10) -> list[dict]:
     """Fetch recent closed candles for the Price Action Evidence layer.
 
@@ -2658,7 +2753,7 @@ def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "1
         return []
 
     try:
-        rows = fetch_okx_candles(
+        rows = _fetch_okx_candles_cached(
             settings.okx_base_url,
             symbol,
             bar=bar,
@@ -2712,7 +2807,7 @@ def _build_4h_resistance_context_for_pair(pair, settings: Settings, bar: str = "
         }
 
     try:
-        rows = fetch_okx_candles(
+        rows = _fetch_okx_candles_cached(
             settings.okx_base_url,
             symbol,
             bar=bar,
@@ -5874,6 +5969,11 @@ def run_once(
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
         flush=True,
     )
+    _log_throttled(
+        "scan_candle_cache_status",
+        f"SCAN_CANDLE_CACHE | entries={len(_CANDLE_CONTEXT_CACHE)} | 15m_ttl={_candle_context_cache_ttl('15m')}s | 4h_ttl={_candle_context_cache_ttl('4H')}s",
+        every_seconds=300,
+    )
 
     for pair in filtered_pairs:
         try:
@@ -5888,29 +5988,35 @@ def run_once(
                 "recent_candles",
                 recent_candles,
             )
-            print(
-                f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
-                flush=True,
-            )
+            if _runtime_verbose_logs_enabled():
+                print(
+                    f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(
+            _log_throttled(
+                f"pa_candles_error:{getattr(pair, 'symbol', '-')}",
                 f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
-                flush=True,
+                every_seconds=300,
+                force=False,
             )
 
         try:
             resistance_4h_context = _build_4h_resistance_context_for_pair(pair, settings)
             setattr(pair, "resistance_4h_context", resistance_4h_context)
-            print(
-                f"4H_RESISTANCE | {pair.symbol} | "
-                f"status={resistance_4h_context.get('status')} | "
-                f"distance={resistance_4h_context.get('distance_pct')}",
-                flush=True,
-            )
+            if _runtime_verbose_logs_enabled():
+                print(
+                    f"4H_RESISTANCE | {pair.symbol} | "
+                    f"status={resistance_4h_context.get('status')} | "
+                    f"distance={resistance_4h_context.get('distance_pct')}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(
+            _log_throttled(
+                f"4h_resistance_error:{getattr(pair, 'symbol', '-')}",
                 f"4H_RESISTANCE | {getattr(pair, 'symbol', '-')} | error={exc}",
-                flush=True,
+                every_seconds=300,
+                force=False,
             )
 
         signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
@@ -5919,13 +6025,14 @@ def run_once(
 
         # ✅ DIAGNOSTIC: تتبع raw_candles داخل الـ signal بعد البناء
         _signal_candles_count = len((signal.meta or {}).get("raw_candles") or [])
-        print(
-            f"SIGNAL_CANDLES | {signal.symbol} | "
-            f"setup={signal.setup_type} | "
-            f"mode={scan_mode} | "
-            f"raw_candles_in_meta={_signal_candles_count}",
-            flush=True,
-        )
+        if _runtime_verbose_logs_enabled():
+            print(
+                f"SIGNAL_CANDLES | {signal.symbol} | "
+                f"setup={signal.setup_type} | "
+                f"mode={scan_mode} | "
+                f"raw_candles_in_meta={_signal_candles_count}",
+                flush=True,
+            )
 
         # First let the normal execution decision run, including BLOCK/RECOVERY
         # exception logic. Then, if a higher hard protection is active
