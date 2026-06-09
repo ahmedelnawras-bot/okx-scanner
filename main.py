@@ -2976,17 +2976,17 @@ def _append_report_update_footer(
     result["last_report_update_at"] = updated_at
 
     if int(stats.get("open", 0) or 0) <= 0:
-        price_line = "🔄 Open Prices: <code>open=0</code>"
+        price_line = "🔄 أسعار الصفقات: لا توجد صفقات مفتوحة"
     else:
         price_line = (
-            f"🔄 Open Prices: <code>refreshed={int(stats.get('refreshed', 0) or 0)}/{int(stats.get('open', 0) or 0)}"
-            f" | stale={int(stats.get('stale', 0) or 0)}</code>"
+            f"🔄 أسعار الصفقات: تم تحديث <code>{int(stats.get('refreshed', 0) or 0)}/{int(stats.get('open', 0) or 0)}</code> ✅"
+            f" | غير محدثة: <code>{int(stats.get('stale', 0) or 0)}</code>"
         )
         last_price = str(stats.get("last_price_refresh_at") or "").strip()
         if last_price:
-            price_line += "\n🕒 Last Open Price Refresh: <code>" + _format_egypt_time(last_price, include_utc=False) + "</code>"
+            price_line += "\n🕒 آخر تحديث لأسعار الصفقات: <code>" + _format_egypt_time(last_price, include_utc=False) + "</code>"
         if stats.get("stale_symbols"):
-            price_line += "\n⚠️ Stale Symbols: <code>" + ",".join(stats.get("stale_symbols") or []) + "</code>"
+            price_line += "\n⚠️ صفقات غير محدثة: <code>" + ",".join(stats.get("stale_symbols") or []) + "</code>"
 
     footer = "\n".join([
         "━━━━━━━━━━━━",
