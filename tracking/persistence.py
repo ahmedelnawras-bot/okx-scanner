@@ -280,6 +280,41 @@ class RedisTradeStore:
         except Exception as exc:
             print(f"⚠️ Redis append_execution_checks failed: {exc}", flush=True)
 
+    def save_execution_checks(self, execution_results: list[dict[str, Any]], limit: int = 10000) -> None:
+        """Overwrite execution check history with updated analytics rows.
+
+        Surgical analytics helper for post_rejection_tracking.
+        It does not touch trade records, open/history sets, signal fingerprints,
+        or simulation namespaces. Rows are stored in chronological order and
+        loaded by load_execution_checks() in the same order as before.
+        """
+        if not self.enabled or not self.client:
+            return
+        try:
+            rows = list(execution_results or [])[-max(1, int(limit or 10000)):]
+            pipe = self.client.pipeline()
+            pipe.delete(EXEC_CHECKS_LIST)
+            for item in reversed(rows):
+                payload = dict(item or {})
+                try:
+                    encoded = json.dumps(_to_json_safe(payload), ensure_ascii=False, default=str)
+                except Exception:
+                    encoded = json.dumps(
+                        {
+                            "status": payload.get("status"),
+                            "reason": payload.get("reason"),
+                            "path": payload.get("path"),
+                            "ts": payload.get("ts") or datetime.now(timezone.utc).isoformat(),
+                        },
+                        ensure_ascii=False,
+                    )
+                pipe.lpush(EXEC_CHECKS_LIST, encoded)
+            pipe.ltrim(EXEC_CHECKS_LIST, 0, max(0, int(limit or 10000) - 1))
+            pipe.expire(EXEC_CHECKS_LIST, RETENTION_SECONDS)
+            pipe.execute()
+        except Exception as exc:
+            print(f"⚠️ Redis save_execution_checks failed: {exc}", flush=True)
+
     def load_execution_checks(self, limit: int | None = None) -> list[dict[str, Any]]:
         if not self.enabled or not self.client:
             return []
