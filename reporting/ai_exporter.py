@@ -913,6 +913,10 @@ def _build_daily_snapshot(
     filter_buckets: dict[str, int] = {}
     rejection_categories: dict[str, int] = {}
     correct_rejections = wrong_rejections = unknown_rejections = 0
+    wrong_rejection_rows: list[dict] = []
+    correct_rejection_rows: list[dict] = []
+    filter_costs: dict[str, float] = {}
+    filter_saves: dict[str, float] = {}
     for r in rejected:
         reason = _s(r.get("reason") or r.get("status") or "unknown")
         category = _s(r.get("rejection_category")) or _classify_rejection_reason(reason, _s(r.get("status")))
@@ -923,13 +927,47 @@ def _build_daily_snapshot(
             filter_buckets["pa_gate"] = filter_buckets.get("pa_gate", 0) + 1
         if "nour" in reason.lower():
             filter_buckets["nour_filter"] = filter_buckets.get("nour_filter", 0) + 1
+
+        pump = _f(r.get("max_pump_after_rejection_pct"))
+        dump = _f(r.get("max_dump_after_rejection_pct"))
+        one_hour = _f(r.get("price_after_1h_pct"))
         verdict = r.get("rejection_was_correct")
         if verdict is True:
             correct_rejections += 1
+            saved = abs(min(dump, one_hour, 0.0))
+            filter_saves[category] = filter_saves.get(category, 0.0) + saved
+            correct_rejection_rows.append({
+                "symbol": _s(r.get("symbol")),
+                "setup_type": _s(r.get("setup_type")),
+                "reason": reason,
+                "category": category,
+                "saved_dump_pct": round(saved, 4),
+                "price_after_1h_pct": one_hour,
+            })
         elif verdict is False:
             wrong_rejections += 1
+            cost = max(pump, one_hour, 0.0)
+            filter_costs[category] = filter_costs.get(category, 0.0) + cost
+            wrong_rejection_rows.append({
+                "symbol": _s(r.get("symbol")),
+                "setup_type": _s(r.get("setup_type")),
+                "reason": reason,
+                "category": category,
+                "missed_pump_pct": round(cost, 4),
+                "would_hit_tp1": _b(r.get("would_hit_tp1")),
+                "would_hit_tp2": _b(r.get("would_hit_tp2")),
+            })
         else:
             unknown_rejections += 1
+
+    most_expensive_filter = None
+    if filter_costs:
+        k, v = max(filter_costs.items(), key=lambda kv: kv[1])
+        most_expensive_filter = {"category": k, "missed_pump_pct": round(v, 4)}
+    most_protective_filter = None
+    if filter_saves:
+        k, v = max(filter_saves.items(), key=lambda kv: kv[1])
+        most_protective_filter = {"category": k, "saved_dump_pct": round(v, 4)}
 
     bot_health = {
         "execution_errors": sum(1 for r in execution_results if "error" in _s(r.get("status")).lower() or "error" in _s(r.get("reason")).lower()),
@@ -1060,11 +1098,11 @@ def _build_daily_snapshot(
             "correct_rejections": correct_rejections,
             "wrong_rejections": wrong_rejections,
             "unknown_rejections": unknown_rejections,
-            "top_wrong_rejections": [],
-            "top_correct_rejections": [],
-            "most_expensive_filter": None,
-            "most_protective_filter": None,
-            "note": "requires post_rejection_tracking population",
+            "top_wrong_rejections": sorted(wrong_rejection_rows, key=lambda x: -_f(x.get("missed_pump_pct")))[:10],
+            "top_correct_rejections": sorted(correct_rejection_rows, key=lambda x: -_f(x.get("saved_dump_pct")))[:10],
+            "most_expensive_filter": most_expensive_filter,
+            "most_protective_filter": most_protective_filter,
+            "note": "post_rejection_tracking_v1 uses scan checkpoint prices",
         },
         "bot_health": bot_health,
         "lessons_today": lessons_today,
