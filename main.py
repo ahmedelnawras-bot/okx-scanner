@@ -2348,9 +2348,14 @@ def _ensure_open_trade_prices_in_map(
             if not inst_id:
                 continue
 
-            # Normalize equivalent keys already present in the scanner map.
+            # Normalize only exact symbol keys already present in the scanner map.
+            # Do NOT use base-symbol / fuzzy / dashless matching here: short symbols
+            # like H-USDT-SWAP can otherwise pick a price belonging to another instrument.
             existing = 0.0
-            for key in (symbol_raw, inst_id, inst_id.replace("-", "")):
+            for key in (inst_id, symbol_raw):
+                key_norm = _normalize_okx_inst_id(str(key or ""))
+                if key_norm != inst_id:
+                    continue
                 existing = _safe_float(out.get(key), 0.0)
                 if existing > 0:
                     break
@@ -2786,25 +2791,88 @@ def _format_egypt_time(value: object | None = None, *, include_utc: bool = True)
 
 
 
-def _report_price_value_for_trade(trade) -> float:
-    """Return the calculation/current price shown beside trade cards in reports.
-
-    For open trades this is the current live/last refreshed price used by the
-    lifecycle/report calculations. For closed trades, prefer the close/exit
-    price when available, then fall back to current_price. This is display-only.
-    """
-    for attr in (
-        "current_price",
-        "mark_price",
-        "last_price",
-        "close_price",
-        "exit_price",
-        "closed_price",
-    ):
+def _report_trade_leverage_for_price(trade, settings: Settings | None = None) -> float:
+    """Best-effort leverage used only to sanity-check report display prices."""
+    for attr in ("effective_leverage", "actual_leverage", "leverage", "simulation_leverage"):
         value = _safe_float(getattr(trade, attr, 0.0), 0.0)
         if value > 0:
             return value
-    return _safe_float(getattr(trade, "entry", 0.0), 0.0)
+    if settings is not None:
+        value = _safe_float(getattr(settings, "default_leverage", 0.0), 0.0)
+        if value > 0:
+            return value
+    return 15.0
+
+
+def _report_trade_pct_for_price(trade) -> float:
+    """Return the PnL% that the report line is displaying for this trade."""
+    if _is_trade_closed(trade):
+        for attr in ("realized_pnl_pct", "pnl_pct", "floating_pnl_pct"):
+            value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+            if abs(value) > 0:
+                return value
+    for attr in ("floating_pnl_pct", "pnl_pct", "realized_pnl_pct"):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if abs(value) > 0:
+            return value
+    return 0.0
+
+
+def _report_implied_price_from_pnl(trade, settings: Settings | None = None) -> float:
+    """Derive the price that matches the displayed leveraged PnL%.
+
+    The bot is long-only. If a stored current_price is polluted/stale, this
+    derived value keeps the report's @ price consistent with the PnL line.
+    Display-only; it does not update TP/SL, lifecycle, slots, or saved trades.
+    """
+    entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+    pnl_pct = _report_trade_pct_for_price(trade)
+    leverage = _report_trade_leverage_for_price(trade, settings)
+    if entry <= 0 or leverage <= 0 or abs(pnl_pct) <= 0:
+        return 0.0
+    implied = entry * (1.0 + (pnl_pct / (leverage * 100.0)))
+    return implied if implied > 0 else 0.0
+
+
+def _report_price_is_consistent(candidate: float, implied: float, entry: float) -> bool:
+    """Reject obviously polluted display prices for short symbols like H."""
+    candidate = _safe_float(candidate, 0.0)
+    implied = _safe_float(implied, 0.0)
+    entry = _safe_float(entry, 0.0)
+    if candidate <= 0:
+        return False
+    if implied > 0:
+        tolerance = max(0.03, 0.003 / max(implied, 1e-12))  # 3% or tiny absolute tolerance
+        return abs(candidate - implied) / implied <= tolerance
+    if entry > 0:
+        # A generic sanity guard when PnL is unavailable. 10x entry is almost
+        # certainly not a valid current price for these short-lived futures cards.
+        return 0.05 * entry <= candidate <= 10.0 * entry
+    return True
+
+
+def _report_price_value_for_trade(trade, settings: Settings | None = None) -> float:
+    """Return the calculation/current price shown beside trade cards in reports.
+
+    Uses exact/stored trade prices only when they are consistent with the PnL
+    printed in the same card. If a stale/polluted current_price exists, fall
+    back to the price implied by entry + leveraged PnL% so the displayed @ value
+    matches the report's actual calculation. Display-only.
+    """
+    entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+    implied = _report_implied_price_from_pnl(trade, settings)
+    attrs = (
+        ("close_price", "exit_price", "closed_price", "current_price", "mark_price", "last_price")
+        if _is_trade_closed(trade)
+        else ("current_price", "mark_price", "last_price", "close_price", "exit_price", "closed_price")
+    )
+    for attr in attrs:
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if _report_price_is_consistent(value, implied, entry):
+            return value
+    if implied > 0:
+        return implied
+    return entry
 
 
 def _format_report_trade_price(value: object) -> str:
@@ -2845,6 +2913,109 @@ def _report_trade_list_for_command(result: dict | None, settings: Settings, comm
     return list(result.get("simulation_trades", []) or []) if _is_simulation_mode(settings) else list(result.get("trades", []) or [])
 
 
+def _extract_report_line_pnl_pct(line: str) -> float | None:
+    """Extract the PnL% printed in a report card header line, if present."""
+    try:
+        match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%\s+(?:Floating|Realized)?\s*PnL", str(line or ""), flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", str(line or ""))
+        if match:
+            return float(match.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def _report_trade_card_pnl_pct_for_match(trade) -> float:
+    """Return the same effective PnL% family used by report cards.
+
+    This is display matching only. It lets the post-processor identify which
+    same-symbol trade card it is editing when multiple H-USDT-SWAP / etc records
+    exist in the same report.
+    """
+    try:
+        return float(_report_trade_effective_pnl(trade) or 0.0)
+    except Exception:
+        return float(_trade_effective_pnl_pct(trade) or 0.0)
+
+
+def _build_report_price_candidates_by_symbol(trades: list, settings: Settings) -> dict[str, list[dict]]:
+    candidates: dict[str, list[dict]] = {}
+    for idx, trade in enumerate(list(trades or [])):
+        symbol = str(getattr(trade, "symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        price = _report_price_value_for_trade(trade, settings)
+        if price <= 0:
+            continue
+        candidates.setdefault(symbol, []).append({
+            "idx": idx,
+            "trade": trade,
+            "price": float(price),
+            "price_text": _format_report_trade_price(price),
+            "pnl_pct": _report_trade_card_pnl_pct_for_match(trade),
+            "used": False,
+        })
+    return candidates
+
+
+def _select_report_price_candidate(symbol: str, line: str, candidates_by_symbol: dict[str, list[dict]]) -> dict | None:
+    """Choose the price candidate for the exact report card line.
+
+    Important safety rule:
+    - One symbol may appear multiple times in the same report.
+    - We must not use a symbol-level dict, because a stale/mismatched H record
+      can inject its price into another H card.
+    - For duplicates, match by the PnL% printed on the same line. If we cannot
+      match confidently, skip price injection for that line instead of showing
+      a wrong @ price.
+    """
+    symbol = str(symbol or "").strip().upper()
+    candidates = list(candidates_by_symbol.get(symbol) or [])
+    if not candidates:
+        return None
+
+    unused = [item for item in candidates if not bool(item.get("used"))]
+    pool = unused or candidates
+
+    # Unique symbol: safe to inject directly.
+    if len(candidates) == 1:
+        pool[0]["used"] = True
+        return pool[0]
+
+    line_pct = _extract_report_line_pnl_pct(line)
+    if line_pct is None:
+        # Duplicate symbol with no comparable PnL in the header: fail safe.
+        return None
+
+    ranked = sorted(
+        pool,
+        key=lambda item: abs(float(item.get("pnl_pct", 0.0) or 0.0) - float(line_pct)),
+    )
+    if not ranked:
+        return None
+
+    best = ranked[0]
+    best_diff = abs(float(best.get("pnl_pct", 0.0) or 0.0) - float(line_pct))
+    second_diff = abs(float(ranked[1].get("pnl_pct", 0.0) or 0.0) - float(line_pct)) if len(ranked) > 1 else 999999.0
+
+    # Report lines are rounded to 2 decimals. Allow a small rounding gap.
+    # If two duplicate same-symbol rows are too close to distinguish, skip.
+    if best_diff <= 0.15 and (second_diff - best_diff >= 0.05 or second_diff > 0.15):
+        best["used"] = True
+        return best
+
+    try:
+        print(
+            "REPORT_PRICE_DUPLICATE_SYMBOL_SKIP | "
+            f"{symbol} | line_pct={line_pct:.4f} | best_diff={best_diff:.4f} | second_diff={second_diff:.4f}",
+            flush=True,
+        )
+    except Exception:
+        pass
+    return None
+
+
 def _inject_report_trade_current_prices(
     message: str,
     result: dict | None,
@@ -2855,10 +3026,14 @@ def _inject_report_trade_current_prices(
     """Add the calculation/current price beside each trade symbol in reports.
 
     This is a report-text post processor only. It does not change PnL, TP/SL,
-    lifecycle, scoring, slots, OKX execution, or saved trades. It enriches every
-    trade-card header produced by the shared report formatter using a compact
-    inline format that does not wrap badly on Telegram mobile, e.g.:
-      • <b>MEGA-USDT-SWAP</b> @ <code>0.0521</code> | +36.03% Floating PnL
+    lifecycle, scoring, slots, OKX execution, or saved trades.
+
+    Safety fix:
+    Do not inject prices with a simple symbol => price dict. The same symbol can
+    appear multiple times in one report (for example H-USDT-SWAP recovery +
+    normal records). Each card is matched by symbol + the PnL% printed in that
+    card. If a duplicate cannot be matched confidently, the @ price is omitted
+    rather than showing a wrong price.
     """
     text = str(message or "")
     if not text or "💱 Now:" in text or " @ <code>" in text:
@@ -2868,29 +3043,22 @@ def _inject_report_trade_current_prices(
     if not trades:
         return text
 
-    price_by_symbol: dict[str, str] = {}
-    for trade in trades:
-        symbol = str(getattr(trade, "symbol", "") or "").strip().upper()
-        if not symbol:
-            continue
-        price = _report_price_value_for_trade(trade)
-        if price > 0:
-            price_by_symbol[symbol] = _format_report_trade_price(price)
-
-    if not price_by_symbol:
+    candidates_by_symbol = _build_report_price_candidates_by_symbol(trades, settings)
+    if not candidates_by_symbol:
         return text
 
     out_lines: list[str] = []
     for line in text.splitlines():
         original = line
-        if "💱 Now:" in line:
+        if "💱 Now:" in line or " @ " in line:
             out_lines.append(line)
             continue
 
         html_match = re.search(r"<b>([^<]+-USDT-SWAP)</b>", line)
         if html_match:
             symbol = str(html_match.group(1) or "").strip().upper()
-            price_text = price_by_symbol.get(symbol)
+            candidate = _select_report_price_candidate(symbol, line, candidates_by_symbol)
+            price_text = str((candidate or {}).get("price_text") or "")
             if price_text and line.lstrip().startswith("•"):
                 token = f"<b>{html_match.group(1)}</b>"
                 replacement = f"{token} @ <code>{price_text}</code>"
@@ -2901,7 +3069,8 @@ def _inject_report_trade_current_prices(
         plain_match = re.search(r"^(\s*•\s*)([A-Z0-9]+-USDT-SWAP)(\s*\|\s*)", line)
         if plain_match:
             symbol = str(plain_match.group(2) or "").strip().upper()
-            price_text = price_by_symbol.get(symbol)
+            candidate = _select_report_price_candidate(symbol, line, candidates_by_symbol)
+            price_text = str((candidate or {}).get("price_text") or "")
             if price_text:
                 prefix = plain_match.group(1) + plain_match.group(2)
                 line = prefix + f" @ {price_text}" + line[plain_match.end(2):]
