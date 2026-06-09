@@ -271,6 +271,109 @@ def calculate_context_component(candidate: Any, config: CapitalIntelligenceConfi
 
     return CapitalComponent("context_quality", round(_clamp(points, 0.0, config.context_max_points), 2), config.context_max_points, ",".join(reasons), {"turnover_usdt": turnover, "change_abs_pct": change, "btc_status": btc_status, "warnings_count": len(warnings)})
 
+def calculate_synergy_component(candidate: Any, config: CapitalIntelligenceConfig = DEFAULT_CONFIG) -> CapitalComponent:
+    """Analytics-only setup synergy bonus.
+
+    This component rewards high-quality combinations that are stronger together
+    than any single setup tag alone. It is still shadow-only: it does not alter
+    entry validity, OKX execution, TP/SL, slots, Recovery, BLOCK, or main.py.
+    """
+    meta = _get_meta(candidate)
+    names = set(_setup_names(candidate))
+    flags = dict(meta.get("pa_score_flags") or {}) if isinstance(meta.get("pa_score_flags"), dict) else {}
+    pa_score = _safe_float(meta.get("pa_score"), 0.0)
+    stability = _safe_float(meta.get("execution_stability"), 0.0)
+    nour_passed = bool(meta.get("nour_filter_passed"))
+    mtf_confirmed = bool(meta.get("mtf_confirmed"))
+    resistance_status = str(meta.get("resistance_4h_status") or "").strip().lower()
+    resistance_distance = _safe_float(meta.get("resistance_4h_distance_pct"), 0.0)
+    setup_type = str(getattr(candidate, "setup_type", "") or meta.get("setup_type") or "").strip()
+
+    acceptance = bool(flags.get("acceptance"))
+    expansion = bool(flags.get("expansion"))
+    sweep = bool(flags.get("sweep"))
+    weak_breakout = bool(flags.get("weak_breakout"))
+    exhausted = bool(meta.get("exhausted_move"))
+    resistance_ok = bool(
+        resistance_status in {"clear", "cleared", "watch"}
+        or resistance_distance >= 3.0
+        or resistance_distance <= 0.0
+    )
+
+    points = 0.0
+    reasons: list[str] = []
+
+    if (
+        "clean_higher_low_structure" in names
+        and (acceptance or expansion or pa_score >= 0.18)
+        and (nour_passed or stability >= 1.20)
+        and resistance_ok
+        and not weak_breakout
+        and not exhausted
+    ):
+        points = max(points, 5.0)
+        reasons.append("clean_higher_low_pa_nour_resistance")
+
+    if (
+        "breakout_pullback_acceptance" in names
+        and (acceptance or pa_score >= 0.18)
+        and resistance_ok
+        and not weak_breakout
+    ):
+        points = max(points, 4.5)
+        reasons.append("breakout_pullback_acceptance_confirmed")
+
+    if (
+        "compression_release_continuation" in names
+        and (expansion or pa_score >= 0.22)
+        and not weak_breakout
+    ):
+        points = max(points, 3.5)
+        reasons.append("compression_release_with_expansion")
+
+    if (
+        "sweep_reclaim_continuation" in names
+        and (sweep or acceptance)
+        and not weak_breakout
+    ):
+        points = max(points, 3.5)
+        reasons.append("sweep_reclaim_acceptance")
+
+    if (
+        setup_type == "wave_3"
+        and mtf_confirmed
+        and pa_score >= 0.18
+        and (nour_passed or stability >= 1.20)
+        and not exhausted
+    ):
+        points = max(points, 3.0)
+        reasons.append("wave3_mtf_pa_nour")
+
+    if weak_breakout or exhausted:
+        points = min(points, 1.0)
+        reasons.append("synergy_capped_by_weak_or_exhausted")
+
+    max_points = _safe_float(getattr(config, "synergy_max_points", 5.0), 5.0)
+    points = round(_clamp(points, 0.0, max_points), 2)
+    reason = ",".join(reasons) if reasons else "no_synergy"
+    return CapitalComponent(
+        "setup_synergy",
+        points,
+        max_points,
+        reason,
+        {
+            "setup_candidates": sorted(names),
+            "pa_score": pa_score,
+            "pa_flags": flags,
+            "execution_stability": stability,
+            "nour_passed": nour_passed,
+            "mtf_confirmed": mtf_confirmed,
+            "resistance_status": resistance_status,
+            "resistance_distance_pct": resistance_distance,
+        },
+    )
+
+
 
 def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DEFAULT_CONFIG) -> CapitalBid:
     components = [
@@ -280,6 +383,7 @@ def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DE
         calculate_nour_component(candidate, config),
         calculate_resistance_component(candidate, config),
         calculate_context_component(candidate, config),
+        calculate_synergy_component(candidate, config),
     ]
     total = round(_clamp(sum(c.points for c in components), 0.0, 100.0), 2)
     trade_class = classify_bid(total, config)
@@ -369,6 +473,7 @@ __all__ = [
     "rank_candidates",
     "annotate_candidates_shadow",
     "classify_bid",
+    "calculate_synergy_component",
     "CapitalIntelligenceConfig",
     "CapitalBid",
     "CapitalAuctionResult",
