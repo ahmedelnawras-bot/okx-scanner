@@ -5063,25 +5063,52 @@ def _sanitize_simulation_trade_record(trade, settings: Settings | None = None, *
         1.0,
     )
 
-    stored_margins = []
+    stored_by_attr = {}
     for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
         value = _safe_float(getattr(trade, attr, 0.0), 0.0)
         if value > 0:
-            stored_margins.append(value)
+            stored_by_attr[attr] = value
 
-    if any(value > max_margin for value in stored_margins):
+    # Simulation accounting must have exactly one margin value across all aliases.
+    # Daily Balance historically used simulation_margin_usdt while Wallet Impact
+    # used used_margin_usdt through report_format.trade_margin_usdt(). When old
+    # Redis rows contained different values, the same open trades produced two
+    # different Floating USDT totals. Normalize all aliases here, display-only for
+    # simulation records and persisted on the next simulation save.
+    preferred_margin = _safe_float(stored_by_attr.get("simulation_margin_usdt"), 0.0)
+    if preferred_margin <= 0:
+        preferred_margin = _safe_float(stored_by_attr.get("used_margin_usdt"), 0.0)
+    if preferred_margin <= 0:
+        preferred_margin = _safe_float(stored_by_attr.get("margin_usdt"), 0.0)
+    if preferred_margin <= 0:
+        preferred_margin = _safe_float(stored_by_attr.get("allocated_margin_usdt"), 0.0)
+    if preferred_margin <= 0:
+        preferred_margin = float(fallback_margin)
+
+    repaired_reason = ""
+    if preferred_margin > max_margin:
+        repaired_reason = "stored_margin_exceeded_simulation_wallet_sanity"
         print(
             f"🧯 SIM_TRADE_MARGIN_REPAIRED | {getattr(trade, 'symbol', '-') or '-'} | "
-            f"stored_max={max(stored_margins):.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
+            f"stored={preferred_margin:.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
             flush=True,
         )
-        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
-            setattr(trade, attr, float(fallback_margin))
+        preferred_margin = float(fallback_margin)
+    elif stored_by_attr and len({round(v, 8) for v in stored_by_attr.values()}) > 1:
+        repaired_reason = "simulation_margin_aliases_normalized"
+        print(
+            f"🧯 SIM_TRADE_MARGIN_ALIAS_NORMALIZED | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"used={_safe_float(stored_by_attr.get('used_margin_usdt'), 0.0):.4f} | "
+            f"sim={_safe_float(stored_by_attr.get('simulation_margin_usdt'), 0.0):.4f} | "
+            f"final={preferred_margin:.4f} | source={source}",
+            flush=True,
+        )
+
+    for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+        setattr(trade, attr, float(preferred_margin))
+    if repaired_reason:
         setattr(trade, "simulation_margin_repaired", True)
-        setattr(trade, "simulation_margin_repair_reason", "stored_margin_exceeded_simulation_wallet_sanity")
-    elif not stored_margins:
-        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
-            setattr(trade, attr, float(fallback_margin))
+        setattr(trade, "simulation_margin_repair_reason", repaired_reason)
 
     default_lev = max(1, int(getattr(settings, "default_leverage", 15) if settings is not None else 15) or 15)
     for attr in ("effective_leverage", "actual_leverage", "leverage", "simulation_leverage"):
