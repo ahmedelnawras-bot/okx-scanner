@@ -35,6 +35,8 @@ class MarketModeState:
     reminder_count: int = 0
     consecutive_improvement_scans: int = 0
     consecutive_weak_scans: int = 0
+    consecutive_recovery_ready_scans: int = 0
+    consecutive_normal_ready_scans: int = 0
 
 
 # Keep transitions stable
@@ -46,6 +48,12 @@ BLOCK_MIN_HOLD_MINUTES = 10
 BLOCK_EXIT_CONFIRM_SCANS = 3
 STRONG_TO_BLOCK_CONFIRM_SCANS = 3
 NORMAL_RETURN_CONFIRM_SCANS = 2
+
+# Recovery anti-whipsaw controls. Recovery must be a confirmed rebound, not a
+# one-scan spike. Once entered, do not bounce back to NORMAL immediately.
+RECOVERY_ENTRY_CONFIRM_SCANS = 3
+RECOVERY_MIN_HOLD_MINUTES = 20
+RECOVERY_TO_NORMAL_CONFIRM_SCANS = 4
 
 # Old-core style thresholds
 BLOCK_RED_RATIO = 0.66
@@ -415,19 +423,30 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     weakening = flags["real_block"]
     next_state.consecutive_improvement_scans = previous.consecutive_improvement_scans + 1 if improving else 0
     next_state.consecutive_weak_scans = previous.consecutive_weak_scans + 1 if weakening else 0
+    next_state.consecutive_recovery_ready_scans = previous.consecutive_recovery_ready_scans + 1 if flags["recovery_ready"] else 0
+    next_state.consecutive_normal_ready_scans = previous.consecutive_normal_ready_scans + 1 if flags["normal_ready"] else 0
 
     candidate_mode = previous.mode
     required_cooldown = MODE_CHANGE_COOLDOWN_MINUTES
     cooldown_applied = False
 
     if previous.mode == MODE_BLOCK_LONGS:
-        # ┘Е┘Ж╪╖┘В ╪з┘Д╪о╪▒┘И╪м ╪з┘Д╪м╪п┘К╪п:
-        # 1. ╪з╪▒╪к╪п╪з╪п ┘В┘И┘К тЖТ RECOVERY
-        if flags["recovery_ready"]:
+        # Exit BLOCK conservatively. Recovery is allowed only after a confirmed
+        # rebound for several scans AND after the block has had time to protect
+        # existing trades. One green spike must not create RECOVERY.
+        block_min_hold_done = minutes_in_mode >= BLOCK_MIN_HOLD_MINUTES
+        recovery_confirmed = (
+            flags["recovery_ready"]
+            and next_state.consecutive_recovery_ready_scans >= RECOVERY_ENTRY_CONFIRM_SCANS
+            and block_min_hold_done
+        )
+
+        if recovery_confirmed:
             candidate_mode = MODE_RECOVERY_LONG
-        # 2. ╪к╪н╪│┘Ж ╪и╪│┘К╪╖ (╪к┘И┘В┘Б ╪з┘Д╪з┘Ж┘З┘К╪з╪▒) тЖТ STRONG ╪и╪╣╪п ╪з┘Д╪к╪г┘Г┘К╪п╪з╪к
         elif flags["no_longer_crashing"] or flags["stabilizing"]:
             if next_state.consecutive_improvement_scans >= BLOCK_EXIT_CONFIRM_SCANS:
+                # Market is improving but recovery is not fully confirmed: use
+                # STRONG, not RECOVERY. This is the anti-rush layer.
                 candidate_mode = MODE_STRONG_LONG_ONLY
             else:
                 candidate_mode = MODE_BLOCK_LONGS
@@ -451,9 +470,16 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
         recovery_expired = _recovery_window_expired(previous, now)
         recovery_edge_still_valid = _is_recovery_edge_still_valid(snapshot, flags)
 
+        recovery_min_hold_done = _recovery_age_minutes(previous, now) >= RECOVERY_MIN_HOLD_MINUTES
+        normal_confirmed = (
+            flags["normal_ready"]
+            and next_state.consecutive_normal_ready_scans >= RECOVERY_TO_NORMAL_CONFIRM_SCANS
+            and recovery_min_hold_done
+        )
+
         if flags["real_block"] or _recovery_hard_fail(snapshot):
             candidate_mode = MODE_BLOCK_LONGS
-        elif flags["normal_ready"] and next_state.consecutive_improvement_scans >= NORMAL_RETURN_CONFIRM_SCANS:
+        elif normal_confirmed:
             candidate_mode = MODE_NORMAL_LONG
         elif recovery_expired:
             # Max window انتهى: ارجع للتقييم السوقي الحالي بدل تثبيت RECOVERY.
@@ -500,6 +526,12 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     next_state.mode = candidate_mode
     next_state.changed_at = now if changed else previous.changed_at
     next_state.reminder_count = 0 if changed else previous.reminder_count
+
+    if changed:
+        # Avoid carrying confirmation counters from the old mode into the new
+        # mode. This prevents instant RECOVERY -> NORMAL flips after entry.
+        next_state.consecutive_recovery_ready_scans = 1 if flags["recovery_ready"] else 0
+        next_state.consecutive_normal_ready_scans = 1 if flags["normal_ready"] else 0
 
     if candidate_mode == MODE_RECOVERY_LONG:
         if previous.mode != MODE_RECOVERY_LONG:
