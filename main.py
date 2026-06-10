@@ -201,6 +201,13 @@ SIMULATION_DAILY_BALANCE_HASH = f"{SIMULATION_REDIS_PREFIX}:daily_balance"
 SIMULATION_BALANCE_STATE_KEY = f"{SIMULATION_REDIS_PREFIX}:wallet:state"
 SIMULATION_ALLOCATION_PCT = 24.0
 
+# Simulation wallet sanity.
+# A corrupted Redis simulation wallet can compound into huge virtual balances
+# because future simulated margins are derived from wallet equity. Keep accounting
+# anchored to the intended paper account unless explicitly overridden.
+SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER = 10.0
+SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER = 0.10
+
 # Execution Daily Baseline
 # Position sizing uses the current OKX balance, but Daily DD uses a daily
 # baseline that is persisted per UTC day. Large external deposits/withdrawals
@@ -1835,7 +1842,50 @@ def _position_row_price(row: dict, *keys: str) -> float:
     return 0.0
 
 
-def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None):
+
+
+def _read_okx_position_protection_orders(okx_client: OKXTradeClient | None, inst_id: str, entry: float = 0.0) -> dict:
+    """Read detected exchange TP/SL prices for a manual/recovered OKX position.
+
+    Best-effort display/recovery helper only. It does not create, amend, cancel,
+    or attach orders. Missing exchange protection remains explicit as None/0,
+    instead of inventing far-away TP targets.
+    """
+    if okx_client is None or not inst_id:
+        return {"ok": False, "reason": "okx_client_missing", "tp_prices": [], "sl_price": 0.0}
+    if not hasattr(okx_client, "get_position_protection_orders"):
+        return {"ok": False, "reason": "client_missing_get_position_protection_orders", "tp_prices": [], "sl_price": 0.0}
+    try:
+        protection = okx_client.get_position_protection_orders(inst_id=inst_id, entry_price=entry)
+        if not isinstance(protection, dict):
+            return {"ok": False, "reason": "invalid_protection_response", "tp_prices": [], "sl_price": 0.0}
+        return protection
+    except Exception as exc:
+        print(f"⚠️ OKX_PROTECTION_READ_FAILED | {inst_id} | {exc}", flush=True)
+        return {"ok": False, "reason": f"exception:{exc}", "tp_prices": [], "sl_price": 0.0}
+
+
+def _protection_prices_from_okx_response(protection: dict | None, entry: float) -> tuple[float, float, float, str]:
+    data = dict(protection or {})
+    tp_prices = []
+    for value in data.get("tp_prices") or []:
+        price = _safe_float(value, 0.0)
+        if price > 0:
+            tp_prices.append(price)
+    tp_prices = sorted(set(tp_prices))
+    sl_price = _safe_float(data.get("sl_price"), 0.0)
+    if entry > 0:
+        tp_prices = [p for p in tp_prices if p > entry]
+        if sl_price > 0 and sl_price >= entry:
+            # For a long position, a stop above entry is likely protected SL. Keep it as SL.
+            pass
+    tp1 = tp_prices[0] if len(tp_prices) >= 1 else 0.0
+    tp2 = tp_prices[1] if len(tp_prices) >= 2 else 0.0
+    reason = str(data.get("reason") or ("exchange_protection_detected" if (tp1 or tp2 or sl_price) else "no_exchange_tp_sl_detected"))
+    return sl_price, tp1, tp2, reason
+
+
+def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None, protection_orders: dict | None = None):
     """Build a conservative TrackedTrade for a live OKX position missing from Redis.
 
     This is a recovery layer, not a strategy entry. It exists so execution reports,
@@ -1867,9 +1917,10 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
     if leverage <= 0:
         leverage = _safe_float(recovery_meta.get("leverage"), 0.0)
-    cached_sl = _safe_float(recovery_meta.get("sl"), 0.0)
-    cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0)
-    cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0)
+    detected_sl, detected_tp1, detected_tp2, protection_reason = _protection_prices_from_okx_response(protection_orders, entry)
+    cached_sl = _safe_float(recovery_meta.get("sl"), 0.0) or detected_sl
+    cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0) or detected_tp1
+    cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0) or detected_tp2
     pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
     trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
 
@@ -1877,8 +1928,8 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
         symbol=inst_id,
         entry=float(entry),
         sl=float(cached_sl) if cached_sl > 0 else 0.0,
-        tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
-        tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
+        tp1=float(cached_tp1) if cached_tp1 > 0 else 0.0,
+        tp2=float(cached_tp2) if cached_tp2 > 0 else 0.0,
         setup_type="bot_order_restored_position" if recovery_meta else "okx_recovered_position",
         market_mode="BOT_ORDER_RESTORED" if recovery_meta else "RECOVERED_FROM_OKX",
         score=0.0,
@@ -1894,6 +1945,9 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "exchange_order_ok", True)
     _safe_set_trade_attr(trade, "exchange_order_reason", "bot_order_restored_from_recent_metadata" if recovery_meta else "recovered_from_okx_live_position")
     _safe_set_trade_attr(trade, "exchange_sync_state", "bot_order_restored_from_okx" if recovery_meta else "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "exchange_protection_read", bool(protection_orders and protection_orders.get("ok")))
+    _safe_set_trade_attr(trade, "exchange_protection_reason", protection_reason)
+    _safe_set_trade_attr(trade, "unmanaged_no_tp_sl", not bool(cached_sl or cached_tp1 or cached_tp2))
     _safe_set_trade_attr(trade, "last_exchange_sync_at", now)
     _safe_set_trade_attr(trade, "opened_at", now)
     _safe_set_trade_attr(trade, "updated_at", now)
@@ -2011,7 +2065,7 @@ def _recover_missing_execution_trades_from_okx_positions(
                 f"remaining={grace_remaining}s | reason=report_status_hard_recovery",
                 flush=True,
             )
-        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings, protection_orders=_read_okx_position_protection_orders(okx_client, inst_id, _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")))
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
@@ -2249,7 +2303,7 @@ def _repair_execution_trades_from_live_okx_positions(
 
         imported = False
         if target is None:
-            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings, protection_orders=_read_okx_position_protection_orders(okx_client, inst_id, _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")))
             if target is None:
                 print(f"OKX_POSITION_REPAIR_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
                 continue
@@ -2318,10 +2372,17 @@ def _repair_execution_trades_from_live_okx_positions(
         if leverage > 0:
             _safe_set_trade_attr(target, "effective_leverage", leverage)
             _safe_set_trade_attr(target, "actual_leverage", leverage)
-        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp1", float(entry) * 999.0)
-        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp2", float(entry) * 999.0)
+        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0:
+            _safe_set_trade_attr(target, "tp1", 0.0)
+        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0:
+            _safe_set_trade_attr(target, "tp2", 0.0)
+        if (
+            _safe_float(getattr(target, "sl", 0.0), 0.0) <= 0
+            and _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0
+            and _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0
+        ):
+            _safe_set_trade_attr(target, "unmanaged_no_tp_sl", True)
+            _safe_set_trade_attr(target, "exchange_protection_reason", "no_exchange_tp_sl_detected")
 
         after_state = {
             "execution_trade": bool(getattr(target, "execution_trade", False)),
@@ -4546,6 +4607,15 @@ def _simulation_wallet_equity_and_start(
         current_equity = SIMULATION_START_BALANCE_USDT
         equity_source = "fallback_start"
 
+    if _simulation_wallet_equity_is_corrupted(current_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=dd | equity={current_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f} | equity_source={equity_source}",
+            flush=True,
+        )
+        current_equity = SIMULATION_START_BALANCE_USDT
+        equity_source = "sanity_fallback_start"
+
     input_start = _safe_float(inputs.get("start_of_day_balance"), 0.0)
     row_start = _safe_float(row.get("start_balance"), 0.0)
     wallet_start = _safe_float(wallet.get("start_balance"), 0.0)
@@ -4876,15 +4946,55 @@ def _simulation_margin_usdt(balance: float, settings: Settings | None = None) ->
     return max(0.0, float(balance or 0.0) * (float(allocation_pct or 0.0) / 100.0) / float(slot_count))
 
 
+
+
+def _simulation_wallet_margin_for_accounting(trade, start_balance: float = SIMULATION_START_BALANCE_USDT) -> float:
+    """Return a sane margin for Simulation wallet accounting.
+
+    This is accounting-only. It does not alter live execution, TP/SL, slots,
+    lifecycle, or saved trade objects. It prevents one corrupted simulation
+    trade margin (for example 23k on a 1k paper wallet) from compounding the
+    virtual wallet into hundreds of thousands.
+    """
+    base = float(start_balance or SIMULATION_START_BALANCE_USDT)
+    if base <= 0:
+        base = SIMULATION_START_BALANCE_USDT
+    stored = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
+    fallback = _simulation_margin_usdt(base, None)
+    if fallback <= 0:
+        fallback = max(1.0, base * 0.03)
+    max_margin = max(fallback * 3.0, base * SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER, 1.0)
+    if stored <= 0:
+        return fallback
+    if stored > max_margin:
+        try:
+            print(
+                f"⚠️ SIM_WALLET_MARGIN_SANITY_CAP | {getattr(trade, 'symbol', '-') or '-'} | "
+                f"stored={stored:.4f} | used={fallback:.4f} | max={max_margin:.4f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return fallback
+    return stored
+
+
+def _simulation_wallet_equity_is_corrupted(equity: float, start_balance: float = SIMULATION_START_BALANCE_USDT) -> bool:
+    base = float(start_balance or SIMULATION_START_BALANCE_USDT)
+    if base <= 0:
+        base = SIMULATION_START_BALANCE_USDT
+    value = _safe_float(equity, 0.0)
+    max_equity = max(base * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER, SIMULATION_START_BALANCE_USDT * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER)
+    return bool(value > max_equity or value < 0)
+
+
 def _simulation_equity_from_trades(
     sim_trades: list,
     start_balance: float = SIMULATION_START_BALANCE_USDT,
 ) -> float:
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
     for trade in sim_trades or []:
-        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
-        if margin <= 0:
-            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
         except Exception:
@@ -4930,6 +5040,13 @@ def _ensure_simulation_daily_log(
 
     wallet = _build_simulation_wallet_snapshot(sim_trades)
     current_equity = float(wallet.get("equity", SIMULATION_START_BALANCE_USDT) or SIMULATION_START_BALANCE_USDT)
+    if _simulation_wallet_equity_is_corrupted(current_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=daily_log | equity={current_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f}",
+            flush=True,
+        )
+        current_equity = SIMULATION_START_BALANCE_USDT
 
     rows = _load_simulation_daily_log(trade_store)
     previous_rows = [r for r in rows if str(r.get("date", "")) < today]
@@ -4938,8 +5055,15 @@ def _ensure_simulation_daily_log(
         last = previous_rows[-1]
         previous_equity = _safe_float(last.get("end_balance") or last.get("current_balance") or last.get("equity"), 0.0)
 
-    if previous_equity and previous_equity > 0:
+    if previous_equity and previous_equity > 0 and not _simulation_wallet_equity_is_corrupted(previous_equity, SIMULATION_START_BALANCE_USDT):
         start_balance = previous_equity
+    elif previous_equity and _simulation_wallet_equity_is_corrupted(previous_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_DAILY_PREVIOUS_EQUITY_IGNORED | previous={previous_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f}",
+            flush=True,
+        )
+        start_balance = SIMULATION_START_BALANCE_USDT
     elif rows and str(rows[-1].get("date", "")) == today:
         start_balance = _safe_float(rows[-1].get("start_balance"), SIMULATION_START_BALANCE_USDT)
     else:
@@ -5136,9 +5260,7 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
     realized = 0.0
     floating = 0.0
     for trade in sim_trades or []:
-        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
-        if margin <= 0:
-            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
         except Exception:
@@ -5150,6 +5272,15 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
             floating += usd
 
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT) + realized + floating
+    if _simulation_wallet_equity_is_corrupted(equity, start_balance):
+        print(
+            f"⚠️ SIM_WALLET_SNAPSHOT_SANITY_RESET | equity={equity:.4f} | "
+            f"start={float(start_balance or SIMULATION_START_BALANCE_USDT):.4f} | realized={realized:.4f} | floating={floating:.4f}",
+            flush=True,
+        )
+        realized = 0.0
+        floating = 0.0
+        equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
     return {
         "start_balance": float(start_balance or SIMULATION_START_BALANCE_USDT),
         "equity": equity,
