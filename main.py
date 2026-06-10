@@ -6623,6 +6623,31 @@ def run_once(
         sync_exchange=exchange_reconcile_enabled,
         sync_exchange_stop=_final_exchange_stop_sync,
     )
+
+    # If TP2 is discovered during this update from OKX TP order state or fresh
+    # price, the previous _final_exchange_stop_sync value may have been False
+    # because it was calculated before lifecycle mutation. Run a second, narrow
+    # stop-sync pass immediately so TP2 runners get breakeven SL in the same scan.
+    _new_tp2_after_update = any(
+        bool(getattr(t, "tp2_hit", False))
+        and not bool((_before_lifecycle.get(_trade_identity_key(t)) or {}).get("tp2_hit"))
+        for t in trades
+    )
+    if (
+        _new_tp2_after_update
+        and exchange_reconcile_enabled
+        and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
+    ):
+        print("TP2_IMMEDIATE_SL_SYNC | new_tp2_detected=1 | action=breakeven_stop_sync", flush=True)
+        trades = update_open_trades(
+            list(trades),
+            price_map,
+            protection_level=protection.get("level", 0),
+            okx_client=okx_client,
+            sync_exchange=False,
+            sync_exchange_stop=True,
+        )
+
     lifecycle_notifications.extend(
         _collect_execution_lifecycle_notifications(
             _before_lifecycle,
