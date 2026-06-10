@@ -666,18 +666,19 @@ def _refresh_runtime_scope_state(
 
     # Execution/trading scope.
     exec_trades = list(result.get("trades", []) or [])
+    exec_trades_for_dd = _dd_trades_after_manual_resume(exec_trades, protection_state)
     inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
     inputs = _apply_daily_dd_manual_baseline(inputs, protection_state)
     result["portfolio_state_inputs"] = inputs
     try:
-        portfolio_state = build_portfolio_state_from_trades(exec_trades, **_portfolio_state_kwargs(inputs))
+        portfolio_state = build_portfolio_state_from_trades(exec_trades_for_dd, **_portfolio_state_kwargs(inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
         portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
             portfolio_state,
             result["drawdown_status"],
             inputs,
-            exec_trades,
+            exec_trades_for_dd,
             runtime_settings,
             trade_store=trade_store,
             label="runtime_scope",
@@ -2634,14 +2635,16 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result["command_outputs"] = build_command_outputs(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result.update(reports)
-    portfolio_state = build_portfolio_state_from_trades(result["trades"], **_portfolio_state_kwargs(portfolio_state_inputs))
+    protection_state_for_dd = result.get("protection_state") or _load_protection_state(trade_store, _protection_scope(settings))
+    trades_for_dd = _dd_trades_after_manual_resume(result["trades"], protection_state_for_dd)
+    portfolio_state = build_portfolio_state_from_trades(trades_for_dd, **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
         portfolio_state,
         result["drawdown_status"],
         portfolio_state_inputs,
-        result["trades"],
+        trades_for_dd,
         settings,
         trade_store=trade_store,
         label="reconcile_report_rebuild",
@@ -4012,6 +4015,78 @@ def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_sta
     return inputs
 
 
+def _manual_resume_cutoff_dt(protection_state: dict | None) -> datetime | None:
+    """Return today's manual-resume cutoff, if active.
+
+    Daily DD after manual resume must start a fresh protection cycle. Old
+    closed trades that caused the protection should not be counted again in
+    the same day, otherwise the bot immediately re-enters Level 1/2 and keeps
+    re-sending SDD alerts after /confirm_resume_trading.
+    """
+    state = dict(protection_state or {})
+    resumed_at = _parse_protection_dt(state.get("manual_resume_at") or state.get("daily_dd_override_at"))
+    if not resumed_at:
+        return None
+    now = datetime.now(timezone.utc)
+    if resumed_at.date() != now.date():
+        return None
+    return resumed_at
+
+
+def _trade_opened_after_cutoff(trade, cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    opened_at = _parse_any_datetime_utc(getattr(trade, "opened_at", None))
+    if opened_at is None:
+        # Unknown legacy records are treated as old records after manual resume.
+        return False
+    return opened_at >= cutoff
+
+
+def _dd_trades_after_manual_resume(trades: list | None, protection_state: dict | None) -> list:
+    """Filter trade records for Daily-DD after manual resume.
+
+    This is DD/accounting-only. It does not delete history, change reports,
+    alter slots, or touch OKX. It simply prevents pre-resume losses from being
+    counted again after the user explicitly starts a new Daily-DD cycle.
+    """
+    cutoff = _manual_resume_cutoff_dt(protection_state)
+    if cutoff is None:
+        return list(trades or [])
+    return [trade for trade in list(trades or []) if _trade_opened_after_cutoff(trade, cutoff)]
+
+
+def _reset_execution_daily_baseline_after_manual_resume(
+    trade_store: RedisTradeStore | None,
+    equity: float,
+    now: datetime | None = None,
+) -> None:
+    """Persistently reset execution daily baseline after manual resume."""
+    now = now or datetime.now(timezone.utc)
+    value = _safe_float(equity, 0.0)
+    if value <= 0:
+        return
+    day = _execution_today_key(now)
+    row = {
+        "date": day,
+        "start_balance": value,
+        "adjusted_start_balance": value,
+        "current_balance": value,
+        "last_equity": value,
+        "external_cashflow_net": 0.0,
+        "external_deposits": 0.0,
+        "external_withdrawals": 0.0,
+        "cashflow_events": [],
+        "manual_resume_at": now.isoformat(),
+        "reason": "manual_resume_daily_dd_reset",
+    }
+    _save_execution_daily_balance_row(trade_store, day, row)
+    print(
+        f"✅ EXECUTION_DAILY_BASELINE_RESET_BY_MANUAL_RESUME | date={day} | baseline={value:.4f}",
+        flush=True,
+    )
+
+
 def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
     result = result or {}
     if _is_simulation_mode(settings):
@@ -4082,8 +4157,14 @@ def _confirm_manual_resume_trading(
         "daily_dd_baseline": equity,
         "override_type": "manual_resume_trading",
         "reason": "manual_resume_after_protection",
+        "last_drawdown_alert_level": 0,
+        "last_drawdown_alert_at": "",
+        "daily_dd_last_notified_pct": 0.0,
+        "protection_alerts_reset_at": now.isoformat(),
     })
     _save_protection_state(trade_store, scope, state)
+    if scope == "execution":
+        _reset_execution_daily_baseline_after_manual_resume(trade_store, equity, now)
 
     if isinstance(result, dict):
         result["protection_state"] = state
@@ -4110,14 +4191,15 @@ def _confirm_manual_resume_trading(
                 )
                 result["drawdown_report"] = _simulation_wallet_drawdown_report(portfolio_state, result["drawdown_status"])
             else:
-                portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **_portfolio_state_kwargs(inputs))
+                trades_after_resume = _dd_trades_after_manual_resume(list(trades_for_dd or []), state)
+                portfolio_state = build_portfolio_state_from_trades(trades_after_resume, **_portfolio_state_kwargs(inputs))
                 result["portfolio_state"] = portfolio_state
                 result["drawdown_status"] = evaluate_drawdown(portfolio_state)
                 portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
                     portfolio_state,
                     result["drawdown_status"],
                     inputs,
-                    list(trades_for_dd or []),
+                    trades_after_resume,
                     settings,
                     trade_store=trade_store,
                     label="manual_resume",
@@ -6305,7 +6387,7 @@ def run_once(
     # - Simulation mode evaluates the virtual simulation wallet/trades.
     # - Trading/execution evaluates live execution trades.
     # This keeps DD protection independent between simulation and execution.
-    dd_base_trades = simulation_trades if simulation_mode_active else persisted_trades
+    dd_base_trades = simulation_trades if simulation_mode_active else _dd_trades_after_manual_resume(persisted_trades, protection_state)
     if simulation_mode_active:
         portfolio_state = _build_simulation_portfolio_state_for_dd(
             simulation_trades,
@@ -6815,7 +6897,7 @@ def run_once(
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     # Final Daily DD snapshot must also follow the active runtime bucket.
     # Without this, simulation DD would be calculated from execution trades.
-    dd_base_trades = simulation_trades if simulation_mode_active else trades
+    dd_base_trades = simulation_trades if simulation_mode_active else _dd_trades_after_manual_resume(trades, protection_state)
     if simulation_mode_active:
         portfolio_state = _build_simulation_portfolio_state_for_dd(
             simulation_trades,
@@ -9740,8 +9822,9 @@ def _refresh_execution_reports_from_redis(
     result.update(reports)
 
     try:
+        refreshed_trades_for_dd = _dd_trades_after_manual_resume(refreshed_trades, protection_state)
         portfolio_state = build_portfolio_state_from_trades(
-            refreshed_trades,
+            refreshed_trades_for_dd,
             **_portfolio_state_kwargs(portfolio_state_inputs),
         )
         result["portfolio_state"] = portfolio_state
@@ -9750,7 +9833,7 @@ def _refresh_execution_reports_from_redis(
             portfolio_state,
             result["drawdown_status"],
             portfolio_state_inputs,
-            refreshed_trades,
+            refreshed_trades_for_dd,
             runtime_settings,
             trade_store=trade_store,
             label="execution_report_refresh",
@@ -10850,6 +10933,13 @@ def _maybe_send_protection_activation_alert(
                 "سيظهر هذا الوضع أيضًا في رسائل المود والـ reminders وتقارير JSON للمحاكاة والتنفيذ.",
             ]).strip(),
         ))
+
+    protection_state = result.get("protection_state") or {}
+    reset_marker = str((protection_state or {}).get("protection_alerts_reset_at") or "")
+    if reset_marker and tracker.get("protection_alerts_reset_at") != reset_marker:
+        tracker["protection_alerts_sent"] = set()
+        tracker["protection_expiry_sent"] = set()
+        tracker["protection_alerts_reset_at"] = reset_marker
 
     sent_keys = tracker.setdefault("protection_alerts_sent", set())
     if not isinstance(sent_keys, set):
