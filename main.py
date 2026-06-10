@@ -5063,52 +5063,25 @@ def _sanitize_simulation_trade_record(trade, settings: Settings | None = None, *
         1.0,
     )
 
-    stored_by_attr = {}
+    stored_margins = []
     for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
         value = _safe_float(getattr(trade, attr, 0.0), 0.0)
         if value > 0:
-            stored_by_attr[attr] = value
+            stored_margins.append(value)
 
-    # Simulation accounting must have exactly one margin value across all aliases.
-    # Daily Balance historically used simulation_margin_usdt while Wallet Impact
-    # used used_margin_usdt through report_format.trade_margin_usdt(). When old
-    # Redis rows contained different values, the same open trades produced two
-    # different Floating USDT totals. Normalize all aliases here, display-only for
-    # simulation records and persisted on the next simulation save.
-    preferred_margin = _safe_float(stored_by_attr.get("simulation_margin_usdt"), 0.0)
-    if preferred_margin <= 0:
-        preferred_margin = _safe_float(stored_by_attr.get("used_margin_usdt"), 0.0)
-    if preferred_margin <= 0:
-        preferred_margin = _safe_float(stored_by_attr.get("margin_usdt"), 0.0)
-    if preferred_margin <= 0:
-        preferred_margin = _safe_float(stored_by_attr.get("allocated_margin_usdt"), 0.0)
-    if preferred_margin <= 0:
-        preferred_margin = float(fallback_margin)
-
-    repaired_reason = ""
-    if preferred_margin > max_margin:
-        repaired_reason = "stored_margin_exceeded_simulation_wallet_sanity"
+    if any(value > max_margin for value in stored_margins):
         print(
             f"🧯 SIM_TRADE_MARGIN_REPAIRED | {getattr(trade, 'symbol', '-') or '-'} | "
-            f"stored={preferred_margin:.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
+            f"stored_max={max(stored_margins):.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
             flush=True,
         )
-        preferred_margin = float(fallback_margin)
-    elif stored_by_attr and len({round(v, 8) for v in stored_by_attr.values()}) > 1:
-        repaired_reason = "simulation_margin_aliases_normalized"
-        print(
-            f"🧯 SIM_TRADE_MARGIN_ALIAS_NORMALIZED | {getattr(trade, 'symbol', '-') or '-'} | "
-            f"used={_safe_float(stored_by_attr.get('used_margin_usdt'), 0.0):.4f} | "
-            f"sim={_safe_float(stored_by_attr.get('simulation_margin_usdt'), 0.0):.4f} | "
-            f"final={preferred_margin:.4f} | source={source}",
-            flush=True,
-        )
-
-    for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
-        setattr(trade, attr, float(preferred_margin))
-    if repaired_reason:
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
         setattr(trade, "simulation_margin_repaired", True)
-        setattr(trade, "simulation_margin_repair_reason", repaired_reason)
+        setattr(trade, "simulation_margin_repair_reason", "stored_margin_exceeded_simulation_wallet_sanity")
+    elif not stored_margins:
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
 
     default_lev = max(1, int(getattr(settings, "default_leverage", 15) if settings is not None else 15) or 15)
     for attr in ("effective_leverage", "actual_leverage", "leverage", "simulation_leverage"):
@@ -5139,6 +5112,77 @@ def _sanitize_simulation_trade_records(trades: list | None, settings: Settings |
     if dropped:
         print(f"🧹 SIM_TRADE_SANITY_SUMMARY | source={source} | kept={len(cleaned)} | dropped={dropped}", flush=True)
     return cleaned
+
+
+
+def _normalize_simulation_report_margins_for_wallet(
+    trades: list | None,
+    *,
+    start_balance: float = SIMULATION_START_BALANCE_USDT,
+    source: str = "simulation_report",
+) -> list:
+    """Align Simulation report margins with Simulation wallet accounting.
+
+    Simulation Daily Balance uses _simulation_wallet_margin_for_accounting()
+    to cap/repair corrupted or legacy margins before converting PnL% to USDT.
+    Wallet Impact comes from reporting.report_format and reads the margin fields
+    stored on the trade. If those fields are larger than the accounting margin,
+    the report shows a different floating/realized USDT than the Daily Balance.
+
+    This is Simulation-only display/accounting hygiene. It does not touch live
+    execution, OKX orders, TP/SL, lifecycle, scoring, slots, or market mode.
+    """
+    normalized = []
+    for trade in list(trades or []):
+        try:
+            if str(getattr(trade, "trade_source", "") or "").lower() != "simulation":
+                normalized.append(trade)
+                continue
+
+            accounting_margin = _simulation_wallet_margin_for_accounting(
+                trade,
+                start_balance=start_balance,
+            )
+            if accounting_margin <= 0:
+                normalized.append(trade)
+                continue
+
+            old_values = {
+                attr: _safe_float(getattr(trade, attr, 0.0), 0.0)
+                for attr in (
+                    "used_margin_usdt",
+                    "simulation_margin_usdt",
+                    "margin_usdt",
+                    "allocated_margin_usdt",
+                )
+            }
+
+            for attr in (
+                "used_margin_usdt",
+                "simulation_margin_usdt",
+                "margin_usdt",
+                "allocated_margin_usdt",
+            ):
+                setattr(trade, attr, float(accounting_margin))
+
+            changed = any(
+                value > 0 and abs(value - accounting_margin) >= 0.01
+                for value in old_values.values()
+            )
+            if changed:
+                print(
+                    "SIM_REPORT_MARGIN_ALIGNED | "
+                    f"{getattr(trade, 'symbol', '-') or '-'} | "
+                    f"used={accounting_margin:.4f} | old={old_values} | source={source}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"⚠️ SIM_REPORT_MARGIN_ALIGN_FAILED | {getattr(trade, 'symbol', '-') or '-'} | {exc}",
+                flush=True,
+            )
+        normalized.append(trade)
+    return normalized
 
 
 def _load_simulation_daily_log(trade_store: RedisTradeStore | None = None) -> list[dict]:
@@ -6053,7 +6097,21 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         settings=get_settings(),
         source="simulation_report",
     )
-    wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
+
+    daily_row_for_margin = dict(result.get("simulation_daily_balance") or {})
+    report_start_balance = _safe_float(
+        daily_row_for_margin.get("start_balance"),
+        SIMULATION_START_BALANCE_USDT,
+    )
+    if report_start_balance <= 0 or _simulation_wallet_equity_is_corrupted(report_start_balance, SIMULATION_START_BALANCE_USDT):
+        report_start_balance = SIMULATION_START_BALANCE_USDT
+
+    result["simulation_trades"] = _normalize_simulation_report_margins_for_wallet(
+        list(result.get("simulation_trades", []) or []),
+        start_balance=report_start_balance,
+        source="simulation_report_command_outputs",
+    )
+    wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []), start_balance=report_start_balance)
     result["simulation_wallet"] = wallet
 
     # Reconcile the command-time daily row with the wallet snapshot before any
