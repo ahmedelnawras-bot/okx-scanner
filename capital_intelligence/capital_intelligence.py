@@ -486,7 +486,8 @@ def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DE
         calculate_market_mode_component(candidate, config),
         calculate_synergy_component(candidate, config),
     ]
-    total = round(_clamp(sum(c.points for c in components), 0.0, 100.0), 2)
+    raw_total = round(sum(c.points for c in components), 2)
+    total = round(_clamp(raw_total, 0.0, 100.0), 2)
     trade_class = classify_bid(total, config)
     meta = _get_meta(candidate)
     symbol = str(getattr(candidate, "symbol", "") or meta.get("symbol") or "-")
@@ -511,6 +512,8 @@ def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DE
             "derived_setups": _as_list(meta.get("derived_setups") or []),
             "resistance_4h_status": meta.get("resistance_4h_status"),
             "resistance_4h_distance_pct": meta.get("resistance_4h_distance_pct"),
+            "capital_raw_score_before_clamp": raw_total,
+            "capital_score_was_clamped": bool(raw_total != total),
         },
         model=config.model_name,
     )
@@ -519,7 +522,8 @@ def calculate_capital_bid(candidate: Any, config: CapitalIntelligenceConfig = DE
 def rank_candidates(candidates: Iterable[Any], available_slots: int = 0, config: CapitalIntelligenceConfig = DEFAULT_CONFIG, mode: str = "shadow") -> CapitalAuctionResult:
     candidate_list = list(candidates or [])
     bids = [calculate_capital_bid(candidate, config) for candidate in candidate_list]
-    bids.sort(key=lambda item: (item.bid_score, item.trade_class, item.symbol), reverse=True)
+    class_rank = {"A+": 4, "A": 3, "B": 2, "C": 1}
+    bids.sort(key=lambda item: (item.bid_score, class_rank.get(item.trade_class, 0), item.symbol), reverse=True)
 
     slots = max(0, int(available_slots or 0))
     selected_symbols: list[str] = []
