@@ -1351,6 +1351,116 @@ class OKXTradeClient:
         response = self._request("GET", path, params=params)
         return self._normalize_query_response(response, query_kind="algo_orders", params=params)
 
+    def get_position_protection_orders(
+        self,
+        *,
+        inst_id: str,
+        entry_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Best-effort reader for existing exchange TP/SL protection.
+
+        Read-only helper for manual/recovered positions. It does not create,
+        amend, cancel, or attach orders. It scans pending reduce-only orders and
+        pending algo/conditional/OCO orders, then returns detected TP/SL prices.
+        """
+        guard = self._read_guard_error()
+        if guard:
+            return {
+                "ok": False,
+                "reason": guard.get("reason") or "read_guard_error",
+                "tp_prices": [],
+                "sl_price": 0.0,
+                "raw": guard,
+            }
+
+        entry = self._safe_float(entry_price)
+        tp_prices: list[float] = []
+        sl_prices: list[float] = []
+        raw_sources: dict[str, Any] = {}
+
+        def add_price(bucket: list[float], value: Any) -> None:
+            price = self._safe_float(value)
+            if price > 0:
+                bucket.append(price)
+
+        def row_inst(row: dict[str, Any]) -> str:
+            return str(row.get("instId") or row.get("inst_id") or "").upper()
+
+        pending = self.list_pending_orders(inst_type="SWAP", inst_id=inst_id, limit=100)
+        raw_sources["pending_orders"] = pending
+        if pending.get("ok"):
+            for row in pending.get("rows") or []:
+                if not isinstance(row, dict) or row_inst(row) != str(inst_id).upper():
+                    continue
+                state = str(row.get("state") or row.get("ordState") or "").lower()
+                if state in {"filled", "canceled", "mmp_canceled"}:
+                    continue
+                side = str(row.get("side") or "").lower()
+                reduce_only = str(row.get("reduceOnly") or row.get("reduce_only") or "").lower() in {"true", "1", "yes"}
+                px = self._safe_float(row.get("px") or row.get("price"))
+                ord_type = str(row.get("ordType") or row.get("ord_type") or "").lower()
+                # Long position protection normally uses sell reduce-only limit TPs.
+                if side == "sell" and (reduce_only or ord_type in {"limit", "post_only", "fok", "ioc"}):
+                    if entry > 0 and px > entry:
+                        add_price(tp_prices, px)
+                    elif entry > 0 and px < entry:
+                        add_price(sl_prices, px)
+                    elif px > 0:
+                        add_price(tp_prices, px)
+
+        for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
+            algo = self.list_algo_orders(ord_type=ord_type, inst_id=inst_id, limit=100)
+            raw_sources[f"algo_{ord_type}"] = algo
+            if not algo.get("ok"):
+                continue
+            for row in algo.get("rows") or []:
+                if not isinstance(row, dict) or row_inst(row) != str(inst_id).upper():
+                    continue
+                state = str(row.get("state") or row.get("ordState") or row.get("algoState") or "").lower()
+                if state in {"filled", "canceled", "mmp_canceled", "effective"}:
+                    continue
+                for key in ("tpTriggerPx", "tpOrdPx", "takeProfitTriggerPx", "takeProfitOrdPx"):
+                    add_price(tp_prices, row.get(key))
+                for key in ("slTriggerPx", "slOrdPx", "stopLossTriggerPx", "stopLossOrdPx"):
+                    add_price(sl_prices, row.get(key))
+                # Generic triggerPx needs classification by side/entry.
+                trigger = self._safe_float(row.get("triggerPx"))
+                if trigger > 0:
+                    if entry > 0 and trigger < entry:
+                        add_price(sl_prices, trigger)
+                    elif entry > 0 and trigger > entry:
+                        add_price(tp_prices, trigger)
+
+        # Classify ambiguous prices around entry for long positions.
+        if entry > 0:
+            tp_prices = [p for p in tp_prices if p > entry]
+            below = [p for p in sl_prices if p < entry]
+            above_sl = [p for p in sl_prices if p >= entry]
+            # protected SL after TP2 can be above entry; keep nearest if no below stop exists.
+            sl_candidates = below or above_sl
+        else:
+            sl_candidates = sl_prices
+
+        tp_prices = sorted(set(round(float(p), 12) for p in tp_prices if p > 0))
+        sl_candidates = sorted(set(round(float(p), 12) for p in sl_candidates if p > 0))
+        sl_price = 0.0
+        if sl_candidates:
+            if entry > 0:
+                below = [p for p in sl_candidates if p <= entry]
+                sl_price = max(below) if below else min(sl_candidates)
+            else:
+                sl_price = sl_candidates[0]
+
+        return {
+            "ok": True,
+            "reason": "exchange_protection_detected" if (tp_prices or sl_price) else "no_exchange_tp_sl_detected",
+            "inst_id": inst_id,
+            "entry_price": entry,
+            "tp_prices": tp_prices[:4],
+            "sl_price": sl_price,
+            "raw": raw_sources,
+        }
+
     def get_algo_order_details(
         self,
         *,
@@ -1410,185 +1520,6 @@ class OKXTradeClient:
             "reason": history.get("reason") or pending.get("reason") or "algo_not_found",
             "pending": pending,
             "history": history,
-        }
-
-
-    def get_position_protection_orders(
-        self,
-        inst_id: str,
-        *,
-        entry_price: float = 0.0,
-        pos_side: str = "long",
-        inst_type: str = "SWAP",
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """Read visible exchange-side TP/SL protection for an existing position.
-
-        Read-only helper for recovered/manual OKX positions:
-        - detects reduce-only sell limit orders above entry as TP candidates;
-        - detects conditional/algo stop-loss triggers below entry as SL candidates;
-        - does not create, amend, cancel, or manage any order.
-        """
-        guard = self._read_guard_error()
-        if guard:
-            return guard
-
-        inst_id = str(inst_id or "").strip()
-        if not inst_id:
-            return {"ok": False, "simulated": self.credentials.simulated, "reason": "missing_inst_id"}
-
-        entry = self._safe_float(entry_price, 0.0)
-        wanted_side = str(pos_side or "long").strip().lower()
-
-        def _rows(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
-            if not isinstance(payload, dict):
-                return []
-            rows = payload.get("rows")
-            if rows is None:
-                rows = payload.get("data")
-            if rows is None and isinstance(payload.get("response"), dict):
-                rows = payload.get("response", {}).get("data")
-            return [row for row in (rows or []) if isinstance(row, dict)] if isinstance(rows, list) else []
-
-        def _is_ok(payload: dict[str, Any] | None) -> bool:
-            if not isinstance(payload, dict):
-                return False
-            if "ok" in payload:
-                return bool(payload.get("ok"))
-            return str(payload.get("code", "")) == "0"
-
-        def _num(row: dict[str, Any], *keys: str) -> float:
-            for key in keys:
-                value = self._safe_float(row.get(key), 0.0)
-                if value > 0:
-                    return value
-            return 0.0
-
-        pending = self.list_pending_orders(inst_type=inst_type, inst_id=inst_id, limit=limit)
-        regular_rows = _rows(pending)
-
-        algo_payloads: dict[str, dict[str, Any]] = {}
-        algo_rows: list[dict[str, Any]] = []
-        for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
-            payload = self.list_algo_orders(ord_type=ord_type, inst_id=inst_id, history=False, limit=limit)
-            algo_payloads[ord_type] = payload
-            if _is_ok(payload):
-                algo_rows.extend(_rows(payload))
-
-        tp_candidates: list[dict[str, Any]] = []
-        sl_candidates: list[dict[str, Any]] = []
-        other_candidates: list[dict[str, Any]] = []
-
-        for row in regular_rows:
-            if str(row.get("instId") or "").strip().upper() != inst_id.upper():
-                continue
-            state = str(row.get("state") or row.get("ordState") or "").strip().lower()
-            if state in {"filled", "canceled", "cancelled", "mmp_canceled"}:
-                continue
-            side = str(row.get("side") or "").strip().lower()
-            reduce_only = str(row.get("reduceOnly") or row.get("reduce_only") or "").strip().lower() in {"true", "1", "yes"}
-            px = _num(row, "px", "price")
-            if wanted_side == "long" and side == "sell" and px > 0:
-                kind = "tp" if (entry <= 0 or px > entry) else "sell_reduce_order_below_or_at_entry"
-                item = {
-                    "kind": kind,
-                    "source": "pending_order",
-                    "price": px,
-                    "size": str(row.get("sz") or row.get("size") or ""),
-                    "order_id": row.get("ordId"),
-                    "client_order_id": row.get("clOrdId"),
-                    "reduce_only": reduce_only,
-                    "row": row,
-                }
-                if kind == "tp" and (reduce_only or str(row.get("ordType") or "").lower() == "limit"):
-                    tp_candidates.append(item)
-                else:
-                    other_candidates.append(item)
-
-        for row in algo_rows:
-            if str(row.get("instId") or "").strip().upper() != inst_id.upper():
-                continue
-            state = str(row.get("state") or row.get("ordState") or row.get("algoStatus") or "").strip().lower()
-            if state in {"filled", "canceled", "cancelled", "mmp_canceled"}:
-                continue
-            side = str(row.get("side") or "").strip().lower()
-            # OKX TP/SL algo rows may expose tpTriggerPx/slTriggerPx or generic triggerPx.
-            tp_px = _num(row, "tpTriggerPx", "tpOrdPx")
-            sl_px = _num(row, "slTriggerPx", "triggerPx", "triggerPxUsd")
-            sz = str(row.get("sz") or row.get("size") or "")
-            if wanted_side == "long" and side in {"", "sell"}:
-                if tp_px > 0 and (entry <= 0 or tp_px > entry):
-                    tp_candidates.append({
-                        "kind": "tp",
-                        "source": "algo_order",
-                        "price": tp_px,
-                        "size": sz,
-                        "algo_id": row.get("algoId"),
-                        "algo_client_order_id": row.get("algoClOrdId"),
-                        "ord_type": row.get("ordType"),
-                        "row": row,
-                    })
-                if sl_px > 0 and (entry <= 0 or sl_px < entry):
-                    sl_candidates.append({
-                        "kind": "sl",
-                        "source": "algo_order",
-                        "price": sl_px,
-                        "size": sz,
-                        "algo_id": row.get("algoId"),
-                        "algo_client_order_id": row.get("algoClOrdId"),
-                        "ord_type": row.get("ordType"),
-                        "row": row,
-                    })
-                elif sl_px > 0:
-                    other_candidates.append({
-                        "kind": "algo_trigger_not_classified",
-                        "source": "algo_order",
-                        "price": sl_px,
-                        "size": sz,
-                        "algo_id": row.get("algoId"),
-                        "algo_client_order_id": row.get("algoClOrdId"),
-                        "ord_type": row.get("ordType"),
-                        "row": row,
-                    })
-
-        # Deduplicate by id/source/price and sort in long-trade meaning.
-        def _dedup(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            out: list[dict[str, Any]] = []
-            seen: set[tuple[Any, ...]] = set()
-            for item in items:
-                key = (
-                    item.get("source"),
-                    item.get("order_id") or item.get("algo_id") or item.get("client_order_id") or item.get("algo_client_order_id"),
-                    round(self._safe_float(item.get("price"), 0.0), 12),
-                    str(item.get("size") or ""),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(item)
-            return out
-
-        tp_candidates = sorted(_dedup(tp_candidates), key=lambda x: self._safe_float(x.get("price"), 0.0))
-        sl_candidates = sorted(_dedup(sl_candidates), key=lambda x: self._safe_float(x.get("price"), 0.0), reverse=True)
-        nearest_sl = sl_candidates[0] if sl_candidates else None
-
-        return {
-            "ok": bool(_is_ok(pending) or any(_is_ok(p) for p in algo_payloads.values())),
-            "simulated": self.credentials.simulated,
-            "reason": "ok" if (tp_candidates or sl_candidates) else "no_exchange_tp_sl_detected",
-            "inst_id": inst_id,
-            "entry_price": entry,
-            "tp_orders": tp_candidates,
-            "sl_orders": sl_candidates,
-            "other_orders": other_candidates,
-            "tp1": tp_candidates[0] if len(tp_candidates) >= 1 else None,
-            "tp2": tp_candidates[1] if len(tp_candidates) >= 2 else None,
-            "sl": nearest_sl,
-            "has_tp": bool(tp_candidates),
-            "has_sl": bool(sl_candidates),
-            "has_any_protection": bool(tp_candidates or sl_candidates),
-            "pending_orders": pending,
-            "algo_orders": algo_payloads,
         }
 
     def get_attached_stop_from_order(
