@@ -39,17 +39,48 @@ def _entry_identifiers(trade: TrackedTrade) -> tuple[str, str]:
 
 
 def _parse_order_state(payload: Any) -> str:
+    """Extract OKX order state from all client response shapes.
+
+    okx_trade_client.get_order_details() returns a normalized shape:
+      {ok, rows, row, response}
+    while raw OKX responses may look like:
+      {code, data:[{state: ...}]}
+
+    The previous parser skipped the normalized `row/rows` keys, so TP1/TP2
+    fills could be invisible to lifecycle even when OKX had already filled them.
+    """
     if not isinstance(payload, dict):
         return ""
 
-    row = payload.get("order") or payload.get("data") or payload.get("response") or payload
-    if isinstance(row, list):
-        row = row[0] if row else {}
-    if not isinstance(row, dict):
-        return ""
+    candidates: list[Any] = []
+    for key in ("order", "row", "rows", "data"):
+        if key in payload:
+            candidates.append(payload.get(key))
 
-    state = row.get("state") or row.get("ordState") or row.get("status") or row.get("fill_state")
-    return str(state or "").strip().lower()
+    response = payload.get("response")
+    if isinstance(response, dict):
+        for key in ("order", "row", "rows", "data"):
+            if key in response:
+                candidates.append(response.get(key))
+        candidates.append(response)
+
+    candidates.append(payload)
+
+    for row in candidates:
+        if isinstance(row, list):
+            row = row[0] if row else {}
+        if not isinstance(row, dict):
+            continue
+        state = (
+            row.get("state")
+            or row.get("ordState")
+            or row.get("status")
+            or row.get("fill_state")
+        )
+        if state:
+            return str(state).strip().lower()
+
+    return ""
 
 
 def _parse_fill_summary(payload: Any) -> dict[str, Any]:
@@ -510,7 +541,10 @@ def update_open_trades(
         trade = update_trade_with_price(trade, current_price, protection_level=protection_level)
         trade = _apply_exchange_tp_fills_to_lifecycle(trade)
 
-        if sync_exchange and sync_exchange_stop and okx_client is not None:
+        # Stop write-back must be allowed even in a narrow second pass where
+        # sync_exchange=False. main.py uses that second pass immediately after a
+        # newly detected TP2 so the runner SL can be pushed to OKX in the same scan.
+        if sync_exchange_stop and okx_client is not None:
             trade = _sync_stop_loss_to_exchange(trade, okx_client)
 
         updated.append(trade)
