@@ -131,6 +131,73 @@ def trade_actual_leverage(t: TrackedTrade) -> float:
     return 0.0
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _trade_report_leverage(t: TrackedTrade) -> float:
+    """Per-trade leverage for report calculations.
+
+    Old reports multiplied every trade by DEFAULT_REPORT_LEVERAGE. That is fine
+    only when all trades use the same leverage. Simulation/execution records can
+    store effective_leverage, actual_leverage, or simulation_leverage, so the
+    report should use the trade's own leverage when present.
+    """
+
+    leverage = trade_actual_leverage(t)
+    if leverage > 0:
+        return leverage
+
+    for attr in ("simulation_leverage", "default_leverage"):
+        value = _safe_float(getattr(t, attr, 0.0), 0.0)
+        if value > 0:
+            return value
+
+    return float(DEFAULT_REPORT_LEVERAGE or 1.0)
+
+
+def _trade_price_raw_pnl(t: TrackedTrade) -> float | None:
+    """Recalculate raw open-trade PnL from entry/current_price when possible.
+
+    Stored pnl_pct / runner_pnl_pct can become stale after recovery, Redis
+    restore, or report rebuilding. For an open trade, entry + current_price is
+    the freshest source for floating PnL display. Closed trades still use their
+    stored realized_pnl_pct.
+    """
+
+    entry = _safe_float(getattr(t, "entry", 0.0), 0.0)
+    current = _safe_float(getattr(t, "current_price", 0.0), 0.0)
+
+    if entry <= 0:
+        return None
+
+    if current <= 0:
+        for attr in ("mark_price", "last_price", "close_price"):
+            current = _safe_float(getattr(t, attr, 0.0), 0.0)
+            if current > 0:
+                break
+
+    if current <= 0:
+        return None
+
+    return ((current - entry) / entry) * 100.0
+
+
+def _current_or_stored_raw_pnl(t: TrackedTrade) -> float:
+    recalculated = _trade_price_raw_pnl(t)
+    if recalculated is not None:
+        return recalculated
+    return _safe_float(getattr(t, "pnl_pct", 0.0), 0.0)
+
+
+def _tp_close_pct(t: TrackedTrade, attr: str, fallback: float) -> float:
+    value = _safe_float(getattr(t, attr, fallback), fallback)
+    return max(0.0, min(100.0, value))
+
+
 def trade_actuals_line(
     t: TrackedTrade,
     *,
@@ -247,46 +314,50 @@ def closed_trades(trades: Iterable[TrackedTrade]) -> list[TrackedTrade]:
 def trade_raw_effective_pnl(t: TrackedTrade) -> float:
     """
     Effective PnL using raw price-move percentages.
+
+    Important:
+    - Closed trades use stored realized_pnl_pct.
+    - Open trades recalculate the current floating leg from entry/current_price.
+      This prevents stale Redis pnl_pct values from poisoning reports.
+    - Partial/runner trades keep realized_pnl_pct for filled portions and
+      recalculate only the still-open remaining portion.
     """
 
-    if t.status in CLOSED_STATUSES:
-        return float(t.realized_pnl_pct or 0.0)
+    if t.status in CLOSED_STATUSES or bool(getattr(t, "is_closed", False)):
+        return _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
 
-    if t.tp2_hit:
-        return (
-            float(t.realized_pnl_pct or 0.0)
-            + float(t.runner_pnl_pct or 0.0)
-        )
+    current_raw = _current_or_stored_raw_pnl(t)
+    realized_raw = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
 
-    if t.tp1_hit:
-        remaining_pct = max(
-            0.0,
-            100.0 - float(getattr(t, "tp1_close_pct", 40.0) or 40.0),
-        )
+    if bool(getattr(t, "tp2_hit", False)):
+        runner_pct = _tp_close_pct(t, "runner_close_pct", 20.0)
+        return realized_raw + current_raw * (runner_pct / 100.0)
 
-        return (
-            float(t.realized_pnl_pct or 0.0)
-            + max(0.0, float(t.pnl_pct or 0.0))
-            * (remaining_pct / 100.0)
-        )
+    if bool(getattr(t, "tp1_hit", False)):
+        tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 40.0)
+        remaining_pct = max(0.0, 100.0 - tp1_close_pct)
+        return realized_raw + current_raw * (remaining_pct / 100.0)
 
-    return float(t.pnl_pct or 0.0)
+    return current_raw
 
 
 def trade_effective_pnl(t: TrackedTrade) -> float:
     """
     Displayed leveraged performance/exposure percentage.
+
+    Uses the leverage stored on the trade when available instead of applying one
+    global default leverage to every record.
     """
 
-    return leveraged_pct(trade_raw_effective_pnl(t))
+    return leveraged_pct(trade_raw_effective_pnl(t), _trade_report_leverage(t))
 
 
 def trade_current_raw_pnl(t: TrackedTrade) -> float:
-    return float(t.pnl_pct or 0.0)
+    return _current_or_stored_raw_pnl(t)
 
 
 def trade_current_exposure_pnl(t: TrackedTrade) -> float:
-    return leveraged_pct(trade_current_raw_pnl(t))
+    return leveraged_pct(trade_current_raw_pnl(t), _trade_report_leverage(t))
 
 
 def trade_stage(t: TrackedTrade) -> str:
