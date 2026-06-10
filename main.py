@@ -207,6 +207,10 @@ SIMULATION_ALLOCATION_PCT = 24.0
 # anchored to the intended paper account unless explicitly overridden.
 SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER = 10.0
 SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER = 0.10
+# Simulation report/trade sanity. Corrupted Redis simulation history must never
+# be allowed to dominate reports or re-seed the virtual wallet.
+SIMULATION_TRADE_MAX_EFFECTIVE_PNL_PCT = 1000.0
+SIMULATION_TRADE_MAX_AGE_DAYS = 90
 
 # Execution Daily Baseline
 # Position sizing uses the current OKX balance, but Daily DD uses a daily
@@ -5003,6 +5007,113 @@ def _simulation_equity_from_trades(
     return equity
 
 
+def _simulation_trade_effective_pnl_for_sanity(trade) -> float:
+    try:
+        return float(_report_trade_effective_pnl(trade) or 0.0)
+    except Exception:
+        try:
+            return float(_trade_effective_pnl_pct(trade) or 0.0)
+        except Exception:
+            return 0.0
+
+
+def _sanitize_simulation_trade_record(trade, settings: Settings | None = None, *, source: str = "load"):
+    """Return a safe Simulation trade for reports/wallet, or None if irreparable.
+
+    Root cause of the corrupted Simulation reports was not the wallet display
+    itself; old Redis simulation trades kept huge stored margins / impossible
+    PnL and report_format.py uses each trade's own margin. The wallet snapshot
+    could reset to 1000 while /report_simulation still summed those corrupted
+    trade records into +600k floating / -45k realized.
+
+    This is Simulation-only hygiene. It never touches execution trades, OKX
+    orders, TP/SL sync, market mode, or scoring.
+    """
+    if trade is None:
+        return None
+
+    # Drop impossibly old simulation records if timestamps are present. Redis TTL
+    # normally handles this, but copied/restored Redis can preserve stale rows.
+    opened_at = _parse_any_datetime_utc(getattr(trade, "opened_at", None) or getattr(trade, "created_at", None))
+    if opened_at is not None:
+        age_days = (datetime.now(timezone.utc) - opened_at).total_seconds() / 86400.0
+        if age_days > float(SIMULATION_TRADE_MAX_AGE_DAYS or 90):
+            print(
+                f"🧹 SIM_TRADE_SANITY_DROP | {getattr(trade, 'symbol', '-') or '-'} | "
+                f"reason=too_old | age_days={age_days:.1f} | source={source}",
+                flush=True,
+            )
+            return None
+
+    # Simulation is always tagged as execution-like for report style, but it
+    # must remain separated by trade_source=simulation.
+    setattr(trade, "trade_source", "simulation")
+    setattr(trade, "tracking_bucket", "execution")
+    setattr(trade, "execution_trade", True)
+
+    fallback_margin = _simulation_margin_usdt(SIMULATION_START_BALANCE_USDT, settings)
+    if fallback_margin <= 0:
+        fallback_margin = _simulation_margin_usdt(SIMULATION_START_BALANCE_USDT, None)
+    if fallback_margin <= 0:
+        fallback_margin = 35.0
+
+    max_margin = max(
+        fallback_margin * 3.0,
+        SIMULATION_START_BALANCE_USDT * SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER,
+        1.0,
+    )
+
+    stored_margins = []
+    for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if value > 0:
+            stored_margins.append(value)
+
+    if any(value > max_margin for value in stored_margins):
+        print(
+            f"🧯 SIM_TRADE_MARGIN_REPAIRED | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"stored_max={max(stored_margins):.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
+            flush=True,
+        )
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
+        setattr(trade, "simulation_margin_repaired", True)
+        setattr(trade, "simulation_margin_repair_reason", "stored_margin_exceeded_simulation_wallet_sanity")
+    elif not stored_margins:
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
+
+    default_lev = max(1, int(getattr(settings, "default_leverage", 15) if settings is not None else 15) or 15)
+    for attr in ("effective_leverage", "actual_leverage", "leverage", "simulation_leverage"):
+        if _safe_float(getattr(trade, attr, 0.0), 0.0) <= 0:
+            setattr(trade, attr, default_lev)
+
+    effective_pct = _simulation_trade_effective_pnl_for_sanity(trade)
+    if abs(effective_pct) > float(SIMULATION_TRADE_MAX_EFFECTIVE_PNL_PCT or 1000.0):
+        print(
+            f"🧹 SIM_TRADE_SANITY_DROP | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"reason=impossible_effective_pnl | pnl={effective_pct:+.2f}% | source={source}",
+            flush=True,
+        )
+        return None
+
+    return trade
+
+
+def _sanitize_simulation_trade_records(trades: list | None, settings: Settings | None = None, *, source: str = "runtime") -> list:
+    cleaned = []
+    dropped = 0
+    for trade in list(trades or []):
+        safe_trade = _sanitize_simulation_trade_record(trade, settings=settings, source=source)
+        if safe_trade is None:
+            dropped += 1
+            continue
+        cleaned.append(safe_trade)
+    if dropped:
+        print(f"🧹 SIM_TRADE_SANITY_SUMMARY | source={source} | kept={len(cleaned)} | dropped={dropped}", flush=True)
+    return cleaned
+
+
 def _load_simulation_daily_log(trade_store: RedisTradeStore | None = None) -> list[dict]:
     if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
         return []
@@ -5123,7 +5234,7 @@ def _build_simulation_daily_balance_text(trade_store: RedisTradeStore | None = N
     return "\n".join(lines)
 
 
-def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
+def _load_simulation_trades(trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> list:
     if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
         return []
 
@@ -5139,12 +5250,11 @@ def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
             except Exception:
                 trade = None
             if trade:
-                setattr(trade, "trade_source", "simulation")
-                setattr(trade, "tracking_bucket", "execution")
-                setattr(trade, "execution_trade", True)
                 if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
                     setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
-                trades.append(trade)
+                trade = _sanitize_simulation_trade_record(trade, settings=settings, source="redis_load")
+                if trade is not None:
+                    trades.append(trade)
     except Exception as exc:
         print(f"⚠️ Simulation load failed: {exc}", flush=True)
     return trades
@@ -5155,6 +5265,7 @@ def _save_simulation_trades(trades: list, trade_store: RedisTradeStore | None = 
         return
 
     try:
+        trades = _sanitize_simulation_trade_records(list(trades or []), settings=get_settings(), source="redis_save")
         pipe = trade_store.client.pipeline()
         for trade in trades or []:
             trade_id = str(getattr(trade, "trade_id", "") or "")
@@ -5254,6 +5365,7 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
     Each trade is assumed to use the configured paper margin if available,
     falling back to 35 USDT. The wallet itself starts at 1000 USDT.
     """
+    sim_trades = _sanitize_simulation_trade_records(list(sim_trades or []), settings=None, source="wallet_snapshot")
     open_trades = [t for t in sim_trades or [] if not _is_trade_closed(t)]
     closed_trades = [t for t in sim_trades or [] if _is_trade_closed(t)]
 
@@ -5876,6 +5988,12 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     - Does not touch execution reports.
     - Keeps shared report_format.py unchanged.
     """
+    result = dict(result or {})
+    result["simulation_trades"] = _sanitize_simulation_trade_records(
+        list(result.get("simulation_trades", []) or []),
+        settings=get_settings(),
+        source="simulation_report",
+    )
     wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
 
     wallet_text = _simulation_header(_simulation_wallet_menu_text())
@@ -9771,6 +9889,7 @@ def _handle_admin_clean_command(
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
         "/reset_reports_normal": ("normal", "/confirm_reset_reports_normal", "📊 Reset Normal Reports Preview"),
         "/reset_reports_simulation": ("simulation", "/confirm_reset_reports_simulation", "🧪 Reset Simulation Reports Preview"),
+        "/reset_simulation": ("simulation", "/confirm_reset_simulation", "🧪 Reset Simulation Data Preview"),
         "/reset_reports_all": ("all", "/confirm_reset_reports_all", "🧹 Reset All Reports Preview"),
     }
     if command in reset_preview_commands:
@@ -9785,6 +9904,7 @@ def _handle_admin_clean_command(
         "/confirm_reset_reports_execution": ("execution", "🚀 Reset Execution Reports Done"),
         "/confirm_reset_reports_normal": ("normal", "📊 Reset Normal Reports Done"),
         "/confirm_reset_reports_simulation": ("simulation", "🧪 Reset Simulation Reports Done"),
+        "/confirm_reset_simulation": ("simulation", "🧪 Reset Simulation Data Done"),
         "/confirm_reset_reports_all": ("all", "🧹 Reset All Reports Done"),
     }
     if command in reset_confirm_commands:
