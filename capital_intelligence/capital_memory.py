@@ -358,7 +358,7 @@ def calculate_symbol_memory_adjustment(
     candidate: Any,
     profile: SymbolMemoryProfile | dict[str, Any] | None,
     max_abs_points: float = 6.0,
-    min_trades_for_full_effect: int = 12,
+    min_trades_for_full_effect: int = 25,
 ) -> SymbolMemoryAdjustment:
     """Return advisory capital bonus/penalty from symbol memory.
 
