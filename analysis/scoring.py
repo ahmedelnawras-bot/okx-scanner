@@ -647,11 +647,13 @@ def _build_analytics_setup_tags(
         and not failed_breakout
     )
 
+    # Reporting priority only: when a clean higher-low structure is present,
+    # make it the primary analytics setup so reports can measure it separately.
     candidates = [
+        ("clean_higher_low_structure", clean_higher_low_structure),
         ("breakout_pullback_acceptance", breakout_pullback_acceptance),
         ("compression_release_continuation", compression_release_continuation),
         ("sweep_reclaim_continuation", sweep_reclaim_continuation),
-        ("clean_higher_low_structure", clean_higher_low_structure),
         ("trend_continuation_after_pause", trend_continuation_after_pause),
     ]
 
@@ -686,6 +688,7 @@ def _build_analytics_setup_tags(
         "analytics_tags": list(derived),
         "derived_setups": list(derived),
         "analytics_setup_primary": derived[0] if derived else "",
+        "reporting_setup_type": derived[0] if derived else setup_type,
         "analytics_setup_details": details,
     }
 
@@ -1793,6 +1796,12 @@ def build_signal_candidate(
 
             "analytics_setup_primary":
                 analytics_setup_context.get("analytics_setup_primary", ""),
+
+            "reporting_setup_type":
+                analytics_setup_context.get("reporting_setup_type", setup_type),
+
+            "base_setup_type":
+                setup_type,
 
             "analytics_setup_details":
                 analytics_setup_context.get("analytics_setup_details", {}),
