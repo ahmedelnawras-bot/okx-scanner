@@ -34,7 +34,7 @@ risk_mode: str = "normal"
 _balance_provider: Callable[[], float] | None = None
 
 # fallback آمن لو لم يتم ربط provider.
-DEFAULT_SAFE_REFERENCE_BALANCE = float(os.getenv("SAFE_REFERENCE_BALANCE_USDT", "1000"))
+DEFAULT_SAFE_REFERENCE_BALANCE = float(os.getenv("SAFE_REFERENCE_BALANCE_USDT", "0"))
 
 
 # ====================== دوال مساعدة ======================
@@ -75,7 +75,7 @@ def get_okx_balance() -> float:
     الأولوية:
     1) مزود رصيد خارجي تم ربطه عبر set_balance_provider
     2) متغير بيئة DAILY_REFERENCE_BALANCE_USDT أو OKX_REFERENCE_BALANCE_USDT
-    3) SAFE fallback
+    3) SAFE fallback only if SAFE_REFERENCE_BALANCE_USDT is explicitly set.
     """
     if callable(_balance_provider):
         balance = _safe_float(_balance_provider(), 0.0)
@@ -110,8 +110,8 @@ def get_reference_portfolio() -> float:
         except Exception:
             pass
 
-        print("⚠️ Working in SAFE FALLBACK mode")
-        return DEFAULT_SAFE_REFERENCE_BALANCE
+        print("⚠️ SAFE FALLBACK DISABLED: reference balance = 0")
+        return DEFAULT_SAFE_REFERENCE_BALANCE if DEFAULT_SAFE_REFERENCE_BALANCE > 0 else 0.0
 
 
 
