@@ -243,6 +243,28 @@ except ImportError:
     def export_ai_snapshot(*args, **kwargs) -> dict:
         return {"ok": False, "error": "ai_exporter not found"}
 
+
+try:
+    from capital_intelligence.capital_intelligence import annotate_candidates_shadow as _capital_annotate_candidates_shadow
+    from capital_intelligence.capital_report import (
+        build_capital_summary as _build_capital_summary,
+        build_capital_report_text as _build_capital_report_text,
+    )
+    from capital_intelligence.capital_dashboard import (
+        build_capital_dashboard_summary as _build_capital_dashboard_summary,
+        build_capital_dashboard_text as _build_capital_dashboard_text,
+    )
+    _CAPITAL_INTELLIGENCE_AVAILABLE = True
+    _CAPITAL_INTELLIGENCE_IMPORT_ERROR = ""
+except Exception as _capital_import_exc:
+    _CAPITAL_INTELLIGENCE_AVAILABLE = False
+    _CAPITAL_INTELLIGENCE_IMPORT_ERROR = str(_capital_import_exc)
+    _capital_annotate_candidates_shadow = None
+    _build_capital_summary = None
+    _build_capital_report_text = None
+    _build_capital_dashboard_summary = None
+    _build_capital_dashboard_text = None
+
 from services.telegram_sender import TelegramSender
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
@@ -5916,6 +5938,152 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
                 print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
 
+
+# =========================================================
+# Capital Intelligence Shadow Integration (scope-aware)
+# =========================================================
+def _capital_shadow_scope(settings: Settings) -> str:
+    return "simulation" if _is_simulation_mode(settings) else "execution"
+
+
+def _capital_auction_to_dict(auction_result) -> dict:
+    if auction_result is None:
+        return {}
+    if isinstance(auction_result, dict):
+        return dict(auction_result)
+    if hasattr(auction_result, "to_dict"):
+        try:
+            data = auction_result.to_dict()
+            return dict(data or {}) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _prepare_capital_shadow_candidates(signal_items: list[dict], settings: Settings, mode_context: dict | None = None) -> list:
+    """Attach read-only Capital Shadow metadata to SignalCandidate objects.
+
+    Scope-aware and analytics-only:
+    - does not change score/entry/SL/TP;
+    - does not change execution result;
+    - does not call OKX/Redis/Telegram;
+    - only enriches signal.meta before Capital Intelligence reads it.
+    """
+    scope = _capital_shadow_scope(settings)
+    mode_context = dict(mode_context or {})
+    candidates = []
+    for item in list(signal_items or []):
+        if not isinstance(item, dict):
+            continue
+        signal = item.get("signal")
+        if signal is None:
+            continue
+        try:
+            meta = getattr(signal, "meta", None)
+            if not isinstance(meta, dict):
+                meta = {}
+                try:
+                    setattr(signal, "meta", meta)
+                except Exception:
+                    pass
+            execution = dict(item.get("execution") or {})
+            meta.setdefault("capital_shadow_scope", scope)
+            meta.setdefault("capital_shadow_runtime_mode", scope)
+            meta.setdefault("capital_shadow_enabled", True)
+            meta.setdefault("capital_shadow_source", "main_post_decision_pre_report")
+            meta.setdefault("market_mode", str(mode_context.get("mode") or getattr(signal, "market_mode", "") or ""))
+            meta.setdefault("mode", str(mode_context.get("mode") or getattr(signal, "market_mode", "") or ""))
+            meta.setdefault("market_strong_coins", int(_safe_float(mode_context.get("strong_coins"), 0.0) or 0))
+            meta.setdefault("market_red_ratio", _safe_float(mode_context.get("red_ratio"), 0.0))
+            meta.setdefault("market_avg15m", _safe_float(mode_context.get("avg15m"), 0.0))
+            meta.setdefault("execution_status", str(execution.get("status") or ""))
+            meta.setdefault("execution_reason", str(execution.get("reason") or execution.get("raw_reason") or ""))
+            meta.setdefault("execution_path", str(execution.get("path") or ""))
+            meta.setdefault("decision_scope", str(execution.get("decision_scope") or scope))
+            meta.setdefault("runtime_mode", str(execution.get("runtime_mode") or scope))
+            candidates.append(signal)
+        except Exception as exc:
+            print(f"⚠️ CAPITAL_SHADOW_CANDIDATE_PREP_FAILED | {getattr(signal, 'symbol', '-') or '-'} | {exc}", flush=True)
+            continue
+    return candidates
+
+
+def _build_capital_shadow_payload(
+    signal_items: list[dict],
+    settings: Settings,
+    *,
+    available_slots: int = 0,
+    mode_context: dict | None = None,
+    slot_snapshot: dict | None = None,
+) -> dict:
+    """Run Capital Intelligence in shadow mode for the active runtime scope.
+
+    This function is deliberately report-only. It returns JSON/text payloads and
+    annotates candidate.meta with capital_bid_shadow when the Capital Layer is
+    available. It never changes trade validity, slots, OKX orders, Recovery,
+    BLOCK, DD, or Telegram delivery.
+    """
+    scope = _capital_shadow_scope(settings)
+    payload = {
+        "ok": False,
+        "scope": scope,
+        "mode": "shadow",
+        "shadow_only": True,
+        "execution_impact": False,
+        "available": bool(_CAPITAL_INTELLIGENCE_AVAILABLE),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "candidate_count": 0,
+        "available_slots": int(max(0, int(available_slots or 0))),
+        "slot_snapshot": dict(slot_snapshot or {}),
+        "reason": "not_built",
+    }
+    if not _CAPITAL_INTELLIGENCE_AVAILABLE or _capital_annotate_candidates_shadow is None:
+        payload["reason"] = "capital_intelligence_import_failed"
+        payload["error"] = _CAPITAL_INTELLIGENCE_IMPORT_ERROR
+        return payload
+
+    try:
+        candidates = _prepare_capital_shadow_candidates(signal_items, settings, mode_context=mode_context)
+        payload["candidate_count"] = len(candidates)
+        if not candidates:
+            payload.update({"ok": True, "reason": "no_candidates", "auction_result": {}, "summary": {}, "dashboard": {}})
+            return payload
+
+        # IMPORTANT: available_slots=0 in the Capital Layer means unlimited selection.
+        # Use at least 1 so advisory_selected remains meaningful even when live slots are currently full.
+        advisory_slots = max(1, int(available_slots or 0))
+        auction_result = _capital_annotate_candidates_shadow(candidates, available_slots=advisory_slots)
+        auction_dict = _capital_auction_to_dict(auction_result)
+        summary = _build_capital_summary(auction_result, top_n=8) if _build_capital_summary else {}
+        report_text = _build_capital_report_text(auction_result, top_n=8) if _build_capital_report_text else ""
+        dashboard = _build_capital_dashboard_summary(auction_result=auction_result, top_n=8) if _build_capital_dashboard_summary else {}
+        dashboard_text = _build_capital_dashboard_text(auction_result=auction_result, top_n=8) if _build_capital_dashboard_text else ""
+        payload.update({
+            "ok": True,
+            "reason": "ok",
+            "available_slots": advisory_slots,
+            "auction_result": auction_dict,
+            "summary": summary,
+            "report_text": report_text,
+            "dashboard": dashboard,
+            "dashboard_text": dashboard_text,
+            "model": str(auction_dict.get("model") or "capital_intelligence_shadow"),
+        })
+        try:
+            avg_bid = _safe_float((summary or {}).get("average_bid"), 0.0) if isinstance(summary, dict) else 0.0
+            print(
+                f"CAPITAL_SHADOW | scope={scope} | candidates={len(candidates)} | "
+                f"slots={advisory_slots} | avg_bid={avg_bid:.2f} | model={payload.get('model')}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return payload
+    except Exception as exc:
+        payload.update({"ok": False, "reason": "capital_shadow_failed", "error": str(exc)})
+        print(f"⚠️ CAPITAL_SHADOW_FAILED | scope={scope} | {exc}", flush=True)
+        return payload
+
 def run_once(
     previous_state: MarketModeState | None = None,
     settings: Settings | None = None,
@@ -6603,8 +6771,32 @@ def run_once(
     protection_summary = _risk_protection_summary(display_result_for_protection)
 
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
+    capital_shadow_scope = _capital_shadow_scope(settings)
+    capital_shadow = _build_capital_shadow_payload(
+        signal_items,
+        settings,
+        available_slots=effective_max_positions,
+        mode_context=mode_context,
+        slot_snapshot={
+            "scope": capital_shadow_scope,
+            "balance_tier": _balance_tier_name,
+            "normal_limit": effective_max_positions,
+            "block_limit": effective_max_block_positions,
+            "recovery_limit": effective_max_recovery_positions,
+            "slot_counts": dict(slot_counts or {}),
+            "simulation_mode": bool(simulation_mode_active),
+        },
+    )
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
     command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
+    try:
+        if isinstance(command_outputs, dict) and capital_shadow.get("ok"):
+            _capital_text = str(capital_shadow.get("dashboard_text") or capital_shadow.get("report_text") or "").strip()
+            if _capital_text:
+                command_outputs["capital_shadow"] = _capital_text
+                command_outputs[f"capital_shadow_{capital_shadow_scope}"] = _capital_text
+    except Exception as exc:
+        print(f"⚠️ CAPITAL_SHADOW_COMMAND_OUTPUT_FAILED | {exc}", flush=True)
 
     return {
         "state": state,
@@ -6652,6 +6844,14 @@ def run_once(
         "simulation_daily_log": _load_simulation_daily_log(trade_store),
         "trades": trades,
         "command_outputs": command_outputs,
+        "capital_shadow_scope": capital_shadow_scope,
+        "capital_shadow": capital_shadow,
+        "capital_shadow_execution": capital_shadow if capital_shadow_scope == "execution" else {},
+        "capital_shadow_simulation": capital_shadow if capital_shadow_scope == "simulation" else {},
+        "capital_auction_result_execution": capital_shadow.get("auction_result", {}) if capital_shadow_scope == "execution" else {},
+        "capital_auction_result_simulation": capital_shadow.get("auction_result", {}) if capital_shadow_scope == "simulation" else {},
+        "capital_dashboard_execution": capital_shadow.get("dashboard", {}) if capital_shadow_scope == "execution" else {},
+        "capital_dashboard_simulation": capital_shadow.get("dashboard", {}) if capital_shadow_scope == "simulation" else {},
         "exchange_reconcile_stats": exchange_reconcile_stats,
         "lifecycle_notifications": lifecycle_notifications,
         "simulation_command_outputs": {},
