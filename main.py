@@ -5961,17 +5961,45 @@ def _collect_execution_lifecycle_notifications(before: dict, trades: list, prote
             events.append(("sl_update", _format_trade_lifecycle_notice(trade, "sl_update", old_sl=old_sl, new_sl=new_sl, reason=reason), "last_notified_sl"))
 
         for event, message, flag in events:
-            if flag == "last_notified_sl":
-                _safe_set_trade_attr(trade, "last_notified_sl", new_sl)
-                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", datetime.now(timezone.utc))
-            else:
-                _safe_set_trade_attr(trade, flag, True)
-                _safe_set_trade_attr(trade, flag + "_at", datetime.now(timezone.utc))
-            notifications.append({"symbol": str(getattr(trade, "symbol", "") or ""), "event": event, "message": message})
+            # Do NOT mark telegram flags here. run_once() saves trades before the
+            # Telegram dispatch loop. If we set the flag before a Telegram outage,
+            # the event becomes permanently muted. The sender marks the flag only
+            # after a successful send and saves the updated trades.
+            notifications.append({
+                "symbol": str(getattr(trade, "symbol", "") or ""),
+                "trade_key": key,
+                "event": event,
+                "message": message,
+                "flag": flag,
+                "new_sl": new_sl if flag == "last_notified_sl" else 0.0,
+            })
     return notifications
 
 
+def _mark_lifecycle_notification_sent(result: dict, item: dict) -> bool:
+    trade_key = str((item or {}).get("trade_key") or "")
+    flag = str((item or {}).get("flag") or "")
+    if not trade_key or not flag:
+        return False
+    for trade in list((result or {}).get("trades", []) or []):
+        try:
+            if _trade_identity_key(trade) != trade_key:
+                continue
+            now = datetime.now(timezone.utc)
+            if flag == "last_notified_sl":
+                _safe_set_trade_attr(trade, "last_notified_sl", _safe_float((item or {}).get("new_sl"), 0.0))
+                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", now)
+            else:
+                _safe_set_trade_attr(trade, flag, True)
+                _safe_set_trade_attr(trade, flag + "_at", now)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_store: RedisTradeStore | None = None) -> None:
+    changed = False
     for item in list((result or {}).get("lifecycle_notifications", []) or []):
         message = str((item or {}).get("message") or "").strip()
         if not message:
@@ -5982,7 +6010,16 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
             send_result = _send_text(sender, message)
             if not (isinstance(send_result, dict) and send_result.get("ok")):
                 print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
+                _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+                continue
+        changed = _mark_lifecycle_notification_sent(result, item) or changed
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+
+    if changed and trade_store:
+        try:
+            trade_store.save_trades(list((result or {}).get("trades", []) or []))
+        except Exception as exc:
+            print(f"⚠️ LIFECYCLE_TELEGRAM_FLAG_SAVE_FAILED | {exc}", flush=True)
 
 
 # =========================================================
