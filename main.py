@@ -351,6 +351,15 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
+    """Extract the live trading USDT balance from OKX account response.
+
+    Safety rule:
+    - Live execution sizing must be based on the trading stablecoin balance
+      (USDT/USDC details), not the account-level totalEq when it may include
+      other assets, funding/spot balances, or converted total account equity.
+    - account-level totalEq/adjEq/availEq is used only when OKX does not return
+      usable stablecoin detail rows.
+    """
     if not isinstance(balance_response, dict):
         return 0.0
 
@@ -358,17 +367,11 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     if not isinstance(data, list):
         data = []
 
-    # Prefer account-level totals when available.
-    for account in data:
-        if not isinstance(account, dict):
-            continue
-        for key in ("totalEq", "adjEq", "availEq"):
-            value = _safe_float(account.get(key), 0.0)
-            if value > 0:
-                return value
-
-    # Fallback: sum stable-coin details when totals are unavailable.
-    total = 0.0
+    # Prefer stablecoin detail rows. This prevents a whole-account totalEq
+    # (for example 816 USDT equivalent) from being treated as futures capital
+    # when the actual USDT trading balance is around 96 USDT.
+    stable_total = 0.0
+    stable_available = 0.0
     for account in data:
         if not isinstance(account, dict):
             continue
@@ -378,13 +381,40 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
             ccy = str(detail.get("ccy") or "").upper()
             if ccy not in {"USDT", "USDC"}:
                 continue
-            value = 0.0
-            for key in ("eqUsd", "eq", "cashBal", "availEq"):
-                value = _safe_float(detail.get(key), 0.0)
-                if value > 0:
+
+            # Equity-like fields first: include margin/PnL inside the trading
+            # currency without importing unrelated account assets.
+            equity_value = 0.0
+            for key in ("eqUsd", "eq", "cashBal"):
+                equity_value = _safe_float(detail.get(key), 0.0)
+                if equity_value > 0:
                     break
-            total += max(0.0, value)
-    return total
+            stable_total += max(0.0, equity_value)
+
+            # Keep an available fallback in case equity fields are absent.
+            avail_value = 0.0
+            for key in ("availEq", "availBal", "availCash"):
+                avail_value = _safe_float(detail.get(key), 0.0)
+                if avail_value > 0:
+                    break
+            stable_available += max(0.0, avail_value)
+
+    if stable_total > 0:
+        return stable_total
+    if stable_available > 0:
+        return stable_available
+
+    # Last resort only: account-level totals. This is deliberately after
+    # stablecoin details to avoid over-sizing live futures from full account equity.
+    for account in data:
+        if not isinstance(account, dict):
+            continue
+        for key in ("totalEq", "adjEq", "availEq"):
+            value = _safe_float(account.get(key), 0.0)
+            if value > 0:
+                return value
+
+    return 0.0
 
 
 def _balance_tier_limits(reference_balance: float = 0.0, settings: Settings | None = None) -> dict:
@@ -8643,8 +8673,13 @@ def _status_update_footer(result: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
-    _refresh_runtime_scope_state(result, settings, trade_store=trade_store)
+def _build_fast_status(
+    result: dict,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> str:
+    _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
@@ -8709,7 +8744,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"• Live Trading: {live_status_line}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
-        f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
+        f"🧪 Simulation: ON | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT" if _is_simulation_mode(settings) else "🧪 Simulation: OFF",
         "",
         risk_block,
         "",
@@ -10134,7 +10169,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             runtime_settings = settings or get_settings()
             if not _is_simulation_mode(runtime_settings):
                 _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=runtime_settings, okx_client=okx_client)
-            _send_text(sender, _build_fast_status(result, runtime_settings, trade_store))
+            _send_text(sender, _build_fast_status(result, runtime_settings, trade_store, okx_client=okx_client))
         else:
             sender.send_message("القسم غير متاح حاليًا.")
         return
@@ -10540,7 +10575,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/status":
                 if not _is_simulation_mode(settings):
                     _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
-                reply = _build_fast_status(result, settings, trade_store)
+                reply = _build_fast_status(result, settings, trade_store, okx_client=okx_client)
             elif command == "/mood":
                 _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
                 fresh_ok, fresh_reason = _refresh_market_mode_snapshot_for_mood(result, settings, trade_store=trade_store)
