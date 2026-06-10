@@ -328,14 +328,22 @@ def _ensure_tp2_runner_protection(trade: TrackedTrade, *, reason: str = "tp2_exc
     _safe_setattr(trade, "counts_as_active_slot", False)
     _safe_setattr(trade, "slot_exempt_reason", "tp2_protected_runner")
 
-    # Promote desired exchange SL to breakeven. _sync_stop_loss_to_exchange()
-    # uses max(protected_sl, sl), so this is the single desired-SL source.
+    # Promote desired exchange SL after TP2 to TP1 floor, not just breakeven.
+    # Design rule: TP1 partial + TP2 partial => remaining 20% runner is protected
+    # at least at TP1 when TP1 is above entry; fallback is entry.
     if entry > 0:
         current_protected = _safe_float(getattr(trade, "protected_sl", 0.0), 0.0)
-        if current_protected < entry:
-            _safe_setattr(trade, "protected_sl", entry)
+        sl_floor = tp1 if tp1 > entry else entry
+        if current_protected < sl_floor:
+            _safe_setattr(trade, "protected_sl", sl_floor)
         _safe_setattr(trade, "breakeven_sl", entry)
         _safe_setattr(trade, "tp2_breakeven_required", True)
+        _safe_setattr(trade, "sl_moved_to_entry", True)
+        if not getattr(trade, "sl_move_to_entry_at", None):
+            _safe_setattr(trade, "sl_move_to_entry_at", now)
+        _safe_setattr(trade, "sl_moved_to_tp1", bool(tp1 > entry))
+        if tp1 > entry and not getattr(trade, "sl_move_to_tp1_at", None):
+            _safe_setattr(trade, "sl_move_to_tp1_at", now)
 
     _safe_setattr(trade, "exchange_tp_lifecycle_reason", reason)
     _safe_setattr(trade, "exchange_sync_state", reason)
@@ -451,10 +459,13 @@ def _sync_trade_with_exchange(trade: TrackedTrade, okx_client: Any) -> TrackedTr
     if okx_client is None:
         return trade
 
-    # ✅ FIX: الـ recovered/restored trades مش عندهم entry_order_id
-    # بنسنحهم من الـ positions endpoint مباشرة بدل ما نتجاهلهم
+    # Recovered/restored trades may still carry TP order ids from recent bot
+    # metadata. Sync position first, then do not skip TP fill reconciliation.
     if _is_recovered_trade(trade):
-        return _sync_recovered_trade_from_position(trade, okx_client)
+        trade = _sync_recovered_trade_from_position(trade, okx_client)
+        trade = _sync_tp_order_state(trade, okx_client)
+        trade = _sync_live_stop_snapshot(trade, okx_client)
+        return trade
 
     trade = _sync_entry_fill_state(trade, okx_client)
     trade = _sync_tp_order_state(trade, okx_client)
@@ -491,6 +502,10 @@ def update_open_trades(
         if sync_exchange and okx_client is not None:
             trade = _sync_trade_with_exchange(trade, okx_client)
             trade = _apply_exchange_tp_fills_to_lifecycle(trade)
+            # Position sync can update current_price from OKX mark price. Use the
+            # freshest price for lifecycle, otherwise TP/SL decisions may run on
+            # a stale price_map value from before exchange reconciliation.
+            current_price = float(price_map.get(trade.symbol, getattr(trade, "current_price", current_price) or current_price))
 
         trade = update_trade_with_price(trade, current_price, protection_level=protection_level)
         trade = _apply_exchange_tp_fills_to_lifecycle(trade)
