@@ -193,6 +193,45 @@ def _current_or_stored_raw_pnl(t: TrackedTrade) -> float:
     return _safe_float(getattr(t, "pnl_pct", 0.0), 0.0)
 
 
+def _raw_move_to_price(t: TrackedTrade, price: float) -> float | None:
+    """Raw price-move pct from entry to a target price, if both are valid."""
+    entry = _safe_float(getattr(t, "entry", 0.0), 0.0)
+    px = _safe_float(price, 0.0)
+    if entry <= 0 or px <= 0:
+        return None
+    return ((px - entry) / entry) * 100.0
+
+
+def _planned_realized_raw_for_open_trade(t: TrackedTrade, stage: str) -> float | None:
+    """Rebuild realized raw PnL for open partial/runner trades from Entry/TPs.
+
+    For open trades, stored realized_pnl_pct can be polluted by old Redis state
+    or previous report/lifecycle bugs. If TP prices are available, the report
+    should deterministically reconstruct the closed portions from the trade plan:
+    - TP1 portion = raw(entry→tp1) * tp1_close_pct
+    - TP2 portion = raw(entry→tp2) * tp2_close_pct
+
+    Closed trades still use stored realized_pnl_pct; this helper is only used
+    for currently-open partial/runner records.
+    """
+    stage = str(stage or "").lower()
+    tp1_raw = _raw_move_to_price(t, _safe_float(getattr(t, "tp1", 0.0), 0.0))
+    if tp1_raw is None:
+        return None
+
+    tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 40.0)
+    realized = tp1_raw * (tp1_close_pct / 100.0)
+
+    if stage == "tp2":
+        tp2_raw = _raw_move_to_price(t, _safe_float(getattr(t, "tp2", 0.0), 0.0))
+        if tp2_raw is None:
+            return None
+        tp2_close_pct = _tp_close_pct(t, "tp2_close_pct", 40.0)
+        realized += tp2_raw * (tp2_close_pct / 100.0)
+
+    return realized
+
+
 def _tp_close_pct(t: TrackedTrade, attr: str, fallback: float) -> float:
     value = _safe_float(getattr(t, attr, fallback), fallback)
     return max(0.0, min(100.0, value))
@@ -327,13 +366,22 @@ def trade_raw_effective_pnl(t: TrackedTrade) -> float:
         return _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
 
     current_raw = _current_or_stored_raw_pnl(t)
-    realized_raw = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
+    stored_realized_raw = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
 
     if bool(getattr(t, "tp2_hit", False)):
+        # For an open TP2 runner, never trust old stored realized_pnl_pct when
+        # TP1/TP2 prices exist. Rebuild closed 30/50 (or configured) portions
+        # from Entry/TP targets, then add the live runner leg from current price.
+        planned_realized = _planned_realized_raw_for_open_trade(t, "tp2")
+        realized_raw = planned_realized if planned_realized is not None else stored_realized_raw
         runner_pct = _tp_close_pct(t, "runner_close_pct", 20.0)
         return realized_raw + current_raw * (runner_pct / 100.0)
 
     if bool(getattr(t, "tp1_hit", False)):
+        # Same protection for TP1 partial records: rebuild the realized TP1
+        # portion from Entry/TP1 if possible, then add only the remaining open leg.
+        planned_realized = _planned_realized_raw_for_open_trade(t, "tp1")
+        realized_raw = planned_realized if planned_realized is not None else stored_realized_raw
         tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 40.0)
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
         return realized_raw + current_raw * (remaining_pct / 100.0)
