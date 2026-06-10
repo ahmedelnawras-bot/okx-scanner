@@ -5789,28 +5789,60 @@ def _simulation_wallet_menu_text() -> str:
 def _build_simulation_account_summary(result: dict | None = None) -> str:
     """Small Simulation account block.
 
-    Same style as execution reports:
-    - short English/LTR metric lines
-    - no split Arabic labels vs numbers
-    - no extra blank lines
+    Source-of-truth rule for Simulation accounting:
+    Current Balance must be rebuilt from the sanitized virtual wallet on every
+    report render. A persisted daily row is allowed to provide the day start,
+    but it must never override wallet equity, because stale Redis rows can make
+    the report show impossible values like 1,821 while realized+floating imply
+    1,418.
     """
     result = result or {}
-    sim_trades = list(result.get("simulation_trades", []) or [])
-    wallet = result.get("simulation_wallet") or _build_simulation_wallet_snapshot(sim_trades)
-    daily_row = result.get("simulation_daily_balance") or {}
+    sim_trades = _sanitize_simulation_trade_records(
+        list(result.get("simulation_trades", []) or []),
+        settings=get_settings(),
+        source="account_summary",
+    )
+    wallet = _build_simulation_wallet_snapshot(sim_trades)
+    daily_row = dict(result.get("simulation_daily_balance") or {})
 
     start_balance = _safe_float(
         daily_row.get("start_balance"),
         _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT),
     )
-    current_balance = _safe_float(
-        daily_row.get("current_balance") or daily_row.get("end_balance"),
-        _safe_float(wallet.get("equity"), start_balance),
-    )
-    delta = current_balance - start_balance
-    growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
+    if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+
+    # Critical fix: never prefer stale daily_row current_balance over wallet equity.
+    current_balance = _safe_float(wallet.get("equity"), start_balance)
     realized = _safe_float(wallet.get("realized"), 0.0)
     floating = _safe_float(wallet.get("floating"), 0.0)
+
+    persisted_current = _safe_float(daily_row.get("current_balance") or daily_row.get("end_balance"), 0.0)
+    if persisted_current > 0 and abs(persisted_current - current_balance) >= 0.01:
+        try:
+            print(
+                "SIM_ACCOUNT_SUMMARY_STALE_DAILY_ROW_IGNORED | "
+                f"persisted={persisted_current:.4f} | wallet={current_balance:.4f} | "
+                f"realized={realized:.4f} | floating={floating:.4f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+    # Patch the in-memory row used by the equity curve so all report sections
+    # agree even before Redis gets rewritten by the next scan/status refresh.
+    daily_row.update({
+        "start_balance": start_balance,
+        "current_balance": current_balance,
+        "end_balance": current_balance,
+        "realized": realized,
+        "floating": floating,
+        "open_trades": int(wallet.get("open_count", 0) or 0),
+        "closed_trades": int(wallet.get("closed_count", 0) or 0),
+    })
+
+    delta = current_balance - start_balance
+    growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
     risk_mode = _simulation_protection_label(result)
     icon = "🟢" if delta >= 0 else "🔴"
 
@@ -5995,6 +6027,33 @@ def _build_simulation_command_outputs(result: dict) -> dict:
         source="simulation_report",
     )
     wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
+    result["simulation_wallet"] = wallet
+
+    # Reconcile the command-time daily row with the wallet snapshot before any
+    # report builder reads it. This prevents stale Redis current_balance/end_balance
+    # from inflating Simulation Daily Balance while Wallet Impact uses fresh trades.
+    daily_row = dict(result.get("simulation_daily_balance") or {})
+    start_balance = _safe_float(daily_row.get("start_balance"), _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT))
+    if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    current_balance = _safe_float(wallet.get("equity"), start_balance)
+    persisted_current = _safe_float(daily_row.get("current_balance") or daily_row.get("end_balance"), 0.0)
+    if persisted_current > 0 and abs(persisted_current - current_balance) >= 0.01:
+        print(
+            "SIM_REPORT_DAILY_ROW_RECONCILED | "
+            f"persisted={persisted_current:.4f} | wallet={current_balance:.4f}",
+            flush=True,
+        )
+    daily_row.update({
+        "start_balance": start_balance,
+        "current_balance": current_balance,
+        "end_balance": current_balance,
+        "realized": _safe_float(wallet.get("realized"), 0.0),
+        "floating": _safe_float(wallet.get("floating"), 0.0),
+        "open_trades": int(wallet.get("open_count", 0) or 0),
+        "closed_trades": int(wallet.get("closed_count", 0) or 0),
+    })
+    result["simulation_daily_balance"] = daily_row
 
     wallet_text = _simulation_header(_simulation_wallet_menu_text())
 
