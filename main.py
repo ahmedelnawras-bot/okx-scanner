@@ -2511,12 +2511,28 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
         setattr(trade, "manual_close_estimated_pnl_pct", realized)
 
         if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
-            if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
+            tp1_hit = bool(getattr(trade, "tp1_hit", False))
+            tp2_hit = bool(getattr(trade, "tp2_hit", False))
+            closed_portion = _safe_float(getattr(trade, "closed_portion_pct", 0.0), 0.0)
+
+            # Reconcile should describe the final exchange reality, not convert
+            # a TP1 partial into a full closed_win. TP1-only disappearance means
+            # the remaining size was closed by exchange/manual/SL after TP1.
+            if tp2_hit and realized > 0:
+                status = "closed_win"
+            elif tp1_hit and not tp2_hit:
+                if realized > 0 and closed_portion >= 100.0:
+                    status = "closed_win"
+                elif realized >= 0:
+                    status = "breakeven_after_tp1"
+                else:
+                    status = "closed_loss"
+            elif realized > 0:
                 status = "closed_win"
             elif realized < 0:
                 status = "closed_loss"
             else:
-                status = "breakeven_after_tp1" if bool(getattr(trade, "tp1_hit", False)) else "closed"
+                status = "closed"
             setattr(trade, "status", status)
 
         setattr(trade, "is_closed", True)
