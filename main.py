@@ -243,28 +243,6 @@ except ImportError:
     def export_ai_snapshot(*args, **kwargs) -> dict:
         return {"ok": False, "error": "ai_exporter not found"}
 
-
-try:
-    from capital_intelligence.capital_intelligence import annotate_candidates_shadow as _capital_annotate_candidates_shadow
-    from capital_intelligence.capital_report import (
-        build_capital_summary as _build_capital_summary,
-        build_capital_report_text as _build_capital_report_text,
-    )
-    from capital_intelligence.capital_dashboard import (
-        build_capital_dashboard_summary as _build_capital_dashboard_summary,
-        build_capital_dashboard_text as _build_capital_dashboard_text,
-    )
-    _CAPITAL_INTELLIGENCE_AVAILABLE = True
-    _CAPITAL_INTELLIGENCE_IMPORT_ERROR = ""
-except Exception as _capital_import_exc:
-    _CAPITAL_INTELLIGENCE_AVAILABLE = False
-    _CAPITAL_INTELLIGENCE_IMPORT_ERROR = str(_capital_import_exc)
-    _capital_annotate_candidates_shadow = None
-    _build_capital_summary = None
-    _build_capital_report_text = None
-    _build_capital_dashboard_summary = None
-    _build_capital_dashboard_text = None
-
 from services.telegram_sender import TelegramSender
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
@@ -351,15 +329,6 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
-    """Extract the live trading USDT balance from OKX account response.
-
-    Safety rule:
-    - Live execution sizing must be based on the trading stablecoin balance
-      (USDT/USDC details), not the account-level totalEq when it may include
-      other assets, funding/spot balances, or converted total account equity.
-    - account-level totalEq/adjEq/availEq is used only when OKX does not return
-      usable stablecoin detail rows.
-    """
     if not isinstance(balance_response, dict):
         return 0.0
 
@@ -367,11 +336,17 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     if not isinstance(data, list):
         data = []
 
-    # Prefer stablecoin detail rows. This prevents a whole-account totalEq
-    # (for example 816 USDT equivalent) from being treated as futures capital
-    # when the actual USDT trading balance is around 96 USDT.
-    stable_total = 0.0
-    stable_available = 0.0
+    # Prefer account-level totals when available.
+    for account in data:
+        if not isinstance(account, dict):
+            continue
+        for key in ("totalEq", "adjEq", "availEq"):
+            value = _safe_float(account.get(key), 0.0)
+            if value > 0:
+                return value
+
+    # Fallback: sum stable-coin details when totals are unavailable.
+    total = 0.0
     for account in data:
         if not isinstance(account, dict):
             continue
@@ -381,40 +356,13 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
             ccy = str(detail.get("ccy") or "").upper()
             if ccy not in {"USDT", "USDC"}:
                 continue
-
-            # Equity-like fields first: include margin/PnL inside the trading
-            # currency without importing unrelated account assets.
-            equity_value = 0.0
-            for key in ("eqUsd", "eq", "cashBal"):
-                equity_value = _safe_float(detail.get(key), 0.0)
-                if equity_value > 0:
+            value = 0.0
+            for key in ("eqUsd", "eq", "cashBal", "availEq"):
+                value = _safe_float(detail.get(key), 0.0)
+                if value > 0:
                     break
-            stable_total += max(0.0, equity_value)
-
-            # Keep an available fallback in case equity fields are absent.
-            avail_value = 0.0
-            for key in ("availEq", "availBal", "availCash"):
-                avail_value = _safe_float(detail.get(key), 0.0)
-                if avail_value > 0:
-                    break
-            stable_available += max(0.0, avail_value)
-
-    if stable_total > 0:
-        return stable_total
-    if stable_available > 0:
-        return stable_available
-
-    # Last resort only: account-level totals. This is deliberately after
-    # stablecoin details to avoid over-sizing live futures from full account equity.
-    for account in data:
-        if not isinstance(account, dict):
-            continue
-        for key in ("totalEq", "adjEq", "availEq"):
-            value = _safe_float(account.get(key), 0.0)
-            if value > 0:
-                return value
-
-    return 0.0
+            total += max(0.0, value)
+    return total
 
 
 def _balance_tier_limits(reference_balance: float = 0.0, settings: Settings | None = None) -> dict:
@@ -666,19 +614,18 @@ def _refresh_runtime_scope_state(
 
     # Execution/trading scope.
     exec_trades = list(result.get("trades", []) or [])
-    exec_trades_for_dd = _dd_trades_after_manual_resume(exec_trades, protection_state)
     inputs = _resolve_portfolio_state_inputs(okx_client, runtime_settings, trade_store=trade_store)
     inputs = _apply_daily_dd_manual_baseline(inputs, protection_state)
     result["portfolio_state_inputs"] = inputs
     try:
-        portfolio_state = build_portfolio_state_from_trades(exec_trades_for_dd, **_portfolio_state_kwargs(inputs))
+        portfolio_state = build_portfolio_state_from_trades(exec_trades, **_portfolio_state_kwargs(inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
         portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
             portfolio_state,
             result["drawdown_status"],
             inputs,
-            exec_trades_for_dd,
+            exec_trades,
             runtime_settings,
             trade_store=trade_store,
             label="runtime_scope",
@@ -1137,17 +1084,32 @@ def _ensure_execution_daily_baseline(
     external_net = _safe_float(row.get("external_cashflow_net"), 0.0)
     deposits = _safe_float(row.get("external_deposits"), 0.0)
     withdrawals = _safe_float(row.get("external_withdrawals"), 0.0)
+
+    # Daily DD safety rule:
+    # Do NOT auto-lower the daily baseline on negative OKX equity deltas.
+    # A falling equity can be normal trading PnL, floating PnL, fees, OKX mark-price
+    # movement, or a temporary balance read. Treating it as an external withdrawal
+    # corrupts adjusted_start_balance and can create impossible DD values
+    # (121%, 293%, ...). Only positive, large jumps are folded in as deposits.
+    if external_net < 0:
+        print(
+            f"⚠️ EXECUTION_NEGATIVE_CASHFLOW_REPAIRED | date={today} | "
+            f"old_external_net={external_net:+.4f} | start={start_balance:.4f}",
+            flush=True,
+        )
+        external_net = 0.0
+        withdrawals = 0.0
+        row["negative_cashflow_repaired_at"] = now.isoformat()
+        row["negative_cashflow_repair_reason"] = "auto_withdrawal_disabled_for_daily_dd"
+
     last_equity = _safe_float(row.get("last_equity") or row.get("current_balance"), equity)
     threshold = _execution_cashflow_threshold(last_equity, settings)
     delta = equity - last_equity
 
-    if last_equity > 0 and abs(delta) >= threshold:
-        event_type = "deposit" if delta > 0 else "withdrawal"
+    if last_equity > 0 and delta >= threshold:
+        event_type = "deposit"
         external_net += delta
-        if delta > 0:
-            deposits += delta
-        else:
-            withdrawals += abs(delta)
+        deposits += delta
         events = list(row.get("cashflow_events") or [])
         events.append({
             "ts": now.isoformat(),
@@ -1163,8 +1125,15 @@ def _ensure_execution_daily_baseline(
             f"start={start_balance:.4f} | external_net={external_net:+.4f} | threshold={threshold:.4f}",
             flush=True,
         )
+    elif last_equity > 0 and delta <= -threshold:
+        # Log-only. Never reduce the Daily DD baseline automatically.
+        print(
+            f"🧯 EXECUTION_NEGATIVE_CASHFLOW_IGNORED | amount={delta:+.4f} | "
+            f"last={last_equity:.4f} | current={equity:.4f} | threshold={threshold:.4f}",
+            flush=True,
+        )
 
-    adjusted_start = max(0.0, start_balance + external_net)
+    adjusted_start = max(0.0, start_balance + max(0.0, external_net))
     row.update({
         "date": today,
         "start_balance": start_balance,
@@ -1348,12 +1317,25 @@ def _repair_execution_drawdown_sanity(
     unrealized = _safe_float(getattr(portfolio_state, "unrealized_pnl_usdt", 0.0), 0.0)
     computed_equity = _safe_float(getattr(portfolio_state, "current_equity", 0.0), 0.0)
 
+    # Sanity guard before Daily DD can become a hard stop.
+    # If OKX reference equity is healthy but portfolio-state equity is far below it,
+    # the reading is almost certainly baseline/trade-state corruption, not real DD.
     needs_repair = bool(
         dd_pct > 100.0
         or start < 0.01
         or (ref > 0 and start > max(ref * 25.0, 10_000.0))
         or (ref > 0 and computed_equity < -max(ref * 5.0, 100.0))
+        or (ref > 0 and dd_pct >= 35.0 and computed_equity < ref * 0.50)
+        or (ref > 0 and dd_pct >= 20.0 and 0 < start < ref * 0.50)
     )
+    if dd_pct >= 20.0 or needs_repair:
+        print(
+            "EXEC_DD_DEBUG | "
+            f"label={label} | dd={dd_pct:.2f}% | ref={ref:.4f} | start={start:.4f} | "
+            f"computed_equity={computed_equity:.4f} | realized={realized:.4f} | unrealized={unrealized:.4f} | "
+            f"repair={needs_repair}",
+            flush=True,
+        )
     if not needs_repair:
         return portfolio_state, drawdown_status, inputs
 
@@ -1853,54 +1835,7 @@ def _position_row_price(row: dict, *keys: str) -> float:
     return 0.0
 
 
-def _read_okx_detected_tp_sl_for_position(
-    okx_client: OKXTradeClient | None,
-    inst_id: str,
-    entry: float,
-) -> dict:
-    """Read exchange-side TP/SL for recovered/manual OKX positions.
-
-    Display/recovery only:
-    - does not create, amend, cancel, or manage orders;
-    - prevents fake TP values like entry*999 from appearing in reports;
-    - lets manual OKX positions show real TP/SL when such orders exist.
-    """
-    if okx_client is None or not hasattr(okx_client, "get_position_protection_orders"):
-        return {"ok": False, "reason": "protection_reader_unavailable", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
-    try:
-        protection = okx_client.get_position_protection_orders(inst_id, entry_price=float(entry or 0.0), pos_side="long")
-    except Exception as exc:
-        return {"ok": False, "reason": f"protection_reader_exception:{exc}", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
-
-    if not isinstance(protection, dict):
-        return {"ok": False, "reason": "protection_reader_bad_response", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
-
-    tp1_row = protection.get("tp1") or {}
-    tp2_row = protection.get("tp2") or {}
-    sl_row = protection.get("sl") or {}
-    tp1 = _safe_float((tp1_row or {}).get("price"), 0.0) if isinstance(tp1_row, dict) else 0.0
-    tp2 = _safe_float((tp2_row or {}).get("price"), 0.0) if isinstance(tp2_row, dict) else 0.0
-    sl = _safe_float((sl_row or {}).get("price"), 0.0) if isinstance(sl_row, dict) else 0.0
-    return {
-        "ok": bool(protection.get("ok")),
-        "reason": str(protection.get("reason") or ""),
-        "tp1": tp1,
-        "tp2": tp2,
-        "sl": sl,
-        "tp1_row": tp1_row if isinstance(tp1_row, dict) else {},
-        "tp2_row": tp2_row if isinstance(tp2_row, dict) else {},
-        "sl_row": sl_row if isinstance(sl_row, dict) else {},
-        "raw": protection,
-    }
-
-
-def _is_placeholder_recovered_target(value: object, entry: float) -> bool:
-    price = _safe_float(value, 0.0)
-    entry_value = _safe_float(entry, 0.0)
-    return bool(price > 0 and entry_value > 0 and price >= entry_value * 100.0)
-
-
-def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None):
+def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None):
     """Build a conservative TrackedTrade for a live OKX position missing from Redis.
 
     This is a recovery layer, not a strategy entry. It exists so execution reports,
@@ -1935,22 +1870,15 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     cached_sl = _safe_float(recovery_meta.get("sl"), 0.0)
     cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0)
     cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0)
-    detected = _read_okx_detected_tp_sl_for_position(okx_client, inst_id, entry) if not recovery_meta else {"ok": False, "reason": "using_recent_bot_metadata", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
-    detected_sl = _safe_float(detected.get("sl"), 0.0)
-    detected_tp1 = _safe_float(detected.get("tp1"), 0.0)
-    detected_tp2 = _safe_float(detected.get("tp2"), 0.0)
-    resolved_sl = cached_sl if cached_sl > 0 else detected_sl
-    resolved_tp1 = cached_tp1 if cached_tp1 > 0 else detected_tp1
-    resolved_tp2 = cached_tp2 if cached_tp2 > 0 else detected_tp2
     pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
     trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
 
     trade = TrackedTrade(
         symbol=inst_id,
         entry=float(entry),
-        sl=float(resolved_sl) if resolved_sl > 0 else 0.0,
-        tp1=float(resolved_tp1) if resolved_tp1 > 0 else 0.0,
-        tp2=float(resolved_tp2) if resolved_tp2 > 0 else 0.0,
+        sl=float(cached_sl) if cached_sl > 0 else 0.0,
+        tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
+        tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
         setup_type="bot_order_restored_position" if recovery_meta else "okx_recovered_position",
         market_mode="BOT_ORDER_RESTORED" if recovery_meta else "RECOVERED_FROM_OKX",
         score=0.0,
@@ -1980,19 +1908,6 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "same_symbol_block_exempt", False)
     _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", True)
     _safe_set_trade_attr(trade, "target_model", "bot_order_restored" if recovery_meta else "recovered_okx_position")
-    _safe_set_trade_attr(trade, "manual_exchange_position", not bool(recovery_meta))
-    _safe_set_trade_attr(trade, "exchange_tp_sl_detected", bool(resolved_sl > 0 or resolved_tp1 > 0 or resolved_tp2 > 0))
-    _safe_set_trade_attr(trade, "exchange_tp_sl_reason", detected.get("reason") if isinstance(detected, dict) else "")
-    _safe_set_trade_attr(trade, "exchange_tp1_order_id", ((detected.get("tp1_row") or {}).get("order_id") or (detected.get("tp1_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
-    _safe_set_trade_attr(trade, "exchange_tp2_order_id", ((detected.get("tp2_row") or {}).get("order_id") or (detected.get("tp2_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
-    _safe_set_trade_attr(trade, "exchange_sl_order_id", ((detected.get("sl_row") or {}).get("order_id") or (detected.get("sl_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
-    if not bool(resolved_sl > 0 or resolved_tp1 > 0 or resolved_tp2 > 0):
-        _safe_set_trade_attr(trade, "management_status", "unmanaged_no_exchange_tp_sl")
-        _safe_set_trade_attr(trade, "lifecycle_price_detection_disabled", True)
-        _safe_set_trade_attr(trade, "tp_sl_display_status", "No exchange TP/SL detected")
-    else:
-        _safe_set_trade_attr(trade, "management_status", "exchange_tp_sl_detected")
-        _safe_set_trade_attr(trade, "tp_sl_display_status", "Exchange TP/SL detected")
     _safe_set_trade_attr(trade, "tp1_close_pct", 30.0)
     _safe_set_trade_attr(trade, "tp2_close_pct", 50.0)
     _safe_set_trade_attr(trade, "runner_close_pct", 20.0)
@@ -2096,7 +2011,7 @@ def _recover_missing_execution_trades_from_okx_positions(
                 f"remaining={grace_remaining}s | reason=report_status_hard_recovery",
                 flush=True,
             )
-        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings, okx_client=okx_client)
+        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
@@ -2334,7 +2249,7 @@ def _repair_execution_trades_from_live_okx_positions(
 
         imported = False
         if target is None:
-            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings, okx_client=okx_client)
+            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
             if target is None:
                 print(f"OKX_POSITION_REPAIR_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
                 continue
@@ -2403,16 +2318,10 @@ def _repair_execution_trades_from_live_okx_positions(
         if leverage > 0:
             _safe_set_trade_attr(target, "effective_leverage", leverage)
             _safe_set_trade_attr(target, "actual_leverage", leverage)
-        # Do not invent placeholder TP values for recovered/manual OKX positions.
-        # If the exchange has no visible TP/SL orders, reports should show that
-        # explicitly instead of fake targets such as entry*999.
-        if _is_placeholder_recovered_target(getattr(target, "tp1", 0.0), entry):
-            _safe_set_trade_attr(target, "tp1", 0.0)
-        if _is_placeholder_recovered_target(getattr(target, "tp2", 0.0), entry):
-            _safe_set_trade_attr(target, "tp2", 0.0)
-        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and _safe_float(getattr(target, "sl", 0.0), 0.0) <= 0:
-            _safe_set_trade_attr(target, "management_status", "unmanaged_no_exchange_tp_sl")
-            _safe_set_trade_attr(target, "tp_sl_display_status", "No exchange TP/SL detected")
+        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and entry > 0:
+            _safe_set_trade_attr(target, "tp1", float(entry) * 999.0)
+        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and entry > 0:
+            _safe_set_trade_attr(target, "tp2", float(entry) * 999.0)
 
         after_state = {
             "execution_trade": bool(getattr(target, "execution_trade", False)),
@@ -2585,28 +2494,12 @@ def _mark_execution_trade_closed_by_reconcile(trade, reason: str = "okx_position
         setattr(trade, "manual_close_estimated_pnl_pct", realized)
 
         if status not in {"closed", "closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
-            tp1_hit = bool(getattr(trade, "tp1_hit", False))
-            tp2_hit = bool(getattr(trade, "tp2_hit", False))
-            closed_portion = _safe_float(getattr(trade, "closed_portion_pct", 0.0), 0.0)
-
-            # Reconcile should describe the final exchange reality, not convert
-            # a TP1 partial into a full closed_win. TP1-only disappearance means
-            # the remaining size was closed by exchange/manual/SL after TP1.
-            if tp2_hit and realized > 0:
-                status = "closed_win"
-            elif tp1_hit and not tp2_hit:
-                if realized > 0 and closed_portion >= 100.0:
-                    status = "closed_win"
-                elif realized >= 0:
-                    status = "breakeven_after_tp1"
-                else:
-                    status = "closed_loss"
-            elif realized > 0:
+            if realized > 0 or bool(getattr(trade, "tp1_hit", False)) or bool(getattr(trade, "tp2_hit", False)):
                 status = "closed_win"
             elif realized < 0:
                 status = "closed_loss"
             else:
-                status = "closed"
+                status = "breakeven_after_tp1" if bool(getattr(trade, "tp1_hit", False)) else "closed"
             setattr(trade, "status", status)
 
         setattr(trade, "is_closed", True)
@@ -2708,16 +2601,14 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     reports = build_report_bundle(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result["command_outputs"] = build_command_outputs(result["trades"], refreshed_checks, list(result.get("signal_items", []) or []), **execution_report_kwargs)
     result.update(reports)
-    protection_state_for_dd = result.get("protection_state") or _load_protection_state(trade_store, _protection_scope(settings))
-    trades_for_dd = _dd_trades_after_manual_resume(result["trades"], protection_state_for_dd)
-    portfolio_state = build_portfolio_state_from_trades(trades_for_dd, **_portfolio_state_kwargs(portfolio_state_inputs))
+    portfolio_state = build_portfolio_state_from_trades(result["trades"], **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
     portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
         portfolio_state,
         result["drawdown_status"],
         portfolio_state_inputs,
-        trades_for_dd,
+        result["trades"],
         settings,
         trade_store=trade_store,
         label="reconcile_report_rebuild",
@@ -4088,100 +3979,48 @@ def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_sta
     return inputs
 
 
-def _manual_resume_cutoff_dt(protection_state: dict | None) -> datetime | None:
-    """Return today's manual-resume cutoff, if active.
-
-    Daily DD after manual resume must start a fresh protection cycle. Old
-    closed trades that caused the protection should not be counted again in
-    the same day, otherwise the bot immediately re-enters Level 1/2 and keeps
-    re-sending SDD alerts after /confirm_resume_trading.
-    """
-    state = dict(protection_state or {})
-    resumed_at = _parse_protection_dt(state.get("manual_resume_at") or state.get("daily_dd_override_at"))
-    if not resumed_at:
-        return None
-    now = datetime.now(timezone.utc)
-    if resumed_at.date() != now.date():
-        return None
-    return resumed_at
-
-
-def _trade_opened_after_cutoff(trade, cutoff: datetime | None) -> bool:
-    if cutoff is None:
-        return True
-    opened_at = _parse_any_datetime_utc(getattr(trade, "opened_at", None))
-    if opened_at is None:
-        # Unknown legacy records are treated as old records after manual resume.
-        return False
-    return opened_at >= cutoff
-
-
-def _dd_trades_after_manual_resume(trades: list | None, protection_state: dict | None) -> list:
-    """Filter trade records for Daily-DD after manual resume.
-
-    This is DD/accounting-only. It does not delete history, change reports,
-    alter slots, or touch OKX. It simply prevents pre-resume losses from being
-    counted again after the user explicitly starts a new Daily-DD cycle.
-    """
-    cutoff = _manual_resume_cutoff_dt(protection_state)
-    if cutoff is None:
-        return list(trades or [])
-    return [trade for trade in list(trades or []) if _trade_opened_after_cutoff(trade, cutoff)]
-
-
-def _reset_execution_daily_baseline_after_manual_resume(
-    trade_store: RedisTradeStore | None,
-    equity: float,
-    now: datetime | None = None,
-) -> None:
-    """Persistently reset execution daily baseline after manual resume."""
-    now = now or datetime.now(timezone.utc)
-    value = _safe_float(equity, 0.0)
-    if value <= 0:
-        return
-    day = _execution_today_key(now)
-    row = {
-        "date": day,
-        "start_balance": value,
-        "adjusted_start_balance": value,
-        "current_balance": value,
-        "last_equity": value,
-        "external_cashflow_net": 0.0,
-        "external_deposits": 0.0,
-        "external_withdrawals": 0.0,
-        "cashflow_events": [],
-        "manual_resume_at": now.isoformat(),
-        "reason": "manual_resume_daily_dd_reset",
-    }
-    _save_execution_daily_balance_row(trade_store, day, row)
-    print(
-        f"✅ EXECUTION_DAILY_BASELINE_RESET_BY_MANUAL_RESUME | date={day} | baseline={value:.4f}",
-        flush=True,
-    )
-
-
 def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
+    """Resolve equity used by /confirm_resume_trading.
+
+    Execution mode must prefer the current OKX-derived reference_portfolio.
+    A corrupted portfolio_state.current_equity can be built from a bad baseline
+    and old trade PnL, so using it for manual resume can persist the corruption.
+    Simulation keeps using its virtual wallet equity.
+    """
     result = result or {}
+    inputs = dict(portfolio_state_inputs or result.get("portfolio_state_inputs") or {})
+
     if _is_simulation_mode(settings):
         wallet = result.get("simulation_wallet") or {}
         equity = _safe_float(wallet.get("equity"), 0.0)
         if equity > 0:
             return equity
+        for key in ("reference_portfolio", "start_of_day_balance", "manual_daily_dd_baseline"):
+            value = _safe_float(inputs.get(key), 0.0)
+            if value > 0:
+                return value
+        return 0.0
+
+    # Live execution: OKX reference balance is the safest source of truth.
+    for key in ("reference_portfolio", "execution_current_balance", "execution_reference_balance"):
+        value = _safe_float(inputs.get(key), 0.0)
+        if value > 0:
+            return value
+
     portfolio_state = result.get("portfolio_state")
-    for attr in ("current_equity", "equity", "balance", "portfolio_value", "current_balance"):
+    for attr in ("reference_portfolio", "current_equity", "equity", "balance", "portfolio_value", "current_balance"):
         try:
             value = _safe_float(getattr(portfolio_state, attr), 0.0)
             if value > 0:
                 return value
         except Exception:
             pass
-    inputs = dict(portfolio_state_inputs or result.get("portfolio_state_inputs") or {})
-    for key in ("reference_portfolio", "start_of_day_balance", "manual_daily_dd_baseline"):
+
+    for key in ("start_of_day_balance", "manual_daily_dd_baseline"):
         value = _safe_float(inputs.get(key), 0.0)
         if value > 0:
             return value
     return 0.0
-
 
 def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
     scope = _protection_scope(settings)
@@ -4264,15 +4103,14 @@ def _confirm_manual_resume_trading(
                 )
                 result["drawdown_report"] = _simulation_wallet_drawdown_report(portfolio_state, result["drawdown_status"])
             else:
-                trades_after_resume = _dd_trades_after_manual_resume(list(trades_for_dd or []), state)
-                portfolio_state = build_portfolio_state_from_trades(trades_after_resume, **_portfolio_state_kwargs(inputs))
+                portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **_portfolio_state_kwargs(inputs))
                 result["portfolio_state"] = portfolio_state
                 result["drawdown_status"] = evaluate_drawdown(portfolio_state)
                 portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
                     portfolio_state,
                     result["drawdown_status"],
                     inputs,
-                    trades_after_resume,
+                    list(trades_for_dd or []),
                     settings,
                     trade_store=trade_store,
                     label="manual_resume",
@@ -6116,45 +5954,17 @@ def _collect_execution_lifecycle_notifications(before: dict, trades: list, prote
             events.append(("sl_update", _format_trade_lifecycle_notice(trade, "sl_update", old_sl=old_sl, new_sl=new_sl, reason=reason), "last_notified_sl"))
 
         for event, message, flag in events:
-            # Do NOT mark telegram flags here. run_once() saves trades before the
-            # Telegram dispatch loop. If we set the flag before a Telegram outage,
-            # the event becomes permanently muted. The sender marks the flag only
-            # after a successful send and saves the updated trades.
-            notifications.append({
-                "symbol": str(getattr(trade, "symbol", "") or ""),
-                "trade_key": key,
-                "event": event,
-                "message": message,
-                "flag": flag,
-                "new_sl": new_sl if flag == "last_notified_sl" else 0.0,
-            })
+            if flag == "last_notified_sl":
+                _safe_set_trade_attr(trade, "last_notified_sl", new_sl)
+                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", datetime.now(timezone.utc))
+            else:
+                _safe_set_trade_attr(trade, flag, True)
+                _safe_set_trade_attr(trade, flag + "_at", datetime.now(timezone.utc))
+            notifications.append({"symbol": str(getattr(trade, "symbol", "") or ""), "event": event, "message": message})
     return notifications
 
 
-def _mark_lifecycle_notification_sent(result: dict, item: dict) -> bool:
-    trade_key = str((item or {}).get("trade_key") or "")
-    flag = str((item or {}).get("flag") or "")
-    if not trade_key or not flag:
-        return False
-    for trade in list((result or {}).get("trades", []) or []):
-        try:
-            if _trade_identity_key(trade) != trade_key:
-                continue
-            now = datetime.now(timezone.utc)
-            if flag == "last_notified_sl":
-                _safe_set_trade_attr(trade, "last_notified_sl", _safe_float((item or {}).get("new_sl"), 0.0))
-                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", now)
-            else:
-                _safe_set_trade_attr(trade, flag, True)
-                _safe_set_trade_attr(trade, flag + "_at", now)
-            return True
-        except Exception:
-            continue
-    return False
-
-
 def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_store: RedisTradeStore | None = None) -> None:
-    changed = False
     for item in list((result or {}).get("lifecycle_notifications", []) or []):
         message = str((item or {}).get("message") or "").strip()
         if not message:
@@ -6165,162 +5975,7 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
             send_result = _send_text(sender, message)
             if not (isinstance(send_result, dict) and send_result.get("ok")):
                 print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
-                _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
-                continue
-        changed = _mark_lifecycle_notification_sent(result, item) or changed
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
-
-    if changed and trade_store:
-        try:
-            trade_store.save_trades(list((result or {}).get("trades", []) or []))
-        except Exception as exc:
-            print(f"⚠️ LIFECYCLE_TELEGRAM_FLAG_SAVE_FAILED | {exc}", flush=True)
-
-
-# =========================================================
-# Capital Intelligence Shadow Integration (scope-aware)
-# =========================================================
-def _capital_shadow_scope(settings: Settings) -> str:
-    return "simulation" if _is_simulation_mode(settings) else "execution"
-
-
-def _capital_auction_to_dict(auction_result) -> dict:
-    if auction_result is None:
-        return {}
-    if isinstance(auction_result, dict):
-        return dict(auction_result)
-    if hasattr(auction_result, "to_dict"):
-        try:
-            data = auction_result.to_dict()
-            return dict(data or {}) if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _prepare_capital_shadow_candidates(signal_items: list[dict], settings: Settings, mode_context: dict | None = None) -> list:
-    """Attach read-only Capital Shadow metadata to SignalCandidate objects.
-
-    Scope-aware and analytics-only:
-    - does not change score/entry/SL/TP;
-    - does not change execution result;
-    - does not call OKX/Redis/Telegram;
-    - only enriches signal.meta before Capital Intelligence reads it.
-    """
-    scope = _capital_shadow_scope(settings)
-    mode_context = dict(mode_context or {})
-    candidates = []
-    for item in list(signal_items or []):
-        if not isinstance(item, dict):
-            continue
-        signal = item.get("signal")
-        if signal is None:
-            continue
-        try:
-            meta = getattr(signal, "meta", None)
-            if not isinstance(meta, dict):
-                meta = {}
-                try:
-                    setattr(signal, "meta", meta)
-                except Exception:
-                    pass
-            execution = dict(item.get("execution") or {})
-            meta.setdefault("capital_shadow_scope", scope)
-            meta.setdefault("capital_shadow_runtime_mode", scope)
-            meta.setdefault("capital_shadow_enabled", True)
-            meta.setdefault("capital_shadow_source", "main_post_decision_pre_report")
-            meta.setdefault("market_mode", str(mode_context.get("mode") or getattr(signal, "market_mode", "") or ""))
-            meta.setdefault("mode", str(mode_context.get("mode") or getattr(signal, "market_mode", "") or ""))
-            meta.setdefault("market_strong_coins", int(_safe_float(mode_context.get("strong_coins"), 0.0) or 0))
-            meta.setdefault("market_red_ratio", _safe_float(mode_context.get("red_ratio"), 0.0))
-            meta.setdefault("market_avg15m", _safe_float(mode_context.get("avg15m"), 0.0))
-            meta.setdefault("execution_status", str(execution.get("status") or ""))
-            meta.setdefault("execution_reason", str(execution.get("reason") or execution.get("raw_reason") or ""))
-            meta.setdefault("execution_path", str(execution.get("path") or ""))
-            meta.setdefault("decision_scope", str(execution.get("decision_scope") or scope))
-            meta.setdefault("runtime_mode", str(execution.get("runtime_mode") or scope))
-            candidates.append(signal)
-        except Exception as exc:
-            print(f"⚠️ CAPITAL_SHADOW_CANDIDATE_PREP_FAILED | {getattr(signal, 'symbol', '-') or '-'} | {exc}", flush=True)
-            continue
-    return candidates
-
-
-def _build_capital_shadow_payload(
-    signal_items: list[dict],
-    settings: Settings,
-    *,
-    available_slots: int = 0,
-    mode_context: dict | None = None,
-    slot_snapshot: dict | None = None,
-) -> dict:
-    """Run Capital Intelligence in shadow mode for the active runtime scope.
-
-    This function is deliberately report-only. It returns JSON/text payloads and
-    annotates candidate.meta with capital_bid_shadow when the Capital Layer is
-    available. It never changes trade validity, slots, OKX orders, Recovery,
-    BLOCK, DD, or Telegram delivery.
-    """
-    scope = _capital_shadow_scope(settings)
-    payload = {
-        "ok": False,
-        "scope": scope,
-        "mode": "shadow",
-        "shadow_only": True,
-        "execution_impact": False,
-        "available": bool(_CAPITAL_INTELLIGENCE_AVAILABLE),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "candidate_count": 0,
-        "available_slots": int(max(0, int(available_slots or 0))),
-        "slot_snapshot": dict(slot_snapshot or {}),
-        "reason": "not_built",
-    }
-    if not _CAPITAL_INTELLIGENCE_AVAILABLE or _capital_annotate_candidates_shadow is None:
-        payload["reason"] = "capital_intelligence_import_failed"
-        payload["error"] = _CAPITAL_INTELLIGENCE_IMPORT_ERROR
-        return payload
-
-    try:
-        candidates = _prepare_capital_shadow_candidates(signal_items, settings, mode_context=mode_context)
-        payload["candidate_count"] = len(candidates)
-        if not candidates:
-            payload.update({"ok": True, "reason": "no_candidates", "auction_result": {}, "summary": {}, "dashboard": {}})
-            return payload
-
-        # IMPORTANT: available_slots=0 in the Capital Layer means unlimited selection.
-        # Use at least 1 so advisory_selected remains meaningful even when live slots are currently full.
-        advisory_slots = max(1, int(available_slots or 0))
-        auction_result = _capital_annotate_candidates_shadow(candidates, available_slots=advisory_slots)
-        auction_dict = _capital_auction_to_dict(auction_result)
-        summary = _build_capital_summary(auction_result, top_n=8) if _build_capital_summary else {}
-        report_text = _build_capital_report_text(auction_result, top_n=8) if _build_capital_report_text else ""
-        dashboard = _build_capital_dashboard_summary(auction_result=auction_result, top_n=8) if _build_capital_dashboard_summary else {}
-        dashboard_text = _build_capital_dashboard_text(auction_result=auction_result, top_n=8) if _build_capital_dashboard_text else ""
-        payload.update({
-            "ok": True,
-            "reason": "ok",
-            "available_slots": advisory_slots,
-            "auction_result": auction_dict,
-            "summary": summary,
-            "report_text": report_text,
-            "dashboard": dashboard,
-            "dashboard_text": dashboard_text,
-            "model": str(auction_dict.get("model") or "capital_intelligence_shadow"),
-        })
-        try:
-            avg_bid = _safe_float((summary or {}).get("average_bid"), 0.0) if isinstance(summary, dict) else 0.0
-            print(
-                f"CAPITAL_SHADOW | scope={scope} | candidates={len(candidates)} | "
-                f"slots={advisory_slots} | avg_bid={avg_bid:.2f} | model={payload.get('model')}",
-                flush=True,
-            )
-        except Exception:
-            pass
-        return payload
-    except Exception as exc:
-        payload.update({"ok": False, "reason": "capital_shadow_failed", "error": str(exc)})
-        print(f"⚠️ CAPITAL_SHADOW_FAILED | scope={scope} | {exc}", flush=True)
-        return payload
 
 def run_once(
     previous_state: MarketModeState | None = None,
@@ -6460,7 +6115,7 @@ def run_once(
     # - Simulation mode evaluates the virtual simulation wallet/trades.
     # - Trading/execution evaluates live execution trades.
     # This keeps DD protection independent between simulation and execution.
-    dd_base_trades = simulation_trades if simulation_mode_active else _dd_trades_after_manual_resume(persisted_trades, protection_state)
+    dd_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     if simulation_mode_active:
         portfolio_state = _build_simulation_portfolio_state_for_dd(
             simulation_trades,
@@ -6861,31 +6516,6 @@ def run_once(
         sync_exchange=exchange_reconcile_enabled,
         sync_exchange_stop=_final_exchange_stop_sync,
     )
-
-    # If TP2 is discovered during this update from OKX TP order state or fresh
-    # price, the previous _final_exchange_stop_sync value may have been False
-    # because it was calculated before lifecycle mutation. Run a second, narrow
-    # stop-sync pass immediately so TP2 runners get breakeven SL in the same scan.
-    _new_tp2_after_update = any(
-        bool(getattr(t, "tp2_hit", False))
-        and not bool((_before_lifecycle.get(_trade_identity_key(t)) or {}).get("tp2_hit"))
-        for t in trades
-    )
-    if (
-        _new_tp2_after_update
-        and exchange_reconcile_enabled
-        and bool(_runtime_mode_snapshot(settings).get("effective_orders_enabled", False))
-    ):
-        print("TP2_IMMEDIATE_SL_SYNC | new_tp2_detected=1 | action=breakeven_stop_sync", flush=True)
-        trades = update_open_trades(
-            list(trades),
-            price_map,
-            protection_level=protection.get("level", 0),
-            okx_client=okx_client,
-            sync_exchange=False,
-            sync_exchange_stop=True,
-        )
-
     lifecycle_notifications.extend(
         _collect_execution_lifecycle_notifications(
             _before_lifecycle,
@@ -6970,7 +6600,7 @@ def run_once(
     portfolio_state_inputs = _apply_daily_dd_manual_baseline(portfolio_state_inputs, protection_state)
     # Final Daily DD snapshot must also follow the active runtime bucket.
     # Without this, simulation DD would be calculated from execution trades.
-    dd_base_trades = simulation_trades if simulation_mode_active else _dd_trades_after_manual_resume(trades, protection_state)
+    dd_base_trades = simulation_trades if simulation_mode_active else trades
     if simulation_mode_active:
         portfolio_state = _build_simulation_portfolio_state_for_dd(
             simulation_trades,
@@ -7034,32 +6664,8 @@ def run_once(
     protection_summary = _risk_protection_summary(display_result_for_protection)
 
     execution_report_kwargs = _execution_report_balance_kwargs(portfolio_state_inputs)
-    capital_shadow_scope = _capital_shadow_scope(settings)
-    capital_shadow = _build_capital_shadow_payload(
-        signal_items,
-        settings,
-        available_slots=effective_max_positions,
-        mode_context=mode_context,
-        slot_snapshot={
-            "scope": capital_shadow_scope,
-            "balance_tier": _balance_tier_name,
-            "normal_limit": effective_max_positions,
-            "block_limit": effective_max_block_positions,
-            "recovery_limit": effective_max_recovery_positions,
-            "slot_counts": dict(slot_counts or {}),
-            "simulation_mode": bool(simulation_mode_active),
-        },
-    )
     reports = build_report_bundle(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
     command_outputs = build_command_outputs(trades, execution_results_for_reports, signal_items, **execution_report_kwargs)
-    try:
-        if isinstance(command_outputs, dict) and capital_shadow.get("ok"):
-            _capital_text = str(capital_shadow.get("dashboard_text") or capital_shadow.get("report_text") or "").strip()
-            if _capital_text:
-                command_outputs["capital_shadow"] = _capital_text
-                command_outputs[f"capital_shadow_{capital_shadow_scope}"] = _capital_text
-    except Exception as exc:
-        print(f"⚠️ CAPITAL_SHADOW_COMMAND_OUTPUT_FAILED | {exc}", flush=True)
 
     return {
         "state": state,
@@ -7107,14 +6713,6 @@ def run_once(
         "simulation_daily_log": _load_simulation_daily_log(trade_store),
         "trades": trades,
         "command_outputs": command_outputs,
-        "capital_shadow_scope": capital_shadow_scope,
-        "capital_shadow": capital_shadow,
-        "capital_shadow_execution": capital_shadow if capital_shadow_scope == "execution" else {},
-        "capital_shadow_simulation": capital_shadow if capital_shadow_scope == "simulation" else {},
-        "capital_auction_result_execution": capital_shadow.get("auction_result", {}) if capital_shadow_scope == "execution" else {},
-        "capital_auction_result_simulation": capital_shadow.get("auction_result", {}) if capital_shadow_scope == "simulation" else {},
-        "capital_dashboard_execution": capital_shadow.get("dashboard", {}) if capital_shadow_scope == "execution" else {},
-        "capital_dashboard_simulation": capital_shadow.get("dashboard", {}) if capital_shadow_scope == "simulation" else {},
         "exchange_reconcile_stats": exchange_reconcile_stats,
         "lifecycle_notifications": lifecycle_notifications,
         "simulation_command_outputs": {},
@@ -8881,13 +8479,8 @@ def _status_update_footer(result: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def _build_fast_status(
-    result: dict,
-    settings: Settings,
-    trade_store: RedisTradeStore | None = None,
-    okx_client: OKXTradeClient | None = None,
-) -> str:
-    _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
+def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
+    _refresh_runtime_scope_state(result, settings, trade_store=trade_store)
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
@@ -8952,7 +8545,7 @@ def _build_fast_status(
         f"• Live Trading: {live_status_line}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
-        f"🧪 Simulation: ON | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT" if _is_simulation_mode(settings) else "🧪 Simulation: OFF",
+        f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
         "",
         risk_block,
         "",
@@ -9895,9 +9488,8 @@ def _refresh_execution_reports_from_redis(
     result.update(reports)
 
     try:
-        refreshed_trades_for_dd = _dd_trades_after_manual_resume(refreshed_trades, protection_state)
         portfolio_state = build_portfolio_state_from_trades(
-            refreshed_trades_for_dd,
+            refreshed_trades,
             **_portfolio_state_kwargs(portfolio_state_inputs),
         )
         result["portfolio_state"] = portfolio_state
@@ -9906,7 +9498,7 @@ def _refresh_execution_reports_from_redis(
             portfolio_state,
             result["drawdown_status"],
             portfolio_state_inputs,
-            refreshed_trades_for_dd,
+            refreshed_trades,
             runtime_settings,
             trade_store=trade_store,
             label="execution_report_refresh",
@@ -10378,7 +9970,7 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
             runtime_settings = settings or get_settings()
             if not _is_simulation_mode(runtime_settings):
                 _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=runtime_settings, okx_client=okx_client)
-            _send_text(sender, _build_fast_status(result, runtime_settings, trade_store, okx_client=okx_client))
+            _send_text(sender, _build_fast_status(result, runtime_settings, trade_store))
         else:
             sender.send_message("القسم غير متاح حاليًا.")
         return
@@ -10784,7 +10376,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/status":
                 if not _is_simulation_mode(settings):
                     _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
-                reply = _build_fast_status(result, settings, trade_store, okx_client=okx_client)
+                reply = _build_fast_status(result, settings, trade_store)
             elif command == "/mood":
                 _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
                 fresh_ok, fresh_reason = _refresh_market_mode_snapshot_for_mood(result, settings, trade_store=trade_store)
@@ -11006,13 +10598,6 @@ def _maybe_send_protection_activation_alert(
                 "سيظهر هذا الوضع أيضًا في رسائل المود والـ reminders وتقارير JSON للمحاكاة والتنفيذ.",
             ]).strip(),
         ))
-
-    protection_state = result.get("protection_state") or {}
-    reset_marker = str((protection_state or {}).get("protection_alerts_reset_at") or "")
-    if reset_marker and tracker.get("protection_alerts_reset_at") != reset_marker:
-        tracker["protection_alerts_sent"] = set()
-        tracker["protection_expiry_sent"] = set()
-        tracker["protection_alerts_reset_at"] = reset_marker
 
     sent_keys = tracker.setdefault("protection_alerts_sent", set())
     if not isinstance(sent_keys, set):
