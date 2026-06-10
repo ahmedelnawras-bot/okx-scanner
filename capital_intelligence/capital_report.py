@@ -141,6 +141,81 @@ def _capital_confidence(avg_bid: float, classes: dict[str, int], candidates: int
     }
 
 
+
+_OPERATIONAL_SETUP_MARKERS = (
+    "okx_recovered",
+    "recovered_position",
+    "bot_order_restored",
+    "restored_position",
+    "manual_recovered",
+    "duplicate_closed_by_okx_repair",
+)
+
+_STRATEGY_SETUP_MARKERS = (
+    "wave_3",
+    "higher_low",
+    "retest_breakout",
+    "vwap_reclaim",
+    "support_bounce",
+    "liquidity_sweep",
+    "breakout_pullback",
+    "compression_release",
+    "sweep_reclaim",
+    "trend_continuation",
+)
+
+
+def _trade_row_family(row: dict[str, Any]) -> str:
+    """Classify report rows without changing trading decisions.
+
+    strategy: real strategy/setup candidates.
+    operational: OKX restore/recovery/sync artifacts that should not pollute
+    setup-quality analytics. Unknown rows default to strategy because Capital
+    auction candidates are normally strategy candidates.
+    """
+    setup = str(row.get("setup_type") or row.get("base_setup_type") or row.get("reporting_setup_type") or "").strip().lower()
+    mode = str(row.get("market_mode") or row.get("exchange_sync_state") or row.get("execution_status") or "").strip().lower()
+    source = str(row.get("trade_source") or row.get("tracking_bucket") or row.get("source") or "").strip().lower()
+    joined = "|".join([setup, mode, source])
+    if any(marker in joined for marker in _OPERATIONAL_SETUP_MARKERS):
+        return "operational"
+    if any(marker in setup for marker in _STRATEGY_SETUP_MARKERS):
+        return "strategy"
+    return "strategy"
+
+
+def _family_summary(rows: list[dict[str, Any]], top_n: int = 8) -> dict[str, Any]:
+    buckets = {"strategy": [], "operational": []}
+    for row in rows:
+        family = _trade_row_family(row)
+        buckets.setdefault(family, []).append(row)
+
+    out: dict[str, Any] = {}
+    for family, items in buckets.items():
+        total = sum(_safe_float(row.get("bid_score"), 0.0) for row in items)
+        classes: dict[str, int] = defaultdict(int)
+        setups: dict[str, list[float]] = defaultdict(list)
+        for row in items:
+            classes[str(row.get("trade_class") or "C")] += 1
+            setups[str(row.get("setup_type") or "unknown")].append(_safe_float(row.get("bid_score"), 0.0))
+        setup_summary = []
+        for setup, scores in setups.items():
+            setup_summary.append({
+                "setup_type": setup,
+                "count": len(scores),
+                "avg_bid": round(sum(scores) / max(1, len(scores)), 2),
+            })
+        setup_summary.sort(key=lambda item: (item["avg_bid"], item["count"]), reverse=True)
+        out[family] = {
+            "count": len(items),
+            "average_bid": round(total / max(1, len(items)), 2) if items else 0.0,
+            "classes": dict(classes),
+            "top": items[: max(1, int(top_n or 8))],
+            "setup_summary": setup_summary,
+        }
+    return out
+
+
 def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int = 8) -> dict[str, Any]:
     rows = _as_rows(result)
     if result is None:
@@ -155,6 +230,9 @@ def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int
             "top": [],
             "setup_summary": [],
             "component_summary": [],
+            "family_summary": {"strategy": {"count": 0, "average_bid": 0.0, "classes": {}, "top": [], "setup_summary": []}, "operational": {"count": 0, "average_bid": 0.0, "classes": {}, "top": [], "setup_summary": []}},
+            "strategy_candidates": 0,
+            "operational_candidates": 0,
             "a_plus_summary": {"count": 0, "avg_bid": 0.0, "top_setups": []},
             "capital_confidence": {"score": 0.0, "label": "NONE", "a_or_better_ratio": 0.0},
         }
@@ -203,6 +281,7 @@ def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int
 
     avg_bid = round(total / max(1, len(rows)), 2)
     confidence = _capital_confidence(avg_bid, dict(classes), len(rows))
+    family_summary = _family_summary(rows, top_n=top_n)
 
     return {
         "ok": True,
@@ -212,6 +291,9 @@ def build_capital_summary(result: CapitalAuctionResult | dict | None, top_n: int
         "top": rows[: max(1, int(top_n or 8))],
         "setup_summary": setup_summary,
         "component_summary": component_summary,
+        "family_summary": family_summary,
+        "strategy_candidates": int((family_summary.get("strategy") or {}).get("count", 0) or 0),
+        "operational_candidates": int((family_summary.get("operational") or {}).get("count", 0) or 0),
         "a_plus_summary": {
             "count": len(a_plus_scores),
             "avg_bid": round(sum(a_plus_scores) / max(1, len(a_plus_scores)), 2) if a_plus_scores else 0.0,
@@ -234,6 +316,7 @@ def build_capital_report_text(result: CapitalAuctionResult | dict | None, top_n:
         f"Average Bid: {_fmt(summary.get('average_bid', 0.0))}",
         "Classes: " + ", ".join(f"{k}={v}" for k, v in sorted((summary.get("classes") or {}).items())) if summary.get("classes") else "Classes: -",
         f"Confidence: {str(confidence.get('label') or 'NONE')} | Score {_fmt(confidence.get('score') or 0.0)} | A/A+ {_fmt(confidence.get('a_or_better_ratio') or 0.0)}%",
+        f"Strategy Candidates: {int(summary.get('strategy_candidates', 0) or 0)} | Operational/Recovered: {int(summary.get('operational_candidates', 0) or 0)}",
         "",
         "🏆 Top Candidates",
     ]
@@ -299,6 +382,13 @@ def build_capital_report_text(result: CapitalAuctionResult | dict | None, top_n:
         lines.extend(["", "📊 Setup Bid Average"])
         for item in setup_summary[:5]:
             lines.append(f"• {item.get('setup_type')}: avg {item.get('avg_bid')} | n={item.get('count')}")
+
+    family_summary = dict(summary.get("family_summary") or {})
+    operational = dict(family_summary.get("operational") or {})
+    if int(operational.get("count", 0) or 0) > 0:
+        lines.extend(["", "🛠️ Operational / Recovered Rows"])
+        lines.append(f"Count: {int(operational.get('count', 0) or 0)} | Avg Bid: {_fmt(operational.get('average_bid') or 0.0)}")
+        lines.append("Note: separated from strategy-quality analytics.")
 
     lines.extend(["", "Mode: Shadow only — no execution impact."])
     return "\n".join(lines)
