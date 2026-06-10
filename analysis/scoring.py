@@ -87,6 +87,12 @@ SMART_TP1_MAX_RR = 2.10
 SMART_TP2_MIN_RR = 1.90
 SMART_TP2_MAX_RR = 3.20
 
+# Effective RR guards after resistance-aware adjustments.
+# These prevent accepting trades where TP1/TP2 geometry becomes weaker
+# than the actual stop distance.
+EFFECTIVE_TP1_MIN_RR = 0.90
+EFFECTIVE_TP2_MIN_RR = 1.50
+
 
 def _safe_float(
     value: object,
@@ -1601,6 +1607,10 @@ def build_signal_candidate(
         risk_amount * rr2
     )
 
+    original_tp1 = tp1
+    original_tp2 = tp2
+    resistance_tp1_was_adjusted = False
+
     # ✅ Resistance-Aware TP1 Adjustment
     # بيستخدم resistance_4h_context المحسوب مسبقاً في main.py
     # لا يغير أي منطق تداول — فقط يعدل موقع TP1 بناءً على المقاومة
@@ -1616,13 +1626,17 @@ def build_signal_candidate(
             # نضع TP1 تحت المقاومة مباشرة بـ 0.4%
             _safe_tp1 = _r_price * 0.996
             if _safe_tp1 > entry:
+                _before_tp1 = tp1
                 tp1 = min(tp1, _safe_tp1)
+                resistance_tp1_was_adjusted = resistance_tp1_was_adjusted or tp1 < _before_tp1
 
         elif _r_status == "near":
             # مقاومة 0.75% → 2% → TP1 يتوقف قبلها بـ 0.3%
             _safe_tp1 = _r_price * 0.997
             if _safe_tp1 > entry:
+                _before_tp1 = tp1
                 tp1 = min(tp1, _safe_tp1)
+                resistance_tp1_was_adjusted = resistance_tp1_was_adjusted or tp1 < _before_tp1
 
         elif _r_status == "watch":
             # مقاومة 2% → 4% → احترازي: قلل RR قليلاً
@@ -1631,7 +1645,9 @@ def build_signal_candidate(
             if _tp1_beyond_resistance:
                 _safe_tp1 = _r_price * 0.997
                 if _safe_tp1 > entry:
+                    _before_tp1 = tp1
                     tp1 = min(tp1, _safe_tp1)
+                    resistance_tp1_was_adjusted = resistance_tp1_was_adjusted or tp1 < _before_tp1
 
         elif _r_status == "clear":
             # طريق واضح > 4% → وسّع TP1 قليلاً
@@ -1640,11 +1656,28 @@ def build_signal_candidate(
                 _wider_tp1 = entry + (risk_amount * min(rr1 * 1.12, SMART_TP1_MAX_RR))
                 tp1 = max(tp1, _wider_tp1)
 
+    actual_tp1_rr = ((tp1 - entry) / risk_amount) if risk_amount > 0 else 0.0
+    actual_tp2_rr = ((tp2 - entry) / risk_amount) if risk_amount > 0 else 0.0
+
     if (
         tp1 <= entry
         or tp2 <= tp1
         or sl >= entry
     ):
+        return None
+
+    # Hard geometry guard after resistance-aware TP1 adjustment.
+    # The old logic only checked tp1 > entry, so a nearby resistance could
+    # compress TP1 to 0.1R-0.4R while leaving a far SL. That creates bad
+    # reward/risk and pollutes TP/SL reports.
+    if actual_tp1_rr < EFFECTIVE_TP1_MIN_RR or actual_tp2_rr < EFFECTIVE_TP2_MIN_RR:
+        print(
+            f"RR_GEOMETRY_REJECT | {pair.symbol} | "
+            f"tp1_rr={actual_tp1_rr:.2f}<{EFFECTIVE_TP1_MIN_RR:.2f} | "
+            f"tp2_rr={actual_tp2_rr:.2f}<{EFFECTIVE_TP2_MIN_RR:.2f} | "
+            f"risk_pct={risk_pct:.2f} | r_status={_r_status or '-'} | r_dist={_r_distance:.2f}",
+            flush=True,
+        )
         return None
 
     quality_meta = (
@@ -1843,14 +1876,16 @@ def build_signal_candidate(
                 pa_score_context.get("pa_score_flags"),
 
             # ✅ Resistance-Aware TP1 — للتتبع والـ AI export
-            "resistance_tp1_adjusted": bool(
-                _r_status in {"very_near", "near", "watch"}
-                and _r_price > entry
-                and _r_distance > 0
-            ),
+            "resistance_tp1_adjusted": bool(resistance_tp1_was_adjusted),
             "resistance_tp1_status": _r_status or None,
             "resistance_tp1_distance_pct": _r_distance or None,
             "resistance_tp1_price": _r_price or None,
+            "original_tp1_before_resistance": round(original_tp1, 8),
+            "original_tp2_before_resistance": round(original_tp2, 8),
+            "actual_tp1_rr_after_adjust": round(actual_tp1_rr, 4),
+            "actual_tp2_rr_after_adjust": round(actual_tp2_rr, 4),
+            "effective_tp1_min_rr": EFFECTIVE_TP1_MIN_RR,
+            "effective_tp2_min_rr": EFFECTIVE_TP2_MIN_RR,
 
             # ✅ Raw candles للـ candle reversal gate في execution layer فقط
             # لا يأثر على الـ score أو الـ ranking أو أي منطق حالي
