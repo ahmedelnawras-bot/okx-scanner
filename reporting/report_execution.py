@@ -88,6 +88,39 @@ def _rejected_checks(execution_results: list[dict]) -> list[dict]:
     return [r for r in execution_results if _is_rejected_status(r.get("status"))]
 
 
+
+def _looks_like_simulation_report_title(title: str | None) -> bool:
+    text = str(title or "").lower()
+    return bool("simulation" in text or "محاك" in text or "virtual" in text)
+
+
+def _normalize_behavior_summary_lines_for_report(
+    summary_lines: list[str],
+    opened: list[TrackedTrade],
+    *,
+    label: str = "Execution Behavior Summary",
+) -> list[str]:
+    """Keep Behavior Summary consistent with the Open Trades section.
+
+    The shared behavior_summary_lines() helper can be reused by execution and
+    simulation reports. In some runtime paths it may print Total Floating PnL
+    from a broader/stale trade set, while the Open Trades section correctly
+    uses only currently-open tracked trades. This function is display-only: it
+    does not mutate trades, lifecycle, TP/SL, OKX orders, or wallet accounting.
+    """
+    fixed: list[str] = []
+    open_total = sum(trade_effective_pnl(t) for t in opened or [])
+    for line in list(summary_lines or []):
+        text = str(line)
+        if "Execution Behavior Summary" in text and label != "Execution Behavior Summary":
+            text = text.replace("Execution Behavior Summary", label)
+        if "Total Floating PnL:" in text:
+            prefix = "⚡ " if text.lstrip().startswith("⚡") else ""
+            text = f"{prefix}Total Floating PnL: {open_total:+.2f}%"
+        fixed.append(text)
+    return fixed
+
+
 def build_execution_period_table(
     execution_results: list[dict],
     trades: list[TrackedTrade] | None = None,
@@ -200,8 +233,12 @@ def build_execution_report(
             "• ده يعني إن أرقام Gate Pass و Rejected هي سجل checks، بينما Open/Closed تأتي فقط من trade tracking.",
         ])
 
+    behavior_label = "Simulation Behavior Summary" if _looks_like_simulation_report_title(title) else "Execution Behavior Summary"
+
     lines.extend([SEP, *wallet_impact_lines(trades, starting_balance=starting_balance, margin_per_trade=margin_per_trade, title="Wallet Impact")])
-    lines.extend([SEP, *behavior_summary_lines(trades, label="Execution Behavior Summary")])
+    behavior_lines = behavior_summary_lines(trades, label=behavior_label)
+    behavior_lines = _normalize_behavior_summary_lines_for_report(behavior_lines, opened, label=behavior_label)
+    lines.extend([SEP, *behavior_lines])
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
