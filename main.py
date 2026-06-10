@@ -1853,7 +1853,54 @@ def _position_row_price(row: dict, *keys: str) -> float:
     return 0.0
 
 
-def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None):
+def _read_okx_detected_tp_sl_for_position(
+    okx_client: OKXTradeClient | None,
+    inst_id: str,
+    entry: float,
+) -> dict:
+    """Read exchange-side TP/SL for recovered/manual OKX positions.
+
+    Display/recovery only:
+    - does not create, amend, cancel, or manage orders;
+    - prevents fake TP values like entry*999 from appearing in reports;
+    - lets manual OKX positions show real TP/SL when such orders exist.
+    """
+    if okx_client is None or not hasattr(okx_client, "get_position_protection_orders"):
+        return {"ok": False, "reason": "protection_reader_unavailable", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
+    try:
+        protection = okx_client.get_position_protection_orders(inst_id, entry_price=float(entry or 0.0), pos_side="long")
+    except Exception as exc:
+        return {"ok": False, "reason": f"protection_reader_exception:{exc}", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
+
+    if not isinstance(protection, dict):
+        return {"ok": False, "reason": "protection_reader_bad_response", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
+
+    tp1_row = protection.get("tp1") or {}
+    tp2_row = protection.get("tp2") or {}
+    sl_row = protection.get("sl") or {}
+    tp1 = _safe_float((tp1_row or {}).get("price"), 0.0) if isinstance(tp1_row, dict) else 0.0
+    tp2 = _safe_float((tp2_row or {}).get("price"), 0.0) if isinstance(tp2_row, dict) else 0.0
+    sl = _safe_float((sl_row or {}).get("price"), 0.0) if isinstance(sl_row, dict) else 0.0
+    return {
+        "ok": bool(protection.get("ok")),
+        "reason": str(protection.get("reason") or ""),
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
+        "tp1_row": tp1_row if isinstance(tp1_row, dict) else {},
+        "tp2_row": tp2_row if isinstance(tp2_row, dict) else {},
+        "sl_row": sl_row if isinstance(sl_row, dict) else {},
+        "raw": protection,
+    }
+
+
+def _is_placeholder_recovered_target(value: object, entry: float) -> bool:
+    price = _safe_float(value, 0.0)
+    entry_value = _safe_float(entry, 0.0)
+    return bool(price > 0 and entry_value > 0 and price >= entry_value * 100.0)
+
+
+def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None, okx_client: OKXTradeClient | None = None):
     """Build a conservative TrackedTrade for a live OKX position missing from Redis.
 
     This is a recovery layer, not a strategy entry. It exists so execution reports,
@@ -1888,15 +1935,22 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     cached_sl = _safe_float(recovery_meta.get("sl"), 0.0)
     cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0)
     cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0)
+    detected = _read_okx_detected_tp_sl_for_position(okx_client, inst_id, entry) if not recovery_meta else {"ok": False, "reason": "using_recent_bot_metadata", "tp1": 0.0, "tp2": 0.0, "sl": 0.0}
+    detected_sl = _safe_float(detected.get("sl"), 0.0)
+    detected_tp1 = _safe_float(detected.get("tp1"), 0.0)
+    detected_tp2 = _safe_float(detected.get("tp2"), 0.0)
+    resolved_sl = cached_sl if cached_sl > 0 else detected_sl
+    resolved_tp1 = cached_tp1 if cached_tp1 > 0 else detected_tp1
+    resolved_tp2 = cached_tp2 if cached_tp2 > 0 else detected_tp2
     pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
     trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
 
     trade = TrackedTrade(
         symbol=inst_id,
         entry=float(entry),
-        sl=float(cached_sl) if cached_sl > 0 else 0.0,
-        tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
-        tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
+        sl=float(resolved_sl) if resolved_sl > 0 else 0.0,
+        tp1=float(resolved_tp1) if resolved_tp1 > 0 else 0.0,
+        tp2=float(resolved_tp2) if resolved_tp2 > 0 else 0.0,
         setup_type="bot_order_restored_position" if recovery_meta else "okx_recovered_position",
         market_mode="BOT_ORDER_RESTORED" if recovery_meta else "RECOVERED_FROM_OKX",
         score=0.0,
@@ -1926,6 +1980,19 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "same_symbol_block_exempt", False)
     _safe_set_trade_attr(trade, "blocks_same_symbol_reentry", True)
     _safe_set_trade_attr(trade, "target_model", "bot_order_restored" if recovery_meta else "recovered_okx_position")
+    _safe_set_trade_attr(trade, "manual_exchange_position", not bool(recovery_meta))
+    _safe_set_trade_attr(trade, "exchange_tp_sl_detected", bool(resolved_sl > 0 or resolved_tp1 > 0 or resolved_tp2 > 0))
+    _safe_set_trade_attr(trade, "exchange_tp_sl_reason", detected.get("reason") if isinstance(detected, dict) else "")
+    _safe_set_trade_attr(trade, "exchange_tp1_order_id", ((detected.get("tp1_row") or {}).get("order_id") or (detected.get("tp1_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
+    _safe_set_trade_attr(trade, "exchange_tp2_order_id", ((detected.get("tp2_row") or {}).get("order_id") or (detected.get("tp2_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
+    _safe_set_trade_attr(trade, "exchange_sl_order_id", ((detected.get("sl_row") or {}).get("order_id") or (detected.get("sl_row") or {}).get("algo_id")) if isinstance(detected, dict) else "")
+    if not bool(resolved_sl > 0 or resolved_tp1 > 0 or resolved_tp2 > 0):
+        _safe_set_trade_attr(trade, "management_status", "unmanaged_no_exchange_tp_sl")
+        _safe_set_trade_attr(trade, "lifecycle_price_detection_disabled", True)
+        _safe_set_trade_attr(trade, "tp_sl_display_status", "No exchange TP/SL detected")
+    else:
+        _safe_set_trade_attr(trade, "management_status", "exchange_tp_sl_detected")
+        _safe_set_trade_attr(trade, "tp_sl_display_status", "Exchange TP/SL detected")
     _safe_set_trade_attr(trade, "tp1_close_pct", 30.0)
     _safe_set_trade_attr(trade, "tp2_close_pct", 50.0)
     _safe_set_trade_attr(trade, "runner_close_pct", 20.0)
@@ -2029,7 +2096,7 @@ def _recover_missing_execution_trades_from_okx_positions(
                 f"remaining={grace_remaining}s | reason=report_status_hard_recovery",
                 flush=True,
             )
-        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings, okx_client=okx_client)
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
@@ -2267,7 +2334,7 @@ def _repair_execution_trades_from_live_okx_positions(
 
         imported = False
         if target is None:
-            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings, okx_client=okx_client)
             if target is None:
                 print(f"OKX_POSITION_REPAIR_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
                 continue
@@ -2336,10 +2403,16 @@ def _repair_execution_trades_from_live_okx_positions(
         if leverage > 0:
             _safe_set_trade_attr(target, "effective_leverage", leverage)
             _safe_set_trade_attr(target, "actual_leverage", leverage)
-        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp1", float(entry) * 999.0)
-        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp2", float(entry) * 999.0)
+        # Do not invent placeholder TP values for recovered/manual OKX positions.
+        # If the exchange has no visible TP/SL orders, reports should show that
+        # explicitly instead of fake targets such as entry*999.
+        if _is_placeholder_recovered_target(getattr(target, "tp1", 0.0), entry):
+            _safe_set_trade_attr(target, "tp1", 0.0)
+        if _is_placeholder_recovered_target(getattr(target, "tp2", 0.0), entry):
+            _safe_set_trade_attr(target, "tp2", 0.0)
+        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and _safe_float(getattr(target, "sl", 0.0), 0.0) <= 0:
+            _safe_set_trade_attr(target, "management_status", "unmanaged_no_exchange_tp_sl")
+            _safe_set_trade_attr(target, "tp_sl_display_status", "No exchange TP/SL detected")
 
         after_state = {
             "execution_trade": bool(getattr(target, "execution_trade", False)),
