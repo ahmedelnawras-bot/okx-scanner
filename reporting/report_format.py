@@ -71,19 +71,33 @@ def trade_margin_usdt(
 ) -> float:
     """Return the margin that belonged to this specific trade.
 
+    Critical Simulation rule:
+    Simulation reports must use the same paper-wallet margin used by
+    Simulation Daily Balance. Old simulation records can carry both
+    used_margin_usdt and simulation_margin_usdt with different values; if the
+    report prefers used_margin_usdt while the wallet snapshot prefers
+    simulation_margin_usdt, Daily Balance and Wallet Impact diverge.
+
     Priority:
-    1) used_margin_usdt            -> live/execution trade margin
-    2) simulation_margin_usdt      -> simulation trade margin
-    3) margin_usdt                 -> legacy/export aliases
-    4) fallback                    -> backward compatibility only
+    - Simulation records: simulation_margin_usdt first.
+    - Execution/live records: used_margin_usdt first.
+    - Then legacy aliases and fallback.
     """
 
-    for attr in (
-        "used_margin_usdt",
-        "simulation_margin_usdt",
-        "margin_usdt",
-        "allocated_margin_usdt",
-    ):
+    try:
+        trade_source = str(getattr(t, "trade_source", "") or "").strip().lower()
+        bucket = str(getattr(t, "tracking_bucket", "") or "").strip().lower()
+        is_simulation = bool(trade_source == "simulation" or bucket == "simulation")
+    except Exception:
+        is_simulation = False
+
+    attrs = (
+        ("simulation_margin_usdt", "used_margin_usdt", "margin_usdt", "allocated_margin_usdt")
+        if is_simulation
+        else ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt")
+    )
+
+    for attr in attrs:
         try:
             value = float(getattr(t, attr, 0.0) or 0.0)
         except Exception:
