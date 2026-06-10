@@ -273,6 +273,103 @@ def _sync_stop_loss_to_exchange(trade: TrackedTrade, okx_client: Any) -> Tracked
     return trade
 
 
+
+_TP_FILLED_STATES = {
+    "filled",
+    "fully_filled",
+    "complete",
+    "completed",
+}
+
+
+def _is_exchange_order_filled_state(state: Any) -> bool:
+    text = str(state or "").strip().lower()
+    return text in _TP_FILLED_STATES or "filled" in text and "partial" not in text
+
+
+def _ensure_tp2_runner_protection(trade: TrackedTrade, *, reason: str = "tp2_exchange_filled") -> TrackedTrade:
+    """Make TP2 lifecycle effects explicit and idempotent.
+
+    OKX reduce-only TP orders can fill between bot scans. Price-based lifecycle
+    may miss the exact touch if price returns below TP2 before the next scan.
+    Once the exchange reports TP2 filled, the trade must become a protected
+    runner immediately: slot released, same-symbol re-entry allowed, and SL
+    target promoted to at least entry for exchange sync.
+    """
+    now = datetime.now(timezone.utc)
+    entry = _safe_float(getattr(trade, "entry", 0.0), 0.0)
+    tp1 = _safe_float(getattr(trade, "tp1", 0.0), 0.0)
+    tp2 = _safe_float(getattr(trade, "tp2", 0.0), 0.0)
+    current = _safe_float(getattr(trade, "current_price", 0.0), 0.0)
+
+    if tp1 > 0:
+        _safe_setattr(trade, "tp1_hit", True)
+        if not getattr(trade, "tp1_hit_at", None):
+            _safe_setattr(trade, "tp1_hit_at", now)
+    if tp2 > 0:
+        _safe_setattr(trade, "tp2_hit", True)
+        if not getattr(trade, "tp2_hit_at", None):
+            _safe_setattr(trade, "tp2_hit_at", now)
+        _safe_setattr(trade, "highest_price", max(_safe_float(getattr(trade, "highest_price", 0.0), 0.0), tp2, current))
+    else:
+        _safe_setattr(trade, "tp2_hit", True)
+        if not getattr(trade, "tp2_hit_at", None):
+            _safe_setattr(trade, "tp2_hit_at", now)
+
+    # Runner/slot semantics agreed in main.py: TP2 releases the entry slot.
+    _safe_setattr(trade, "runner_active", True)
+    _safe_setattr(trade, "protected_runner", True)
+    _safe_setattr(trade, "has_open_runner", True)
+    _safe_setattr(trade, "status", "runner")
+    _safe_setattr(trade, "slot_exempt", True)
+    _safe_setattr(trade, "daily_open_risk_exempt", True)
+    _safe_setattr(trade, "same_symbol_block_exempt", True)
+    _safe_setattr(trade, "blocks_same_symbol_reentry", False)
+    _safe_setattr(trade, "counts_as_active_slot", False)
+    _safe_setattr(trade, "slot_exempt_reason", "tp2_protected_runner")
+
+    # Promote desired exchange SL to breakeven. _sync_stop_loss_to_exchange()
+    # uses max(protected_sl, sl), so this is the single desired-SL source.
+    if entry > 0:
+        current_protected = _safe_float(getattr(trade, "protected_sl", 0.0), 0.0)
+        if current_protected < entry:
+            _safe_setattr(trade, "protected_sl", entry)
+        _safe_setattr(trade, "breakeven_sl", entry)
+        _safe_setattr(trade, "tp2_breakeven_required", True)
+
+    _safe_setattr(trade, "exchange_tp_lifecycle_reason", reason)
+    _safe_setattr(trade, "exchange_sync_state", reason)
+    _safe_setattr(trade, "updated_at", now)
+    return trade
+
+
+def _apply_exchange_tp_fills_to_lifecycle(trade: TrackedTrade) -> TrackedTrade:
+    """Convert OKX TP order fill states into local lifecycle flags.
+
+    This bridges the gap between exchange truth and price polling. Without it,
+    a reduce-only TP2 order can fill on OKX while Redis still says tp2_hit=False,
+    so SL is not moved and the slot stays occupied.
+    """
+    tp1_state = str(getattr(trade, "tp1_exchange_state", "") or "").strip().lower()
+    tp2_state = str(getattr(trade, "tp2_exchange_state", "") or "").strip().lower()
+
+    if _is_exchange_order_filled_state(tp1_state):
+        _safe_setattr(trade, "tp1_hit", True)
+        if not getattr(trade, "tp1_hit_at", None):
+            _safe_setattr(trade, "tp1_hit_at", datetime.now(timezone.utc))
+        _safe_setattr(trade, "exchange_tp1_fill_detected", True)
+
+    if _is_exchange_order_filled_state(tp2_state):
+        _safe_setattr(trade, "exchange_tp2_fill_detected", True)
+        trade = _ensure_tp2_runner_protection(trade, reason="tp2_filled_on_exchange")
+
+    # Idempotent repair for old records that already have tp2_hit=True but are
+    # still consuming slots or blocking re-entry after Redis/report recovery.
+    if bool(getattr(trade, "tp2_hit", False)):
+        trade = _ensure_tp2_runner_protection(trade, reason=str(getattr(trade, "exchange_sync_state", "") or "tp2_runner_state_repaired"))
+
+    return trade
+
 def _is_recovered_trade(trade: TrackedTrade) -> bool:
     """Return True for trades imported from OKX without original order IDs."""
     market_mode = str(getattr(trade, "market_mode", "") or "").upper()
@@ -393,8 +490,10 @@ def update_open_trades(
 
         if sync_exchange and okx_client is not None:
             trade = _sync_trade_with_exchange(trade, okx_client)
+            trade = _apply_exchange_tp_fills_to_lifecycle(trade)
 
         trade = update_trade_with_price(trade, current_price, protection_level=protection_level)
+        trade = _apply_exchange_tp_fills_to_lifecycle(trade)
 
         if sync_exchange and sync_exchange_stop and okx_client is not None:
             trade = _sync_stop_loss_to_exchange(trade, okx_client)
