@@ -296,6 +296,7 @@ def build_capital_dashboard_text(
         "",
         "💰 Current Bid Quality",
         f"Candidates: <code>{_safe_int(scan.get('candidates'), 0)}</code>",
+        f"Strategy: <code>{_safe_int(scan.get('strategy_candidates'), 0)}</code> | Operational/Recovered: <code>{_safe_int(scan.get('operational_candidates'), 0)}</code>",
         f"Average Bid: <code>{_fmt(scan.get('average_bid'), 2)}</code>",
         "Classes: " + (", ".join(f"{k}={v}" for k, v in sorted(classes.items())) if classes else "-"),
     ]
@@ -359,6 +360,13 @@ def build_capital_dashboard_text(
         worst = regret.get("worst_selected") or regret.get("worst_acceptance")
         if isinstance(worst, dict):
             lines.append(f"Worst Selected: <b>{worst.get('symbol', '-')}</b> | Bid <code>{_fmt(worst.get('bid_score') or worst.get('bid'), 2)}</code>")
+
+    family_summary = dict(scan.get("family_summary") or {})
+    operational = dict(family_summary.get("operational") or {})
+    if int(operational.get("count", 0) or 0) > 0:
+        lines.extend(["", "🛠️ Operational / Recovered Rows"])
+        lines.append(f"Count: <code>{_safe_int(operational.get('count'), 0)}</code> | Avg Bid <code>{_fmt(operational.get('average_bid'), 2)}</code>")
+        lines.append("Separated from strategy-quality analytics.")
 
     lines.extend([
         "",
