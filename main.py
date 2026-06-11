@@ -9131,6 +9131,22 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
+    # Display-only wallet truth by runtime mode.
+    # In execution, hide the simulation wallet value so it cannot be confused with
+    # OKX capital/sizing. In simulation, show the virtual wallet only.
+    if simulation_active:
+        simulation_equity = _safe_float((result.get("simulation_wallet") or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
+        runtime_wallet_lines = [
+            f"🧪 Simulation: ON | Wallet={simulation_equity:.2f} USDT",
+        ]
+    else:
+        okx_balance = _safe_float(risk_profile.get("reference_balance_usdt"), 0.0)
+        runtime_wallet_lines = [
+            "🧪 Simulation: OFF",
+            "🧪 Simulation Wallet: hidden in execution mode",
+            f"💰 OKX Balance: {okx_balance:.2f} USDT",
+        ]
+
     # Build Balance Tier line outside nested f-strings to avoid quote parsing issues.
     try:
         _portfolio_inputs = result.get("portfolio_state_inputs") or {}
@@ -9170,7 +9186,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"• Live Trading: {live_status_line}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
-        f"🧪 Simulation: {'ON' if _is_simulation_mode(settings) else 'OFF'} | Wallet={result.get('simulation_wallet', {}).get('equity', SIMULATION_START_BALANCE_USDT):.2f} USDT",
+        *runtime_wallet_lines,
         "",
         risk_block,
         "",
