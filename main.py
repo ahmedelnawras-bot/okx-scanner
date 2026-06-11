@@ -5173,7 +5173,8 @@ def _simulation_equity_from_trades(
     start_balance: float = SIMULATION_START_BALANCE_USDT,
 ) -> float:
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
-    for trade in sim_trades or []:
+    groups = _simulation_report_visible_trade_sets(sim_trades)
+    for trade in [*groups.get("closed", []), *groups.get("floating", [])]:
         margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
@@ -5191,6 +5192,54 @@ def _simulation_trade_effective_pnl_for_sanity(trade) -> float:
             return float(_trade_effective_pnl_pct(trade) or 0.0)
         except Exception:
             return 0.0
+
+
+def _simulation_report_visible_trade_sets(sim_trades: list | None) -> dict:
+    """Return the same Simulation trade groups used by /report_simulation.
+
+    Surgical accounting rule:
+    Simulation Daily Balance, wallet snapshot, DD, and /report_simulation must
+    not use different open-trade universes. The report module already separates
+    real active/runner exposure from legacy simulation records; the wallet must
+    use the same visible floating exposure so hidden legacy rows cannot inflate
+    Daily Floating while the lower report shows only 8 open trades.
+
+    This is Simulation-only accounting hygiene. It does not mutate Redis, OKX,
+    execution trades, TP/SL, scoring, or order placement.
+    """
+    source = list(sim_trades or [])
+    try:
+        from reporting import report_simulation as _sim_report
+
+        scoped = _sim_report._simulation_scope_trades(source)
+        floating = _sim_report._simulation_floating_trades(scoped)
+        closed = closed_trades(scoped)
+        visible_ids = {id(t) for t in [*floating, *closed]}
+        ignored = [t for t in scoped if id(t) not in visible_ids]
+        return {
+            "scoped": scoped,
+            "closed": list(closed),
+            "floating": list(floating),
+            "ignored": ignored,
+            "source": "report_simulation_visible_scope",
+        }
+    except Exception as exc:
+        # Safe fallback keeps the bot bootable if report_simulation private helpers
+        # are unavailable during deploy. It is deliberately conservative and uses
+        # the old all-nonclosed behavior only as a last resort.
+        try:
+            print(f"⚠️ SIM_VISIBLE_SCOPE_FALLBACK | {exc}", flush=True)
+        except Exception:
+            pass
+        closed = [t for t in source if _is_trade_closed(t)]
+        floating = [t for t in source if not _is_trade_closed(t)]
+        return {
+            "scoped": source,
+            "closed": closed,
+            "floating": floating,
+            "ignored": [],
+            "source": "fallback_nonclosed_scope",
+        }
 
 
 def _sanitize_simulation_trade_record(trade, settings: Settings | None = None, *, source: str = "load"):
@@ -5606,29 +5655,49 @@ def _money_from_pct(pct: float, margin: float = 35.0) -> float:
 
 
 def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = SIMULATION_START_BALANCE_USDT) -> dict:
-    """Build a simple virtual wallet snapshot from simulation trades.
+    """Build the virtual Simulation wallet from report-visible exposure only.
 
-    This uses the same lifecycle PnL fields produced by update_open_trades.
-    Each trade is assumed to use the configured paper margin if available,
-    falling back to 35 USDT. The wallet itself starts at 1000 USDT.
+    The previous implementation summed every non-closed simulation Redis row as
+    floating exposure. After legacy rows accumulated, the top Daily Balance could
+    show +600$ floating while /report_simulation displayed only 8 visible open
+    trades with about +30$ floating. The wallet now uses the same visible scope
+    as report_simulation: closed history + active open slots + protected runners;
+    legacy/non-active rows are ignored for wallet equity.
     """
     sim_trades = _sanitize_simulation_trade_records(list(sim_trades or []), settings=None, source="wallet_snapshot")
-    open_trades = [t for t in sim_trades or [] if not _is_trade_closed(t)]
-    closed_trades = [t for t in sim_trades or [] if _is_trade_closed(t)]
+    groups = _simulation_report_visible_trade_sets(sim_trades)
+    floating_trades = list(groups.get("floating", []) or [])
+    closed_trades_list = list(groups.get("closed", []) or [])
+    ignored_trades = list(groups.get("ignored", []) or [])
 
     realized = 0.0
     floating = 0.0
-    for trade in sim_trades or []:
+    for trade in closed_trades_list:
         margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
         except Exception:
             pct = _trade_effective_pnl_pct(trade)
-        usd = _money_from_pct(pct, margin=margin)
-        if _is_trade_closed(trade):
-            realized += usd
-        else:
-            floating += usd
+        realized += _money_from_pct(pct, margin=margin)
+
+    for trade in floating_trades:
+        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
+        try:
+            pct = _report_trade_effective_pnl(trade)
+        except Exception:
+            pct = _trade_effective_pnl_pct(trade)
+        floating += _money_from_pct(pct, margin=margin)
+
+    if ignored_trades:
+        try:
+            print(
+                "SIM_WALLET_VISIBLE_SCOPE | "
+                f"floating={len(floating_trades)} | closed={len(closed_trades_list)} | "
+                f"ignored_legacy={len(ignored_trades)} | source={groups.get('source')}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT) + realized + floating
     if _simulation_wallet_equity_is_corrupted(equity, start_balance):
@@ -5645,9 +5714,11 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
         "equity": equity,
         "realized": realized,
         "floating": floating,
-        "open_count": len(open_trades),
-        "closed_count": len(closed_trades),
+        "open_count": len(floating_trades),
+        "closed_count": len(closed_trades_list),
+        "ignored_legacy_count": len(ignored_trades),
         "total_count": len(sim_trades or []),
+        "wallet_scope": str(groups.get("source") or "report_simulation_visible_scope"),
     }
 
 
