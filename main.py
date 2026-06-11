@@ -45,7 +45,55 @@ except Exception:
 from risk.portfolio_state import build_portfolio_state_from_trades
 from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
 from tracking.trade_registry import register_trade
-from tracking.open_trades_updater import update_open_trades
+try:
+    from tracking.open_trades_updater import update_open_trades
+except Exception as _open_trades_updater_import_exc:
+    print(
+        f"⚠️ OPEN_TRADES_UPDATER_IMPORT_FAILED | using emergency fallback | {_open_trades_updater_import_exc}",
+        flush=True,
+    )
+
+    def update_open_trades(
+        trades,
+        price_map,
+        protection_level=0,
+        okx_client=None,
+        sync_exchange=False,
+        sync_exchange_stop=False,
+    ):
+        """Emergency fallback only used if tracking.open_trades_updater cannot import.
+
+        Keeps the bot bootable and updates lifecycle from exact price_map symbols.
+        Exchange reconciliation/SL write-back is intentionally disabled in fallback
+        to avoid accidental OKX writes when the real updater module is broken.
+        """
+        try:
+            from tracking.lifecycle import update_trade_with_price as _fallback_update_trade_with_price
+        except Exception as exc:
+            print(f"❌ OPEN_TRADES_UPDATER_FALLBACK_FAILED | lifecycle import | {exc}", flush=True)
+            return list(trades or [])
+
+        updated = []
+        for trade in trades or []:
+            try:
+                symbol = str(getattr(trade, "symbol", "") or "")
+                entry = float(getattr(trade, "entry", 0.0) or 0.0)
+                previous = float(getattr(trade, "current_price", 0.0) or entry)
+                current_price = float(price_map.get(symbol, previous or entry))
+                updated.append(
+                    _fallback_update_trade_with_price(
+                        trade,
+                        current_price,
+                        protection_level=protection_level,
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"⚠️ OPEN_TRADES_UPDATER_FALLBACK_TRADE_FAILED | {getattr(trade, 'symbol', '?')} | {exc}",
+                    flush=True,
+                )
+                updated.append(trade)
+        return updated
 from tracking.persistence import RedisTradeStore, trade_to_dict, trade_from_dict
 from tracking.models import TrackedTrade
 from reporting.report_router import build_report_bundle, build_command_outputs
@@ -104,12 +152,25 @@ SYMBOL_PULLBACK_DEDUP_TTL_SECONDS = 60 * 60
 SYMBOL_EXECUTION_DEDUP_TTL_SECONDS = 2 * 60 * 60
 SYMBOL_TRADING_SAME_SYMBOL_DEDUP_TTL_SECONDS = 5 * 60
 
-# Low Balance Mode
-# لو الرصيد أقل من الحد → allocation أكبر وعدد slots أقل.
-# Block Exception و Recovery استثناء — بيفضلوا على حدودهم الأصلية.
+# Balance-tier sizing for NORMAL entries only.
+# Block Exception و Recovery عندهم slots منفصلة خارج normal slots.
+# <109      → normal=3  | block=1 | recovery=1 | allocation=40%
+# 109-240   → normal=4  | block=1 | recovery=1 | allocation=40%
+# >=240     → normal=7  | block=3 | recovery=3 | allocation=30%
 LOW_BALANCE_THRESHOLD_USDT: float = 109.0
+MID_BALANCE_THRESHOLD_USDT: float = 240.0
 LOW_BALANCE_ALLOCATION_PCT: float = 40.0
+MID_BALANCE_ALLOCATION_PCT: float = 40.0
+MATURE_BALANCE_ALLOCATION_PCT: float = 30.0
 LOW_BALANCE_MAX_SLOTS: int = 3
+MID_BALANCE_MAX_SLOTS: int = 4
+MATURE_BALANCE_MAX_SLOTS: int = 7
+LOW_BALANCE_BLOCK_SLOTS: int = 1
+LOW_BALANCE_RECOVERY_SLOTS: int = 1
+MID_BALANCE_BLOCK_SLOTS: int = 1
+MID_BALANCE_RECOVERY_SLOTS: int = 1
+MATURE_BALANCE_BLOCK_SLOTS: int = 3
+MATURE_BALANCE_RECOVERY_SLOTS: int = 3
 
 # Live execution hard guard: never send OKX orders when planned margin is too small
 # to survive OKX lot/min-size normalization. This prevents normalized_size_zero
@@ -139,6 +200,17 @@ SIMULATION_EXEC_CHECKS_LIST = f"{SIMULATION_REDIS_PREFIX}:execution:checks"
 SIMULATION_DAILY_BALANCE_HASH = f"{SIMULATION_REDIS_PREFIX}:daily_balance"
 SIMULATION_BALANCE_STATE_KEY = f"{SIMULATION_REDIS_PREFIX}:wallet:state"
 SIMULATION_ALLOCATION_PCT = 24.0
+
+# Simulation wallet sanity.
+# A corrupted Redis simulation wallet can compound into huge virtual balances
+# because future simulated margins are derived from wallet equity. Keep accounting
+# anchored to the intended paper account unless explicitly overridden.
+SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER = 10.0
+SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER = 0.10
+# Simulation report/trade sanity. Corrupted Redis simulation history must never
+# be allowed to dominate reports or re-seed the virtual wallet.
+SIMULATION_TRADE_MAX_EFFECTIVE_PNL_PCT = 1000.0
+SIMULATION_TRADE_MAX_AGE_DAYS = 90
 
 # Execution Daily Baseline
 # Position sizing uses the current OKX balance, but Daily DD uses a daily
@@ -304,9 +376,44 @@ def _extract_okx_reference_balance_usdt(balance_response: dict | None) -> float:
     return total
 
 
+def _balance_tier_limits(reference_balance: float = 0.0, settings: Settings | None = None) -> dict:
+    """Return balance-tier limits while keeping Block/Recovery outside normal slots."""
+    balance = _safe_float(reference_balance, 0.0)
+
+    if 0 < balance < LOW_BALANCE_THRESHOLD_USDT:
+        return {
+            "tier": "low_balance",
+            "label": f"<{LOW_BALANCE_THRESHOLD_USDT:.0f}",
+            "allocation_pct": LOW_BALANCE_ALLOCATION_PCT,
+            "normal_slots": LOW_BALANCE_MAX_SLOTS,
+            "block_slots": LOW_BALANCE_BLOCK_SLOTS,
+            "recovery_slots": LOW_BALANCE_RECOVERY_SLOTS,
+        }
+
+    if 0 < balance < MID_BALANCE_THRESHOLD_USDT:
+        return {
+            "tier": "mid_balance",
+            "label": f"{LOW_BALANCE_THRESHOLD_USDT:.0f}-{MID_BALANCE_THRESHOLD_USDT:.0f}",
+            "allocation_pct": MID_BALANCE_ALLOCATION_PCT,
+            "normal_slots": MID_BALANCE_MAX_SLOTS,
+            "block_slots": MID_BALANCE_BLOCK_SLOTS,
+            "recovery_slots": MID_BALANCE_RECOVERY_SLOTS,
+        }
+
+    mature_slots = max(1, int(getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS)) if settings is not None else MATURE_BALANCE_MAX_SLOTS
+    return {
+        "tier": "mature_balance",
+        "label": f">={MID_BALANCE_THRESHOLD_USDT:.0f}",
+        "allocation_pct": MATURE_BALANCE_ALLOCATION_PCT,
+        "normal_slots": mature_slots,
+        "block_slots": MATURE_BALANCE_BLOCK_SLOTS,
+        "recovery_slots": MATURE_BALANCE_RECOVERY_SLOTS,
+    }
+
+
 def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -> tuple[float, int]:
-    allocation_pct = 24.0
-    slot_count = max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
+    allocation_pct = MATURE_BALANCE_ALLOCATION_PCT
+    slot_count = max(1, int(getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS))
 
     if risk_manager_module is not None:
         allocation_pct = _safe_float(getattr(risk_manager_module, "max_portion_pct", allocation_pct), allocation_pct)
@@ -315,11 +422,12 @@ def _risk_sizing_constants(settings: Settings, reference_balance: float = 0.0) -
             int(getattr(risk_manager_module, "max_positions_total_normal_strong", slot_count) or slot_count),
         )
 
-    # Low Balance Mode — رصيد أقل من الحد → allocation أعلى وعدد slots أقل.
-    # Block Exception و Recovery استثناء ومش بيتأثروا هنا.
-    if 0 < float(reference_balance or 0.0) < LOW_BALANCE_THRESHOLD_USDT:
-        allocation_pct = LOW_BALANCE_ALLOCATION_PCT
-        slot_count = LOW_BALANCE_MAX_SLOTS
+    # Balance tiers apply only when a real reference balance is available.
+    # Block Exception و Recovery استثناء مستقلين ويتحسبوا في _balance_tier_limits.
+    if float(reference_balance or 0.0) > 0:
+        tier = _balance_tier_limits(reference_balance, settings)
+        allocation_pct = _safe_float(tier.get("allocation_pct"), allocation_pct)
+        slot_count = max(1, int(tier.get("normal_slots") or slot_count))
 
     return allocation_pct, slot_count
 
@@ -524,6 +632,17 @@ def _refresh_runtime_scope_state(
         portfolio_state = build_portfolio_state_from_trades(exec_trades, **_portfolio_state_kwargs(inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            inputs,
+            exec_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="runtime_scope",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     except Exception as exc:
         print(f"⚠️ runtime scope execution portfolio refresh failed: {exc}", flush=True)
@@ -572,11 +691,18 @@ def _risk_profile_snapshot(
     # Low balance mode is applied here via reference_balance
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
 
-    margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
-    if risk_context == "simulation" or margin_per_trade <= 0:
+    # Scope truth rule for status/mood display:
+    # - Execution sizing is recalculated from OKX reference balance + balance tier.
+    # - Simulation sizing remains simulation-wallet based.
+    # Never display a stale margin_per_trade from the wrong scope.
+    if risk_context == "execution":
         margin_per_trade = _compute_margin_from_reference(reference_balance, settings) if reference_balance > 0 else 0.0
-    if risk_context == "execution" and margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
-        margin_per_trade = 0.0
+        if margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
+            margin_per_trade = 0.0
+    else:
+        margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
+        if risk_context == "simulation" or margin_per_trade <= 0:
+            margin_per_trade = _compute_margin_from_reference(reference_balance, settings) if reference_balance > 0 else 0.0
 
     reason_bits: list[str] = []
     if risk_context == "simulation":
@@ -588,6 +714,7 @@ def _risk_profile_snapshot(
             reason_bits.append("live_okx_margin_too_small")
         else:
             reason_bits.append("okx_live_balance")
+            reason_bits.append("execution_truth_sizing")
     else:
         reason_bits.append("scan_or_paper_sizing")
 
@@ -673,16 +800,18 @@ def _risk_slot_usage_snapshot(settings: Settings, result: dict | None, reference
     context = _risk_profile_context(settings, result)
     base_trades = list(result.get("simulation_trades", []) or []) if context == "simulation" else list(result.get("trades", []) or [])
     counts = _execution_slot_counts(base_trades)
-    low_balance = bool(0 < _safe_float(reference_balance, 0.0) < LOW_BALANCE_THRESHOLD_USDT)
-    general_limit = LOW_BALANCE_MAX_SLOTS if low_balance else max(1, int(getattr(settings, "max_execution_positions", 7) or 7))
-    block_limit = 1 if low_balance else 3
-    recovery_limit = 1 if low_balance else 3
+    tier_limits = _balance_tier_limits(reference_balance, settings)
+    low_balance = str(tier_limits.get("tier") or "") == "low_balance"
+    general_limit = max(1, int(tier_limits.get("normal_slots") or getattr(settings, "max_execution_positions", MATURE_BALANCE_MAX_SLOTS) or MATURE_BALANCE_MAX_SLOTS))
+    block_limit = max(0, int(tier_limits.get("block_slots") or 0))
+    recovery_limit = max(0, int(tier_limits.get("recovery_slots") or 0))
     general_used = int(counts.get("general", 0) or 0)
     block_used = int(counts.get("block_exception", 0) or 0)
     recovery_used = int(counts.get("recovery", 0) or 0)
     return {
         "context": context,
         "low_balance": low_balance,
+        "balance_tier": str(tier_limits.get("tier") or ""),
         "general_used": general_used,
         "general_limit": general_limit,
         "block_used": block_used,
@@ -974,17 +1103,32 @@ def _ensure_execution_daily_baseline(
     external_net = _safe_float(row.get("external_cashflow_net"), 0.0)
     deposits = _safe_float(row.get("external_deposits"), 0.0)
     withdrawals = _safe_float(row.get("external_withdrawals"), 0.0)
+
+    # Daily DD safety rule:
+    # Do NOT auto-lower the daily baseline on negative OKX equity deltas.
+    # A falling equity can be normal trading PnL, floating PnL, fees, OKX mark-price
+    # movement, or a temporary balance read. Treating it as an external withdrawal
+    # corrupts adjusted_start_balance and can create impossible DD values
+    # (121%, 293%, ...). Only positive, large jumps are folded in as deposits.
+    if external_net < 0:
+        print(
+            f"⚠️ EXECUTION_NEGATIVE_CASHFLOW_REPAIRED | date={today} | "
+            f"old_external_net={external_net:+.4f} | start={start_balance:.4f}",
+            flush=True,
+        )
+        external_net = 0.0
+        withdrawals = 0.0
+        row["negative_cashflow_repaired_at"] = now.isoformat()
+        row["negative_cashflow_repair_reason"] = "auto_withdrawal_disabled_for_daily_dd"
+
     last_equity = _safe_float(row.get("last_equity") or row.get("current_balance"), equity)
     threshold = _execution_cashflow_threshold(last_equity, settings)
     delta = equity - last_equity
 
-    if last_equity > 0 and abs(delta) >= threshold:
-        event_type = "deposit" if delta > 0 else "withdrawal"
+    if last_equity > 0 and delta >= threshold:
+        event_type = "deposit"
         external_net += delta
-        if delta > 0:
-            deposits += delta
-        else:
-            withdrawals += abs(delta)
+        deposits += delta
         events = list(row.get("cashflow_events") or [])
         events.append({
             "ts": now.isoformat(),
@@ -1000,8 +1144,15 @@ def _ensure_execution_daily_baseline(
             f"start={start_balance:.4f} | external_net={external_net:+.4f} | threshold={threshold:.4f}",
             flush=True,
         )
+    elif last_equity > 0 and delta <= -threshold:
+        # Log-only. Never reduce the Daily DD baseline automatically.
+        print(
+            f"🧯 EXECUTION_NEGATIVE_CASHFLOW_IGNORED | amount={delta:+.4f} | "
+            f"last={last_equity:.4f} | current={equity:.4f} | threshold={threshold:.4f}",
+            flush=True,
+        )
 
-    adjusted_start = max(0.0, start_balance + external_net)
+    adjusted_start = max(0.0, start_balance + max(0.0, external_net))
     row.update({
         "date": today,
         "start_balance": start_balance,
@@ -1109,16 +1260,17 @@ def _resolve_portfolio_state_inputs(
         if start_of_day_balance <= 0:
             start_of_day_balance = reference_balance
 
-        # Position sizing is intentionally stable during the day.
-        # It follows the daily adjusted baseline, so normal floating PnL does not
-        # resize trades every scan; external deposits/withdrawals update it.
-        daily_sizing_balance = start_of_day_balance
-        margin_per_trade = _compute_margin_from_reference(daily_sizing_balance, settings)
+        # Execution truth rule:
+        # In live OKX execution, position sizing must come from the CURRENT OKX
+        # equity, not from simulation wallet, stale risk-manager values, or an
+        # adjusted daily DD baseline. The daily baseline is only for DD tracking.
+        daily_sizing_balance = reference_balance
+        margin_per_trade = _compute_margin_from_reference(reference_balance, settings)
         if margin_per_trade < LIVE_MIN_EXECUTION_MARGIN_USDT:
             margin_per_trade = 0.0
         elif reference_balance > 0 and margin_per_trade > reference_balance:
             margin_per_trade = 0.0
-            sizing["reason"] = "live_okx_balance_below_daily_sizing_margin"
+            sizing["reason"] = "live_okx_balance_below_current_sizing_margin"
     else:
         daily_sizing_balance = reference_balance
 
@@ -1141,6 +1293,163 @@ def _resolve_portfolio_state_inputs(
         "execution_daily_baseline_date": str(execution_daily.get("date") or ""),
     }
 
+
+
+
+def _execution_drawdown_pct_value(drawdown_status=None, portfolio_state=None) -> float:
+    try:
+        return float(getattr(drawdown_status, "drawdown_pct", 0.0) or 0.0)
+    except Exception:
+        pass
+    try:
+        return float(getattr(portfolio_state, "drawdown_pct", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _repair_execution_drawdown_sanity(
+    portfolio_state,
+    drawdown_status,
+    portfolio_state_inputs: dict | None,
+    trades: list | None,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    *,
+    label: str = "runtime",
+):
+    """Repair impossible execution Daily-DD readings from current OKX equity.
+
+    Execution-only hygiene. It does not touch simulation, OKX orders, TP/SL,
+    lifecycle, slots, scoring, or saved trades. It prevents corrupted execution
+    DD/baseline state from producing impossible values such as 1881566%.
+    """
+    try:
+        if _is_simulation_mode(settings):
+            return portfolio_state, drawdown_status, dict(portfolio_state_inputs or {})
+    except Exception:
+        return portfolio_state, drawdown_status, dict(portfolio_state_inputs or {})
+
+    inputs = dict(portfolio_state_inputs or {})
+    ref = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    start = _safe_float(inputs.get("start_of_day_balance"), 0.0)
+    dd_pct = _execution_drawdown_pct_value(drawdown_status, portfolio_state)
+    realized = _safe_float(getattr(portfolio_state, "realized_pnl_usdt", 0.0), 0.0)
+    unrealized = _safe_float(getattr(portfolio_state, "unrealized_pnl_usdt", 0.0), 0.0)
+    computed_equity = _safe_float(getattr(portfolio_state, "current_equity", 0.0), 0.0)
+
+    # Sanity guard before Daily DD can become a hard stop.
+    # If OKX reference equity is healthy but portfolio-state equity is far below it,
+    # the reading is almost certainly baseline/trade-state corruption, not real DD.
+    needs_repair = bool(
+        dd_pct > 100.0
+        or start < 0.01
+        or (ref > 0 and start > max(ref * 25.0, 10_000.0))
+        or (ref > 0 and computed_equity < -max(ref * 5.0, 100.0))
+        or (ref > 0 and dd_pct >= 35.0 and computed_equity < ref * 0.50)
+        or (ref > 0 and dd_pct >= 20.0 and 0 < start < ref * 0.50)
+    )
+    if dd_pct >= 20.0 or needs_repair:
+        print(
+            "EXEC_DD_DEBUG | "
+            f"label={label} | dd={dd_pct:.2f}% | ref={ref:.4f} | start={start:.4f} | "
+            f"computed_equity={computed_equity:.4f} | realized={realized:.4f} | unrealized={unrealized:.4f} | "
+            f"repair={needs_repair}",
+            flush=True,
+        )
+    if not needs_repair:
+        return portfolio_state, drawdown_status, inputs
+
+    trade_pnl = realized + unrealized
+
+    # Execution truth rule:
+    # If tracked execution PnL creates impossible Daily-DD/equity readings,
+    # do not use Redis trade PnL as wallet truth. OKX current equity is the
+    # source of truth. Keep tracked PnL only for analytics/report diagnostics.
+    hard_flat_repair = bool(dd_pct > 100.0 or computed_equity < 0.0)
+    if hard_flat_repair and ref > 0:
+        repaired_start = ref
+        used_flat_repair = True
+    else:
+        repaired_start = ref - trade_pnl if ref > 0 else 0.0
+        used_flat_repair = False
+        if ref > 0:
+            if repaired_start <= 0 or repaired_start > max(ref * 10.0, 1000.0):
+                repaired_start = ref
+                used_flat_repair = True
+        else:
+            repaired_start = 0.0
+            used_flat_repair = True
+
+        if ref > 0 and repaired_start < 1.0:
+            repaired_start = ref
+            used_flat_repair = True
+
+    clean_inputs = dict(inputs)
+    clean_inputs["start_of_day_balance"] = float(repaired_start)
+    clean_inputs["execution_dd_sanity_repaired"] = True
+    clean_inputs["execution_dd_sanity_repair_reason"] = "impossible_execution_daily_dd"
+
+    try:
+        repaired_state = build_portfolio_state_from_trades(list(trades or []), **_portfolio_state_kwargs(clean_inputs))
+        if used_flat_repair:
+            try:
+                repaired_state.realized_pnl_usdt = 0.0
+                repaired_state.unrealized_pnl_usdt = 0.0
+                repaired_state.start_of_day_balance = round(float(ref or repaired_start or 0.0), 4)
+                repaired_state.reference_portfolio = float(ref or 0.0)
+            except Exception:
+                pass
+        repaired_dd = evaluate_drawdown(repaired_state)
+    except Exception as exc:
+        print(f"⚠️ EXEC_DD_SANITY_REPAIR_REBUILD_FAILED | {label} | {exc}", flush=True)
+        return portfolio_state, drawdown_status, inputs
+
+    repaired_pct = _execution_drawdown_pct_value(repaired_dd, repaired_state)
+    if repaired_pct > 100.0 and ref > 0:
+        try:
+            repaired_state.realized_pnl_usdt = 0.0
+            repaired_state.unrealized_pnl_usdt = 0.0
+            repaired_state.start_of_day_balance = round(float(ref), 4)
+            repaired_state.reference_portfolio = float(ref)
+            repaired_dd = evaluate_drawdown(repaired_state)
+            repaired_pct = _execution_drawdown_pct_value(repaired_dd, repaired_state)
+            clean_inputs["start_of_day_balance"] = float(ref)
+            used_flat_repair = True
+        except Exception:
+            pass
+
+    if ref > 0 and trade_store is not None:
+        try:
+            today = _execution_today_key()
+            row = _load_execution_daily_balance_row(trade_store, today)
+            row.update({
+                "date": today,
+                "start_balance": float(clean_inputs.get("start_of_day_balance") or ref),
+                "adjusted_start_balance": float(clean_inputs.get("start_of_day_balance") or ref),
+                "current_balance": float(ref),
+                "last_equity": float(ref),
+                "external_cashflow_net": 0.0,
+                "external_deposits": 0.0,
+                "external_withdrawals": 0.0,
+                "reason": "execution_dd_sanity_repair_from_okx_balance",
+                "sanity_repaired_at": datetime.now(timezone.utc).isoformat(),
+                "sanity_old_drawdown_pct": float(dd_pct or 0.0),
+                "sanity_old_start_balance": float(start or 0.0),
+                "sanity_old_computed_equity": float(computed_equity or 0.0),
+                "sanity_flat_repair": bool(used_flat_repair),
+            })
+            _save_execution_daily_balance_row(trade_store, today, row)
+        except Exception as exc:
+            print(f"⚠️ EXEC_DD_SANITY_REPAIR_SAVE_FAILED | {label} | {exc}", flush=True)
+
+    print(
+        "EXEC_DD_SANITY_REPAIR | "
+        f"{label} | old_pct={dd_pct:.2f} | new_pct={repaired_pct:.2f} | "
+        f"ref={ref:.4f} | old_start={start:.8f} | new_start={_safe_float(clean_inputs.get('start_of_day_balance'), 0.0):.4f} | "
+        f"old_equity={computed_equity:.4f} | flat={used_flat_repair}",
+        flush=True,
+    )
+    return repaired_state, repaired_dd, clean_inputs
 
 def _resolve_simulation_portfolio_state_inputs(
     simulation_trades: list,
@@ -1390,6 +1699,55 @@ def _okx_result_is_ok(payload: dict | None) -> bool:
     return str(payload.get("code", "")) == "0"
 
 
+_RUNTIME_LOG_THROTTLE: dict[str, float] = {}
+_REPORT_OKX_HARD_REFRESH_THROTTLE: dict[str, float] = {}
+
+
+def _runtime_verbose_logs_enabled() -> bool:
+    return str(os.getenv("VERBOSE_LOGS") or os.getenv("OKX_VERBOSE_LOGS") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_throttled(key: str, message: str, *, every_seconds: int = 300, force: bool = False) -> None:
+    """Print noisy operational logs at most once per interval.
+
+    Keeps Railway responsive by preventing repeated OKX position/report repair
+    diagnostics from flooding stdout while preserving important first/error logs.
+    """
+    try:
+        if force or _runtime_verbose_logs_enabled():
+            print(message, flush=True)
+            return
+        now = time.monotonic()
+        last = float(_RUNTIME_LOG_THROTTLE.get(key, 0.0) or 0.0)
+        if now - last >= max(1, int(every_seconds or 300)):
+            _RUNTIME_LOG_THROTTLE[key] = now
+            print(message, flush=True)
+    except Exception:
+        try:
+            print(message, flush=True)
+        except Exception:
+            pass
+
+
+def _report_hard_okx_refresh_allowed(scope_key: str = "execution", *, every_seconds: int | None = None) -> bool:
+    """Throttle expensive report-only OKX hard reconcile/recovery/repair.
+
+    This affects report/status freshness only. It does NOT affect live execution
+    safety checks, order placement, TP/SL, or lifecycle updates.
+    """
+    try:
+        interval = int(every_seconds if every_seconds is not None else os.getenv("OKX_REPORT_HARD_REFRESH_SECONDS", "60"))
+    except Exception:
+        interval = 60
+    interval = max(10, interval)
+    now = time.monotonic()
+    last = float(_REPORT_OKX_HARD_REFRESH_THROTTLE.get(scope_key, 0.0) or 0.0)
+    if now - last >= interval:
+        _REPORT_OKX_HARD_REFRESH_THROTTLE[scope_key] = now
+        return True
+    return False
+
+
 def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int = 8) -> None:
     """Print compact OKX positions diagnostics without exposing secrets.
 
@@ -1405,26 +1763,29 @@ def _okx_positions_debug_log(label: str, payload: dict | None, *, max_rows: int 
         code = str(response.get("code") or (payload or {}).get("code") or "") if isinstance(payload, dict) else ""
         msg = str(response.get("msg") or (payload or {}).get("reason") or (payload or {}).get("msg") or "") if isinstance(payload, dict) else ""
         rows = _okx_result_rows(payload)
-        print(
+        _log_throttled(
+            f"okx_positions_debug:{label}",
             f"OKX_POSITIONS_DEBUG | {label} | ok={ok} | code={code or '-'} | rows={len(rows)} | msg={msg[:140] or '-'}",
-            flush=True,
+            every_seconds=300,
+            force=not ok,
         )
-        for row in rows[:max(1, int(max_rows or 8))]:
-            inst_id = _row_inst_id(row)
-            pos = _row_float(row, "pos", "availPos")
-            notional = _row_float(row, "notionalUsd", "notional")
-            margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
-            avg = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
-            mark = _position_row_price(row, "markPx", "last", "lastPx", "idxPx")
-            print(
-                "OKX_POS_ROW | "
-                f"{label} | instId={inst_id or '-'} | pos={pos} | notional={notional} | margin={margin} | "
-                f"avgPx={avg} | markPx={mark} | mgnMode={row.get('mgnMode') or '-'} | "
-                f"posSide={row.get('posSide') or '-'}",
-                flush=True,
-            )
+        if _runtime_verbose_logs_enabled():
+            for row in rows[:max(1, int(max_rows or 8))]:
+                inst_id = _row_inst_id(row)
+                pos = _row_float(row, "pos", "availPos")
+                notional = _row_float(row, "notionalUsd", "notional")
+                margin = _row_float(row, "margin", "imr", "initialMargin", "marginUsd")
+                avg = _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")
+                mark = _position_row_price(row, "markPx", "last", "lastPx", "idxPx")
+                print(
+                    "OKX_POS_ROW | "
+                    f"{label} | instId={inst_id or '-'} | pos={pos} | notional={notional} | margin={margin} | "
+                    f"avgPx={avg} | markPx={mark} | mgnMode={row.get('mgnMode') or '-'} | "
+                    f"posSide={row.get('posSide') or '-'}",
+                    flush=True,
+                )
     except Exception as exc:
-        print(f"OKX_POSITIONS_DEBUG | {label} | log_failed={exc}", flush=True)
+        _log_throttled(f"okx_positions_debug_failed:{label}", f"OKX_POSITIONS_DEBUG | {label} | log_failed={exc}", every_seconds=300, force=True)
 
 
 def _resolve_okx_td_mode(settings: Settings | None = None) -> str:
@@ -1504,7 +1865,50 @@ def _position_row_price(row: dict, *keys: str) -> float:
     return 0.0
 
 
-def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None):
+
+
+def _read_okx_position_protection_orders(okx_client: OKXTradeClient | None, inst_id: str, entry: float = 0.0) -> dict:
+    """Read detected exchange TP/SL prices for a manual/recovered OKX position.
+
+    Best-effort display/recovery helper only. It does not create, amend, cancel,
+    or attach orders. Missing exchange protection remains explicit as None/0,
+    instead of inventing far-away TP targets.
+    """
+    if okx_client is None or not inst_id:
+        return {"ok": False, "reason": "okx_client_missing", "tp_prices": [], "sl_price": 0.0}
+    if not hasattr(okx_client, "get_position_protection_orders"):
+        return {"ok": False, "reason": "client_missing_get_position_protection_orders", "tp_prices": [], "sl_price": 0.0}
+    try:
+        protection = okx_client.get_position_protection_orders(inst_id=inst_id, entry_price=entry)
+        if not isinstance(protection, dict):
+            return {"ok": False, "reason": "invalid_protection_response", "tp_prices": [], "sl_price": 0.0}
+        return protection
+    except Exception as exc:
+        print(f"⚠️ OKX_PROTECTION_READ_FAILED | {inst_id} | {exc}", flush=True)
+        return {"ok": False, "reason": f"exception:{exc}", "tp_prices": [], "sl_price": 0.0}
+
+
+def _protection_prices_from_okx_response(protection: dict | None, entry: float) -> tuple[float, float, float, str]:
+    data = dict(protection or {})
+    tp_prices = []
+    for value in data.get("tp_prices") or []:
+        price = _safe_float(value, 0.0)
+        if price > 0:
+            tp_prices.append(price)
+    tp_prices = sorted(set(tp_prices))
+    sl_price = _safe_float(data.get("sl_price"), 0.0)
+    if entry > 0:
+        tp_prices = [p for p in tp_prices if p > entry]
+        if sl_price > 0 and sl_price >= entry:
+            # For a long position, a stop above entry is likely protected SL. Keep it as SL.
+            pass
+    tp1 = tp_prices[0] if len(tp_prices) >= 1 else 0.0
+    tp2 = tp_prices[1] if len(tp_prices) >= 2 else 0.0
+    reason = str(data.get("reason") or ("exchange_protection_detected" if (tp1 or tp2 or sl_price) else "no_exchange_tp_sl_detected"))
+    return sl_price, tp1, tp2, reason
+
+
+def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Settings | None = None, protection_orders: dict | None = None):
     """Build a conservative TrackedTrade for a live OKX position missing from Redis.
 
     This is a recovery layer, not a strategy entry. It exists so execution reports,
@@ -1536,9 +1940,10 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     leverage = _safe_float((row or {}).get("lever") or (row or {}).get("leverage"), 0.0)
     if leverage <= 0:
         leverage = _safe_float(recovery_meta.get("leverage"), 0.0)
-    cached_sl = _safe_float(recovery_meta.get("sl"), 0.0)
-    cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0)
-    cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0)
+    detected_sl, detected_tp1, detected_tp2, protection_reason = _protection_prices_from_okx_response(protection_orders, entry)
+    cached_sl = _safe_float(recovery_meta.get("sl"), 0.0) or detected_sl
+    cached_tp1 = _safe_float(recovery_meta.get("tp1"), 0.0) or detected_tp1
+    cached_tp2 = _safe_float(recovery_meta.get("tp2"), 0.0) or detected_tp2
     pnl_pct = ((current - entry) / entry) * 100.0 if current > 0 else 0.0
     trade_id = "okx_recovered_" + inst_id.replace("-", "_").lower()
 
@@ -1546,8 +1951,8 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
         symbol=inst_id,
         entry=float(entry),
         sl=float(cached_sl) if cached_sl > 0 else 0.0,
-        tp1=float(cached_tp1) if cached_tp1 > 0 else float(entry) * 999.0,
-        tp2=float(cached_tp2) if cached_tp2 > 0 else float(entry) * 999.0,
+        tp1=float(cached_tp1) if cached_tp1 > 0 else 0.0,
+        tp2=float(cached_tp2) if cached_tp2 > 0 else 0.0,
         setup_type="bot_order_restored_position" if recovery_meta else "okx_recovered_position",
         market_mode="BOT_ORDER_RESTORED" if recovery_meta else "RECOVERED_FROM_OKX",
         score=0.0,
@@ -1563,6 +1968,9 @@ def _build_recovered_execution_trade_from_okx_position(row: dict, settings: Sett
     _safe_set_trade_attr(trade, "exchange_order_ok", True)
     _safe_set_trade_attr(trade, "exchange_order_reason", "bot_order_restored_from_recent_metadata" if recovery_meta else "recovered_from_okx_live_position")
     _safe_set_trade_attr(trade, "exchange_sync_state", "bot_order_restored_from_okx" if recovery_meta else "recovered_live_okx_position")
+    _safe_set_trade_attr(trade, "exchange_protection_read", bool(protection_orders and protection_orders.get("ok")))
+    _safe_set_trade_attr(trade, "exchange_protection_reason", protection_reason)
+    _safe_set_trade_attr(trade, "unmanaged_no_tp_sl", not bool(cached_sl or cached_tp1 or cached_tp2))
     _safe_set_trade_attr(trade, "last_exchange_sync_at", now)
     _safe_set_trade_attr(trade, "opened_at", now)
     _safe_set_trade_attr(trade, "updated_at", now)
@@ -1660,7 +2068,7 @@ def _recover_missing_execution_trades_from_okx_positions(
         if abs(pos_size) <= 0:
             continue
         if inst_id in represented:
-            print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", flush=True)
+            _log_throttled(f"okx_recovery_skip_represented:{inst_id}", f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=already_represented", every_seconds=300)
             continue
         grace_remaining = _recent_bot_okx_order_grace_remaining(inst_id)
         if grace_remaining > 0 and not force_import_recent:
@@ -1680,7 +2088,7 @@ def _recover_missing_execution_trades_from_okx_positions(
                 f"remaining={grace_remaining}s | reason=report_status_hard_recovery",
                 flush=True,
             )
-        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+        trade = _build_recovered_execution_trade_from_okx_position(row, settings=settings, protection_orders=_read_okx_position_protection_orders(okx_client, inst_id, _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")))
         if trade is None:
             print(f"OKX_POSITION_RECOVERY_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
             continue
@@ -1701,9 +2109,10 @@ def _recover_missing_execution_trades_from_okx_positions(
             flush=True,
         )
     else:
-        print(
+        _log_throttled(
+            "okx_position_recovery_imported_zero",
             f"OKX_POSITION_RECOVERY | imported=0 | rows={len(_okx_result_rows(positions_result))} | represented={len(represented)} | reason=ok",
-            flush=True,
+            every_seconds=300,
         )
     return recovered, stats
 
@@ -1917,7 +2326,7 @@ def _repair_execution_trades_from_live_okx_positions(
 
         imported = False
         if target is None:
-            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings)
+            target = _build_recovered_execution_trade_from_okx_position(row, settings=settings, protection_orders=_read_okx_position_protection_orders(okx_client, inst_id, _position_row_price(row, "avgPx", "avgPxUsd", "openAvgPx", "entryPx")))
             if target is None:
                 print(f"OKX_POSITION_REPAIR_SKIP | {inst_id} | reason=build_trade_failed", flush=True)
                 continue
@@ -1986,10 +2395,17 @@ def _repair_execution_trades_from_live_okx_positions(
         if leverage > 0:
             _safe_set_trade_attr(target, "effective_leverage", leverage)
             _safe_set_trade_attr(target, "actual_leverage", leverage)
-        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp1", float(entry) * 999.0)
-        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0 and entry > 0:
-            _safe_set_trade_attr(target, "tp2", float(entry) * 999.0)
+        if _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0:
+            _safe_set_trade_attr(target, "tp1", 0.0)
+        if _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0:
+            _safe_set_trade_attr(target, "tp2", 0.0)
+        if (
+            _safe_float(getattr(target, "sl", 0.0), 0.0) <= 0
+            and _safe_float(getattr(target, "tp1", 0.0), 0.0) <= 0
+            and _safe_float(getattr(target, "tp2", 0.0), 0.0) <= 0
+        ):
+            _safe_set_trade_attr(target, "unmanaged_no_tp_sl", True)
+            _safe_set_trade_attr(target, "exchange_protection_reason", "no_exchange_tp_sl_detected")
 
         after_state = {
             "execution_trade": bool(getattr(target, "execution_trade", False)),
@@ -2053,13 +2469,15 @@ def _repair_execution_trades_from_live_okx_positions(
         "dedup_symbols": list(dict.fromkeys(stats.get("dedup_symbols", []) or []))[:20],
         "reason": "ok",
     })
-    print(
+    _log_throttled(
+        "exec_report_hard_repair",
         "EXEC_REPORT_HARD_REPAIR | "
         f"repaired={int(stats.get('repaired', 0) or 0)} | "
         f"imported={int(stats.get('imported', 0) or 0)} | "
         f"dedup_closed={int(stats.get('dedup_closed', 0) or 0)} | "
         f"symbols={','.join(stats.get('symbols', []) or []) or '-'}",
-        flush=True,
+        every_seconds=300,
+        force=bool(stats.get("changed")),
     )
     return repaired, stats
 
@@ -2270,6 +2688,17 @@ def _rebuild_runtime_reports_after_reconcile(result: dict, trades: list, trade_s
     portfolio_state = build_portfolio_state_from_trades(result["trades"], **_portfolio_state_kwargs(portfolio_state_inputs))
     result["portfolio_state"] = portfolio_state
     result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+    portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+        portfolio_state,
+        result["drawdown_status"],
+        portfolio_state_inputs,
+        result["trades"],
+        settings,
+        trade_store=trade_store,
+        label="reconcile_report_rebuild",
+    )
+    result["portfolio_state"] = portfolio_state
+    result["portfolio_state_inputs"] = portfolio_state_inputs
     result["drawdown_report"] = build_drawdown_report(portfolio_state)
     result["loss_streak_guard"] = _build_loss_streak_guard(
         _loss_streak_base_trades_for_runtime(settings, result, execution_trades=result["trades"])
@@ -2312,6 +2741,190 @@ def _build_live_price_map(raw_tickers: list[dict], fallback_pairs=None) -> dict[
         if symbol and price > 0 and symbol not in price_map:
             price_map[symbol] = price
     return price_map
+
+
+
+
+# =========================================================
+# Post-rejection tracking analytics (no trading side effects)
+# =========================================================
+POST_REJECTION_TRACKING_WINDOWS = (
+    (5, "price_after_5m_pct"),
+    (15, "price_after_15m_pct"),
+    (60, "price_after_1h_pct"),
+)
+
+
+def _is_rejection_exec_result(row: dict | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    return bool(status.startswith("rejected") or status == "candidate_only")
+
+
+def _post_rejection_dt(value: object) -> datetime | None:
+    try:
+        return _parse_any_datetime_utc(value)
+    except Exception:
+        pass
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _post_rejection_pct(entry_price: float, current_price: float) -> float:
+    entry = _safe_float(entry_price, 0.0)
+    current = _safe_float(current_price, 0.0)
+    if entry <= 0 or current <= 0:
+        return 0.0
+    return round(((current - entry) / entry) * 100.0, 4)
+
+
+def _ensure_post_rejection_seed(signal, exec_result: dict | None, *, now: datetime | None = None) -> dict:
+    """Seed rejection rows with stable tracking fields.
+
+    Analytics-only: does not alter execution decisions, slots, OKX orders,
+    lifecycle, or reports except JSON/export diagnostics.
+    """
+    row = dict(exec_result or {})
+    if not _is_rejection_exec_result(row):
+        return row
+    now = now or datetime.now(timezone.utc)
+    meta = getattr(signal, "meta", {}) or {}
+    symbol = str(getattr(signal, "symbol", "") or row.get("symbol") or "")
+    setup = str(getattr(signal, "setup_type", "") or row.get("setup_type") or "")
+    row.setdefault("record_type", "rejection")
+    row.setdefault("symbol", symbol)
+    row.setdefault("setup_type", setup)
+    row.setdefault("market_mode", str(getattr(signal, "market_mode", "") or row.get("market_mode") or ""))
+    row.setdefault("entry_price", _safe_float(getattr(signal, "entry", 0.0), 0.0))
+    row.setdefault("stop_loss", _safe_float(getattr(signal, "sl", 0.0), 0.0))
+    row.setdefault("tp1", _safe_float(getattr(signal, "tp1", 0.0), 0.0))
+    row.setdefault("tp2", _safe_float(getattr(signal, "tp2", 0.0), 0.0))
+    row.setdefault("score", _safe_float(getattr(signal, "score", 0.0), 0.0))
+    row.setdefault("boost_score", _safe_float(meta.get("boost_score"), 0.0))
+    row.setdefault("rejected_at", row.get("ts") or now.isoformat())
+    row.setdefault("post_rejection_tracking_enabled", True)
+    row.setdefault("post_rejection_tracking_status", "pending")
+    row.setdefault("post_rejection_tracking_model", "post_rejection_tracking_v1")
+    if not row.get("decision_trace_id"):
+        safe_ts = str(row.get("rejected_at") or now.isoformat()).replace(":", "").replace("-", "").replace("+", "Z").replace(".", "_")
+        safe_symbol = symbol.replace("/", "_").replace(":", "_") or "unknown"
+        safe_setup = setup.replace("/", "_").replace(":", "_") or "unknown"
+        row["decision_trace_id"] = f"scan_{safe_ts}_{safe_symbol}_{safe_setup}"
+    return row
+
+
+def _update_post_rejection_tracking_rows(execution_results: list[dict] | None, price_map: dict | None, *, now: datetime | None = None) -> tuple[list[dict], dict]:
+    """Update matured rejection rows from the latest available price_map.
+
+    This is deliberately conservative: it uses the current scan price as a
+    checkpoint for 5m/15m/1h fields when enough time has elapsed. It is not a
+    tick-by-tick MFE engine, but it makes rejected decisions measurable without
+    touching trading logic.
+    """
+    now = now or datetime.now(timezone.utc)
+    prices = dict(price_map or {})
+    updated: list[dict] = []
+    changed = 0
+    matured = 0
+    for source_row in list(execution_results or []):
+        row = dict(source_row or {})
+        if not _is_rejection_exec_result(row):
+            updated.append(row)
+            continue
+
+        row.setdefault("post_rejection_tracking_enabled", True)
+        row.setdefault("post_rejection_tracking_model", "post_rejection_tracking_v1")
+        rejected_at = _post_rejection_dt(row.get("rejected_at") or row.get("ts") or row.get("timestamp") or row.get("created_at"))
+        if rejected_at is None:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_timestamp")
+            updated.append(row)
+            continue
+
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_symbol")
+            updated.append(row)
+            continue
+
+        current_price = _safe_float(prices.get(symbol), 0.0)
+        if current_price <= 0:
+            norm_symbol = _normalize_okx_inst_id(symbol)
+            current_price = _safe_float(prices.get(norm_symbol), 0.0)
+        if current_price <= 0:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_price")
+            updated.append(row)
+            continue
+
+        entry = _safe_float(row.get("entry_price") or row.get("entry"), 0.0)
+        if entry <= 0:
+            row.setdefault("post_rejection_tracking_status", "pending_missing_entry")
+            updated.append(row)
+            continue
+
+        elapsed_min = max(0.0, (now - rejected_at).total_seconds() / 60.0)
+        checkpoint_pct = _post_rejection_pct(entry, current_price)
+        row["post_rejection_last_checked_at"] = now.isoformat()
+        row["post_rejection_last_price"] = current_price
+        row["post_rejection_last_elapsed_minutes"] = round(elapsed_min, 2)
+        row.setdefault("max_pump_after_rejection_pct", max(0.0, checkpoint_pct))
+        row.setdefault("max_dump_after_rejection_pct", min(0.0, checkpoint_pct))
+        row["max_pump_after_rejection_pct"] = round(max(_safe_float(row.get("max_pump_after_rejection_pct"), 0.0), checkpoint_pct, 0.0), 4)
+        row["max_dump_after_rejection_pct"] = round(min(_safe_float(row.get("max_dump_after_rejection_pct"), 0.0), checkpoint_pct, 0.0), 4)
+
+        before = dict(row)
+        for minutes, field in POST_REJECTION_TRACKING_WINDOWS:
+            if elapsed_min >= minutes and field not in row:
+                row[field] = checkpoint_pct
+                matured += 1
+
+        tp1 = _safe_float(row.get("tp1"), 0.0)
+        tp2 = _safe_float(row.get("tp2"), 0.0)
+        sl = _safe_float(row.get("stop_loss") or row.get("sl"), 0.0)
+        if tp1 > 0:
+            row["would_hit_tp1"] = bool(row.get("would_hit_tp1") or current_price >= tp1)
+        if tp2 > 0:
+            row["would_hit_tp2"] = bool(row.get("would_hit_tp2") or current_price >= tp2)
+        if sl > 0:
+            row["would_hit_sl"] = bool(row.get("would_hit_sl") or current_price <= sl)
+
+        if row.get("would_hit_tp2") or row.get("would_hit_tp1"):
+            row["rejection_was_correct"] = False
+            row["rejection_verdict_reason"] = "missed_target_after_rejection"
+        elif row.get("would_hit_sl"):
+            row["rejection_was_correct"] = True
+            row["rejection_verdict_reason"] = "would_have_hit_sl_after_rejection"
+        elif elapsed_min >= 60 and "price_after_1h_pct" in row:
+            one_hour = _safe_float(row.get("price_after_1h_pct"), 0.0)
+            row["rejection_was_correct"] = bool(one_hour <= 0.0)
+            row["rejection_verdict_reason"] = "one_hour_negative_or_flat" if one_hour <= 0.0 else "one_hour_positive_missed_move"
+
+        if row.get("rejection_was_correct") is True:
+            row["post_rejection_tracking_status"] = "verdict_correct"
+        elif row.get("rejection_was_correct") is False:
+            row["post_rejection_tracking_status"] = "verdict_wrong"
+        elif elapsed_min >= 60:
+            row["post_rejection_tracking_status"] = "tracked_1h_unknown"
+        elif elapsed_min >= 15:
+            row["post_rejection_tracking_status"] = "tracked_15m_pending_1h"
+        elif elapsed_min >= 5:
+            row["post_rejection_tracking_status"] = "tracked_5m_pending"
+        else:
+            row["post_rejection_tracking_status"] = "pending"
+
+        if row != before:
+            changed += 1
+        updated.append(row)
+
+    return updated, {"changed": changed, "matured_fields": matured, "total": len(updated)}
 
 
 def _ensure_open_trade_prices_in_map(
@@ -2433,6 +3046,53 @@ def _ensure_trade_display_defaults(trades: list | None, settings: Settings, *, l
 
 
 
+
+_CANDLE_CONTEXT_CACHE: dict[tuple[str, str, int], tuple[float, list]] = {}
+_CANDLE_CONTEXT_CACHE_LOCK = threading.Lock()
+
+
+def _candle_context_cache_ttl(bar: str) -> int:
+    """TTL for scan-only candle context cache.
+
+    This reduces repeated OKX candle calls during scans/reports without changing
+    execution/order logic. Use VERBOSE_LOGS=ON to debug per-pair candle fetches.
+    """
+    normalized = str(bar or "").strip().lower()
+    env_key = "OKX_SCAN_CANDLE_CACHE_4H_SECONDS" if normalized in {"4h", "4H".lower()} else "OKX_SCAN_CANDLE_CACHE_15M_SECONDS"
+    default = 900 if normalized in {"4h"} else 180
+    try:
+        return max(30, int(os.getenv(env_key, str(default))))
+    except Exception:
+        return default
+
+
+def _fetch_okx_candles_cached(base_url: str, symbol: str, *, bar: str, limit: int, timeout: float):
+    key = (str(symbol or "").upper(), str(bar or ""), int(limit or 0))
+    ttl = _candle_context_cache_ttl(bar)
+    now = time.monotonic()
+    try:
+        with _CANDLE_CONTEXT_CACHE_LOCK:
+            cached = _CANDLE_CONTEXT_CACHE.get(key)
+            if cached and now - float(cached[0]) <= ttl:
+                return cached[1]
+    except Exception:
+        pass
+
+    rows = fetch_okx_candles(base_url, symbol, bar=bar, limit=limit, timeout=timeout)
+    try:
+        if isinstance(rows, list):
+            with _CANDLE_CONTEXT_CACHE_LOCK:
+                _CANDLE_CONTEXT_CACHE[key] = (now, rows)
+                # prevent unbounded growth; ranked universe is normally <=200.
+                if len(_CANDLE_CONTEXT_CACHE) > 800:
+                    oldest = sorted(_CANDLE_CONTEXT_CACHE.items(), key=lambda item: item[1][0])[:200]
+                    for old_key, _ in oldest:
+                        _CANDLE_CONTEXT_CACHE.pop(old_key, None)
+    except Exception:
+        pass
+    return rows
+
+
 def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "15m", limit: int = 10) -> list[dict]:
     """Fetch recent closed candles for the Price Action Evidence layer.
 
@@ -2447,7 +3107,7 @@ def _build_price_action_candles_for_pair(pair, settings: Settings, bar: str = "1
         return []
 
     try:
-        rows = fetch_okx_candles(
+        rows = _fetch_okx_candles_cached(
             settings.okx_base_url,
             symbol,
             bar=bar,
@@ -2501,7 +3161,7 @@ def _build_4h_resistance_context_for_pair(pair, settings: Settings, bar: str = "
         }
 
     try:
-        rows = fetch_okx_candles(
+        rows = _fetch_okx_candles_cached(
             settings.okx_base_url,
             symbol,
             bar=bar,
@@ -3404,27 +4064,47 @@ def _apply_daily_dd_manual_baseline(portfolio_state_inputs: dict, protection_sta
 
 
 def _current_equity_for_manual_resume(result: dict | None, settings: Settings, portfolio_state_inputs: dict | None = None) -> float:
+    """Resolve equity used by /confirm_resume_trading.
+
+    Execution mode must prefer the current OKX-derived reference_portfolio.
+    A corrupted portfolio_state.current_equity can be built from a bad baseline
+    and old trade PnL, so using it for manual resume can persist the corruption.
+    Simulation keeps using its virtual wallet equity.
+    """
     result = result or {}
+    inputs = dict(portfolio_state_inputs or result.get("portfolio_state_inputs") or {})
+
     if _is_simulation_mode(settings):
         wallet = result.get("simulation_wallet") or {}
         equity = _safe_float(wallet.get("equity"), 0.0)
         if equity > 0:
             return equity
+        for key in ("reference_portfolio", "start_of_day_balance", "manual_daily_dd_baseline"):
+            value = _safe_float(inputs.get(key), 0.0)
+            if value > 0:
+                return value
+        return 0.0
+
+    # Live execution: OKX reference balance is the safest source of truth.
+    for key in ("reference_portfolio", "execution_current_balance", "execution_reference_balance"):
+        value = _safe_float(inputs.get(key), 0.0)
+        if value > 0:
+            return value
+
     portfolio_state = result.get("portfolio_state")
-    for attr in ("current_equity", "equity", "balance", "portfolio_value", "current_balance"):
+    for attr in ("reference_portfolio", "current_equity", "equity", "balance", "portfolio_value", "current_balance"):
         try:
             value = _safe_float(getattr(portfolio_state, attr), 0.0)
             if value > 0:
                 return value
         except Exception:
             pass
-    inputs = dict(portfolio_state_inputs or result.get("portfolio_state_inputs") or {})
-    for key in ("reference_portfolio", "start_of_day_balance", "manual_daily_dd_baseline"):
+
+    for key in ("start_of_day_balance", "manual_daily_dd_baseline"):
         value = _safe_float(inputs.get(key), 0.0)
         if value > 0:
             return value
     return 0.0
-
 
 def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str:
     scope = _protection_scope(settings)
@@ -3456,6 +4136,46 @@ def _build_manual_resume_preview(result: dict | None, settings: Settings) -> str
     ])
 
 
+def _reset_execution_daily_baseline_after_manual_resume(
+    trade_store: RedisTradeStore | None,
+    equity: float,
+    now: datetime | None = None,
+) -> dict:
+    """Reset live execution Daily DD baseline after manual resume.
+
+    Execution-only accounting repair. It keeps OKX as truth by setting today's
+    execution baseline to the current OKX equity/equity resolved by the runtime,
+    and clears external cashflow counters so the next Daily DD cycle starts clean.
+    """
+    now = now or datetime.now(timezone.utc)
+    current_equity = max(0.0, _safe_float(equity, 0.0))
+    day = _execution_today_key(now)
+    row = {
+        "date": day,
+        "start_balance": current_equity,
+        "adjusted_start_balance": current_equity,
+        "current_balance": current_equity,
+        "last_equity": current_equity,
+        "external_cashflow_net": 0.0,
+        "external_deposits": 0.0,
+        "external_withdrawals": 0.0,
+        "cashflow_events": [],
+        "created_at": now.isoformat(),
+        "manual_resume_at": now.isoformat(),
+        "reason": "manual_resume_execution_daily_baseline_reset",
+    }
+    try:
+        saved = _save_execution_daily_balance_row(trade_store, day, row)
+        print(
+            f"✅ EXECUTION_DAILY_BASELINE_RESET_BY_MANUAL_RESUME | date={day} | equity={current_equity:.4f}",
+            flush=True,
+        )
+        return saved
+    except Exception as exc:
+        print(f"⚠️ EXECUTION_DAILY_BASELINE_RESET_FAILED | manual_resume | {exc}", flush=True)
+        return row
+
+
 def _confirm_manual_resume_trading(
     result: dict | None,
     settings: Settings,
@@ -3473,8 +4193,14 @@ def _confirm_manual_resume_trading(
         "daily_dd_baseline": equity,
         "override_type": "manual_resume_trading",
         "reason": "manual_resume_after_protection",
+        "last_drawdown_alert_level": 0,
+        "last_drawdown_alert_at": "",
+        "daily_dd_last_notified_pct": 0.0,
+        "protection_alerts_reset_at": now.isoformat(),
     })
     _save_protection_state(trade_store, scope, state)
+    if scope == "execution":
+        _reset_execution_daily_baseline_after_manual_resume(trade_store, equity, now)
 
     if isinstance(result, dict):
         result["protection_state"] = state
@@ -3504,6 +4230,17 @@ def _confirm_manual_resume_trading(
                 portfolio_state = build_portfolio_state_from_trades(list(trades_for_dd or []), **_portfolio_state_kwargs(inputs))
                 result["portfolio_state"] = portfolio_state
                 result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+                portfolio_state, result["drawdown_status"], inputs = _repair_execution_drawdown_sanity(
+                    portfolio_state,
+                    result["drawdown_status"],
+                    inputs,
+                    list(trades_for_dd or []),
+                    settings,
+                    trade_store=trade_store,
+                    label="manual_resume",
+                )
+                result["portfolio_state"] = portfolio_state
+                result["portfolio_state_inputs"] = inputs
                 result["drawdown_report"] = build_drawdown_report(portfolio_state)
             base_trades = _loss_streak_base_trades_for_runtime(
                 settings,
@@ -3933,6 +4670,15 @@ def _simulation_wallet_equity_and_start(
         current_equity = SIMULATION_START_BALANCE_USDT
         equity_source = "fallback_start"
 
+    if _simulation_wallet_equity_is_corrupted(current_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=dd | equity={current_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f} | equity_source={equity_source}",
+            flush=True,
+        )
+        current_equity = SIMULATION_START_BALANCE_USDT
+        equity_source = "sanity_fallback_start"
+
     input_start = _safe_float(inputs.get("start_of_day_balance"), 0.0)
     row_start = _safe_float(row.get("start_balance"), 0.0)
     wallet_start = _safe_float(wallet.get("start_balance"), 0.0)
@@ -4263,21 +5009,239 @@ def _simulation_margin_usdt(balance: float, settings: Settings | None = None) ->
     return max(0.0, float(balance or 0.0) * (float(allocation_pct or 0.0) / 100.0) / float(slot_count))
 
 
+
+
+def _simulation_wallet_margin_for_accounting(trade, start_balance: float = SIMULATION_START_BALANCE_USDT) -> float:
+    """Return a sane margin for Simulation wallet accounting.
+
+    This is accounting-only. It does not alter live execution, TP/SL, slots,
+    lifecycle, or saved trade objects. It prevents one corrupted simulation
+    trade margin (for example 23k on a 1k paper wallet) from compounding the
+    virtual wallet into hundreds of thousands.
+    """
+    base = float(start_balance or SIMULATION_START_BALANCE_USDT)
+    if base <= 0:
+        base = SIMULATION_START_BALANCE_USDT
+    stored = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
+    fallback = _simulation_margin_usdt(base, None)
+    if fallback <= 0:
+        fallback = max(1.0, base * 0.03)
+    max_margin = max(fallback * 3.0, base * SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER, 1.0)
+    if stored <= 0:
+        return fallback
+    if stored > max_margin:
+        try:
+            print(
+                f"⚠️ SIM_WALLET_MARGIN_SANITY_CAP | {getattr(trade, 'symbol', '-') or '-'} | "
+                f"stored={stored:.4f} | used={fallback:.4f} | max={max_margin:.4f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return fallback
+    return stored
+
+
+def _simulation_wallet_equity_is_corrupted(equity: float, start_balance: float = SIMULATION_START_BALANCE_USDT) -> bool:
+    base = float(start_balance or SIMULATION_START_BALANCE_USDT)
+    if base <= 0:
+        base = SIMULATION_START_BALANCE_USDT
+    value = _safe_float(equity, 0.0)
+    max_equity = max(base * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER, SIMULATION_START_BALANCE_USDT * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER)
+    return bool(value > max_equity or value < 0)
+
+
 def _simulation_equity_from_trades(
     sim_trades: list,
     start_balance: float = SIMULATION_START_BALANCE_USDT,
 ) -> float:
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
     for trade in sim_trades or []:
-        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
-        if margin <= 0:
-            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
         except Exception:
             pct = _trade_effective_pnl_pct(trade)
         equity += _money_from_pct(pct, margin=margin)
     return equity
+
+
+def _simulation_trade_effective_pnl_for_sanity(trade) -> float:
+    try:
+        return float(_report_trade_effective_pnl(trade) or 0.0)
+    except Exception:
+        try:
+            return float(_trade_effective_pnl_pct(trade) or 0.0)
+        except Exception:
+            return 0.0
+
+
+def _sanitize_simulation_trade_record(trade, settings: Settings | None = None, *, source: str = "load"):
+    """Return a safe Simulation trade for reports/wallet, or None if irreparable.
+
+    Root cause of the corrupted Simulation reports was not the wallet display
+    itself; old Redis simulation trades kept huge stored margins / impossible
+    PnL and report_format.py uses each trade's own margin. The wallet snapshot
+    could reset to 1000 while /report_simulation still summed those corrupted
+    trade records into +600k floating / -45k realized.
+
+    This is Simulation-only hygiene. It never touches execution trades, OKX
+    orders, TP/SL sync, market mode, or scoring.
+    """
+    if trade is None:
+        return None
+
+    # Drop impossibly old simulation records if timestamps are present. Redis TTL
+    # normally handles this, but copied/restored Redis can preserve stale rows.
+    opened_at = _parse_any_datetime_utc(getattr(trade, "opened_at", None) or getattr(trade, "created_at", None))
+    if opened_at is not None:
+        age_days = (datetime.now(timezone.utc) - opened_at).total_seconds() / 86400.0
+        if age_days > float(SIMULATION_TRADE_MAX_AGE_DAYS or 90):
+            print(
+                f"🧹 SIM_TRADE_SANITY_DROP | {getattr(trade, 'symbol', '-') or '-'} | "
+                f"reason=too_old | age_days={age_days:.1f} | source={source}",
+                flush=True,
+            )
+            return None
+
+    # Simulation is always tagged as execution-like for report style, but it
+    # must remain separated by trade_source=simulation.
+    setattr(trade, "trade_source", "simulation")
+    setattr(trade, "tracking_bucket", "execution")
+    setattr(trade, "execution_trade", True)
+
+    fallback_margin = _simulation_margin_usdt(SIMULATION_START_BALANCE_USDT, settings)
+    if fallback_margin <= 0:
+        fallback_margin = _simulation_margin_usdt(SIMULATION_START_BALANCE_USDT, None)
+    if fallback_margin <= 0:
+        fallback_margin = 35.0
+
+    max_margin = max(
+        fallback_margin * 3.0,
+        SIMULATION_START_BALANCE_USDT * SIMULATION_WALLET_MAX_MARGIN_MULTIPLIER,
+        1.0,
+    )
+
+    stored_margins = []
+    for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+        value = _safe_float(getattr(trade, attr, 0.0), 0.0)
+        if value > 0:
+            stored_margins.append(value)
+
+    if any(value > max_margin for value in stored_margins):
+        print(
+            f"🧯 SIM_TRADE_MARGIN_REPAIRED | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"stored_max={max(stored_margins):.4f} | used={fallback_margin:.4f} | max={max_margin:.4f} | source={source}",
+            flush=True,
+        )
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
+        setattr(trade, "simulation_margin_repaired", True)
+        setattr(trade, "simulation_margin_repair_reason", "stored_margin_exceeded_simulation_wallet_sanity")
+    elif not stored_margins:
+        for attr in ("used_margin_usdt", "simulation_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+            setattr(trade, attr, float(fallback_margin))
+
+    default_lev = max(1, int(getattr(settings, "default_leverage", 15) if settings is not None else 15) or 15)
+    for attr in ("effective_leverage", "actual_leverage", "leverage", "simulation_leverage"):
+        if _safe_float(getattr(trade, attr, 0.0), 0.0) <= 0:
+            setattr(trade, attr, default_lev)
+
+    effective_pct = _simulation_trade_effective_pnl_for_sanity(trade)
+    if abs(effective_pct) > float(SIMULATION_TRADE_MAX_EFFECTIVE_PNL_PCT or 1000.0):
+        print(
+            f"🧹 SIM_TRADE_SANITY_DROP | {getattr(trade, 'symbol', '-') or '-'} | "
+            f"reason=impossible_effective_pnl | pnl={effective_pct:+.2f}% | source={source}",
+            flush=True,
+        )
+        return None
+
+    return trade
+
+
+def _sanitize_simulation_trade_records(trades: list | None, settings: Settings | None = None, *, source: str = "runtime") -> list:
+    cleaned = []
+    dropped = 0
+    for trade in list(trades or []):
+        safe_trade = _sanitize_simulation_trade_record(trade, settings=settings, source=source)
+        if safe_trade is None:
+            dropped += 1
+            continue
+        cleaned.append(safe_trade)
+    if dropped:
+        print(f"🧹 SIM_TRADE_SANITY_SUMMARY | source={source} | kept={len(cleaned)} | dropped={dropped}", flush=True)
+    return cleaned
+
+
+
+def _normalize_simulation_report_margins_for_wallet(
+    trades: list | None,
+    *,
+    start_balance: float = SIMULATION_START_BALANCE_USDT,
+    source: str = "simulation_report",
+) -> list:
+    """Align Simulation report margins with Simulation wallet accounting.
+
+    Simulation Daily Balance uses _simulation_wallet_margin_for_accounting()
+    to cap/repair corrupted or legacy margins before converting PnL% to USDT.
+    Wallet Impact comes from reporting.report_format and reads the margin fields
+    stored on the trade. If those fields are larger than the accounting margin,
+    the report shows a different floating/realized USDT than the Daily Balance.
+
+    This is Simulation-only display/accounting hygiene. It does not touch live
+    execution, OKX orders, TP/SL, lifecycle, scoring, slots, or market mode.
+    """
+    normalized = []
+    for trade in list(trades or []):
+        try:
+            if str(getattr(trade, "trade_source", "") or "").lower() != "simulation":
+                normalized.append(trade)
+                continue
+
+            accounting_margin = _simulation_wallet_margin_for_accounting(
+                trade,
+                start_balance=start_balance,
+            )
+            if accounting_margin <= 0:
+                normalized.append(trade)
+                continue
+
+            old_values = {
+                attr: _safe_float(getattr(trade, attr, 0.0), 0.0)
+                for attr in (
+                    "used_margin_usdt",
+                    "simulation_margin_usdt",
+                    "margin_usdt",
+                    "allocated_margin_usdt",
+                )
+            }
+
+            for attr in (
+                "used_margin_usdt",
+                "simulation_margin_usdt",
+                "margin_usdt",
+                "allocated_margin_usdt",
+            ):
+                setattr(trade, attr, float(accounting_margin))
+
+            changed = any(
+                value > 0 and abs(value - accounting_margin) >= 0.01
+                for value in old_values.values()
+            )
+            if changed:
+                print(
+                    "SIM_REPORT_MARGIN_ALIGNED | "
+                    f"{getattr(trade, 'symbol', '-') or '-'} | "
+                    f"used={accounting_margin:.4f} | old={old_values} | source={source}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"⚠️ SIM_REPORT_MARGIN_ALIGN_FAILED | {getattr(trade, 'symbol', '-') or '-'} | {exc}",
+                flush=True,
+            )
+        normalized.append(trade)
+    return normalized
 
 
 def _load_simulation_daily_log(trade_store: RedisTradeStore | None = None) -> list[dict]:
@@ -4317,6 +5281,13 @@ def _ensure_simulation_daily_log(
 
     wallet = _build_simulation_wallet_snapshot(sim_trades)
     current_equity = float(wallet.get("equity", SIMULATION_START_BALANCE_USDT) or SIMULATION_START_BALANCE_USDT)
+    if _simulation_wallet_equity_is_corrupted(current_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=daily_log | equity={current_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f}",
+            flush=True,
+        )
+        current_equity = SIMULATION_START_BALANCE_USDT
 
     rows = _load_simulation_daily_log(trade_store)
     previous_rows = [r for r in rows if str(r.get("date", "")) < today]
@@ -4325,8 +5296,15 @@ def _ensure_simulation_daily_log(
         last = previous_rows[-1]
         previous_equity = _safe_float(last.get("end_balance") or last.get("current_balance") or last.get("equity"), 0.0)
 
-    if previous_equity and previous_equity > 0:
+    if previous_equity and previous_equity > 0 and not _simulation_wallet_equity_is_corrupted(previous_equity, SIMULATION_START_BALANCE_USDT):
         start_balance = previous_equity
+    elif previous_equity and _simulation_wallet_equity_is_corrupted(previous_equity, SIMULATION_START_BALANCE_USDT):
+        print(
+            f"⚠️ SIM_DAILY_PREVIOUS_EQUITY_IGNORED | previous={previous_equity:.4f} | "
+            f"fallback={SIMULATION_START_BALANCE_USDT:.2f}",
+            flush=True,
+        )
+        start_balance = SIMULATION_START_BALANCE_USDT
     elif rows and str(rows[-1].get("date", "")) == today:
         start_balance = _safe_float(rows[-1].get("start_balance"), SIMULATION_START_BALANCE_USDT)
     else:
@@ -4386,7 +5364,7 @@ def _build_simulation_daily_balance_text(trade_store: RedisTradeStore | None = N
     return "\n".join(lines)
 
 
-def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
+def _load_simulation_trades(trade_store: RedisTradeStore | None = None, settings: Settings | None = None) -> list:
     if not trade_store or not getattr(trade_store, "enabled", False) or not getattr(trade_store, "client", None):
         return []
 
@@ -4402,12 +5380,11 @@ def _load_simulation_trades(trade_store: RedisTradeStore | None = None) -> list:
             except Exception:
                 trade = None
             if trade:
-                setattr(trade, "trade_source", "simulation")
-                setattr(trade, "tracking_bucket", "execution")
-                setattr(trade, "execution_trade", True)
                 if str(getattr(trade, "status", "") or "").lower() not in {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired", "duplicate_closed_by_okx_repair"}:
                     setattr(trade, "status", str(getattr(trade, "status", "") or "open"))
-                trades.append(trade)
+                trade = _sanitize_simulation_trade_record(trade, settings=settings, source="redis_load")
+                if trade is not None:
+                    trades.append(trade)
     except Exception as exc:
         print(f"⚠️ Simulation load failed: {exc}", flush=True)
     return trades
@@ -4418,6 +5395,7 @@ def _save_simulation_trades(trades: list, trade_store: RedisTradeStore | None = 
         return
 
     try:
+        trades = _sanitize_simulation_trade_records(list(trades or []), settings=get_settings(), source="redis_save")
         pipe = trade_store.client.pipeline()
         for trade in trades or []:
             trade_id = str(getattr(trade, "trade_id", "") or "")
@@ -4517,15 +5495,14 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
     Each trade is assumed to use the configured paper margin if available,
     falling back to 35 USDT. The wallet itself starts at 1000 USDT.
     """
+    sim_trades = _sanitize_simulation_trade_records(list(sim_trades or []), settings=None, source="wallet_snapshot")
     open_trades = [t for t in sim_trades or [] if not _is_trade_closed(t)]
     closed_trades = [t for t in sim_trades or [] if _is_trade_closed(t)]
 
     realized = 0.0
     floating = 0.0
     for trade in sim_trades or []:
-        margin = _safe_float(getattr(trade, "simulation_margin_usdt", 0.0), 0.0)
-        if margin <= 0:
-            margin = _simulation_margin_usdt(float(start_balance or SIMULATION_START_BALANCE_USDT), None)
+        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
         try:
             pct = _report_trade_effective_pnl(trade)
         except Exception:
@@ -4537,6 +5514,15 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
             floating += usd
 
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT) + realized + floating
+    if _simulation_wallet_equity_is_corrupted(equity, start_balance):
+        print(
+            f"⚠️ SIM_WALLET_SNAPSHOT_SANITY_RESET | equity={equity:.4f} | "
+            f"start={float(start_balance or SIMULATION_START_BALANCE_USDT):.4f} | realized={realized:.4f} | floating={floating:.4f}",
+            flush=True,
+        )
+        realized = 0.0
+        floating = 0.0
+        equity = float(start_balance or SIMULATION_START_BALANCE_USDT)
     return {
         "start_balance": float(start_balance or SIMULATION_START_BALANCE_USDT),
         "equity": equity,
@@ -4933,28 +5919,60 @@ def _simulation_wallet_menu_text() -> str:
 def _build_simulation_account_summary(result: dict | None = None) -> str:
     """Small Simulation account block.
 
-    Same style as execution reports:
-    - short English/LTR metric lines
-    - no split Arabic labels vs numbers
-    - no extra blank lines
+    Source-of-truth rule for Simulation accounting:
+    Current Balance must be rebuilt from the sanitized virtual wallet on every
+    report render. A persisted daily row is allowed to provide the day start,
+    but it must never override wallet equity, because stale Redis rows can make
+    the report show impossible values like 1,821 while realized+floating imply
+    1,418.
     """
     result = result or {}
-    sim_trades = list(result.get("simulation_trades", []) or [])
-    wallet = result.get("simulation_wallet") or _build_simulation_wallet_snapshot(sim_trades)
-    daily_row = result.get("simulation_daily_balance") or {}
+    sim_trades = _sanitize_simulation_trade_records(
+        list(result.get("simulation_trades", []) or []),
+        settings=get_settings(),
+        source="account_summary",
+    )
+    wallet = _build_simulation_wallet_snapshot(sim_trades)
+    daily_row = dict(result.get("simulation_daily_balance") or {})
 
     start_balance = _safe_float(
         daily_row.get("start_balance"),
         _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT),
     )
-    current_balance = _safe_float(
-        daily_row.get("current_balance") or daily_row.get("end_balance"),
-        _safe_float(wallet.get("equity"), start_balance),
-    )
-    delta = current_balance - start_balance
-    growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
+    if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+
+    # Critical fix: never prefer stale daily_row current_balance over wallet equity.
+    current_balance = _safe_float(wallet.get("equity"), start_balance)
     realized = _safe_float(wallet.get("realized"), 0.0)
     floating = _safe_float(wallet.get("floating"), 0.0)
+
+    persisted_current = _safe_float(daily_row.get("current_balance") or daily_row.get("end_balance"), 0.0)
+    if persisted_current > 0 and abs(persisted_current - current_balance) >= 0.01:
+        try:
+            print(
+                "SIM_ACCOUNT_SUMMARY_STALE_DAILY_ROW_IGNORED | "
+                f"persisted={persisted_current:.4f} | wallet={current_balance:.4f} | "
+                f"realized={realized:.4f} | floating={floating:.4f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+    # Patch the in-memory row used by the equity curve so all report sections
+    # agree even before Redis gets rewritten by the next scan/status refresh.
+    daily_row.update({
+        "start_balance": start_balance,
+        "current_balance": current_balance,
+        "end_balance": current_balance,
+        "realized": realized,
+        "floating": floating,
+        "open_trades": int(wallet.get("open_count", 0) or 0),
+        "closed_trades": int(wallet.get("closed_count", 0) or 0),
+    })
+
+    delta = current_balance - start_balance
+    growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
     risk_mode = _simulation_protection_label(result)
     icon = "🟢" if delta >= 0 else "🔴"
 
@@ -5132,7 +6150,54 @@ def _build_simulation_command_outputs(result: dict) -> dict:
     - Does not touch execution reports.
     - Keeps shared report_format.py unchanged.
     """
-    wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []))
+    result = dict(result or {})
+    result["simulation_trades"] = _sanitize_simulation_trade_records(
+        list(result.get("simulation_trades", []) or []),
+        settings=get_settings(),
+        source="simulation_report",
+    )
+
+    daily_row_for_margin = dict(result.get("simulation_daily_balance") or {})
+    report_start_balance = _safe_float(
+        daily_row_for_margin.get("start_balance"),
+        SIMULATION_START_BALANCE_USDT,
+    )
+    if report_start_balance <= 0 or _simulation_wallet_equity_is_corrupted(report_start_balance, SIMULATION_START_BALANCE_USDT):
+        report_start_balance = SIMULATION_START_BALANCE_USDT
+
+    result["simulation_trades"] = _normalize_simulation_report_margins_for_wallet(
+        list(result.get("simulation_trades", []) or []),
+        start_balance=report_start_balance,
+        source="simulation_report_command_outputs",
+    )
+    wallet = _build_simulation_wallet_snapshot(list(result.get("simulation_trades", []) or []), start_balance=report_start_balance)
+    result["simulation_wallet"] = wallet
+
+    # Reconcile the command-time daily row with the wallet snapshot before any
+    # report builder reads it. This prevents stale Redis current_balance/end_balance
+    # from inflating Simulation Daily Balance while Wallet Impact uses fresh trades.
+    daily_row = dict(result.get("simulation_daily_balance") or {})
+    start_balance = _safe_float(daily_row.get("start_balance"), _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT))
+    if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
+        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+    current_balance = _safe_float(wallet.get("equity"), start_balance)
+    persisted_current = _safe_float(daily_row.get("current_balance") or daily_row.get("end_balance"), 0.0)
+    if persisted_current > 0 and abs(persisted_current - current_balance) >= 0.01:
+        print(
+            "SIM_REPORT_DAILY_ROW_RECONCILED | "
+            f"persisted={persisted_current:.4f} | wallet={current_balance:.4f}",
+            flush=True,
+        )
+    daily_row.update({
+        "start_balance": start_balance,
+        "current_balance": current_balance,
+        "end_balance": current_balance,
+        "realized": _safe_float(wallet.get("realized"), 0.0),
+        "floating": _safe_float(wallet.get("floating"), 0.0),
+        "open_trades": int(wallet.get("open_count", 0) or 0),
+        "closed_trades": int(wallet.get("closed_count", 0) or 0),
+    })
+    result["simulation_daily_balance"] = daily_row
 
     wallet_text = _simulation_header(_simulation_wallet_menu_text())
 
@@ -5521,6 +6586,15 @@ def run_once(
     else:
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         drawdown_status = evaluate_drawdown(portfolio_state)
+        portfolio_state, drawdown_status, portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            drawdown_status,
+            portfolio_state_inputs,
+            dd_base_trades,
+            settings,
+            trade_store=trade_store,
+            label="run_once_dd",
+        )
     loss_streak_base_trades = simulation_trades if simulation_mode_active else persisted_trades
     loss_streak_reset_at = _parse_protection_dt(protection_state.get("loss_streak_reset_at"))
     loss_streak_guard = _build_loss_streak_guard(loss_streak_base_trades, reset_at=loss_streak_reset_at)
@@ -5559,8 +6633,8 @@ def run_once(
     # على باقي الـ pairs في نفس الـ scan
     scan_mode = state.mode
 
-    # Low Balance Mode — لو الرصيد أقل من الحد، نغير الـ slots والـ margin.
-    # Block Exception و Recovery بيفضلوا على حدودهم الأصلية.
+    # Balance Tier Mode — يغير Normal slots/margin فقط.
+    # Block Exception و Recovery لهم slots منفصلة حسب tier الرصيد.
     if simulation_mode_active:
         _sim_wallet_balance = _safe_float(
             _build_simulation_wallet_snapshot(simulation_trades).get("equity"),
@@ -5572,8 +6646,11 @@ def run_once(
             portfolio_state_inputs.get("reference_portfolio"), 0.0
         )
 
-    _low_balance_mode = bool(0 < _effective_reference_balance < LOW_BALANCE_THRESHOLD_USDT)
-    effective_max_positions = LOW_BALANCE_MAX_SLOTS if _low_balance_mode else settings.max_execution_positions
+    _balance_tier = _balance_tier_limits(_effective_reference_balance, settings)
+    _balance_tier_name = str(_balance_tier.get("tier") or "mature_balance")
+    _low_balance_mode = _balance_tier_name == "low_balance"
+    effective_max_positions = max(1, int(_balance_tier.get("normal_slots") or settings.max_execution_positions))
+    _effective_allocation_pct = _safe_float(_balance_tier.get("allocation_pct"), MATURE_BALANCE_ALLOCATION_PCT)
 
     # ✅ OKX GATE GUARD: لو execution mode والـ Redis فاضي (أول scan بعد التحويل)
     # اسأل OKX مباشرة عن الـ open positions عشان الـ slot_counts يكون صح
@@ -5602,7 +6679,7 @@ def run_once(
                 print(
                     f"🛡 OKX_GATE_GUARD | "
                     f"OKX positions={_okx_open_count} | tracked_general={previous_general} | "
-                    f"max_allowed={'LOW='+str(effective_max_positions) if _low_balance_mode else 'NORMAL='+str(effective_max_positions)} | "
+                    f"max_allowed={_balance_tier_name.upper()}={effective_max_positions} | "
                     f"slot_counts[general] set to {slot_counts['general']} | "
                     f"symbols={','.join(sorted(_okx_live_symbols))}",
                     flush=True,
@@ -5610,38 +6687,28 @@ def run_once(
         except Exception as _exc:
             print(f"⚠️ OKX_GATE_GUARD | failed to fetch positions: {_exc}", flush=True)
 
-    # Block Exception و Recovery slots — ديناميكية حسب الرصيد
-    # رصيد ≥ $109 → كل مود عنده 3 slots منفصلة
-    # رصيد < $109 → كل مود عنده slot واحد فقط
-    NORMAL_BLOCK_SLOTS = 3
-    NORMAL_RECOVERY_SLOTS = 3
-    LOW_BALANCE_BLOCK_SLOTS = 1
-    LOW_BALANCE_RECOVERY_SLOTS = 1
-
-    effective_max_block_positions = LOW_BALANCE_BLOCK_SLOTS if _low_balance_mode else NORMAL_BLOCK_SLOTS
-    effective_max_recovery_positions = LOW_BALANCE_RECOVERY_SLOTS if _low_balance_mode else NORMAL_RECOVERY_SLOTS
+    # Block Exception و Recovery slots — منفصلين عن Normal slots حسب tier الرصيد.
+    effective_max_block_positions = max(0, int(_balance_tier.get("block_slots") or 0))
+    effective_max_recovery_positions = max(0, int(_balance_tier.get("recovery_slots") or 0))
 
     # إعادة حساب recovery_remaining بالحد الجديد
     recovery_remaining = max(0, effective_max_recovery_positions - slot_counts.get("recovery", 0))
 
-    if _low_balance_mode:
-        print(
-            f"⚠️ LOW_BALANCE_MODE | balance={_effective_reference_balance:.2f} < {LOW_BALANCE_THRESHOLD_USDT} | "
-            f"general={effective_max_positions} | block={effective_max_block_positions} | "
-            f"recovery={effective_max_recovery_positions} | alloc={LOW_BALANCE_ALLOCATION_PCT}%",
-            flush=True,
-        )
-    else:
-        print(
-            f"✅ NORMAL_MODE | balance={_effective_reference_balance:.2f} | "
-            f"general={effective_max_positions} | block={effective_max_block_positions} | "
-            f"recovery={effective_max_recovery_positions} | alloc=24%",
-            flush=True,
-        )
+    print(
+        f"💼 BALANCE_TIER | tier={_balance_tier_name} | balance={_effective_reference_balance:.2f} | "
+        f"general={effective_max_positions} | block={effective_max_block_positions} | "
+        f"recovery={effective_max_recovery_positions} | alloc={_effective_allocation_pct:.2f}%",
+        flush=True,
+    )
 
     print(
         f"📊 Ranked pairs: {len(ranked_pairs)} | After prefilter: {len(filtered_pairs)} | Scanned pairs: {len(filtered_pairs)}",
         flush=True,
+    )
+    _log_throttled(
+        "scan_candle_cache_status",
+        f"SCAN_CANDLE_CACHE | entries={len(_CANDLE_CONTEXT_CACHE)} | 15m_ttl={_candle_context_cache_ttl('15m')}s | 4h_ttl={_candle_context_cache_ttl('4H')}s",
+        every_seconds=300,
     )
 
     for pair in filtered_pairs:
@@ -5657,29 +6724,35 @@ def run_once(
                 "recent_candles",
                 recent_candles,
             )
-            print(
-                f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
-                flush=True,
-            )
+            if _runtime_verbose_logs_enabled():
+                print(
+                    f"PA_CANDLES | {pair.symbol} | count={len(recent_candles)}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(
+            _log_throttled(
+                f"pa_candles_error:{getattr(pair, 'symbol', '-')}",
                 f"PA_CANDLES | {getattr(pair, 'symbol', '-')} | error={exc}",
-                flush=True,
+                every_seconds=300,
+                force=False,
             )
 
         try:
             resistance_4h_context = _build_4h_resistance_context_for_pair(pair, settings)
             setattr(pair, "resistance_4h_context", resistance_4h_context)
-            print(
-                f"4H_RESISTANCE | {pair.symbol} | "
-                f"status={resistance_4h_context.get('status')} | "
-                f"distance={resistance_4h_context.get('distance_pct')}",
-                flush=True,
-            )
+            if _runtime_verbose_logs_enabled():
+                print(
+                    f"4H_RESISTANCE | {pair.symbol} | "
+                    f"status={resistance_4h_context.get('status')} | "
+                    f"distance={resistance_4h_context.get('distance_pct')}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(
+            _log_throttled(
+                f"4h_resistance_error:{getattr(pair, 'symbol', '-')}",
                 f"4H_RESISTANCE | {getattr(pair, 'symbol', '-')} | error={exc}",
-                flush=True,
+                every_seconds=300,
+                force=False,
             )
 
         signal = build_signal_candidate(pair, scan_mode, settings.min_normal_score, settings.min_strong_score)
@@ -5688,13 +6761,14 @@ def run_once(
 
         # ✅ DIAGNOSTIC: تتبع raw_candles داخل الـ signal بعد البناء
         _signal_candles_count = len((signal.meta or {}).get("raw_candles") or [])
-        print(
-            f"SIGNAL_CANDLES | {signal.symbol} | "
-            f"setup={signal.setup_type} | "
-            f"mode={scan_mode} | "
-            f"raw_candles_in_meta={_signal_candles_count}",
-            flush=True,
-        )
+        if _runtime_verbose_logs_enabled():
+            print(
+                f"SIGNAL_CANDLES | {signal.symbol} | "
+                f"setup={signal.setup_type} | "
+                f"mode={scan_mode} | "
+                f"raw_candles_in_meta={_signal_candles_count}",
+                flush=True,
+            )
 
         # First let the normal execution decision run, including BLOCK/RECOVERY
         # exception logic. Then, if a higher hard protection is active
@@ -5825,6 +6899,8 @@ def run_once(
             "announcement_status": "pending" if exec_status in {"accepted_preview", "pending_pullback_preview"} else "n/a",
             "simulation_mode": simulation_mode_active,
         })
+        exec_result = _ensure_post_rejection_seed(signal, exec_result)
+        signal_items[-1]["execution"] = exec_result
         current_execution_results.append(exec_result)
 
         if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)):
@@ -5860,6 +6936,17 @@ def run_once(
         settings,
         label="final_lifecycle",
     )
+    current_execution_results, _post_rej_current_stats = _update_post_rejection_tracking_rows(
+        current_execution_results,
+        price_map,
+    )
+    if _post_rej_current_stats.get("changed"):
+        print(
+            f"POST_REJECTION_TRACKING | current_updated={_post_rej_current_stats.get('changed')} | "
+            f"matured={_post_rej_current_stats.get('matured_fields')}",
+            flush=True,
+        )
+
     protection = block_protection_status(state)
 
     # ✅ FIX: احسب exchange_stop_sync للـ final update بعد ما الصفقات اتفتحت في اللوب
@@ -5920,10 +7007,27 @@ def run_once(
         else:
             trade_store.append_execution_checks(current_execution_results)
         execution_results_for_reports = trade_store.load_execution_checks(limit=500) or current_execution_results
+        execution_results_for_reports, _post_rej_report_stats = _update_post_rejection_tracking_rows(
+            execution_results_for_reports,
+            price_map,
+        )
+        if _post_rej_report_stats.get("changed") and hasattr(trade_store, "save_execution_checks"):
+            trade_store.save_execution_checks(execution_results_for_reports)
+            print(
+                f"POST_REJECTION_TRACKING | history_updated={_post_rej_report_stats.get('changed')} | "
+                f"matured={_post_rej_report_stats.get('matured_fields')}",
+                flush=True,
+            )
         simulation_execution_results_for_reports = _load_simulation_execution_checks(trade_store, limit=500)
+        simulation_execution_results_for_reports, _post_rej_sim_stats = _update_post_rejection_tracking_rows(
+            simulation_execution_results_for_reports,
+            price_map,
+        )
     else:
         execution_results_for_reports = current_execution_results
         simulation_execution_results_for_reports = current_execution_results if simulation_mode_active else []
+        execution_results_for_reports, _ = _update_post_rejection_tracking_rows(execution_results_for_reports, price_map)
+        simulation_execution_results_for_reports, _ = _update_post_rejection_tracking_rows(simulation_execution_results_for_reports, price_map)
 
     if technical_snapshot_records:
         snapshot_write_result = append_many_signal_snapshots(technical_snapshot_records, settings, redis_client=_snapshot_redis_client(trade_store))
@@ -5967,6 +7071,15 @@ def run_once(
     else:
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         drawdown_status = evaluate_drawdown(portfolio_state)
+        portfolio_state, drawdown_status, portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            drawdown_status,
+            portfolio_state_inputs,
+            dd_base_trades,
+            settings,
+            trade_store=trade_store,
+            label="run_once_dd",
+        )
     if simulation_mode_active:
         drawdown_report = _simulation_wallet_drawdown_report(portfolio_state, drawdown_status)
     else:
@@ -6147,6 +7260,17 @@ def _refresh_runtime_result_outputs(result: dict, trade_store: RedisTradeStore |
         portfolio_state = build_portfolio_state_from_trades(dd_base_trades, **_portfolio_state_kwargs(portfolio_state_inputs))
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            portfolio_state_inputs,
+            dd_base_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="runtime_after_reset",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = portfolio_state_inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     result["loss_streak_guard"] = _build_loss_streak_guard(
         dd_base_trades,
@@ -7584,13 +8708,14 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
     """بلوك رصيد OKX يظهر في أعلى تقارير التنفيذ.
 
     بيأخذ البيانات من portfolio_state_inputs اللي بتجي من OKX balance
-    أو fallback وبيظهرها بشكل واضح مع Low Balance Mode لو مفعل.
+    أو fallback وبيظهرها بشكل واضح مع Balance Tier الحالي.
     """
     inputs = dict((result or {}).get("portfolio_state_inputs") or {})
     reference_balance = _safe_float(inputs.get("reference_portfolio"), 0.0)
     margin_per_trade = _safe_float(inputs.get("margin_per_trade"), 0.0)
     allocation_pct, slot_count = _risk_sizing_constants(settings, reference_balance=reference_balance)
-    low_balance = bool(0 < reference_balance < LOW_BALANCE_THRESHOLD_USDT)
+    tier_limits = _balance_tier_limits(reference_balance, settings)
+    tier_name = str(tier_limits.get("tier") or "mature_balance")
 
     lines = [
         "💼 <b>OKX Account — Execution Sizing</b>",
@@ -7599,8 +8724,11 @@ def _build_execution_balance_header(result: dict, settings: Settings) -> str:
         f"• Allocation: <b>{allocation_pct:.2f}%</b> / <b>{slot_count} slots</b>",
         f"• Planned Margin / Trade: <b>{margin_per_trade:,.2f} USDT</b>",
     ]
-    if low_balance:
-        lines.append(f"⚠️ <b>Low Balance Mode</b> — balance &lt; {LOW_BALANCE_THRESHOLD_USDT:.0f} USDT")
+    lines.append(
+        f"• Balance Tier: <b>{tier_name}</b> "
+        f"(Block <b>{int(tier_limits.get('block_slots') or 0)}</b> | "
+        f"Recovery <b>{int(tier_limits.get('recovery_slots') or 0)}</b>)"
+    )
     lines.append("━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -7845,6 +8973,21 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
+    # Build Balance Tier line outside nested f-strings to avoid quote parsing issues.
+    try:
+        _portfolio_inputs = result.get("portfolio_state_inputs") or {}
+        _tier_reference_balance = _safe_float(_portfolio_inputs.get("reference_portfolio"), 0.0)
+        _tier = _balance_tier_limits(_tier_reference_balance, settings)
+        balance_tier_line = (
+            f"💰 Balance Tier: {_tier.get('tier')} — "
+            f"general={int(_tier.get('normal_slots') or 0)} | "
+            f"block={int(_tier.get('block_slots') or 0)} | "
+            f"recovery={int(_tier.get('recovery_slots') or 0)} | "
+            f"alloc={_safe_float(_tier.get('allocation_pct'), 0.0):.0f}%"
+        )
+    except Exception:
+        balance_tier_line = "💰 Balance Tier: unavailable"
+
     # UI-only status flag, scoped by active runtime.
     drawdown_state = "halted" if (drawdown is not None and not bool(getattr(drawdown, "allowed", True))) else "active"
     if simulation_active:
@@ -7878,7 +9021,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
         f"🧯 Manual Resume: {manual_resume_line}",
-        f"💰 Low Balance Mode: {'⚠️ ON — general=3 | block=1 | recovery=1 | alloc=40%' if (lambda b: 0 < b < LOW_BALANCE_THRESHOLD_USDT)(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0)) else f'OFF — general=7 | block=3 | recovery=3 | alloc=24%'}",
+        balance_tier_line,
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
@@ -8718,53 +9861,64 @@ def _refresh_execution_reports_from_redis(
     live_okx_mode = _is_live_okx_execution_mode(runtime_settings, okx_client)
 
     if live_okx_mode:
-        try:
-            reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
-            )
-            if reconcile_stats.get("changed") and trade_store:
-                trade_store.save_trades(reconciled)
-            refreshed_trades = reconciled
-        except Exception as exc:
-            print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
+        if _report_hard_okx_refresh_allowed("execution_report"):
+            try:
+                reconciled, reconcile_stats = _reconcile_execution_trades_with_okx(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                )
+                if reconcile_stats.get("changed") and trade_store:
+                    trade_store.save_trades(reconciled)
+                refreshed_trades = reconciled
+            except Exception as exc:
+                print(f"⚠️ execution report reconcile refresh failed: {exc}", flush=True)
 
-        try:
-            recovered, recovery_stats = _recover_missing_execution_trades_from_okx_positions(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
-                force_import_recent=True,
-            )
-            if recovery_stats.get("changed") and trade_store:
-                trade_store.save_trades(recovered)
-            refreshed_trades = recovered
-            print(
-                "EXEC_REPORT_HARD_RECOVERY | "
-                f"live_okx_mode={live_okx_mode} | "
-                f"imported={int((recovery_stats or {}).get('imported', 0) or 0)} | "
-                f"symbols={','.join((recovery_stats or {}).get('symbols', []) or []) or '-'}",
-                flush=True,
-            )
-        except Exception as exc:
-            recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
-            print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
+            try:
+                recovered, recovery_stats = _recover_missing_execution_trades_from_okx_positions(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                    force_import_recent=True,
+                )
+                if recovery_stats.get("changed") and trade_store:
+                    trade_store.save_trades(recovered)
+                refreshed_trades = recovered
+                _log_throttled(
+                    "exec_report_hard_recovery",
+                    "EXEC_REPORT_HARD_RECOVERY | "
+                    f"live_okx_mode={live_okx_mode} | "
+                    f"imported={int((recovery_stats or {}).get('imported', 0) or 0)} | "
+                    f"symbols={','.join((recovery_stats or {}).get('symbols', []) or []) or '-'}",
+                    every_seconds=300,
+                    force=bool((recovery_stats or {}).get("changed")),
+                )
+            except Exception as exc:
+                recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": f"hard_recovery_failed:{exc}"}
+                print(f"⚠️ execution report OKX hard recovery failed: {exc}", flush=True)
 
-        try:
-            repaired, repair_stats = _repair_execution_trades_from_live_okx_positions(
-                refreshed_trades,
-                okx_client,
-                runtime_settings,
+            try:
+                repaired, repair_stats = _repair_execution_trades_from_live_okx_positions(
+                    refreshed_trades,
+                    okx_client,
+                    runtime_settings,
+                )
+                if repair_stats.get("changed") and trade_store:
+                    trade_store.save_trades(repaired)
+                refreshed_trades = repaired
+                result["okx_position_repair_stats"] = repair_stats
+            except Exception as exc:
+                repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"hard_repair_failed:{exc}"}
+                result["okx_position_repair_stats"] = repair_stats
+                print(f"⚠️ execution report OKX hard repair failed: {exc}", flush=True)
+        else:
+            recovery_stats = {"enabled": True, "changed": False, "imported": 0, "reason": "report_hard_okx_refresh_throttled"}
+            result["okx_position_recovery_stats"] = recovery_stats
+            _log_throttled(
+                "exec_report_hard_refresh_throttled",
+                "EXEC_REPORT_HARD_REFRESH_THROTTLED | reason=recent_hard_refresh | set OKX_REPORT_HARD_REFRESH_SECONDS to tune",
+                every_seconds=300,
             )
-            if repair_stats.get("changed") and trade_store:
-                trade_store.save_trades(repaired)
-            refreshed_trades = repaired
-            result["okx_position_repair_stats"] = repair_stats
-        except Exception as exc:
-            repair_stats = {"enabled": True, "changed": False, "repaired": 0, "imported": 0, "reason": f"hard_repair_failed:{exc}"}
-            result["okx_position_repair_stats"] = repair_stats
-            print(f"⚠️ execution report OKX hard repair failed: {exc}", flush=True)
 
     result["trades"] = refreshed_trades
     result["execution_results"] = refreshed_checks
@@ -8807,6 +9961,17 @@ def _refresh_execution_reports_from_redis(
         )
         result["portfolio_state"] = portfolio_state
         result["drawdown_status"] = evaluate_drawdown(portfolio_state)
+        portfolio_state, result["drawdown_status"], portfolio_state_inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            result["drawdown_status"],
+            portfolio_state_inputs,
+            refreshed_trades,
+            runtime_settings,
+            trade_store=trade_store,
+            label="execution_report_refresh",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["portfolio_state_inputs"] = portfolio_state_inputs
         result["drawdown_report"] = build_drawdown_report(portfolio_state)
     except Exception as exc:
         print(f"⚠️ execution report portfolio refresh failed: {exc}", flush=True)
@@ -8942,6 +10107,7 @@ def _handle_admin_clean_command(
         "/reset_reports_execution": ("execution", "/confirm_reset_reports_execution", "🚀 Reset Execution Reports Preview"),
         "/reset_reports_normal": ("normal", "/confirm_reset_reports_normal", "📊 Reset Normal Reports Preview"),
         "/reset_reports_simulation": ("simulation", "/confirm_reset_reports_simulation", "🧪 Reset Simulation Reports Preview"),
+        "/reset_simulation": ("simulation", "/confirm_reset_simulation", "🧪 Reset Simulation Data Preview"),
         "/reset_reports_all": ("all", "/confirm_reset_reports_all", "🧹 Reset All Reports Preview"),
     }
     if command in reset_preview_commands:
@@ -8956,6 +10122,7 @@ def _handle_admin_clean_command(
         "/confirm_reset_reports_execution": ("execution", "🚀 Reset Execution Reports Done"),
         "/confirm_reset_reports_normal": ("normal", "📊 Reset Normal Reports Done"),
         "/confirm_reset_reports_simulation": ("simulation", "🧪 Reset Simulation Reports Done"),
+        "/confirm_reset_simulation": ("simulation", "🧪 Reset Simulation Data Done"),
         "/confirm_reset_reports_all": ("all", "🧹 Reset All Reports Done"),
     }
     if command in reset_confirm_commands:
