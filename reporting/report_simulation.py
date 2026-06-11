@@ -259,6 +259,23 @@ def _simulation_floating_trades(trades: list) -> list:
             merged.append(t)
     return merged
 
+
+def _simulation_behavior_trades(trades: list) -> list:
+    """Closed history + visible floating exposure for Behavior Summary only.
+
+    Keeps the old report design but prevents legacy/non-active simulation records
+    from inflating Behavior Summary Total Floating PnL. Report-only; no Redis or
+    lifecycle mutation.
+    """
+    merged = []
+    seen: set[int] = set()
+    for t in [*closed_trades(trades), *_simulation_floating_trades(trades)]:
+        marker = id(t)
+        if marker not in seen:
+            seen.add(marker)
+            merged.append(t)
+    return merged
+
 def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None = None, starting_balance: float = 1000.0) -> list[str]:
     active_opened = _simulation_active_open_trades(trades)
     runners = _simulation_runner_trades(trades)
@@ -362,7 +379,7 @@ def build_simulation_report(
         f"🛣 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
     lines.extend([SEP, *_simulation_wallet_impact_lines(trades, account_summary=account_summary, starting_balance=start_balance)])
-    behavior_lines = behavior_summary_lines(trades, label="Simulation Behavior Summary")
+    behavior_lines = behavior_summary_lines(_simulation_behavior_trades(trades), label="Simulation Behavior Summary")
     lines.extend([SEP, *behavior_lines])
 
     # Keep the old report design: one Open Trades section, not separate Active/Runner sections.
