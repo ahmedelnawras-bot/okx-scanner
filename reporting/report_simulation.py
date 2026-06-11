@@ -294,8 +294,7 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
         "⚖️ الصافي",
         f"<b>{money_icon(closed_net_usd)} | {closed_net:+.2f}% Realized PnL</b>",
         "",
-        "🔄 <b>الصفقات المفتوحة / الرنر</b>",
-        f"📌 Active Slots: {len(active_opened)} | Protected Runners: {len(runners)}",
+        "🔄 <b>الصفقات المفتوحة</b>",
         "📈 الأرباح العائمة",
         f"{floating_profit_usd:+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
         "📉 الخسائر العائمة",
@@ -323,6 +322,13 @@ def build_simulation_report(
     period: str = "since_start",
     account_summary: str | None = None,
 ) -> str:
+    """Build the Simulation report with the old visual format and safer open counts.
+
+    Report-only rules:
+    - Keep the previous Simulation report layout/section names.
+    - Do not count legacy mirror records as active open trades.
+    - Treat active slots + protected runners as visible floating exposure.
+    """
     trades = filter_trades_by_period(_simulation_scope_trades(sim_trades), period)
     checks = filter_checks_by_period(sim_checks or [], period)
     accepted_checks = _accepted_gate_checks(checks)
@@ -333,14 +339,12 @@ def build_simulation_report(
 
     active_opened = _simulation_active_open_trades(trades)
     runners = _simulation_runner_trades(trades)
-    floating_trades = _simulation_floating_trades(trades)
+    opened = _simulation_floating_trades(trades)
     closed = closed_trades(trades)
 
     win_count, loss_count, wr = _closed_wr_parts(trades)
-    winners = sorted([t for t in active_opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
-    losers = sorted([t for t in active_opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
-    runner_winners = sorted([t for t in runners if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
-    runner_losers = sorted([t for t in runners if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
+    losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
     closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     start_balance = _extract_sim_start_balance(account_summary, 1000.0)
@@ -350,8 +354,8 @@ def build_simulation_report(
         "📊 <b>Quick Stats</b>",
         f"• Checked Candidates: {checked}",
         f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
-        f"• Active Open Trades: {len(active_opened)}",
-        f"• Protected Runners: {len(runners)}",
+        f"• Currently Open Tracked Trades: {len(opened)}",
+        f"• Active Slots: {len(active_opened)} | Protected Runners: {len(runners)}",
         f"• Closed Tracked Trades: {len(closed)}",
         f"🏆 Win Rate: <b>{wr:.1f}%</b>",
         f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
@@ -362,28 +366,17 @@ def build_simulation_report(
     behavior_lines = behavior_summary_lines(trades, label="Simulation Behavior Summary")
     lines.extend([SEP, *behavior_lines])
 
-    lines.extend([SEP, "📂 <b>Active Open Trades</b>"])
-    lines.append(f"🟢 Active Winners: {len(winners)} | 🔴 Active Losers: {len(losers)}")
-    if active_opened:
-        lines.append(f"⚡ Active Floating PnL: {sum(trade_effective_pnl(t) for t in active_opened):+.2f}%")
-    append_trade_cards(lines, "🟢 <b>Top 3 Active Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "🔴 <b>Top 3 Active Losers</b>", losers[:3], limit=3)
-
-    if runners:
-        lines.extend([SEP, "🏃 <b>Protected Runners</b>"])
-        lines.append(f"🟢 Runner Winners: {len(runner_winners)} | 🔴 Runner Losers: {len(runner_losers)}")
-        lines.append(f"⚡ Runner Floating PnL: {sum(trade_effective_pnl(t) for t in runners):+.2f}%")
-        append_trade_cards(lines, "🏃 <b>Top 3 Protected Runner Winners</b>", runner_winners[:3], limit=3)
-        append_trade_cards(lines, "🔴 <b>Top 3 Protected Runner Losers</b>", runner_losers[:3], limit=3)
-
-    if floating_trades:
-        lines.append(f"⚖️ Total Visible Floating PnL: {sum(trade_effective_pnl(t) for t in floating_trades):+.2f}%")
-
+    # Keep the old report design: one Open Trades section, not separate Active/Runner sections.
+    lines.extend([SEP, "📂 <b>Open Trades</b>"])
+    lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
+    if opened:
+        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+    append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
+    append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
     append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
     append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
     lines.extend([SEP, "💡 إدارة الصفقات: Simulation 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
-
 
 PERIODS = [
     ("", "since_start"),
