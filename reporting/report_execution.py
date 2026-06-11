@@ -36,6 +36,8 @@ from reporting.report_format import (
 EXECUTION_SCOPE_MARKER = "execution_scope_okx_truth_v1"
 OPEN_EXECUTION_MIN_DISPLAY_PNL_PCT = -100.0
 OPEN_EXECUTION_MAX_DISPLAY_PNL_PCT = 1500.0
+CLOSED_EXECUTION_MIN_DISPLAY_PNL_PCT = -100.0
+CLOSED_EXECUTION_MAX_DISPLAY_PNL_PCT = 1500.0
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -94,17 +96,26 @@ def _cap_open_execution_pnl_pct(value: float) -> tuple[float, bool]:
     return capped, abs(capped - raw) > 1e-9
 
 
-def _execution_effective_pnl(t: TrackedTrade) -> tuple[float, bool]:
-    """Display PnL for execution reports.
+def _cap_closed_execution_pnl_pct(value: float) -> tuple[float, bool]:
+    raw = _safe_float(value, 0.0)
+    capped = max(CLOSED_EXECUTION_MIN_DISPLAY_PNL_PCT, min(CLOSED_EXECUTION_MAX_DISPLAY_PNL_PCT, raw))
+    return capped, abs(capped - raw) > 1e-9
 
-    Closed trades remain unchanged because their history is analytics. Open live
-    trades are capped for display so one corrupted Redis price/entry cannot make
-    the report claim an impossible -6000% floating wallet loss. OKX balance stays
-    the source of truth and is displayed separately.
+
+def _execution_effective_pnl(t: TrackedTrade) -> tuple[float, bool]:
+    """Display PnL for execution reports only.
+
+    OKX balance is the financial truth. Redis tracked PnL is analytics.
+    Therefore both open and closed execution records are capped for display so
+    corrupted legacy Redis records cannot make reports show impossible wallet
+    impacts such as +400k$ or -6000%. This does not mutate Redis, orders, TP/SL,
+    lifecycle, or Simulation.
     """
     pct = trade_effective_pnl(t)
     if t in open_trades([t]):
         return _cap_open_execution_pnl_pct(pct)
+    if t in closed_trades([t]) or bool(getattr(t, "is_closed", False)):
+        return _cap_closed_execution_pnl_pct(pct)
     return pct, False
 
 
@@ -126,13 +137,27 @@ def _execution_wallet_impact_lines(
     def pct_value(t):
         return _execution_effective_pnl(t)[0]
 
-    closed_profit = sum(max(0.0, trade_effective_pnl(t)) for t in closed)
-    closed_loss = sum(min(0.0, trade_effective_pnl(t)) for t in closed)
+    closed_capped_symbols = []
+    closed_profit = 0.0
+    closed_loss = 0.0
+    closed_profit_usd = 0.0
+    closed_loss_usd = 0.0
+    for t in closed:
+        pct, capped = _execution_effective_pnl(t)
+        if capped:
+            closed_capped_symbols.append(str(getattr(t, "symbol", "?") or "?"))
+        money = (pct / 100.0) * _trade_margin_usdt_local(t, fallback=margin_per_trade)
+        if pct >= 0:
+            closed_profit += pct
+        else:
+            closed_loss += pct
+        if money >= 0:
+            closed_profit_usd += money
+        else:
+            closed_loss_usd += money
+
     floating_profit = sum(max(0.0, pct_value(t)) for t in opened)
     floating_loss = sum(min(0.0, pct_value(t)) for t in opened)
-
-    closed_profit_usd = sum(max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade)) for t in closed)
-    closed_loss_usd = sum(min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade)) for t in closed)
 
     capped_symbols = []
     floating_profit_usd = 0.0
@@ -161,6 +186,9 @@ def _execution_wallet_impact_lines(
         f"📌 OKX Truth Balance: <b>{float(starting_balance or 0.0):.2f} USDT</b>",
         "📌 Tracked PnL below is analytics from execution records only.",
     ]
+    if closed_capped_symbols:
+        unique = list(dict.fromkeys(closed_capped_symbols))[:8]
+        lines.append(f"🧯 Closed PnL sanity capped: <b>{len(closed_capped_symbols)}</b> trade(s) | {', '.join(unique)}")
     if capped_symbols:
         unique = list(dict.fromkeys(capped_symbols))[:8]
         lines.append(f"🧯 Open PnL sanity capped: <b>{len(capped_symbols)}</b> trade(s) | {', '.join(unique)}")
@@ -237,7 +265,44 @@ def _closed_wr_parts(trades: list[TrackedTrade]) -> tuple[int, int, float]:
 
 
 def _trade_net_usd(trades: list[TrackedTrade], margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE) -> float:
-    return money_from_exposure_pct(sum(trade_effective_pnl(t) for t in trades), margin_per_trade)
+    return sum((_execution_effective_pnl(t)[0] / 100.0) * _trade_margin_usdt_local(t, fallback=margin_per_trade) for t in trades)
+
+
+def _fmt_price_local(value) -> str:
+    v = _safe_float(value, 0.0)
+    if v == 0:
+        return "0"
+    if abs(v) >= 1:
+        return f"{v:.6f}".rstrip("0").rstrip(".")
+    return f"{v:.10f}".rstrip("0").rstrip(".")
+
+
+def _execution_trade_card_lines(t: TrackedTrade, *, fallback_margin: float = DEFAULT_MARGIN_PER_TRADE) -> list[str]:
+    pct, capped = _execution_effective_pnl(t)
+    pnl_name = "Realized PnL" if (bool(getattr(t, "is_closed", False)) or t in closed_trades([t])) else "Floating PnL"
+    margin = _trade_margin_usdt_local(t, fallback=fallback_margin)
+    impact = (pct / 100.0) * margin
+    cap_note = " | 🧯 capped" if capped else ""
+    return [
+        f"• <b>{getattr(t, 'symbol', '-')}</b> | {pct:+.2f}% {pnl_name}{cap_note}",
+        f"⚙️ Margin {margin:.2f}$ | Impact {impact:+.2f}$",
+        f"🎯 Entry: {_fmt_price_local(getattr(t, 'entry', 0.0))}",
+        f"🎯 TP1: {_fmt_price_local(getattr(t, 'tp1', 0.0))} | 🏁 TP2: {_fmt_price_local(getattr(t, 'tp2', 0.0))}",
+        f"🛡 SL: {_fmt_price_local(getattr(t, 'sl', 0.0))}",
+    ]
+
+
+def _append_execution_trade_cards(lines: list[str], title: str, items: list[TrackedTrade], *, limit: int = 3, margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE) -> None:
+    if not items:
+        return
+    lines.extend([SEP, title])
+    for index, trade in enumerate(items[:limit]):
+        if index:
+            lines.append("┄┄┄┄┄┄┄┄")
+        lines.extend(_execution_trade_card_lines(trade, fallback_margin=margin_per_trade))
+    remaining = len(items) - limit
+    if remaining > 0:
+        lines.append(f"📂 +{remaining} more trades...")
 
 
 def _execution_path_counts(execution_results: list[dict]) -> dict[str, int]:
@@ -392,8 +457,8 @@ def build_execution_report(
     win_count, loss_count, wr = _closed_wr_parts(trades)
     winners = sorted([t for t in opened if _execution_effective_pnl(t)[0] >= 0], key=lambda t: _execution_effective_pnl(t)[0], reverse=True)
     losers = sorted([t for t in opened if _execution_effective_pnl(t)[0] < 0], key=lambda t: _execution_effective_pnl(t)[0])
-    closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
-    closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    closed_wins = sorted([t for t in closed if _execution_effective_pnl(t)[0] > 0], key=lambda t: _execution_effective_pnl(t)[0], reverse=True)
+    closed_losses = sorted([t for t in closed if _execution_effective_pnl(t)[0] < 0], key=lambda t: _execution_effective_pnl(t)[0])
 
     lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
@@ -431,10 +496,10 @@ def build_execution_report(
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
         lines.append(f"⚡ Total Floating PnL: {sum(_execution_effective_pnl(t)[0] for t in opened):+.2f}%")
-    append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
-    append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
-    append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
+    _append_execution_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3, margin_per_trade=margin_per_trade)
+    _append_execution_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3, margin_per_trade=margin_per_trade)
+    _append_execution_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3, margin_per_trade=margin_per_trade)
+    _append_execution_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3, margin_per_trade=margin_per_trade)
 
     if rejected_checks:
         reason_counts = Counter(item.get("reason", "unknown") for item in rejected_checks)
