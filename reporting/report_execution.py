@@ -23,6 +23,188 @@ from reporting.report_format import (
 )
 
 
+
+
+# =========================================================
+# Scope-isolated execution accounting
+# =========================================================
+# Execution reports must not borrow Simulation accounting rules.
+# In live trading, the account balance shown to the user is the OKX-derived
+# starting_balance passed by main.py. Redis tracked trades are used for analytics
+# and open-trade diagnostics only.
+EXECUTION_SCOPE_MARKER = "execution_scope_okx_truth_v1"
+OPEN_EXECUTION_MIN_DISPLAY_PNL_PCT = -100.0
+OPEN_EXECUTION_MAX_DISPLAY_PNL_PCT = 1500.0
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _is_simulation_trade(t: TrackedTrade) -> bool:
+    try:
+        source = str(getattr(t, "trade_source", "") or "").strip().lower()
+        bucket = str(getattr(t, "tracking_bucket", "") or "").strip().lower()
+        return bool(source == "simulation" or bucket == "simulation")
+    except Exception:
+        return False
+
+
+def _is_execution_trade(t: TrackedTrade) -> bool:
+    """Execution report scope filter.
+
+    - Explicit simulation records are always excluded.
+    - Explicit execution records are included.
+    - Legacy tracked records with no scope are kept for backward compatibility
+      because older execution history may not carry trade_source yet.
+    """
+    if _is_simulation_trade(t):
+        return False
+    try:
+        source = str(getattr(t, "trade_source", "") or "").strip().lower()
+        bucket = str(getattr(t, "tracking_bucket", "") or "").strip().lower()
+        if source == "execution" or bucket == "execution" or bool(getattr(t, "execution_trade", False)):
+            return True
+        if not source and not bucket:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _execution_scope_trades(trades: list[TrackedTrade] | None) -> list[TrackedTrade]:
+    return [t for t in list(trades or []) if _is_execution_trade(t)]
+
+
+def _trade_margin_usdt_local(t: TrackedTrade, fallback: float = DEFAULT_MARGIN_PER_TRADE) -> float:
+    for attr in ("used_margin_usdt", "margin_usdt", "allocated_margin_usdt"):
+        value = _safe_float(getattr(t, attr, 0.0), 0.0)
+        if value > 0:
+            return value
+    return float(fallback or DEFAULT_MARGIN_PER_TRADE)
+
+
+def _cap_open_execution_pnl_pct(value: float) -> tuple[float, bool]:
+    raw = _safe_float(value, 0.0)
+    capped = max(OPEN_EXECUTION_MIN_DISPLAY_PNL_PCT, min(OPEN_EXECUTION_MAX_DISPLAY_PNL_PCT, raw))
+    return capped, abs(capped - raw) > 1e-9
+
+
+def _execution_effective_pnl(t: TrackedTrade) -> tuple[float, bool]:
+    """Display PnL for execution reports.
+
+    Closed trades remain unchanged because their history is analytics. Open live
+    trades are capped for display so one corrupted Redis price/entry cannot make
+    the report claim an impossible -6000% floating wallet loss. OKX balance stays
+    the source of truth and is displayed separately.
+    """
+    pct = trade_effective_pnl(t)
+    if t in open_trades([t]):
+        return _cap_open_execution_pnl_pct(pct)
+    return pct, False
+
+
+def _execution_money_pnl(t: TrackedTrade, *, fallback_margin: float = DEFAULT_MARGIN_PER_TRADE) -> tuple[float, bool]:
+    pct, capped = _execution_effective_pnl(t)
+    return (pct / 100.0) * _trade_margin_usdt_local(t, fallback=fallback_margin), capped
+
+
+def _execution_wallet_impact_lines(
+    trades: list[TrackedTrade],
+    *,
+    starting_balance: float = 0.0,
+    margin_per_trade: float = DEFAULT_MARGIN_PER_TRADE,
+    title: str = "Wallet Impact",
+) -> list[str]:
+    opened = open_trades(trades)
+    closed = closed_trades(trades)
+
+    def pct_value(t):
+        return _execution_effective_pnl(t)[0]
+
+    closed_profit = sum(max(0.0, trade_effective_pnl(t)) for t in closed)
+    closed_loss = sum(min(0.0, trade_effective_pnl(t)) for t in closed)
+    floating_profit = sum(max(0.0, pct_value(t)) for t in opened)
+    floating_loss = sum(min(0.0, pct_value(t)) for t in opened)
+
+    closed_profit_usd = sum(max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade)) for t in closed)
+    closed_loss_usd = sum(min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade)) for t in closed)
+
+    capped_symbols = []
+    floating_profit_usd = 0.0
+    floating_loss_usd = 0.0
+    for t in opened:
+        money, capped = _execution_money_pnl(t, fallback_margin=margin_per_trade)
+        if capped:
+            capped_symbols.append(str(getattr(t, "symbol", "?") or "?"))
+        if money >= 0:
+            floating_profit_usd += money
+        else:
+            floating_loss_usd += money
+
+    closed_net_usd = closed_profit_usd + closed_loss_usd
+    floating_net_usd = floating_profit_usd + floating_loss_usd
+    total_usd = closed_net_usd + floating_net_usd
+    closed_net = closed_profit + closed_loss
+    floating_net = floating_profit + floating_loss
+
+    def money_icon(value: float) -> str:
+        return ("🟢" if value >= 0 else "🔴") + f" {value:+.2f}$"
+
+    lines = [
+        f"💰 <b>{title}</b>",
+        f"🧱 Report Scope: <code>{EXECUTION_SCOPE_MARKER}</code>",
+        f"📌 OKX Truth Balance: <b>{float(starting_balance or 0.0):.2f} USDT</b>",
+        "📌 Tracked PnL below is analytics from execution records only.",
+    ]
+    if capped_symbols:
+        unique = list(dict.fromkeys(capped_symbols))[:8]
+        lines.append(f"🧯 Open PnL sanity capped: <b>{len(capped_symbols)}</b> trade(s) | {', '.join(unique)}")
+
+    lines.extend([
+        "",
+        "✅ <b>الصفقات المغلقة</b>",
+        "📈 الأرباح",
+        f"{closed_profit_usd:+.2f}$ | {closed_profit:+.2f}% Realized PnL",
+        "📉 الخسائر",
+        f"{closed_loss_usd:+.2f}$ | {closed_loss:+.2f}% Realized PnL",
+        "⚖️ الصافي",
+        f"<b>{money_icon(closed_net_usd)} | {closed_net:+.2f}% Realized PnL</b>",
+        "",
+        "🔄 <b>الصفقات المفتوحة</b>",
+        "📈 الأرباح العائمة",
+        f"{floating_profit_usd:+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
+        "📉 الخسائر العائمة",
+        f"{floating_loss_usd:+.2f}$ | {floating_loss:+.2f}% Total Floating PnL",
+        "⚖️ Total Floating PnL",
+        f"<b>{money_icon(floating_net_usd)} | {floating_net:+.2f}% Total Floating PnL</b>",
+        "",
+        "💼 <b>Tracked impact, not OKX balance</b>",
+        f"<b>{money_icon(total_usd)}</b>",
+    ])
+    return lines
+
+
+def _normalize_behavior_summary_lines_for_execution(
+    summary_lines: list[str],
+    opened: list[TrackedTrade],
+    *,
+    label: str = "Execution Behavior Summary",
+) -> list[str]:
+    fixed: list[str] = []
+    open_total = sum(_execution_effective_pnl(t)[0] for t in opened or [])
+    for line in list(summary_lines or []):
+        text = str(line)
+        if "Total Floating PnL:" in text:
+            prefix = "⚡ " if text.lstrip().startswith("⚡") else ""
+            text = f"{prefix}Total Floating PnL: {open_total:+.2f}%"
+        fixed.append(text)
+    return fixed
+
+
 ACCEPTED_STATUSES = {
     "accepted_preview",
     "pending_pullback_preview",
@@ -133,7 +315,7 @@ def build_execution_period_table(
     Checked / Accepted / Rejected come from execution checks.
     Open / Closed / Net come from tracked trades only.
     """
-    trades = filter_trades_by_period(trades or [], period)
+    trades = filter_trades_by_period(_execution_scope_trades(trades or []), period)
     checks = filter_checks_by_period(execution_results or [], period)
 
     if period == "last_1h":
@@ -195,7 +377,7 @@ def build_execution_report(
             margin_per_trade=margin_per_trade,
         )
 
-    trades = filter_trades_by_period(trades or [], period)
+    trades = filter_trades_by_period(_execution_scope_trades(trades or []), period)
     execution_results = filter_checks_by_period(execution_results or [], period)
 
     accepted_checks = _accepted_gate_checks(execution_results)
@@ -207,8 +389,8 @@ def build_execution_report(
     opened = open_trades(trades)
     closed = closed_trades(trades)
     win_count, loss_count, wr = _closed_wr_parts(trades)
-    winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
-    losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    winners = sorted([t for t in opened if _execution_effective_pnl(t)[0] >= 0], key=lambda t: _execution_effective_pnl(t)[0], reverse=True)
+    losers = sorted([t for t in opened if _execution_effective_pnl(t)[0] < 0], key=lambda t: _execution_effective_pnl(t)[0])
     closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
     closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
 
@@ -235,14 +417,19 @@ def build_execution_report(
 
     behavior_label = "Simulation Behavior Summary" if _looks_like_simulation_report_title(title) else "Execution Behavior Summary"
 
-    lines.extend([SEP, *wallet_impact_lines(trades, starting_balance=starting_balance, margin_per_trade=margin_per_trade, title="Wallet Impact")])
+    lines.extend([SEP, *_execution_wallet_impact_lines(
+        trades,
+        starting_balance=starting_balance,
+        margin_per_trade=margin_per_trade,
+        title="Wallet Impact",
+    )])
     behavior_lines = behavior_summary_lines(trades, label=behavior_label)
-    behavior_lines = _normalize_behavior_summary_lines_for_report(behavior_lines, opened, label=behavior_label)
+    behavior_lines = _normalize_behavior_summary_lines_for_execution(behavior_lines, opened, label=behavior_label)
     lines.extend([SEP, *behavior_lines])
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+        lines.append(f"⚡ Total Floating PnL: {sum(_execution_effective_pnl(t)[0] for t in opened):+.2f}%")
     append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
     append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
     append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
