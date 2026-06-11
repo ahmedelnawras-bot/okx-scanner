@@ -1702,6 +1702,19 @@ def _okx_result_is_ok(payload: dict | None) -> bool:
 _RUNTIME_LOG_THROTTLE: dict[str, float] = {}
 _REPORT_OKX_HARD_REFRESH_THROTTLE: dict[str, float] = {}
 
+# Live OKX positions strict-guard cache.
+# The final pre-order guard and same-symbol guard can run back-to-back in the
+# same decision path. Without a tiny cache, the bot can ask OKX positions twice
+# for one candidate and hit 429 Too Many Requests, then fail-close a valid
+# execution. Cache is execution-safety scoped and very short-lived.
+_OKX_STRICT_POSITIONS_CACHE: dict[str, object] = {
+    "ts": 0.0,
+    "ok": False,
+    "live_symbols": set(),
+    "reason": "empty",
+}
+OKX_STRICT_POSITIONS_CACHE_TTL_SECONDS: float = 8.0
+
 
 def _runtime_verbose_logs_enabled() -> bool:
     return str(os.getenv("VERBOSE_LOGS") or os.getenv("OKX_VERBOSE_LOGS") or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -2482,25 +2495,51 @@ def _repair_execution_trades_from_live_okx_positions(
     return repaired, stats
 
 
-def _fetch_live_okx_position_inst_ids_strict(okx_client: OKXTradeClient | None) -> tuple[bool, set[str], str]:
+def _fetch_live_okx_position_inst_ids_strict(
+    okx_client: OKXTradeClient | None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, set[str], str]:
     """Fetch live OKX positions, fail-closed for execution guards.
 
-    If we cannot read OKX positions, live execution must be blocked. Returning an
-    empty set on API failure is unsafe because the bot may think there are no
-    positions and open duplicate symbols / extra slots.
+    Safety rule remains unchanged: if OKX positions cannot be read, live
+    execution blocks. The improvement is a tiny cache so one accepted candidate
+    does not call /account/positions repeatedly and trigger OKX 429 Too Many
+    Requests before order placement.
     """
+    import time as _time
+
     if okx_client is None or not hasattr(okx_client, "get_positions"):
         return False, set(), "okx_client_missing_get_positions"
+
+    now_ts = _time.time()
+    try:
+        cached_ts = float(_OKX_STRICT_POSITIONS_CACHE.get("ts") or 0.0)
+        if not force_refresh and cached_ts > 0 and (now_ts - cached_ts) <= OKX_STRICT_POSITIONS_CACHE_TTL_SECONDS:
+            cached_live = set(_OKX_STRICT_POSITIONS_CACHE.get("live_symbols") or set())
+            cached_ok = bool(_OKX_STRICT_POSITIONS_CACHE.get("ok"))
+            cached_reason = str(_OKX_STRICT_POSITIONS_CACHE.get("reason") or "cached")
+            return cached_ok, cached_live, f"cached:{cached_reason}" if cached_reason != "ok" else "ok"
+    except Exception:
+        pass
+
     try:
         positions_result = okx_client.get_positions(inst_type="SWAP") or {}
     except Exception as exc:
         print(f"⚠️ OKX position fetch failed: {exc}", flush=True)
-        return False, set(), f"okx_positions_fetch_exception:{exc}"
+        reason = f"okx_positions_fetch_exception:{exc}"
+        _OKX_STRICT_POSITIONS_CACHE.update({"ts": now_ts, "ok": False, "live_symbols": set(), "reason": reason})
+        return False, set(), reason
+
     _okx_positions_debug_log("strict_guard", positions_result, max_rows=6)
     if not _okx_result_is_ok(positions_result):
         reason = str((positions_result or {}).get("reason") or (positions_result or {}).get("msg") or "positions_not_ok")
+        _OKX_STRICT_POSITIONS_CACHE.update({"ts": now_ts, "ok": False, "live_symbols": set(), "reason": reason})
         return False, set(), reason
-    return True, _extract_live_okx_position_inst_ids(positions_result), "ok"
+
+    live_symbols = _extract_live_okx_position_inst_ids(positions_result)
+    _OKX_STRICT_POSITIONS_CACHE.update({"ts": now_ts, "ok": True, "live_symbols": set(live_symbols), "reason": "ok"})
+    return True, live_symbols, "ok"
 
 
 def _fetch_live_okx_position_inst_ids(okx_client: OKXTradeClient | None) -> set[str]:
@@ -7607,6 +7646,10 @@ def _okx_symbol_blocks_reentry(
     okx_client: OKXTradeClient | None,
     symbol: str,
     tracked_trades: list | None = None,
+    *,
+    live_ok: bool | None = None,
+    live_symbols: set[str] | None = None,
+    live_reason: str | None = None,
 ) -> tuple[bool, str]:
     """Live OKX same-symbol guard with TP2 re-entry unlock.
 
@@ -7620,7 +7663,12 @@ def _okx_symbol_blocks_reentry(
         return False, "missing_symbol"
 
     symbol = _normalize_okx_inst_id(symbol)
-    ok, live_symbols, live_reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+    if live_ok is None or live_symbols is None:
+        ok, live_symbols, live_reason = _fetch_live_okx_position_inst_ids_strict(okx_client)
+    else:
+        ok = bool(live_ok)
+        live_symbols = set(live_symbols or set())
+        live_reason = str(live_reason or "ok")
     if not ok:
         return True, f"okx_positions_unavailable_fail_closed:{live_reason}"
     if symbol not in live_symbols:
@@ -8566,6 +8614,9 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                     okx_client,
                     _candidate_symbol_norm,
                     tracked_trades=_tracked_trades_now,
+                    live_ok=_live_ok,
+                    live_symbols=_live_symbols,
+                    live_reason=_live_reason,
                 )
 
             if _okx_blocks:
