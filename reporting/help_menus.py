@@ -309,8 +309,9 @@ def build_okx_control_help() -> str:
         "/mood — حالة السوق الحالية",
         "/report_execution_open — صفقات التنفيذ المفتوحة",
         "",
-        "🧪 OKX Orders يتم التحكم فيه من Railway Variables.",
-        "🔒 Live Trading يظل BLOCKED إلا لو تم تفعيله صراحة.",
+        "📌 حالة التداول الحقيقية تظهر في اللوحة أسفل السطور التالية.",
+        "• OKX Orders / Effective يوضحان هل أوامر OKX مفعلة الآن.",
+        "• Live Trading Guard يوضح هل التداول الحي ALLOWED أو BLOCKED فعليًا.",
     ])
 
 
