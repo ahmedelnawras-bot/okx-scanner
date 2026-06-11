@@ -19,6 +19,7 @@ from reporting.report_format import (
     period_label,
     trade_activity_time,
     trade_effective_pnl,
+    trade_money_pnl,
     wallet_impact_lines,
 )
 
