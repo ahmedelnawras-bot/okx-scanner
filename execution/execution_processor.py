@@ -436,29 +436,50 @@ def process_trade_candidate(
             effective_risk_mode=risk_mode,
         )
 
+    path = str(gate.get("path") or "")
+
     # ─────────────────────────────────────────
     # Candle Reversal Gate
-    # Normal:   يمنع شراء القمم (bearish reversal)
-    # Recovery: يشترط bullish reversal
+    # يعمل على كل مسارات الدخول العادية:
+    # - NORMAL / STRONG: يمنع شراء القمم bearish reversal
+    # - RECOVERY: يشترط bullish reversal
+    # - BLOCK EXCEPTION: مستثنى عمداً لأنه مسار استثنائي نادر داخل البلوك
     # لا يغير الـ score أو الـ ranking
     # ─────────────────────────────────────────
-    _candle_gate = evaluate_candle_reversal_gate(signal, risk_mode)
-    try:
-        signal.meta = dict(getattr(signal, "meta", {}) or {})
-        signal.meta.update(_candle_extra(_candle_gate))
-        signal.meta["decision_trace_id"] = decision_trace_id
-    except Exception:
-        pass
-    if not _candle_gate["execution_allowed"]:
-        return _base_response(
-            signal=signal,
-            gate=gate,
-            status="rejected_quality",
-            reason=_candle_gate["reason"],
-            extra=_candle_extra(_candle_gate),
-            decision_trace_id=decision_trace_id,
-            effective_risk_mode=risk_mode,
-        )
+    if path != "block_exception":
+        candle_mode = "recovery" if path == "recovery" else risk_mode
+        _candle_gate = evaluate_candle_reversal_gate(signal, candle_mode)
+        try:
+            signal.meta = dict(getattr(signal, "meta", {}) or {})
+            signal.meta.update(_candle_extra(_candle_gate))
+            signal.meta["decision_trace_id"] = decision_trace_id
+            signal.meta["candle_gate_scope"] = "all_modes_except_block_exception"
+            signal.meta["candle_gate_path"] = path or "general"
+        except Exception:
+            pass
+        if not _candle_gate["execution_allowed"]:
+            return _base_response(
+                signal=signal,
+                gate=gate,
+                status="rejected_quality",
+                reason=_candle_gate["reason"],
+                extra=_candle_extra(_candle_gate) | {
+                    "candle_gate_scope": "all_modes_except_block_exception",
+                    "candle_gate_path": path or "general",
+                },
+                decision_trace_id=decision_trace_id,
+                effective_risk_mode=risk_mode,
+            )
+    else:
+        try:
+            signal.meta = dict(getattr(signal, "meta", {}) or {})
+            signal.meta["decision_trace_id"] = decision_trace_id
+            signal.meta["candle_gate_skipped"] = True
+            signal.meta["candle_gate_skip_reason"] = "block_exception_path"
+            signal.meta["candle_gate_scope"] = "all_modes_except_block_exception"
+            signal.meta["candle_gate_path"] = "block_exception"
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────
     # Same symbol protection
@@ -494,8 +515,6 @@ def process_trade_candidate(
     # NOT display_score
     # ─────────────────────────────────────────
     execution_score = _get_execution_score(signal)
-
-    path = str(gate.get("path") or "")
 
     # ─────────────────────────────────────────
     # BLOCK exception routing
