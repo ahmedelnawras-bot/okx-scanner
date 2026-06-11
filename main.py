@@ -9224,8 +9224,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     else:
         okx_balance = _safe_float(risk_profile.get("reference_balance_usdt"), 0.0)
         runtime_wallet_lines = [
-            "🧪 Simulation: OFF",
-            "🧪 Simulation Wallet: hidden in execution mode",
+            "🚀 Runtime Mode: TRADING",
+            "🧪 Simulation Mode: OFF",
+            "🚀 Execution Mode: ON",
             f"💰 OKX Balance: {okx_balance:.2f} USDT",
         ]
 
