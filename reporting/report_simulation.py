@@ -200,30 +200,30 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
     floating_net = floating_profit + floating_loss
 
     def money_icon(value: float) -> str:
-        return ("ðŸŸ¢" if value >= 0 else "ðŸ”´") + f" {value:+.2f}$"
+        return ("\U0001f7e2" if value >= 0 else "\U0001f534") + f" {value:+.2f}$"
 
     return [
-        "ðŸ’° <b>Wallet Impact</b>",
-        f"ðŸ§± Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
-        f"ðŸ“Œ Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
+        "\U0001f4b0 <b>Wallet Impact</b>",
+        f"\U0001f9f1 Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
+        f"\U0001f4cc \u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
         "",
-        "âœ… <b>Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…ØºÙ„Ù‚Ø©</b>",
-        "ðŸ“ˆ Ø§Ù„Ø£Ø±Ø¨Ø§Ø­",
+        "\u2705 <b>\u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u063a\u0644\u0642\u0629</b>",
+        "\U0001f4c8 \u0627\u0644\u0623\u0631\u0628\u0627\u062d",
         f"{closed_profit_usd:+.2f}$ | {closed_profit:+.2f}% Realized PnL",
-        "ðŸ“‰ Ø§Ù„Ø®Ø³Ø§Ø¦Ø±",
+        "\U0001f4c9 \u0627\u0644\u062e\u0633\u0627\u0626\u0631",
         f"{closed_loss_usd:+.2f}$ | {closed_loss:+.2f}% Realized PnL",
-        "âš–ï¸ Ø§Ù„ØµØ§ÙÙŠ",
+        "\u2696\ufe0f \u0627\u0644\u0635\u0627\u0641\u064a",
         f"<b>{money_icon(closed_net_usd)} | {closed_net:+.2f}% Realized PnL</b>",
         "",
-        "ðŸ”„ <b>Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…ÙØªÙˆØ­Ø©</b>",
-        "ðŸ“ˆ Ø§Ù„Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ø¹Ø§Ø¦Ù…Ø©",
+        "\U0001f504 <b>\u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u0641\u062a\u0648\u062d\u0629</b>",
+        "\U0001f4c8 \u0627\u0644\u0623\u0631\u0628\u0627\u062d \u0627\u0644\u0639\u0627\u0626\u0645\u0629",
         f"{floating_profit_usd:+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
-        "ðŸ“‰ Ø§Ù„Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ø¹Ø§Ø¦Ù…Ø©",
+        "\U0001f4c9 \u0627\u0644\u062e\u0633\u0627\u0626\u0631 \u0627\u0644\u0639\u0627\u0626\u0645\u0629",
         f"{floating_loss_usd:+.2f}$ | {floating_loss:+.2f}% Total Floating PnL",
-        "âš–ï¸ Total Floating PnL",
+        "\u2696\ufe0f Total Floating PnL",
         f"<b>{money_icon(floating_net_usd)} | {floating_net:+.2f}% Total Floating PnL</b>",
         "",
-        "ðŸ’¼ <b>Ø§Ù„ØªØ£Ø«ÙŠØ± Ø§Ù„Ø­Ø§Ù„ÙŠ Ø¹Ù„Ù‰ Ù…Ø­ÙØ¸Ø© Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©</b>",
+        "\U0001f4bc <b>\u0627\u0644\u062a\u0623\u062b\u064a\u0631 \u0627\u0644\u062d\u0627\u0644\u064a \u0639\u0644\u0649 \u0645\u062d\u0641\u0638\u0629 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629</b>",
         f"<b>{money_icon(total_usd)}</b>",
     ]
 
@@ -240,7 +240,7 @@ def build_simulation_report(
     sim_checks: list[dict],
     sim_trades: list,
     *,
-    title: str = "ðŸ§ª ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©",
+    title: str = "\U0001f9ea \u062a\u0642\u0631\u064a\u0631 \u0623\u062f\u0627\u0621 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629",
     period: str = "since_start",
     account_summary: str | None = None,
 ) -> str:
@@ -260,30 +260,30 @@ def build_simulation_report(
     closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     start_balance = _extract_sim_start_balance(account_summary, 1000.0)
 
-    lines: list[str] = [title, f"ðŸ“… {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
+    lines: list[str] = [title, f"\U0001f4c5 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
-        "ðŸ“Š <b>Quick Stats</b>",
-        f"â€¢ Checked Candidates: {checked}",
-        f"â€¢ Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
-        f"â€¢ Currently Open Tracked Trades: {len(opened)}",
-        f"â€¢ Closed Tracked Trades: {len(closed)}",
-        f"ðŸ† Win Rate: <b>{wr:.1f}%</b>",
-        f"ðŸŸ¢ Winners: {win_count} | ðŸ”´ Losers: {loss_count}",
-        f"ðŸ“Œ Rejected After Check: {len(rejected_checks)} Ù…Ø­ÙÙˆØ¸Ø© Ù„Ù„ØªØ­Ù„ÙŠÙ„ ÙÙ‚Ø· ÙˆÙ„Ø§ ØªÙØ­Ø³Ø¨ ÙƒØµÙÙ‚Ø§Øª Ù…ÙØªÙˆØ­Ø©.",
-        f"ðŸ›£ Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
+        "\U0001f4ca <b>Quick Stats</b>",
+        f"\u2022 Checked Candidates: {checked}",
+        f"\u2022 Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
+        f"\u2022 Currently Open Tracked Trades: {len(opened)}",
+        f"\u2022 Closed Tracked Trades: {len(closed)}",
+        f"\U0001f3c6 Win Rate: <b>{wr:.1f}%</b>",
+        f"\U0001f7e2 Winners: {win_count} | \U0001f534 Losers: {loss_count}",
+        f"\U0001f4cc Rejected After Check: {len(rejected_checks)} \u0645\u062d\u0641\u0648\u0638\u0629 \u0644\u0644\u062a\u062d\u0644\u064a\u0644 \u0641\u0642\u0637 \u0648\u0644\u0627 \u062a\u064f\u062d\u0633\u0628 \u0643\u0635\u0641\u0642\u0627\u062a \u0645\u0641\u062a\u0648\u062d\u0629.",
+        f"\U0001f6e3 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
     lines.extend([SEP, *_simulation_wallet_impact_lines(trades, account_summary=account_summary, starting_balance=start_balance)])
     behavior_lines = behavior_summary_lines(trades, label="Simulation Behavior Summary")
     lines.extend([SEP, *behavior_lines])
-    lines.extend([SEP, "ðŸ“‚ <b>Open Trades</b>"])
-    lines.append(f"ðŸŸ¢ Open Winners: {len(winners)} | ðŸ”´ Open Losers: {len(losers)}")
+    lines.extend([SEP, "\U0001f4c2 <b>Open Trades</b>"])
+    lines.append(f"\U0001f7e2 Open Winners: {len(winners)} | \U0001f534 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"âš¡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
-    append_trade_cards(lines, "ðŸŸ¢ <b>Top 3 Open Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "ðŸ”´ <b>Top 3 Open Losers</b>", losers[:3], limit=3)
-    append_trade_cards(lines, "ðŸ† <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
-    append_trade_cards(lines, "ðŸ’€ <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
-    lines.extend([SEP, "ðŸ’¡ Ø¥Ø¯Ø§Ø±Ø© Ø§Ù„ØµÙÙ‚Ø§Øª: Simulation 30/50/20 | Recovery 50/25/25"])
+        lines.append(f"\u26a1 Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+    append_trade_cards(lines, "\U0001f7e2 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
+    append_trade_cards(lines, "\U0001f534 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
+    append_trade_cards(lines, "\U0001f3c6 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
+    append_trade_cards(lines, "\U0001f480 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
+    lines.extend([SEP, "\U0001f4a1 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0635\u0641\u0642\u0627\u062a: Simulation 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
 
 
@@ -297,7 +297,7 @@ PERIODS = [
 
 
 def _simulation_header(text: str) -> str:
-    return "ðŸ§ª Simulation Mode\nâ”â”â”â”â”â”â”â”â”â”â”â”\n" + str(text or "").strip()
+    return "\U0001f9ea Simulation Mode\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" + str(text or "").strip()
 
 
 def _compact_tradingview_links(text: str) -> str:
@@ -310,15 +310,15 @@ def _compact_tradingview_links(text: str) -> str:
     url = r"https://www\.tradingview\.com/chart/\?symbol=[^\s<]+"
 
     # Original shared formatter:
-    # ðŸ”— TradingView: https://...
-    value = re.sub(rf"ðŸ”—\s*TradingView:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
+    # \U0001f517 TradingView: https://...
+    value = re.sub(f"\U0001f517\s*TradingView:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
 
     # Some previous versions already changed label to TV but left the URL visible:
-    # ðŸ”— TV: https://...
-    value = re.sub(rf"ðŸ”—\s*TV:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
+    # \U0001f517 TV: https://...
+    value = re.sub(f"\U0001f517\s*TV:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
 
     # Fallback if the icon is missing.
-    value = re.sub(rf"(?m)^TV:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
+    value = re.sub(rf"(?m)^TV:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
 
     return value
 
@@ -334,7 +334,7 @@ def _strip_inherited_execution_title(text: str) -> str:
     removed = False
     for line in lines:
         stripped = line.strip()
-        if not removed and stripped in {"ðŸš€ ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„ØªÙ†ÙÙŠØ°", "ðŸš€ ØªÙ‚Ø±ÙŠØ± Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø±Ø´Ø­Ø© â€” Execution"}:
+        if not removed and stripped in {"\U0001f680 \u062a\u0642\u0631\u064a\u0631 \u0623\u062f\u0627\u0621 \u0627\u0644\u062a\u0646\u0641\u064a\u0630", "\U0001f680 \u062a\u0642\u0631\u064a\u0631 \u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u0631\u0634\u062d\u0629 \u2014 Execution"}:
             removed = True
             continue
         cleaned.append(line)
@@ -349,8 +349,8 @@ def _polish_wallet_impact_rtl(text: str) -> str:
     """
     value = str(text or "")
     value = re.sub(
-        r"(?m)^ðŸ“Œ\s*Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„:\s*([^\n]+)$",
-        r"ðŸ“Œ Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„\n<b>\1</b>",
+        "(?m)^\U0001f4cc\s*\u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644:\s*([^\\n]+)$",
+        "\U0001f4cc \u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644\\n<b>\\1</b>",
         value,
     )
     return value
@@ -391,7 +391,7 @@ def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, 
             build_simulation_report(
                 checks,
                 trades,
-                title="ðŸ§ª ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©",
+                title="\U0001f9ea \u062a\u0642\u0631\u064a\u0631 \u0623\u062f\u0627\u0621 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629",
                 period=period,
                 account_summary=account_summary,
             ),
@@ -400,7 +400,7 @@ def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, 
         out[f"/report_simulation_open{suffix}"] = _decorate(
             build_open_trades_report(
                 trades,
-                title="ðŸ§ªðŸ“‚ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø© Ø§Ù„Ù…ÙØªÙˆØ­Ø©",
+                title="\U0001f9ea\U0001f4c2 \u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629 \u0627\u0644\u0645\u0641\u062a\u0648\u062d\u0629",
                 execution_only=True,
                 period=period,
             ),
@@ -442,15 +442,15 @@ def build_simulation_command_outputs(
         account_summary,
     )
     out["/report_simulation_profit_analysis"] = _decorate(
-        build_profit_analysis_report(sim_trades, title="ðŸ“ˆ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+        build_profit_analysis_report(sim_trades, title="\U0001f4c8 \u062a\u062d\u0644\u064a\u0644 \u0623\u0633\u0628\u0627\u0628 \u0623\u0631\u0628\u0627\u062d \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
         account_summary,
     )
     out["/report_simulation_losses_analysis"] = _decorate(
-        build_losses_analysis_report(sim_trades, title="ðŸ“‰ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+        build_losses_analysis_report(sim_trades, title="\U0001f4c9 \u062a\u062d\u0644\u064a\u0644 \u0623\u0633\u0628\u0627\u0628 \u062e\u0633\u0627\u0626\u0631 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
         account_summary,
     )
     out["/report_simulation_intelligence"] = _decorate(
-        build_execution_intelligence_report(sim_trades, sim_checks, "ðŸ§ ðŸ§ª Ø°ÙƒØ§Ø¡ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+        build_execution_intelligence_report(sim_trades, sim_checks, "\U0001f9e0\U0001f9ea \u0630\u0643\u0627\u0621 \u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
         account_summary,
     )
     out["/report_simulation_diagnostics"] = _decorate(
@@ -463,15 +463,15 @@ def build_simulation_command_outputs(
         trades = filter_trades_by_period(sim_trades, period)
         checks = filter_checks_by_period(sim_checks, period)
         out[f"/report_simulation_profit_analysis{suffix}"] = _decorate(
-            build_profit_analysis_report(trades, title="ðŸ“ˆ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+            build_profit_analysis_report(trades, title="\U0001f4c8 \u062a\u062d\u0644\u064a\u0644 \u0623\u0633\u0628\u0627\u0628 \u0623\u0631\u0628\u0627\u062d \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
             account_summary,
         )
         out[f"/report_simulation_losses_analysis{suffix}"] = _decorate(
-            build_losses_analysis_report(trades, title="ðŸ“‰ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+            build_losses_analysis_report(trades, title="\U0001f4c9 \u062a\u062d\u0644\u064a\u0644 \u0623\u0633\u0628\u0627\u0628 \u062e\u0633\u0627\u0626\u0631 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
             account_summary,
         )
         out[f"/report_simulation_intelligence{suffix}"] = _decorate(
-            build_execution_intelligence_report(trades, checks, "ðŸ§ ðŸ§ª Ø°ÙƒØ§Ø¡ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
+            build_execution_intelligence_report(trades, checks, "\U0001f9e0\U0001f9ea \u0630\u0643\u0627\u0621 \u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629"),
             account_summary,
         )
         out[f"/report_simulation_diagnostics{suffix}"] = _decorate(
@@ -491,12 +491,12 @@ def build_simulation_command_outputs(
         out["/simulation_open"] = out["/report_simulation_open"]
 
     out["/simulation"] = "\n".join([
-        "ðŸ§ª Simulation Mode",
-        "â”â”â”â”â”â”â”â”â”â”â”â”",
-        "Mirror ÙƒØ§Ù…Ù„ Ù„ÙˆØ¶Ø¹ Ø§Ù„ØªØ¯Ø§ÙˆÙ„.",
-        "â€¢ Ù†ÙØ³ Ø´Ø±ÙˆØ· Ø§Ù„ØªØ±Ø´ÙŠØ­ ÙˆØ§Ù„ØªÙ†ÙÙŠØ°",
-        "â€¢ Ù„Ø§ ÙŠØ±Ø³Ù„ Ø£ÙˆØ§Ù…Ø± OKX Live",
-        "â€¢ ÙŠÙØªØ­ ØµÙÙ‚Ø§Øª Ø¯Ø§Ø®Ù„ÙŠØ© Ø¨Ù…Ø­ÙØ¸Ø© Ù…Ø­Ø§ÙƒØ§Ø©",
+        "\U0001f9ea Simulation Mode",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "Mirror \u0643\u0627\u0645\u0644 \u0644\u0648\u0636\u0639 \u0627\u0644\u062a\u062f\u0627\u0648\u0644.",
+        "\u2022 \u0646\u0641\u0633 \u0634\u0631\u0648\u0637 \u0627\u0644\u062a\u0631\u0634\u064a\u062d \u0648\u0627\u0644\u062a\u0646\u0641\u064a\u0630",
+        "\u2022 \u0644\u0627 \u064a\u0631\u0633\u0644 \u0623\u0648\u0627\u0645\u0631 OKX Live",
+        "\u2022 \u064a\u0641\u062a\u062d \u0635\u0641\u0642\u0627\u062a \u062f\u0627\u062e\u0644\u064a\u0629 \u0628\u0645\u062d\u0641\u0638\u0629 \u0645\u062d\u0627\u0643\u0627\u0629",
         "",
         str(wallet_text or "").strip(),
     ]).strip()
