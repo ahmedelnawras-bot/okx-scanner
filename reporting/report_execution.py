@@ -234,6 +234,68 @@ def _normalize_behavior_summary_lines_for_execution(
     return fixed
 
 
+
+def _execution_behavior_summary_lines(
+    trades: list[TrackedTrade],
+    *,
+    label: str = "Execution Behavior Summary",
+) -> list[str]:
+    """Execution-only behavior summary using capped/scope-safe PnL.
+
+    The shared behavior_summary_lines() uses raw report_format.trade_effective_pnl().
+    That is fine for clean data, but execution Redis can contain old corrupted
+    history records. Wallet Impact already caps those records for display; this
+    local summary must use the same capped PnL so Avg Winner/Avg Loser cannot
+    show impossible values such as +1,995,682%.
+    """
+    scoped = _execution_scope_trades(list(trades or []))
+    opened = open_trades(scoped)
+    closed = closed_trades(scoped)
+
+    closed_pnls = [_execution_effective_pnl(t)[0] for t in closed]
+    winners = [v for v in closed_pnls if v > 0]
+    losers = [v for v in closed_pnls if v < 0]
+    avg_winner = sum(winners) / len(winners) if winners else 0.0
+    avg_loser = sum(losers) / len(losers) if losers else 0.0
+
+    total_trades = len(closed)
+    tp1_hits = sum(1 for t in closed if bool(getattr(t, "tp1_hit", False)) or bool(getattr(t, "tp2_hit", False)))
+    tp2_hits = sum(1 for t in closed if bool(getattr(t, "tp2_hit", False)))
+    tp1_rate = (tp1_hits / total_trades * 100.0) if total_trades else 0.0
+    tp2_rate = (tp2_hits / total_trades * 100.0) if total_trades else 0.0
+    tp1_to_tp2 = (tp2_hits / tp1_hits * 100.0) if tp1_hits else 0.0
+
+    trailing_exits = sum(1 for t in closed if str(getattr(t, "status", "") or "").lower() == "trailing_hit" or bool(getattr(t, "trailing_hit", False)))
+    breakeven_exits = sum(1 for t in closed if str(getattr(t, "status", "") or "").lower() == "breakeven_after_tp1")
+    direct_sl = sum(1 for t in closed if str(getattr(t, "status", "") or "").lower() == "closed_loss" and not bool(getattr(t, "tp1_hit", False)))
+    trailing_rate = (trailing_exits / total_trades * 100.0) if total_trades else 0.0
+    breakeven_rate = (breakeven_exits / total_trades * 100.0) if total_trades else 0.0
+    direct_sl_rate = (direct_sl / total_trades * 100.0) if total_trades else 0.0
+
+    floating_total = sum(_execution_effective_pnl(t)[0] for t in opened)
+    rr_quality = "إيجابي ✅" if (avg_winner > abs(avg_loser) or floating_total >= 0) else "ضعيف ⚠️"
+
+    capped_closed = sum(1 for t in closed if _execution_effective_pnl(t)[1])
+    capped_open = sum(1 for t in opened if _execution_effective_pnl(t)[1])
+
+    lines = [
+        f"🧠 <b>{label}</b>",
+        "📦 Model: Normal/Strong/Block 30/50/20 | Recovery 50/25/25",
+        f"📈 Avg Winner: {avg_winner:+.2f}%",
+        f"📉 Avg Loser: {avg_loser:+.2f}%",
+        f"🎯 TP1 Rate: {tp1_rate:.1f}% | 🏁 TP2 Rate: {tp2_rate:.1f}%",
+        f"🔁 TP1 → TP2: {tp1_to_tp2:.1f}%",
+        f"🔄 Trailing Exit: {trailing_rate:.1f}%",
+        f"🔒 Breakeven Exit: {breakeven_rate:.1f}%",
+        f"🛑 Direct SL: {direct_sl_rate:.1f}%",
+        f"⚡ Total Floating PnL: {floating_total:+.2f}%",
+        f"💡 Risk / Reward Quality: {rr_quality}",
+    ]
+    if capped_closed or capped_open:
+        lines.append(f"🧯 Summary sanity capped: closed={capped_closed} | open={capped_open}")
+    return lines
+
+
 ACCEPTED_STATUSES = {
     "accepted_preview",
     "pending_pullback_preview",
@@ -489,8 +551,7 @@ def build_execution_report(
         margin_per_trade=margin_per_trade,
         title="Wallet Impact",
     )])
-    behavior_lines = behavior_summary_lines(trades, label=behavior_label)
-    behavior_lines = _normalize_behavior_summary_lines_for_execution(behavior_lines, opened, label=behavior_label)
+    behavior_lines = _execution_behavior_summary_lines(trades, label=behavior_label)
     lines.extend([SEP, *behavior_lines])
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
