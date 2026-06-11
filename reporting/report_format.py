@@ -152,6 +152,73 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+# Report-only execution PnL sanity guard.
+# Execution/open positions should not show losses far beyond the margin while
+# they are still marked open. Such values usually come from stale/corrupted
+# Redis current_price/entry or recovered-position data, not from OKX equity.
+# This is display/accounting hygiene only: it does not touch TP/SL, order flow,
+# lifecycle state, Redis persistence, or simulation accounting.
+EXECUTION_OPEN_MAX_LOSS_EXPOSURE_PCT = 100.0
+EXECUTION_OPEN_MAX_GAIN_EXPOSURE_PCT = 1500.0
+
+
+def _trade_scope(t: TrackedTrade) -> str:
+    try:
+        source = str(getattr(t, "trade_source", "") or "").strip().lower()
+        bucket = str(getattr(t, "tracking_bucket", "") or "").strip().lower()
+    except Exception:
+        source = ""
+        bucket = ""
+    if source == "simulation" or bucket == "simulation":
+        return "simulation"
+    if bool(getattr(t, "execution_trade", False)) or bucket == "execution" or source == "execution":
+        return "execution"
+    return "normal"
+
+
+def _trade_is_open_for_report(t: TrackedTrade) -> bool:
+    try:
+        if bool(getattr(t, "is_closed", False)):
+            return False
+        return str(getattr(t, "status", "") or "").strip().lower() in OPEN_STATUSES
+    except Exception:
+        return False
+
+
+def _sanitize_report_effective_pnl(t: TrackedTrade, value: float) -> float:
+    """Clamp impossible open execution exposure values for reports only.
+
+    A live/open long position normally cannot keep losing thousands of percent
+    of its margin; OKX would liquidate or close it. When the report sees e.g.
+    -6079% on an open execution trade, that is a corrupted display input. Keep
+    the report readable and bounded while leaving closed-trade history and all
+    trading logic untouched.
+    """
+    pnl = float(value or 0.0)
+    if _trade_scope(t) != "execution" or not _trade_is_open_for_report(t):
+        return pnl
+
+    max_loss = float(EXECUTION_OPEN_MAX_LOSS_EXPOSURE_PCT or 100.0)
+    max_gain = float(EXECUTION_OPEN_MAX_GAIN_EXPOSURE_PCT or 1500.0)
+    if pnl < -max_loss:
+        try:
+            setattr(t, "report_pnl_sanitized", True)
+            setattr(t, "report_original_effective_pnl_pct", pnl)
+            setattr(t, "report_sanitize_reason", "open_execution_loss_beyond_margin")
+        except Exception:
+            pass
+        return -max_loss
+    if pnl > max_gain:
+        try:
+            setattr(t, "report_pnl_sanitized", True)
+            setattr(t, "report_original_effective_pnl_pct", pnl)
+            setattr(t, "report_sanitize_reason", "open_execution_gain_extreme")
+        except Exception:
+            pass
+        return max_gain
+    return pnl
+
+
 def _trade_report_leverage(t: TrackedTrade) -> float:
     """Per-trade leverage for report calculations.
 
@@ -408,10 +475,12 @@ def trade_effective_pnl(t: TrackedTrade) -> float:
     Displayed leveraged performance/exposure percentage.
 
     Uses the leverage stored on the trade when available instead of applying one
-    global default leverage to every record.
+    global default leverage to every record. Impossible open execution values
+    are clamped for report display/accounting only.
     """
 
-    return leveraged_pct(trade_raw_effective_pnl(t), _trade_report_leverage(t))
+    value = leveraged_pct(trade_raw_effective_pnl(t), _trade_report_leverage(t))
+    return _sanitize_report_effective_pnl(t, value)
 
 
 def trade_current_raw_pnl(t: TrackedTrade) -> float:
@@ -563,6 +632,10 @@ def trade_card_lines(
 
     if getattr(t, "trailing_tightened", False):
         extra.append("🔧 Tightened")
+
+    if getattr(t, "report_pnl_sanitized", False):
+        original = _safe_float(getattr(t, "report_original_effective_pnl_pct", 0.0), 0.0)
+        extra.append(f"🧯 Report PnL capped from {original:+.2f}%")
 
     extra_text = f" | {' | '.join(extra)}" if extra else ""
 
@@ -757,7 +830,16 @@ def wallet_impact_lines(
 
     total_usd = closed_net_usd + floating_net_usd
 
-    return [
+    sanitized_open = [
+        t for t in opened
+        if bool(getattr(t, "report_pnl_sanitized", False))
+    ]
+    sanitize_note = (
+        f"🧯 Report sanity: capped {len(sanitized_open)} open execution trade(s) with impossible stored PnL."
+        if sanitized_open else ""
+    )
+
+    lines = [
         f"💰 <b>{title}</b>",
         f"📌 رأس المال: {starting_balance:.0f}$",
 
@@ -805,6 +887,9 @@ def wallet_impact_lines(
 
         f"<b>{money_line(total_usd)}</b>",
     ]
+    if sanitize_note:
+        lines.extend(["", sanitize_note])
+    return lines
 
 
 def quick_stats_lines(
