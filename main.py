@@ -3312,6 +3312,69 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
     }
 
 
+
+def _runtime_okx_state_lines(settings: Settings) -> list[str]:
+    """User-facing OKX runtime state for mode/help messages.
+
+    Display-only. It makes the real execution/simulation state explicit:
+    - Execution/trading: show raw + effective OKX order state and live guard.
+    - Simulation: show OKX is forced off and no live order will be sent.
+    """
+    runtime = _runtime_mode_snapshot(settings)
+    active_mode = str(runtime.get("active_mode") or "-").strip().upper()
+    risk_context = str(runtime.get("risk_context") or "-").strip()
+    raw_orders = "ON" if bool(runtime.get("orders_enabled")) else "OFF"
+    effective_orders = "ON" if bool(runtime.get("effective_orders_enabled")) else "OFF"
+    simulation_active = str(runtime.get("active_mode") or "").strip().lower() == "simulation"
+
+    lines = [
+        "⚙️ <b>حالة OKX الفعلية</b>",
+        f"• Runtime Mode: <b>{active_mode}</b>",
+        f"• Risk Context: <b>{risk_context}</b>",
+    ]
+
+    if simulation_active:
+        lines.extend([
+            f"• OKX Orders: <b>FORCED OFF in Simulation</b> | raw=<code>{raw_orders}</code> | effective=<code>OFF</code>",
+            "• Live Trading Guard: <b>DISABLED BY SIMULATION</b>",
+            "• وضع المحاكاة لا يرسل أوامر OKX ولا يلمس الصفقات الحقيقية المفتوحة.",
+        ])
+    else:
+        live_guard = "ALLOWED" if bool(getattr(settings, "allow_live_trading", False)) else "BLOCKED"
+        lines.extend([
+            f"• OKX Orders: raw=<code>{raw_orders}</code> | effective=<code>{effective_orders}</code>",
+            f"• Live Trading Guard: <b>{live_guard}</b>",
+            "• في وضع التنفيذ، أي أمر حي يعتمد على OKX Effective + Live Guard فقط.",
+        ])
+    return lines
+
+
+def _strip_static_live_trading_warning_from_mode_text(message: str) -> str:
+    """Remove stale/static live-trading wording from market-mode templates.
+
+    The exact live/simulation truth is appended by _runtime_okx_state_lines().
+    This avoids showing confusing text like "التداول الحي محظور..." while
+    /okx_status and runtime mode are actually ALLOWED.
+    """
+    cleaned: list[str] = []
+    skip_next = False
+    for raw_line in str(message or "").splitlines():
+        line = str(raw_line)
+        compact = line.replace(" ", "")
+        if "التداولالحي" in compact and ("محظور" in line or "ممنوع" in line):
+            continue
+        if "أوامر OKX" in line and "Railway" in line:
+            continue
+        cleaned.append(raw_line)
+    return "\n".join(cleaned).strip()
+
+
+def _append_runtime_okx_state_to_mode_message(message: str, settings: Settings) -> str:
+    base = _strip_static_live_trading_warning_from_mode_text(message)
+    if "⚙️ <b>حالة OKX الفعلية</b>" in base:
+        return base
+    return (base + "\n\n" + "\n".join(_runtime_okx_state_lines(settings))).strip()
+
 def _build_mode_message(
     state: MarketModeState,
     snapshot: MarketSnapshot,
@@ -3331,6 +3394,7 @@ def _build_mode_message(
         context["old_mode"] = old_mode
 
     message = _compact_mode_message_text(build_market_mode_sections(state.mode, context, variant=variant))
+    message = _append_runtime_okx_state_to_mode_message(message, runtime_settings)
 
     risk_result = dict(result or {})
     risk_result.setdefault("mode_context", context)
@@ -3355,6 +3419,7 @@ def _refresh_risk_block_in_mode_message(message: str, settings: Settings, result
         flags=re.DOTALL,
     ).strip()
     risk_result = dict(result or {})
+    base = _append_runtime_okx_state_to_mode_message(base, settings)
     risk_profile = _risk_profile_snapshot(settings, risk_result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
     return _append_protection_notice(base + "\n" + risk_block, risk_result)
@@ -6445,17 +6510,20 @@ def _collect_execution_lifecycle_notifications(before: dict, trades: list, prote
             events.append(("sl_update", _format_trade_lifecycle_notice(trade, "sl_update", old_sl=old_sl, new_sl=new_sl, reason=reason), "last_notified_sl"))
 
         for event, message, flag in events:
-            if flag == "last_notified_sl":
-                _safe_set_trade_attr(trade, "last_notified_sl", new_sl)
-                _safe_set_trade_attr(trade, "last_sl_update_telegram_at", datetime.now(timezone.utc))
-            else:
-                _safe_set_trade_attr(trade, flag, True)
-                _safe_set_trade_attr(trade, flag + "_at", datetime.now(timezone.utc))
-            notifications.append({"symbol": str(getattr(trade, "symbol", "") or ""), "event": event, "message": message})
+            notifications.append({
+                "symbol": str(getattr(trade, "symbol", "") or ""),
+                "event": event,
+                "message": message,
+                "trade": trade,
+                "flag": flag,
+                "flag_value": new_sl if flag == "last_notified_sl" else True,
+            })
     return notifications
 
 
 def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_store: RedisTradeStore | None = None) -> None:
+    sent_any = False
+    changed_flags = False
     for item in list((result or {}).get("lifecycle_notifications", []) or []):
         message = str((item or {}).get("message") or "").strip()
         if not message:
@@ -6464,9 +6532,35 @@ def _send_lifecycle_notifications(sender: TelegramSender, result: dict, trade_st
         if not (isinstance(send_result, dict) and send_result.get("ok")):
             time.sleep(1.0)
             send_result = _send_text(sender, message)
-            if not (isinstance(send_result, dict) and send_result.get("ok")):
-                print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
+        send_ok = bool(isinstance(send_result, dict) and send_result.get("ok"))
+        if not send_ok:
+            print(f"⚠️ LIFECYCLE_TELEGRAM_SEND_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'}", flush=True)
+            _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+            continue
+
+        sent_any = True
+        trade = (item or {}).get("trade")
+        flag = str((item or {}).get("flag") or "").strip()
+        try:
+            if trade is not None and flag:
+                if flag == "last_notified_sl":
+                    _safe_set_trade_attr(trade, "last_notified_sl", _safe_float((item or {}).get("flag_value"), 0.0))
+                    _safe_set_trade_attr(trade, "last_sl_update_telegram_at", datetime.now(timezone.utc))
+                else:
+                    _safe_set_trade_attr(trade, flag, True)
+                    _safe_set_trade_attr(trade, flag + "_at", datetime.now(timezone.utc))
+                changed_flags = True
+        except Exception as exc:
+            print(f"⚠️ LIFECYCLE_TELEGRAM_FLAG_FAILED | {(item or {}).get('symbol') or '-'} | {(item or {}).get('event') or '-'} | {exc}", flush=True)
         _telegram_send_pause(TELEGRAM_EXECUTION_SEND_GAP_SECONDS)
+
+    # Persist telegram-sent flags only after successful delivery.
+    # If Telegram fails, flags stay unset and the next scan can retry the TP/SL/runner notice.
+    if changed_flags and trade_store and getattr(trade_store, "enabled", False):
+        try:
+            trade_store.save_trades(list((result or {}).get("trades", []) or []))
+        except Exception as exc:
+            print(f"⚠️ LIFECYCLE_TELEGRAM_FLAG_SAVE_FAILED | {exc}", flush=True)
 
 def run_once(
     previous_state: MarketModeState | None = None,
@@ -9120,16 +9214,27 @@ def _build_okx_status_panel(
 
     configured = bool(getattr(client, "configured", False))
     paper_mode = bool(getattr(getattr(client, "credentials", None), "simulated", getattr(settings, "okx_simulated", True)))
-    orders_on = bool(_runtime_mode_snapshot(settings).get("orders_enabled", False))
-    live_guard = bool(getattr(settings, "allow_live_trading", False))
+    runtime = _runtime_mode_snapshot(settings)
+    simulation_active = str(runtime.get("active_mode") or "").strip().lower() == "simulation"
+    orders_on = bool(runtime.get("orders_enabled", False))
+    effective_orders_on = bool(runtime.get("effective_orders_enabled", False))
+    live_guard = bool(getattr(settings, "allow_live_trading", False)) and not simulation_active
+    if simulation_active:
+        okx_orders_text = f"FORCED OFF in Simulation | raw={'ON' if orders_on else 'OFF'} | effective=OFF"
+        live_guard_text = "DISABLED BY SIMULATION"
+    else:
+        okx_orders_text = f"raw={'ON' if orders_on else 'OFF'} | effective={'ON' if effective_orders_on else 'OFF'}"
+        live_guard_text = "ALLOWED" if live_guard else "BLOCKED"
 
     lines = [
         "📘 <b>OKX Status</b>",
         "━━━━━━━━━━━━",
+        f"• Runtime Mode: <b>{str(runtime.get('active_mode') or '-').upper()}</b>",
+        f"• Risk Context: <b>{str(runtime.get('risk_context') or '-')}</b>",
         f"• Credentials: <b>{'CONFIGURED' if configured else 'MISSING'}</b>",
         f"• Account Mode: <b>{'PAPER / DEMO' if paper_mode else 'LIVE'}</b>",
-        f"• OKX Orders: <b>{'ON' if orders_on else 'OFF'}</b>",
-        f"• Live Trading Guard: <b>{'ALLOWED' if live_guard else 'BLOCKED'}</b>",
+        f"• OKX Orders: <b>{okx_orders_text}</b>",
+        f"• Live Trading Guard: <b>{live_guard_text}</b>",
         f"• Base URL: {getattr(settings, 'okx_base_url', '-')}",
     ]
 
