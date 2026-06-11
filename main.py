@@ -1338,10 +1338,21 @@ def _repair_execution_drawdown_sanity(
     computed_equity = _safe_float(getattr(portfolio_state, "current_equity", 0.0), 0.0)
 
     # Sanity guard before Daily DD can become a hard stop.
-    # If OKX reference equity is healthy but portfolio-state equity is far below it,
-    # the reading is almost certainly baseline/trade-state corruption, not real DD.
+    # If OKX reference equity is healthy but portfolio-state equity/baseline
+    # disagrees with it, the reading is almost certainly stale baseline /
+    # Redis state pollution, not real DD. OKX is the execution truth.
+    trade_pnl = realized + unrealized
+    baseline_gap = max(0.0, start - ref) if ref > 0 else 0.0
+    tracked_loss = max(0.0, -float(trade_pnl or 0.0))
+    baseline_high_mismatch = bool(
+        ref > 0
+        and dd_pct >= 20.0
+        and start > max(ref * 1.35, ref + max(50.0, ref * 0.10))
+        and tracked_loss < max(25.0, baseline_gap * 0.75)
+    )
     needs_repair = bool(
         dd_pct > 100.0
+        or baseline_high_mismatch
         or start < 0.01
         or (ref > 0 and start > max(ref * 25.0, 10_000.0))
         or (ref > 0 and computed_equity < -max(ref * 5.0, 100.0))
@@ -1359,8 +1370,6 @@ def _repair_execution_drawdown_sanity(
     if not needs_repair:
         return portfolio_state, drawdown_status, inputs
 
-    trade_pnl = realized + unrealized
-
     # Execution truth rule:
     # If tracked execution PnL creates impossible Daily-DD/equity readings,
     # do not use Redis trade PnL as wallet truth. OKX current equity is the
@@ -1374,6 +1383,7 @@ def _repair_execution_drawdown_sanity(
     # OKX equity as both current truth and daily baseline for this runtime DD.
     hard_flat_repair = bool(
         dd_pct > 100.0
+        or baseline_high_mismatch
         or computed_equity < 0.0
         or (ref > 0 and computed_equity < ref * 0.50)
         or (ref > 0 and start > max(ref * 10.0, 1000.0))
@@ -1400,7 +1410,9 @@ def _repair_execution_drawdown_sanity(
     clean_inputs = dict(inputs)
     clean_inputs["start_of_day_balance"] = float(repaired_start)
     clean_inputs["execution_dd_sanity_repaired"] = True
-    clean_inputs["execution_dd_sanity_repair_reason"] = "impossible_execution_daily_dd"
+    clean_inputs["execution_dd_sanity_repair_reason"] = (
+        "execution_baseline_mismatch_okx_truth" if baseline_high_mismatch else "impossible_execution_daily_dd"
+    )
 
     try:
         repaired_state = build_portfolio_state_from_trades(list(trades or []), **_portfolio_state_kwargs(clean_inputs))
@@ -1449,11 +1461,40 @@ def _repair_execution_drawdown_sanity(
                 "sanity_old_drawdown_pct": float(dd_pct or 0.0),
                 "sanity_old_start_balance": float(start or 0.0),
                 "sanity_old_computed_equity": float(computed_equity or 0.0),
+                "sanity_baseline_high_mismatch": bool(baseline_high_mismatch),
+                "sanity_tracked_loss_usdt": float(tracked_loss or 0.0),
+                "sanity_baseline_gap_usdt": float(baseline_gap or 0.0),
                 "sanity_flat_repair": bool(used_flat_repair),
             })
             _save_execution_daily_balance_row(trade_store, today, row)
         except Exception as exc:
             print(f"⚠️ EXEC_DD_SANITY_REPAIR_SAVE_FAILED | {label} | {exc}", flush=True)
+
+        # If manual resume/protection state stored a stale Daily-DD baseline,
+        # it would be re-applied on every scan before this repair and can keep
+        # re-triggering false hard stops. Repair it only when the high-baseline
+        # mismatch is proven against tracked PnL and OKX current equity.
+        if baseline_high_mismatch:
+            try:
+                pstate = _load_protection_state(trade_store, "execution")
+                manual_baseline = _safe_float(pstate.get("daily_dd_baseline"), 0.0)
+                if manual_baseline > 0 and manual_baseline > max(ref * 1.35, ref + max(50.0, ref * 0.10)):
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    pstate.update({
+                        "daily_dd_baseline": float(ref),
+                        "daily_dd_override_at": now_iso,
+                        "daily_dd_baseline_repaired_at": now_iso,
+                        "daily_dd_baseline_repair_reason": "execution_baseline_mismatch_okx_truth",
+                        "daily_dd_old_baseline": float(manual_baseline),
+                    })
+                    _save_protection_state(trade_store, "execution", pstate)
+                    print(
+                        "EXEC_DD_PROTECTION_BASELINE_REPAIR | "
+                        f"old={manual_baseline:.4f} | new={ref:.4f} | dd={dd_pct:.2f}% | label={label}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"⚠️ EXEC_DD_PROTECTION_BASELINE_REPAIR_FAILED | {label} | {exc}", flush=True)
 
     print(
         "EXEC_DD_SANITY_REPAIR | "
@@ -3384,10 +3425,12 @@ def _runtime_status_state_lines(settings: Settings, result: dict | None = None, 
         ])
     elif active_mode == "trading":
         okx_balance = _safe_float((risk_profile or {}).get("reference_balance_usdt"), 0.0)
+        # In TRADING status, do not mention Simulation at all.
+        # The active runtime is execution, so the whole block must serve OKX truth.
         lines.extend([
-            "🧪 Simulation Mode: <b>OFF</b>",
             "🚀 Execution Mode: <b>ON</b>",
-            f"💰 Active Balance Truth: <b>{okx_balance:,.2f} USDT</b> | <code>OKX</code>",
+            "🧭 Active Runtime Scope: <b>execution</b>",
+            f"💰 OKX Balance Truth: <b>{okx_balance:,.2f} USDT</b>",
         ])
     else:
         reference_balance = _safe_float((risk_profile or {}).get("reference_balance_usdt"), 0.0)
@@ -9208,8 +9251,117 @@ def _status_update_footer(result: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None) -> str:
-    _refresh_runtime_scope_state(result, settings, trade_store=trade_store)
+
+def _fresh_okx_balance_truth_for_execution_status(
+    settings: Settings,
+    okx_client: OKXTradeClient | None = None,
+) -> tuple[float, str]:
+    """Read the live OKX account balance for execution status/DD truth.
+
+    Execution status must not display stale cached result balances. In trading
+    mode the active balance truth is OKX now. This helper is status/protection
+    hygiene only; it does not place/cancel/amend orders.
+    """
+    try:
+        if okx_client is None:
+            okx_client = OKXTradeClient(
+                api_key=settings.okx_api_key,
+                api_secret=settings.okx_api_secret,
+                passphrase=settings.okx_passphrase,
+                base_url=settings.okx_base_url,
+                simulated=settings.okx_simulated,
+                allow_live_trading=settings.allow_live_trading,
+                timeout=settings.request_timeout,
+            )
+        if not _is_live_okx_execution_mode(settings, okx_client):
+            return 0.0, "not_live_okx_execution_mode"
+        payload = okx_client.get_balance()
+        balance = _extract_okx_reference_balance_usdt(payload if isinstance(payload, dict) else None)
+        if balance > 0:
+            return float(balance), "fresh_okx_balance"
+        msg = ""
+        if isinstance(payload, dict):
+            msg = str(payload.get("msg") or payload.get("reason") or payload.get("code") or "")
+        return 0.0, "okx_balance_unavailable" + (f":{msg}" if msg else "")
+    except Exception as exc:
+        return 0.0, f"okx_balance_exception:{exc}"
+
+
+def _force_execution_status_to_fresh_okx_truth(
+    result: dict | None,
+    settings: Settings,
+    trade_store: RedisTradeStore | None = None,
+    okx_client: OKXTradeClient | None = None,
+) -> dict:
+    """Make /status and execution Daily-DD use the same live OKX truth as /mood.
+
+    Surgical scope:
+    - execution/trading mode only;
+    - refreshes reference_portfolio from fresh OKX balance;
+    - lets _repair_execution_drawdown_sanity fix stale high baselines when the
+      tracked trade PnL does not justify them;
+    - no OKX writes, no order changes, no simulation changes.
+    """
+    if not isinstance(result, dict) or _is_simulation_mode(settings):
+        return result or {}
+
+    fresh_balance, source = _fresh_okx_balance_truth_for_execution_status(settings, okx_client)
+    if fresh_balance <= 0:
+        result["execution_status_okx_balance_truth_source"] = source
+        print(f"⚠️ STATUS_OKX_BALANCE_TRUTH_UNAVAILABLE | {source}", flush=True)
+        return result
+
+    inputs = dict(result.get("portfolio_state_inputs") or {})
+    previous_ref = _safe_float(inputs.get("reference_portfolio"), 0.0)
+    inputs["reference_portfolio"] = float(fresh_balance)
+    inputs["execution_current_balance"] = float(fresh_balance)
+    inputs["execution_reference_balance"] = float(fresh_balance)
+    inputs["status_okx_balance_truth_source"] = source
+
+    # Keep current OKX sizing truth visible in /status. Daily DD baseline remains
+    # a separate field and is repaired below only if stale/corrupt.
+    current_margin = _compute_margin_from_reference(fresh_balance, settings)
+    if current_margin >= LIVE_MIN_EXECUTION_MARGIN_USDT:
+        inputs["margin_per_trade"] = float(current_margin)
+    else:
+        inputs["margin_per_trade"] = 0.0
+
+    result["portfolio_state_inputs"] = inputs
+    result["execution_status_okx_balance_truth"] = float(fresh_balance)
+    result["execution_status_okx_balance_previous_ref"] = float(previous_ref or 0.0)
+
+    try:
+        trades = list(result.get("trades", []) or [])
+        portfolio_state = build_portfolio_state_from_trades(trades, **_portfolio_state_kwargs(inputs))
+        drawdown_status = evaluate_drawdown(portfolio_state)
+        portfolio_state, drawdown_status, inputs = _repair_execution_drawdown_sanity(
+            portfolio_state,
+            drawdown_status,
+            inputs,
+            trades,
+            settings,
+            trade_store=trade_store,
+            label="status_fresh_okx_truth",
+        )
+        result["portfolio_state"] = portfolio_state
+        result["drawdown_status"] = drawdown_status
+        result["portfolio_state_inputs"] = inputs
+        result["drawdown_report"] = build_drawdown_report(portfolio_state)
+        result["risk_protection_summary"] = _risk_protection_summary(result)
+        result["active_protections"] = result["risk_protection_summary"].get("active_protections", [])
+        print(
+            "STATUS_OKX_BALANCE_TRUTH | "
+            f"fresh={fresh_balance:.4f} | previous_ref={previous_ref:.4f} | "
+            f"dd={_execution_drawdown_pct_value(drawdown_status, portfolio_state):.2f}% | source={source}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"⚠️ STATUS_OKX_BALANCE_TRUTH_REBUILD_FAILED | {exc}", flush=True)
+    return result
+
+def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTradeStore | None = None, okx_client: OKXTradeClient | None = None) -> str:
+    _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
+    _force_execution_status_to_fresh_okx_truth(result, settings, trade_store=trade_store, okx_client=okx_client)
     execution_results = result.get("execution_results", []) or []
     last_rejection = next(
         (r for r in reversed(execution_results) if str(r.get("status", "")).startswith("rejected")),
@@ -11136,7 +11288,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             elif command == "/status":
                 if not _is_simulation_mode(settings):
                     _refresh_execution_reports_from_redis(result, trade_store=trade_store, settings=settings, okx_client=okx_client)
-                reply = _build_fast_status(result, settings, trade_store)
+                reply = _build_fast_status(result, settings, trade_store, okx_client=okx_client)
             elif command == "/mood":
                 _refresh_runtime_scope_state(result, settings, trade_store=trade_store, okx_client=okx_client)
                 fresh_ok, fresh_reason = _refresh_market_mode_snapshot_for_mood(result, settings, trade_store=trade_store)
