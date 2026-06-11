@@ -1365,7 +1365,20 @@ def _repair_execution_drawdown_sanity(
     # If tracked execution PnL creates impossible Daily-DD/equity readings,
     # do not use Redis trade PnL as wallet truth. OKX current equity is the
     # source of truth. Keep tracked PnL only for analytics/report diagnostics.
-    hard_flat_repair = bool(dd_pct > 100.0 or computed_equity < 0.0)
+    #
+    # Important: a corrupted Redis trade can make computed_equity far below the
+    # real OKX balance without making DD > 100%. In that case the old repair
+    # recalculated start = ref - tracked_pnl and could still leave DD above the
+    # hard-stop threshold, causing false hard_daily_drawdown_pause_no_exceptions.
+    # When computed portfolio equity materially disagrees with OKX equity, use
+    # OKX equity as both current truth and daily baseline for this runtime DD.
+    hard_flat_repair = bool(
+        dd_pct > 100.0
+        or computed_equity < 0.0
+        or (ref > 0 and computed_equity < ref * 0.50)
+        or (ref > 0 and start > max(ref * 10.0, 1000.0))
+        or (ref > 0 and 0 < start < ref * 0.50)
+    )
     if hard_flat_repair and ref > 0:
         repaired_start = ref
         used_flat_repair = True
