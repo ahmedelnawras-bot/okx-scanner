@@ -3362,6 +3362,43 @@ def _runtime_okx_state_lines(settings: Settings) -> list[str]:
     return lines
 
 
+def _runtime_status_state_lines(settings: Settings, result: dict | None = None, risk_profile: dict | None = None) -> list[str]:
+    """Status runtime block sourced from the same truth as /mood.
+
+    /mood already reads runtime truth through _runtime_mode_snapshot() via
+    _runtime_okx_state_lines(). /status must not keep a parallel wording path
+    that can drift or look like Simulation while the bot is trading.
+
+    Display-only: no orders, no sizing, no Redis writes, no report changes.
+    """
+    runtime = _runtime_mode_snapshot(settings)
+    active_mode = str(runtime.get("active_mode") or "").strip().lower()
+    lines = list(_runtime_okx_state_lines(settings))
+
+    if active_mode == "simulation":
+        sim_equity = _safe_float(((result or {}).get("simulation_wallet") or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
+        lines.extend([
+            "🧪 Simulation Mode: <b>ON</b>",
+            "🚀 Execution Mode: <b>OFF</b>",
+            f"💰 Active Balance Truth: <b>{sim_equity:,.2f} USDT</b> | <code>simulation_wallet</code>",
+        ])
+    elif active_mode == "trading":
+        okx_balance = _safe_float((risk_profile or {}).get("reference_balance_usdt"), 0.0)
+        lines.extend([
+            "🧪 Simulation Mode: <b>OFF</b>",
+            "🚀 Execution Mode: <b>ON</b>",
+            f"💰 Active Balance Truth: <b>{okx_balance:,.2f} USDT</b> | <code>OKX</code>",
+        ])
+    else:
+        reference_balance = _safe_float((risk_profile or {}).get("reference_balance_usdt"), 0.0)
+        lines.extend([
+            "🧪 Simulation Mode: <b>OFF</b>",
+            "🚀 Execution Mode: <b>OFF</b>",
+            f"💰 Active Balance Truth: <b>{reference_balance:,.2f} USDT</b> | <code>scanner/status</code>",
+        ])
+    return lines
+
+
 def _strip_static_live_trading_warning_from_mode_text(message: str) -> str:
     """Remove stale/static live-trading wording from market-mode templates.
 
@@ -9213,22 +9250,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
-    # Display-only wallet truth by runtime mode.
-    # In execution, hide the simulation wallet value so it cannot be confused with
-    # OKX capital/sizing. In simulation, show the virtual wallet only.
-    if simulation_active:
-        simulation_equity = _safe_float((result.get("simulation_wallet") or {}).get("equity"), SIMULATION_START_BALANCE_USDT)
-        runtime_wallet_lines = [
-            f"🧪 Simulation: ON | Wallet={simulation_equity:.2f} USDT",
-        ]
-    else:
-        okx_balance = _safe_float(risk_profile.get("reference_balance_usdt"), 0.0)
-        runtime_wallet_lines = [
-            "🚀 Runtime Mode: TRADING",
-            "🧪 Simulation Mode: OFF",
-            "🚀 Execution Mode: ON",
-            f"💰 OKX Balance: {okx_balance:.2f} USDT",
-        ]
+    # Status runtime block uses the same runtime truth helper as /mood.
+    # This prevents split-brain wording between mode messages and /status.
+    runtime_status_lines = _runtime_status_state_lines(settings, result, risk_profile)
 
     # Build Balance Tier line outside nested f-strings to avoid quote parsing issues.
     try:
@@ -9262,14 +9286,9 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         trading_state_line,
         f"📈 Market Mode: {result.get('mode', 'UNKNOWN')}",
         f"⚡ Execution Engine: {'ON' if settings.execution_enabled else 'OFF'}",
-        "🔌 OKX",
-        f"• Orders: {'ON' if runtime.get('orders_enabled') else 'OFF'}",
-        f"• Raw: {'ON' if runtime.get('orders_enabled') else 'OFF'}",
-        f"• Effective: {'ON' if runtime.get('effective_orders_enabled') else 'OFF'}",
-        f"• Live Trading: {live_status_line}",
         f"🧰 Offline Test Mode: {'ON' if settings.offline_test_mode else 'OFF'}",
         f"📡 Signal Mode: {_signal_delivery_mode_label(settings)}",
-        *runtime_wallet_lines,
+        *runtime_status_lines,
         "",
         risk_block,
         "",
