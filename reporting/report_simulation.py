@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import copy
 from typing import Any
 
 from reporting.report_open_trades import build_open_trades_report
@@ -95,7 +96,71 @@ def _is_simulation_trade(t) -> bool:
 
 
 def _simulation_scope_trades(trades: list | None) -> list:
-    return [t for t in list(trades or []) if _is_simulation_trade(t)]
+    """Return Simulation trades normalized for report-only accounting.
+
+    Important: result["simulation_trades"] is already the Simulation bucket from
+    main.py. Some legacy simulation records were created by mirroring the
+    execution path and may still carry fields like execution_trade=True or
+    non-standard statuses. If we trust those flags here, the isolated Simulation
+    report can show 0 open/closed trades while the Simulation wallet/top block
+    correctly sees active trades.
+
+    This function creates shallow report-only copies. It does not mutate Redis,
+    lifecycle, execution, OKX, TP/SL, or the original trade objects.
+    """
+    out = []
+    closed_statuses = {
+        "closed", "stopped", "closed_loss", "closed_win", "expired",
+        "trailing_hit", "breakeven_after_tp1", "duplicate_closed_by_okx_repair",
+    }
+    open_statuses = {
+        "open", "tp1_hit", "tp2_hit", "tp1_partial", "tp2_partial",
+        "runner", "runner_active", "protected_runner", "breakeven_runner",
+        "partial_runner", "accepted_preview", "pending_pullback_preview",
+    }
+
+    for original in list(trades or []):
+        # Only reject records explicitly marked as execution by source/bucket.
+        # Do not reject merely because execution_trade=True; old simulation
+        # mirror records may carry that flag.
+        source = str(getattr(original, "trade_source", "") or "").strip().lower()
+        bucket = str(getattr(original, "tracking_bucket", "") or "").strip().lower()
+        if source == "execution" or bucket == "execution":
+            continue
+
+        try:
+            t = copy.copy(original)
+        except Exception:
+            t = original
+
+        try:
+            setattr(t, "trade_source", "simulation")
+            setattr(t, "tracking_bucket", "simulation")
+            setattr(t, "execution_trade", False)
+        except Exception:
+            pass
+
+        status = str(getattr(t, "status", "") or "").strip().lower()
+        is_closed = bool(getattr(t, "is_closed", False) or getattr(t, "closed_at", None) or status in closed_statuses)
+        try:
+            if is_closed:
+                setattr(t, "is_closed", True)
+                if status not in {"closed_loss", "closed_win", "breakeven_after_tp1", "trailing_hit"}:
+                    realized = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
+                    setattr(t, "status", "closed_win" if realized > 0 else "closed_loss")
+            else:
+                setattr(t, "is_closed", False)
+                if status not in open_statuses:
+                    setattr(t, "status", "open")
+                elif status in {"tp1_hit", "tp1_partial"}:
+                    setattr(t, "status", "tp1_partial")
+                elif status in {"tp2_hit", "tp2_partial", "runner_active", "protected_runner", "partial_runner", "breakeven_runner"}:
+                    setattr(t, "status", "runner")
+        except Exception:
+            pass
+
+        out.append(t)
+    return out
 
 
 def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None = None, starting_balance: float = 1000.0) -> list[str]:
@@ -349,8 +414,11 @@ def build_simulation_command_outputs(
     out = _periodic_execution_style_reports(sim_checks, sim_trades, account_summary)
 
     # Same report families as execution, but under /report_simulation_*.
+    # Dedicated isolated Simulation wallet impact. Do not call the shared
+    # execution-style wallet report here because legacy simulation records may
+    # carry execution-like flags/statuses.
     out["/report_simulation_wallet"] = _decorate(
-        build_wallet_report(sim_trades, title="💼 Wallet Impact — Simulation"),
+        "\n".join(_simulation_wallet_impact_lines(_simulation_scope_trades(sim_trades), account_summary=account_summary, starting_balance=_extract_sim_start_balance(account_summary, 1000.0))),
         account_summary,
     )
     out["/report_simulation_profit_analysis"] = _decorate(
