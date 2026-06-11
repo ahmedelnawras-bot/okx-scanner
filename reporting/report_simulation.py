@@ -355,7 +355,6 @@ def build_simulation_report(
         f"• Checked Candidates: {checked}",
         f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
         f"• Currently Open Tracked Trades: {len(opened)}",
-        f"• Active Slots: {len(active_opened)} | Protected Runners: {len(runners)}",
         f"• Closed Tracked Trades: {len(closed)}",
         f"🏆 Win Rate: <b>{wr:.1f}%</b>",
         f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
