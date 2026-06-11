@@ -88,9 +88,21 @@ def _closed_wr_parts(trades: list) -> tuple[int, int, float]:
 def _is_simulation_trade(t) -> bool:
     source = str(getattr(t, "trade_source", "") or "").strip().lower()
     bucket = str(getattr(t, "tracking_bucket", "") or "").strip().lower()
-    # report_simulation receives simulation_trades from main, so legacy records in
-    # this list are accepted unless explicitly marked execution.
-    if source == "execution" or bucket == "execution" or bool(getattr(t, "execution_trade", False)):
+
+    # report_simulation receives result["simulation_trades"] from main.
+    # Trust an explicit simulation source even when legacy mirror records still
+    # carry execution-style fields like tracking_bucket="execution" or
+    # execution_trade=True. Only reject records explicitly marked execution AND
+    # not explicitly marked simulation.
+    if source == "simulation":
+        return True
+    if source == "execution":
+        return False
+    if bucket == "simulation":
+        return True
+    if bucket == "execution":
+        return False
+    if bool(getattr(t, "execution_trade", False)):
         return False
     return True
 
@@ -120,12 +132,19 @@ def _simulation_scope_trades(trades: list | None) -> list:
     }
 
     for original in list(trades or []):
-        # Only reject records explicitly marked as execution by source/bucket.
-        # Do not reject merely because execution_trade=True; old simulation
-        # mirror records may carry that flag.
+        # Trust explicit trade_source="simulation" first.
+        # Legacy simulation mirror records may still carry execution-style fields
+        # such as tracking_bucket="execution" or execution_trade=True. Those must
+        # still be counted in Simulation reports because they came from
+        # result["simulation_trades"]. Only reject records explicitly marked
+        # execution when they are not explicitly marked simulation.
         source = str(getattr(original, "trade_source", "") or "").strip().lower()
         bucket = str(getattr(original, "tracking_bucket", "") or "").strip().lower()
-        if source == "execution" or bucket == "execution":
+        if source == "simulation":
+            pass
+        elif source == "execution":
+            continue
+        elif bucket == "execution":
             continue
 
         try:
@@ -181,30 +200,30 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
     floating_net = floating_profit + floating_loss
 
     def money_icon(value: float) -> str:
-        return ("🟢" if value >= 0 else "🔴") + f" {value:+.2f}$"
+        return ("ðŸŸ¢" if value >= 0 else "ðŸ”´") + f" {value:+.2f}$"
 
     return [
-        "💰 <b>Wallet Impact</b>",
-        f"🧱 Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
-        f"📌 رأس المال\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
+        "ðŸ’° <b>Wallet Impact</b>",
+        f"ðŸ§± Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
+        f"ðŸ“Œ Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
         "",
-        "✅ <b>الصفقات المغلقة</b>",
-        "📈 الأرباح",
+        "âœ… <b>Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…ØºÙ„Ù‚Ø©</b>",
+        "ðŸ“ˆ Ø§Ù„Ø£Ø±Ø¨Ø§Ø­",
         f"{closed_profit_usd:+.2f}$ | {closed_profit:+.2f}% Realized PnL",
-        "📉 الخسائر",
+        "ðŸ“‰ Ø§Ù„Ø®Ø³Ø§Ø¦Ø±",
         f"{closed_loss_usd:+.2f}$ | {closed_loss:+.2f}% Realized PnL",
-        "⚖️ الصافي",
+        "âš–ï¸ Ø§Ù„ØµØ§ÙÙŠ",
         f"<b>{money_icon(closed_net_usd)} | {closed_net:+.2f}% Realized PnL</b>",
         "",
-        "🔄 <b>الصفقات المفتوحة</b>",
-        "📈 الأرباح العائمة",
+        "ðŸ”„ <b>Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…ÙØªÙˆØ­Ø©</b>",
+        "ðŸ“ˆ Ø§Ù„Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ø¹Ø§Ø¦Ù…Ø©",
         f"{floating_profit_usd:+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
-        "📉 الخسائر العائمة",
+        "ðŸ“‰ Ø§Ù„Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ø¹Ø§Ø¦Ù…Ø©",
         f"{floating_loss_usd:+.2f}$ | {floating_loss:+.2f}% Total Floating PnL",
-        "⚖️ Total Floating PnL",
+        "âš–ï¸ Total Floating PnL",
         f"<b>{money_icon(floating_net_usd)} | {floating_net:+.2f}% Total Floating PnL</b>",
         "",
-        "💼 <b>التأثير الحالي على محفظة المحاكاة</b>",
+        "ðŸ’¼ <b>Ø§Ù„ØªØ£Ø«ÙŠØ± Ø§Ù„Ø­Ø§Ù„ÙŠ Ø¹Ù„Ù‰ Ù…Ø­ÙØ¸Ø© Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©</b>",
         f"<b>{money_icon(total_usd)}</b>",
     ]
 
@@ -221,7 +240,7 @@ def build_simulation_report(
     sim_checks: list[dict],
     sim_trades: list,
     *,
-    title: str = "🧪 تقرير أداء المحاكاة",
+    title: str = "ðŸ§ª ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©",
     period: str = "since_start",
     account_summary: str | None = None,
 ) -> str:
@@ -241,30 +260,30 @@ def build_simulation_report(
     closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     start_balance = _extract_sim_start_balance(account_summary, 1000.0)
 
-    lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
+    lines: list[str] = [title, f"ðŸ“… {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
-        "📊 <b>Quick Stats</b>",
-        f"• Checked Candidates: {checked}",
-        f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
-        f"• Currently Open Tracked Trades: {len(opened)}",
-        f"• Closed Tracked Trades: {len(closed)}",
-        f"🏆 Win Rate: <b>{wr:.1f}%</b>",
-        f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
-        f"📌 Rejected After Check: {len(rejected_checks)} محفوظة للتحليل فقط ولا تُحسب كصفقات مفتوحة.",
-        f"🛣 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
+        "ðŸ“Š <b>Quick Stats</b>",
+        f"â€¢ Checked Candidates: {checked}",
+        f"â€¢ Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
+        f"â€¢ Currently Open Tracked Trades: {len(opened)}",
+        f"â€¢ Closed Tracked Trades: {len(closed)}",
+        f"ðŸ† Win Rate: <b>{wr:.1f}%</b>",
+        f"ðŸŸ¢ Winners: {win_count} | ðŸ”´ Losers: {loss_count}",
+        f"ðŸ“Œ Rejected After Check: {len(rejected_checks)} Ù…Ø­ÙÙˆØ¸Ø© Ù„Ù„ØªØ­Ù„ÙŠÙ„ ÙÙ‚Ø· ÙˆÙ„Ø§ ØªÙØ­Ø³Ø¨ ÙƒØµÙÙ‚Ø§Øª Ù…ÙØªÙˆØ­Ø©.",
+        f"ðŸ›£ Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
     lines.extend([SEP, *_simulation_wallet_impact_lines(trades, account_summary=account_summary, starting_balance=start_balance)])
     behavior_lines = behavior_summary_lines(trades, label="Simulation Behavior Summary")
     lines.extend([SEP, *behavior_lines])
-    lines.extend([SEP, "📂 <b>Open Trades</b>"])
-    lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
+    lines.extend([SEP, "ðŸ“‚ <b>Open Trades</b>"])
+    lines.append(f"ðŸŸ¢ Open Winners: {len(winners)} | ðŸ”´ Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
-    append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
-    append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
-    append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
-    lines.extend([SEP, "💡 إدارة الصفقات: Simulation 30/50/20 | Recovery 50/25/25"])
+        lines.append(f"âš¡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+    append_trade_cards(lines, "ðŸŸ¢ <b>Top 3 Open Winners</b>", winners[:3], limit=3)
+    append_trade_cards(lines, "ðŸ”´ <b>Top 3 Open Losers</b>", losers[:3], limit=3)
+    append_trade_cards(lines, "ðŸ† <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
+    append_trade_cards(lines, "ðŸ’€ <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
+    lines.extend([SEP, "ðŸ’¡ Ø¥Ø¯Ø§Ø±Ø© Ø§Ù„ØµÙÙ‚Ø§Øª: Simulation 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
 
 
@@ -278,7 +297,7 @@ PERIODS = [
 
 
 def _simulation_header(text: str) -> str:
-    return "🧪 Simulation Mode\n━━━━━━━━━━━━\n" + str(text or "").strip()
+    return "ðŸ§ª Simulation Mode\nâ”â”â”â”â”â”â”â”â”â”â”â”\n" + str(text or "").strip()
 
 
 def _compact_tradingview_links(text: str) -> str:
@@ -291,15 +310,15 @@ def _compact_tradingview_links(text: str) -> str:
     url = r"https://www\.tradingview\.com/chart/\?symbol=[^\s<]+"
 
     # Original shared formatter:
-    # 🔗 TradingView: https://...
-    value = re.sub(rf"🔗\s*TradingView:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
+    # ðŸ”— TradingView: https://...
+    value = re.sub(rf"ðŸ”—\s*TradingView:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
 
     # Some previous versions already changed label to TV but left the URL visible:
-    # 🔗 TV: https://...
-    value = re.sub(rf"🔗\s*TV:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
+    # ðŸ”— TV: https://...
+    value = re.sub(rf"ðŸ”—\s*TV:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
 
     # Fallback if the icon is missing.
-    value = re.sub(rf"(?m)^TV:\s*({url})", r'🔗 <a href="\1">TV</a>', value)
+    value = re.sub(rf"(?m)^TV:\s*({url})", r'ðŸ”— <a href="\1">TV</a>', value)
 
     return value
 
@@ -315,7 +334,7 @@ def _strip_inherited_execution_title(text: str) -> str:
     removed = False
     for line in lines:
         stripped = line.strip()
-        if not removed and stripped in {"🚀 تقرير أداء التنفيذ", "🚀 تقرير الصفقات المرشحة — Execution"}:
+        if not removed and stripped in {"ðŸš€ ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„ØªÙ†ÙÙŠØ°", "ðŸš€ ØªÙ‚Ø±ÙŠØ± Ø§Ù„ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø±Ø´Ø­Ø© â€” Execution"}:
             removed = True
             continue
         cleaned.append(line)
@@ -330,8 +349,8 @@ def _polish_wallet_impact_rtl(text: str) -> str:
     """
     value = str(text or "")
     value = re.sub(
-        r"(?m)^📌\s*رأس المال:\s*([^\n]+)$",
-        r"📌 رأس المال\n<b>\1</b>",
+        r"(?m)^ðŸ“Œ\s*Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„:\s*([^\n]+)$",
+        r"ðŸ“Œ Ø±Ø£Ø³ Ø§Ù„Ù…Ø§Ù„\n<b>\1</b>",
         value,
     )
     return value
@@ -372,7 +391,7 @@ def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, 
             build_simulation_report(
                 checks,
                 trades,
-                title="🧪 تقرير أداء المحاكاة",
+                title="ðŸ§ª ØªÙ‚Ø±ÙŠØ± Ø£Ø¯Ø§Ø¡ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©",
                 period=period,
                 account_summary=account_summary,
             ),
@@ -381,7 +400,7 @@ def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, 
         out[f"/report_simulation_open{suffix}"] = _decorate(
             build_open_trades_report(
                 trades,
-                title="🧪📂 صفقات المحاكاة المفتوحة",
+                title="ðŸ§ªðŸ“‚ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø© Ø§Ù„Ù…ÙØªÙˆØ­Ø©",
                 execution_only=True,
                 period=period,
             ),
@@ -407,7 +426,8 @@ def build_simulation_command_outputs(
     It deliberately mirrors execution report builders/terms/order without
     modifying execution, normal reports, or shared report_format.py.
     """
-    sim_trades = list((result or {}).get("simulation_trades", []) or [])
+    raw_sim_trades = list((result or {}).get("simulation_trades", []) or [])
+    sim_trades = _simulation_scope_trades(raw_sim_trades)
     sim_checks = list((result or {}).get("simulation_execution_results", []) or [])
     sim_items = list((result or {}).get("simulation_signal_items", []) or [])
 
@@ -422,15 +442,15 @@ def build_simulation_command_outputs(
         account_summary,
     )
     out["/report_simulation_profit_analysis"] = _decorate(
-        build_profit_analysis_report(sim_trades, title="📈 تحليل أسباب أرباح المحاكاة"),
+        build_profit_analysis_report(sim_trades, title="ðŸ“ˆ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
         account_summary,
     )
     out["/report_simulation_losses_analysis"] = _decorate(
-        build_losses_analysis_report(sim_trades, title="📉 تحليل أسباب خسائر المحاكاة"),
+        build_losses_analysis_report(sim_trades, title="ðŸ“‰ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
         account_summary,
     )
     out["/report_simulation_intelligence"] = _decorate(
-        build_execution_intelligence_report(sim_trades, sim_checks, "🧠🧪 ذكاء صفقات المحاكاة"),
+        build_execution_intelligence_report(sim_trades, sim_checks, "ðŸ§ ðŸ§ª Ø°ÙƒØ§Ø¡ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
         account_summary,
     )
     out["/report_simulation_diagnostics"] = _decorate(
@@ -443,15 +463,15 @@ def build_simulation_command_outputs(
         trades = filter_trades_by_period(sim_trades, period)
         checks = filter_checks_by_period(sim_checks, period)
         out[f"/report_simulation_profit_analysis{suffix}"] = _decorate(
-            build_profit_analysis_report(trades, title="📈 تحليل أسباب أرباح المحاكاة"),
+            build_profit_analysis_report(trades, title="ðŸ“ˆ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø£Ø±Ø¨Ø§Ø­ Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
             account_summary,
         )
         out[f"/report_simulation_losses_analysis{suffix}"] = _decorate(
-            build_losses_analysis_report(trades, title="📉 تحليل أسباب خسائر المحاكاة"),
+            build_losses_analysis_report(trades, title="ðŸ“‰ ØªØ­Ù„ÙŠÙ„ Ø£Ø³Ø¨Ø§Ø¨ Ø®Ø³Ø§Ø¦Ø± Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
             account_summary,
         )
         out[f"/report_simulation_intelligence{suffix}"] = _decorate(
-            build_execution_intelligence_report(trades, checks, "🧠🧪 ذكاء صفقات المحاكاة"),
+            build_execution_intelligence_report(trades, checks, "ðŸ§ ðŸ§ª Ø°ÙƒØ§Ø¡ ØµÙÙ‚Ø§Øª Ø§Ù„Ù…Ø­Ø§ÙƒØ§Ø©"),
             account_summary,
         )
         out[f"/report_simulation_diagnostics{suffix}"] = _decorate(
@@ -471,12 +491,12 @@ def build_simulation_command_outputs(
         out["/simulation_open"] = out["/report_simulation_open"]
 
     out["/simulation"] = "\n".join([
-        "🧪 Simulation Mode",
-        "━━━━━━━━━━━━",
-        "Mirror كامل لوضع التداول.",
-        "• نفس شروط الترشيح والتنفيذ",
-        "• لا يرسل أوامر OKX Live",
-        "• يفتح صفقات داخلية بمحفظة محاكاة",
+        "ðŸ§ª Simulation Mode",
+        "â”â”â”â”â”â”â”â”â”â”â”â”",
+        "Mirror ÙƒØ§Ù…Ù„ Ù„ÙˆØ¶Ø¹ Ø§Ù„ØªØ¯Ø§ÙˆÙ„.",
+        "â€¢ Ù†ÙØ³ Ø´Ø±ÙˆØ· Ø§Ù„ØªØ±Ø´ÙŠØ­ ÙˆØ§Ù„ØªÙ†ÙÙŠØ°",
+        "â€¢ Ù„Ø§ ÙŠØ±Ø³Ù„ Ø£ÙˆØ§Ù…Ø± OKX Live",
+        "â€¢ ÙŠÙØªØ­ ØµÙÙ‚Ø§Øª Ø¯Ø§Ø®Ù„ÙŠØ© Ø¨Ù…Ø­ÙØ¸Ø© Ù…Ø­Ø§ÙƒØ§Ø©",
         "",
         str(wallet_text or "").strip(),
     ]).strip()
