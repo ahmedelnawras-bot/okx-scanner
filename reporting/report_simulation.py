@@ -110,12 +110,17 @@ def _is_simulation_trade(t) -> bool:
 def _simulation_scope_trades(trades: list | None) -> list:
     """Return Simulation trades normalized for report-only accounting.
 
-    Important: result["simulation_trades"] is already the Simulation bucket from
-    main.py. Some legacy simulation records were created by mirroring the
-    execution path and may still carry fields like execution_trade=True or
-    non-standard statuses. If we trust those flags here, the isolated Simulation
-    report can show 0 open/closed trades while the Simulation wallet/top block
-    correctly sees active trades.
+    Scope rule:
+    - result["simulation_trades"] is already the Simulation bucket from main.py.
+    - Trust explicit trade_source="simulation" even if legacy mirror fields still
+      say tracking_bucket="execution" / execution_trade=True.
+
+    Open-count rule:
+    Do NOT convert every non-closed legacy row into an open trade. That was the
+    reason /report_simulation showed impossible values such as 39 open trades
+    while the simulation slot manager was limited to 7 slots. Unknown/non-active
+    legacy rows are kept for diagnostics but assigned a non-report status so
+    report_format.open_trades() does not count them as active.
 
     This function creates shallow report-only copies. It does not mutate Redis,
     lifecycle, execution, OKX, TP/SL, or the original trade objects.
@@ -125,21 +130,18 @@ def _simulation_scope_trades(trades: list | None) -> list:
         "closed", "stopped", "closed_loss", "closed_win", "expired",
         "trailing_hit", "breakeven_after_tp1", "duplicate_closed_by_okx_repair",
     }
-    open_statuses = {
-        "open", "tp1_hit", "tp2_hit", "tp1_partial", "tp2_partial",
-        "runner", "runner_active", "protected_runner", "breakeven_runner",
-        "partial_runner", "accepted_preview", "pending_pullback_preview",
+    active_statuses = {"open", "tp1_hit", "tp1_partial", "accepted_preview", "pending_pullback_preview"}
+    runner_statuses = {
+        "tp2_hit", "tp2_partial", "runner", "runner_active",
+        "protected_runner", "breakeven_runner", "partial_runner",
     }
 
     for original in list(trades or []):
-        # Trust explicit trade_source="simulation" first.
-        # Legacy simulation mirror records may still carry execution-style fields
-        # such as tracking_bucket="execution" or execution_trade=True. Those must
-        # still be counted in Simulation reports because they came from
-        # result["simulation_trades"]. Only reject records explicitly marked
-        # execution when they are not explicitly marked simulation.
         source = str(getattr(original, "trade_source", "") or "").strip().lower()
         bucket = str(getattr(original, "tracking_bucket", "") or "").strip().lower()
+
+        # Trust explicit simulation source first. Only reject explicit execution
+        # when source is not simulation.
         if source == "simulation":
             pass
         elif source == "execution":
@@ -161,20 +163,45 @@ def _simulation_scope_trades(trades: list | None) -> list:
 
         status = str(getattr(t, "status", "") or "").strip().lower()
         is_closed = bool(getattr(t, "is_closed", False) or getattr(t, "closed_at", None) or status in closed_statuses)
+        counts_as_active = getattr(t, "counts_as_active_slot", None)
+        slot_exempt = bool(
+            getattr(t, "slot_exempt", False)
+            or getattr(t, "daily_open_risk_exempt", False)
+            or getattr(t, "same_symbol_block_exempt", False)
+        )
+        tp2_or_runner = bool(
+            status in runner_statuses
+            or getattr(t, "tp2_hit", False)
+            or getattr(t, "runner_active", False)
+            or getattr(t, "protected_runner", False)
+        )
+
         try:
             if is_closed:
                 setattr(t, "is_closed", True)
                 if status not in {"closed_loss", "closed_win", "breakeven_after_tp1", "trailing_hit"}:
                     realized = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
                     setattr(t, "status", "closed_win" if realized > 0 else "closed_loss")
-            else:
+            elif tp2_or_runner or slot_exempt or counts_as_active is False:
+                # Residual runner / TP2-protected position: visible as runner,
+                # but not counted as an active slot trade.
                 setattr(t, "is_closed", False)
-                if status not in open_statuses:
-                    setattr(t, "status", "open")
-                elif status in {"tp1_hit", "tp1_partial"}:
+                setattr(t, "status", "runner")
+                setattr(t, "counts_as_active_slot", False)
+            elif counts_as_active is True or status in active_statuses:
+                setattr(t, "is_closed", False)
+                if status in {"tp1_hit", "tp1_partial"}:
                     setattr(t, "status", "tp1_partial")
-                elif status in {"tp2_hit", "tp2_partial", "runner_active", "protected_runner", "partial_runner", "breakeven_runner"}:
-                    setattr(t, "status", "runner")
+                else:
+                    setattr(t, "status", "open")
+                setattr(t, "counts_as_active_slot", True)
+            else:
+                # Unknown legacy row. Keep it in the normalized list for future
+                # diagnostics/period filtering, but do not let report_format count
+                # it as open or closed.
+                setattr(t, "is_closed", False)
+                setattr(t, "status", "legacy_simulation_record")
+                setattr(t, "counts_as_active_slot", False)
         except Exception:
             pass
 
@@ -182,8 +209,60 @@ def _simulation_scope_trades(trades: list | None) -> list:
     return out
 
 
+def _simulation_active_open_trades(trades: list) -> list:
+    """Trades that consume active simulation slots and should appear in Quick Stats."""
+    active = []
+    for t in open_trades(trades):
+        if bool(getattr(t, "is_closed", False)) or getattr(t, "closed_at", None):
+            continue
+        if bool(getattr(t, "tp2_hit", False)):
+            continue
+        if bool(getattr(t, "slot_exempt", False) or getattr(t, "daily_open_risk_exempt", False) or getattr(t, "same_symbol_block_exempt", False)):
+            continue
+        counts = getattr(t, "counts_as_active_slot", None)
+        if counts is False:
+            continue
+        status = str(getattr(t, "status", "") or "").strip().lower()
+        if status in {"open", "tp1_partial"} or counts is True:
+            active.append(t)
+    return active
+
+
+def _simulation_runner_trades(trades: list) -> list:
+    """Residual TP2/protected runners: visible floating exposure, not active slots."""
+    runners = []
+    for t in open_trades(trades):
+        if bool(getattr(t, "is_closed", False)) or getattr(t, "closed_at", None):
+            continue
+        status = str(getattr(t, "status", "") or "").strip().lower()
+        is_runner = bool(
+            status in {"runner", "tp2_partial"}
+            or getattr(t, "tp2_hit", False)
+            or getattr(t, "runner_active", False)
+            or getattr(t, "protected_runner", False)
+            or getattr(t, "slot_exempt", False)
+            or getattr(t, "same_symbol_block_exempt", False)
+        )
+        if is_runner and t not in runners:
+            runners.append(t)
+    return runners
+
+
+def _simulation_floating_trades(trades: list) -> list:
+    """All report-visible floating simulation exposure: active slots + runners."""
+    merged = []
+    seen: set[int] = set()
+    for t in [*_simulation_active_open_trades(trades), *_simulation_runner_trades(trades)]:
+        marker = id(t)
+        if marker not in seen:
+            seen.add(marker)
+            merged.append(t)
+    return merged
+
 def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None = None, starting_balance: float = 1000.0) -> list[str]:
-    opened = open_trades(trades)
+    active_opened = _simulation_active_open_trades(trades)
+    runners = _simulation_runner_trades(trades)
+    opened = _simulation_floating_trades(trades)
     closed = closed_trades(trades)
     closed_profit_usd = sum(max(0.0, trade_money_pnl(t)) for t in closed)
     closed_loss_usd = sum(min(0.0, trade_money_pnl(t)) for t in closed)
@@ -200,33 +279,33 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
     floating_net = floating_profit + floating_loss
 
     def money_icon(value: float) -> str:
-        return ("\U0001f7e2" if value >= 0 else "\U0001f534") + f" {value:+.2f}$"
+        return ("🟢" if value >= 0 else "🔴") + f" {value:+.2f}$"
 
     return [
-        "\U0001f4b0 <b>Wallet Impact</b>",
-        f"\U0001f9f1 Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
-        f"\U0001f4cc \u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
+        "💰 <b>Wallet Impact</b>",
+        f"🧱 Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
+        f"📌 رأس المال\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
         "",
-        "\u2705 <b>\u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u063a\u0644\u0642\u0629</b>",
-        "\U0001f4c8 \u0627\u0644\u0623\u0631\u0628\u0627\u062d",
+        "✅ <b>الصفقات المغلقة</b>",
+        "📈 الأرباح",
         f"{closed_profit_usd:+.2f}$ | {closed_profit:+.2f}% Realized PnL",
-        "\U0001f4c9 \u0627\u0644\u062e\u0633\u0627\u0626\u0631",
+        "📉 الخسائر",
         f"{closed_loss_usd:+.2f}$ | {closed_loss:+.2f}% Realized PnL",
-        "\u2696\ufe0f \u0627\u0644\u0635\u0627\u0641\u064a",
+        "⚖️ الصافي",
         f"<b>{money_icon(closed_net_usd)} | {closed_net:+.2f}% Realized PnL</b>",
         "",
-        "\U0001f504 <b>\u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u0641\u062a\u0648\u062d\u0629</b>",
-        "\U0001f4c8 \u0627\u0644\u0623\u0631\u0628\u0627\u062d \u0627\u0644\u0639\u0627\u0626\u0645\u0629",
+        "🔄 <b>الصفقات المفتوحة / الرنر</b>",
+        f"📌 Active Slots: {len(active_opened)} | Protected Runners: {len(runners)}",
+        "📈 الأرباح العائمة",
         f"{floating_profit_usd:+.2f}$ | {floating_profit:+.2f}% Total Floating PnL",
-        "\U0001f4c9 \u0627\u0644\u062e\u0633\u0627\u0626\u0631 \u0627\u0644\u0639\u0627\u0626\u0645\u0629",
+        "📉 الخسائر العائمة",
         f"{floating_loss_usd:+.2f}$ | {floating_loss:+.2f}% Total Floating PnL",
-        "\u2696\ufe0f Total Floating PnL",
+        "⚖️ Total Floating PnL",
         f"<b>{money_icon(floating_net_usd)} | {floating_net:+.2f}% Total Floating PnL</b>",
         "",
-        "\U0001f4bc <b>\u0627\u0644\u062a\u0623\u062b\u064a\u0631 \u0627\u0644\u062d\u0627\u0644\u064a \u0639\u0644\u0649 \u0645\u062d\u0641\u0638\u0629 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629</b>",
+        "💼 <b>التأثير الحالي على محفظة المحاكاة</b>",
         f"<b>{money_icon(total_usd)}</b>",
     ]
-
 
 def _extract_sim_start_balance(account_summary: str | None, fallback: float = 1000.0) -> float:
     text = str(account_summary or "")
@@ -240,7 +319,7 @@ def build_simulation_report(
     sim_checks: list[dict],
     sim_trades: list,
     *,
-    title: str = "\U0001f9ea \u062a\u0642\u0631\u064a\u0631 \u0623\u062f\u0627\u0621 \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629",
+    title: str = "🧪 تقرير أداء المحاكاة",
     period: str = "since_start",
     account_summary: str | None = None,
 ) -> str:
@@ -251,39 +330,58 @@ def build_simulation_report(
     checked = len(checks)
     counts = _execution_path_counts(checks)
     acc_rate = (len(accepted_checks) / max(1, checked)) * 100 if checked else 0.0
-    opened = open_trades(trades)
+
+    active_opened = _simulation_active_open_trades(trades)
+    runners = _simulation_runner_trades(trades)
+    floating_trades = _simulation_floating_trades(trades)
     closed = closed_trades(trades)
+
     win_count, loss_count, wr = _closed_wr_parts(trades)
-    winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
-    losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    winners = sorted([t for t in active_opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
+    losers = sorted([t for t in active_opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
+    runner_winners = sorted([t for t in runners if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
+    runner_losers = sorted([t for t in runners if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
     closed_losses = sorted([t for t in closed if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     start_balance = _extract_sim_start_balance(account_summary, 1000.0)
 
-    lines: list[str] = [title, f"\U0001f4c5 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
+    lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
-        "\U0001f4ca <b>Quick Stats</b>",
-        f"\u2022 Checked Candidates: {checked}",
-        f"\u2022 Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
-        f"\u2022 Currently Open Tracked Trades: {len(opened)}",
-        f"\u2022 Closed Tracked Trades: {len(closed)}",
-        f"\U0001f3c6 Win Rate: <b>{wr:.1f}%</b>",
-        f"\U0001f7e2 Winners: {win_count} | \U0001f534 Losers: {loss_count}",
-        f"\U0001f4cc Rejected After Check: {len(rejected_checks)} \u0645\u062d\u0641\u0648\u0638\u0629 \u0644\u0644\u062a\u062d\u0644\u064a\u0644 \u0641\u0642\u0637 \u0648\u0644\u0627 \u062a\u064f\u062d\u0633\u0628 \u0643\u0635\u0641\u0642\u0627\u062a \u0645\u0641\u062a\u0648\u062d\u0629.",
-        f"\U0001f6e3 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
+        "📊 <b>Quick Stats</b>",
+        f"• Checked Candidates: {checked}",
+        f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
+        f"• Active Open Trades: {len(active_opened)}",
+        f"• Protected Runners: {len(runners)}",
+        f"• Closed Tracked Trades: {len(closed)}",
+        f"🏆 Win Rate: <b>{wr:.1f}%</b>",
+        f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
+        f"📌 Rejected After Check: {len(rejected_checks)} محفوظة للتحليل فقط ولا تُحسب كصفقات مفتوحة.",
+        f"🛣 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
     lines.extend([SEP, *_simulation_wallet_impact_lines(trades, account_summary=account_summary, starting_balance=start_balance)])
     behavior_lines = behavior_summary_lines(trades, label="Simulation Behavior Summary")
     lines.extend([SEP, *behavior_lines])
-    lines.extend([SEP, "\U0001f4c2 <b>Open Trades</b>"])
-    lines.append(f"\U0001f7e2 Open Winners: {len(winners)} | \U0001f534 Open Losers: {len(losers)}")
-    if opened:
-        lines.append(f"\u26a1 Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
-    append_trade_cards(lines, "\U0001f7e2 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
-    append_trade_cards(lines, "\U0001f534 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
-    append_trade_cards(lines, "\U0001f3c6 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
-    append_trade_cards(lines, "\U0001f480 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
-    lines.extend([SEP, "\U0001f4a1 \u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0635\u0641\u0642\u0627\u062a: Simulation 30/50/20 | Recovery 50/25/25"])
+
+    lines.extend([SEP, "📂 <b>Active Open Trades</b>"])
+    lines.append(f"🟢 Active Winners: {len(winners)} | 🔴 Active Losers: {len(losers)}")
+    if active_opened:
+        lines.append(f"⚡ Active Floating PnL: {sum(trade_effective_pnl(t) for t in active_opened):+.2f}%")
+    append_trade_cards(lines, "🟢 <b>Top 3 Active Winners</b>", winners[:3], limit=3)
+    append_trade_cards(lines, "🔴 <b>Top 3 Active Losers</b>", losers[:3], limit=3)
+
+    if runners:
+        lines.extend([SEP, "🏃 <b>Protected Runners</b>"])
+        lines.append(f"🟢 Runner Winners: {len(runner_winners)} | 🔴 Runner Losers: {len(runner_losers)}")
+        lines.append(f"⚡ Runner Floating PnL: {sum(trade_effective_pnl(t) for t in runners):+.2f}%")
+        append_trade_cards(lines, "🏃 <b>Top 3 Protected Runner Winners</b>", runner_winners[:3], limit=3)
+        append_trade_cards(lines, "🔴 <b>Top 3 Protected Runner Losers</b>", runner_losers[:3], limit=3)
+
+    if floating_trades:
+        lines.append(f"⚖️ Total Visible Floating PnL: {sum(trade_effective_pnl(t) for t in floating_trades):+.2f}%")
+
+    append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
+    append_trade_cards(lines, "💀 <b>Top 3 Closed Losers</b>", closed_losses[:3], limit=3)
+    lines.extend([SEP, "💡 إدارة الصفقات: Simulation 30/50/20 | Recovery 50/25/25"])
     return "\n".join(lines)
 
 
