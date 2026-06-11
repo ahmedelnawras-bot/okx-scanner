@@ -5445,16 +5445,6 @@ def _ensure_simulation_daily_log(
     now = now or datetime.now(timezone.utc)
     today = _simulation_today_key(now)
 
-    wallet = _build_simulation_wallet_snapshot(sim_trades)
-    current_equity = float(wallet.get("equity", SIMULATION_START_BALANCE_USDT) or SIMULATION_START_BALANCE_USDT)
-    if _simulation_wallet_equity_is_corrupted(current_equity, SIMULATION_START_BALANCE_USDT):
-        print(
-            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=daily_log | equity={current_equity:.4f} | "
-            f"fallback={SIMULATION_START_BALANCE_USDT:.2f}",
-            flush=True,
-        )
-        current_equity = SIMULATION_START_BALANCE_USDT
-
     rows = _load_simulation_daily_log(trade_store)
     previous_rows = [r for r in rows if str(r.get("date", "")) < today]
     previous_equity = None
@@ -5475,6 +5465,22 @@ def _ensure_simulation_daily_log(
         start_balance = _safe_float(rows[-1].get("start_balance"), SIMULATION_START_BALANCE_USDT)
     else:
         start_balance = SIMULATION_START_BALANCE_USDT
+
+    if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    # Daily log must use the same start_balance/capital base as the Simulation
+    # report body. Building the wallet before resolving today's start_balance
+    # caused the top block to use 1000 USDT while Wallet Impact used 762.50 USDT.
+    wallet = _build_simulation_wallet_snapshot(sim_trades, start_balance=start_balance)
+    current_equity = float(wallet.get("equity", start_balance) or start_balance)
+    if _simulation_wallet_equity_is_corrupted(current_equity, start_balance):
+        print(
+            f"⚠️ SIM_WALLET_EQUITY_SANITY_RESET | source=daily_log | equity={current_equity:.4f} | "
+            f"fallback={start_balance:.2f}",
+            flush=True,
+        )
+        current_equity = start_balance
 
     realized = _safe_float(wallet.get("realized"), 0.0)
     floating = _safe_float(wallet.get("floating"), 0.0)
@@ -6120,15 +6126,20 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
         settings=get_settings(),
         source="account_summary",
     )
-    wallet = _build_simulation_wallet_snapshot(sim_trades)
     daily_row = dict(result.get("simulation_daily_balance") or {})
 
+    # Use the same capital base as the report Wallet Impact. The previous build
+    # rebuilt the account-summary wallet with the global 1000 USDT start while
+    # the report body used today's simulation start_balance (for example 762.50).
+    # That made the top Daily Balance disagree with Wallet Impact/Open Trades.
     start_balance = _safe_float(
         daily_row.get("start_balance"),
-        _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT),
+        SIMULATION_START_BALANCE_USDT,
     )
     if start_balance <= 0 or _simulation_wallet_equity_is_corrupted(start_balance, SIMULATION_START_BALANCE_USDT):
-        start_balance = _safe_float(wallet.get("start_balance"), SIMULATION_START_BALANCE_USDT)
+        start_balance = SIMULATION_START_BALANCE_USDT
+
+    wallet = _build_simulation_wallet_snapshot(sim_trades, start_balance=start_balance)
 
     # Critical fix: never prefer stale daily_row current_balance over wallet equity.
     current_balance = _safe_float(wallet.get("equity"), start_balance)
