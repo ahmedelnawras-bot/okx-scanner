@@ -8914,6 +8914,21 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
     risk_profile = _risk_profile_snapshot(settings, result)
     risk_block = _format_risk_profile_block(risk_profile, title=_risk_profile_title(settings, risk_profile))
 
+    # Build Balance Tier line outside nested f-strings to avoid quote parsing issues.
+    try:
+        _portfolio_inputs = result.get("portfolio_state_inputs") or {}
+        _tier_reference_balance = _safe_float(_portfolio_inputs.get("reference_portfolio"), 0.0)
+        _tier = _balance_tier_limits(_tier_reference_balance, settings)
+        balance_tier_line = (
+            f"💰 Balance Tier: {_tier.get('tier')} — "
+            f"general={int(_tier.get('normal_slots') or 0)} | "
+            f"block={int(_tier.get('block_slots') or 0)} | "
+            f"recovery={int(_tier.get('recovery_slots') or 0)} | "
+            f"alloc={_safe_float(_tier.get('allocation_pct'), 0.0):.0f}%"
+        )
+    except Exception:
+        balance_tier_line = "💰 Balance Tier: unavailable"
+
     # UI-only status flag, scoped by active runtime.
     drawdown_state = "halted" if (drawdown is not None and not bool(getattr(drawdown, "allowed", True))) else "active"
     if simulation_active:
@@ -8947,7 +8962,7 @@ def _build_fast_status(result: dict, settings: Settings, trade_store: RedisTrade
         f"💼 Drawdown: {drawdown_line}",
         f"🛑 Loss Streak Guard: {loss_guard_line}",
         f"🧯 Manual Resume: {manual_resume_line}",
-        f"💰 Balance Tier: {(lambda t: f'{t.get("tier")} — general={int(t.get("normal_slots") or 0)} | block={int(t.get("block_slots") or 0)} | recovery={int(t.get("recovery_slots") or 0)} | alloc={_safe_float(t.get("allocation_pct"), 0.0):.0f}%')(_balance_tier_limits(_safe_float((result.get('portfolio_state_inputs') or {}).get('reference_portfolio'), 0.0), settings))}",
+        balance_tier_line,
         f"⏱ Full Scan: {settings.scan_interval_seconds}s",
         f"🛡 Mode Guard: {settings.market_mode_guard_interval_seconds}s",
         f"🧠 Technical Snapshot: {'ON' if is_snapshot_enabled(settings, redis_client=_snapshot_redis_client(trade_store)) else 'OFF'}",
