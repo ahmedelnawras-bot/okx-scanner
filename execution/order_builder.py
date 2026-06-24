@@ -9,7 +9,7 @@ def _target_plan_for(signal: SignalCandidate, execution_path: str = "") -> tuple
     Resolve the managed exit split model.
 
     Recovery path uses 50/25/25.
-    Everything else defaults to 40/40/20.
+    Everything else defaults to 30/50/20.
     """
     if execution_path == "recovery" or getattr(signal, "market_mode", "") == MODE_RECOVERY_LONG:
         return "recovery_50_25_25", 50.0, 25.0, 25.0
