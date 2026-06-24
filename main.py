@@ -5245,7 +5245,11 @@ def _simulation_wallet_equity_is_corrupted(equity: float, start_balance: float =
         base = SIMULATION_START_BALANCE_USDT
     value = _safe_float(equity, 0.0)
     max_equity = max(base * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER, SIMULATION_START_BALANCE_USDT * SIMULATION_WALLET_MAX_EQUITY_MULTIPLIER)
-    return bool(value > max_equity or value < 0)
+    # ✅ FIX #1–#4 (Level 1): equity سالب = خسارة حقيقية، مش "فساد".
+    # شرط value < 0 كان بيعمل reset للرصيد لـ start_balance → تجميد منحنى الـ equity
+    # و Daily Net = 0 رغم أن Wallet Impact = -1044$. سيبنا الحارس الأعلى فقط
+    # (ضد margin مفسود ضخم يضخّم الرصيد)، والسالب يعدّي بصدق.
+    return bool(value > max_equity)
 
 
 def _simulation_equity_from_trades(
@@ -5852,13 +5856,18 @@ def _format_simulation_equity_curve_rows(rows: list[dict], current_row: dict | N
     selected = merged[-max(1, int(limit or 5)):]
 
     out: list[str] = []
+    prev_end = None
     for item in selected:
         date = str(item.get("date") or "-")
         start_eq = _safe_float(item.get("start_balance"), SIMULATION_START_BALANCE_USDT)
         end_eq = _safe_float(item.get("end_balance") or item.get("current_balance"), start_eq)
-        pnl = end_eq - start_eq
+        # ✅ يومي حقيقي: بداية اليوم = إغلاق اليوم السابق (carry forward).
+        # أول يوم في النافذة يستخدم start_balance المخزّن بتاعه.
+        day_open = prev_end if prev_end is not None else start_eq
+        pnl = end_eq - day_open
         icon = "🟢" if pnl >= 0 else "🔴"
-        out.append(f"• {date} | {start_eq:,.2f} → {end_eq:,.2f} USDT | {icon} {pnl:+,.2f} USDT")
+        out.append(f"• {date} | {day_open:,.2f} → {end_eq:,.2f} USDT | {icon} {pnl:+,.2f} USDT")
+        prev_end = end_eq
 
     return out
 
@@ -6250,7 +6259,26 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
         "closed_trades": int(wallet.get("closed_count", 0) or 0),
     })
 
-    delta = current_balance - start_balance
+    # ✅ يومي حقيقي: Daily Net = equity النهارده − equity إغلاق آخر يوم سابق
+    # (مش تراكمي). أول يوم يستخدم start_balance (رأس المال).
+    _today_key = _simulation_today_key()
+    _prev_rows = sorted(
+        [
+            r
+            for r in (result.get("simulation_daily_log", []) or [])
+            if isinstance(r, dict) and str(r.get("date", "")) < _today_key
+        ],
+        key=lambda r: str(r.get("date", "")),
+    )
+    if _prev_rows:
+        day_open_equity = _safe_float(
+            _prev_rows[-1].get("end_balance") or _prev_rows[-1].get("current_balance"),
+            start_balance,
+        )
+    else:
+        day_open_equity = start_balance
+
+    delta = current_balance - day_open_equity
     growth_pct = ((delta / start_balance) * 100.0) if start_balance else 0.0
     risk_mode = _simulation_protection_label(result)
     icon = "🟢" if delta >= 0 else "🔴"
@@ -6261,7 +6289,7 @@ def _build_simulation_account_summary(result: dict | None = None) -> str:
     return "\n".join([
         "💰 <b>Simulation Daily Balance</b>",
         "━━━━━━━━━━━━",
-        f"📍 Start Balance: {start_balance:,.2f} USDT",
+        f"📍 Start Balance: {day_open_equity:,.2f} USDT",
         f"💼 Current Balance: {current_balance:,.2f} USDT",
         f"{icon} Daily Net: {delta:+,.2f} USDT | {growth_pct:+.2f}%",
         f"✅ Realized: {realized:+,.2f} USDT",
