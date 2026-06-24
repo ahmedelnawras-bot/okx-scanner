@@ -8327,6 +8327,13 @@ def _execute_managed_okx_order(
     tp2_value = float(raw_tp2) if raw_tp2 not in (None, "", "-", 0) else None
     entry_value = float(getattr(signal, "entry", 0.0) or 0.0)
 
+    # ✅ FIX #14: مرّر نسب التقسيم صراحةً حسب المسار.
+    # recovery = 50/25/25 ، غير كده (normal/strong/block) = 30/50/20.
+    # بدون ده المنصة كانت تستخدم default 40/40.
+    _is_recovery_split = str(getattr(signal, "market_mode", "") or "") == MODE_RECOVERY_LONG
+    _tp1_split_pct, _tp2_split_pct = (50.0, 25.0) if _is_recovery_split else (30.0, 50.0)
+    _runner_split_pct = max(0.0, 100.0 - _tp1_split_pct - _tp2_split_pct)
+
     sizing = _resolve_entry_margin_plan(okx_client, settings)
     margin_usdt = max(_safe_float(sizing.get("margin_usdt"), 0.0), 0.0)
 
@@ -8428,6 +8435,9 @@ def _execute_managed_okx_order(
             sl_value,
             tp1_value,
             tp2_value,
+            tp1_pct=_tp1_split_pct,   # ✅ FIX #14
+            tp2_pct=_tp2_split_pct,
+            runner_pct=_runner_split_pct,
         )
 
     tp_split_result = None
@@ -8453,6 +8463,8 @@ def _execute_managed_okx_order(
                     effective_leverage,
                     tp1_price=tp1_value,
                     tp2_price=tp2_value,
+                    tp1_pct=_tp1_split_pct,   # ✅ FIX #14
+                    tp2_pct=_tp2_split_pct,
                     td_mode=TD_MODE,
                     tag="tp",
                 )
@@ -8493,8 +8505,67 @@ def _execute_managed_okx_order(
                     "reason": f"tp_exception:{exc}",
                 }
 
+    # ✅ FIX #13: لو الـ entry اتفتح والـ TP فشل/جزئي — أعِد المحاولة مرة.
+    # لو لسه فشل: الصفقة مفتوحة بالـ SL (محمية) لكن بدون TP على المنصة — نعلّمها ونبلّغ.
+    if (
+        entry_result.get("ok")
+        and tp1_value
+        and tp2_value
+        and not (isinstance(tp_split_result, dict) and tp_split_result.get("ok"))
+    ):
+        try:
+            _prev_reason = (tp_split_result or {}).get("reason") if isinstance(tp_split_result, dict) else "no_tp_result"
+            print(f"🔁 TP_RETRY | {signal.symbol} | first attempt failed: {_prev_reason}", flush=True)
+            time.sleep(0.5)
+            _retry_resp = okx_client.place_reduce_only_tp_split(
+                signal.symbol,
+                entry_value,
+                margin_usdt,
+                effective_leverage,
+                tp1_price=tp1_value,
+                tp2_price=tp2_value,
+                tp1_pct=_tp1_split_pct,
+                tp2_pct=_tp2_split_pct,
+                td_mode=TD_MODE,
+                tag="tp_retry",
+            )
+            if isinstance(_retry_resp, dict) and _retry_resp.get("ok"):
+                print(f"✅ TP_RETRY_OK | {signal.symbol}", flush=True)
+                tp_split_result = _retry_resp
+            else:
+                print(
+                    f"🚨 TP_RETRY_FAILED | {signal.symbol} | position OPEN with SL but NO TP on exchange — manual TP needed",
+                    flush=True,
+                )
+                tp_split_result = {
+                    **(_retry_resp if isinstance(_retry_resp, dict) else {}),
+                    "ok": False,
+                    "reason": (
+                        _retry_resp.get("reason")
+                        if isinstance(_retry_resp, dict) and _retry_resp.get("reason")
+                        else "tp_retry_failed"
+                    ),
+                    "tp_retry_attempted": True,
+                }
+        except Exception as _tp_exc:
+            print(f"🚨 TP_RETRY_EXCEPTION | {signal.symbol} | {_tp_exc}", flush=True)
+            tp_split_result = {
+                "ok": False,
+                "reason": f"tp_retry_exception:{_tp_exc}",
+                "tp_retry_attempted": True,
+            }
+
+    _tp_failed = (
+        bool(entry_result.get("ok"))
+        and bool(tp1_value)
+        and bool(tp2_value)
+        and not (isinstance(tp_split_result, dict) and tp_split_result.get("ok"))
+    )
+
     return {
         "ok": bool(entry_result.get("ok")),
+        "tp_placement_failed": _tp_failed,   # ✅ FIX #13
+        "needs_manual_tp": _tp_failed,
         "entry": entry_result,
         "tp_split": tp_split_result,
         "plan": plan,
@@ -8627,6 +8698,9 @@ def _build_managed_execution_lines(managed_order_result: dict | None) -> list[st
 
     if managed_order_result.get("requires_runner_trailing"):
         lines.append("🏃 Runner Trail after TP2")
+
+    if ok and managed_order_result.get("tp_placement_failed"):
+        lines.append("⚠️ <b>TP لم تُوضع على المنصة</b> — الصفقة مفتوحة بـ SL فقط، راجعها يدوياً")
 
     if not ok:
         lines.append("📌 لم يتم فتح الصفقة على OKX")
