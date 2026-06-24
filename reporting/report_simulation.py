@@ -302,6 +302,7 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
         "💰 <b>Wallet Impact</b>",
         f"🧱 Report Scope: <code>{SIMULATION_SCOPE_MARKER}</code>",
         f"📌 رأس المال\n<b>{float(starting_balance or 1000.0):.0f}$</b>",
+        "📐 <i>كل النِسَب هنا = % من رأس المال</i>",
         "",
         "✅ <b>الصفقات المغلقة</b>",
         "📈 الأرباح",
@@ -369,12 +370,13 @@ def build_simulation_report(
     lines: list[str] = [title, f"📅 {period_label(period)}", SEP, LEVERAGE_NOTE_AR, ""]
     lines.extend([
         "📊 <b>Quick Stats</b>",
-        f"• Checked Candidates: {checked}",
-        f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
         f"• Currently Open Tracked Trades: {len(opened)}",
         f"• Closed Tracked Trades: {len(closed)}",
         f"🏆 Win Rate: <b>{wr:.1f}%</b>",
         f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
+        "— <i>الأرقام التالية من آخر ≤500 فحص (نافذة حديثة، مش تراكمي)</i> —",
+        f"• Checked Candidates: {checked}",
+        f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
         f"📌 Rejected After Check: {len(rejected_checks)} محفوظة للتحليل فقط ولا تُحسب كصفقات مفتوحة.",
         f"🛣 Whitelist: {counts['whitelist']} | Strong: {counts['strong']} | Recovery: {counts['recovery']} | Block: {counts['block']}",
     ])
@@ -386,7 +388,7 @@ def build_simulation_report(
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}%")
+        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}% (مجموع نسب الرافعة للمفتوحة)")
     append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
     append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
     append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
@@ -418,11 +420,11 @@ def _compact_tradingview_links(text: str) -> str:
 
     # Original shared formatter:
     # \U0001f517 TradingView: https://...
-    value = re.sub(f"\U0001f517\s*TradingView:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
+    value = re.sub(f"\U0001f517\\s*TradingView:\\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
 
     # Some previous versions already changed label to TV but left the URL visible:
     # \U0001f517 TV: https://...
-    value = re.sub(f"\U0001f517\s*TV:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
+    value = re.sub(f"\U0001f517\\s*TV:\\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
 
     # Fallback if the icon is missing.
     value = re.sub(rf"(?m)^TV:\s*({url})", '\U0001f517 <a href="\\1">TV</a>', value)
@@ -456,7 +458,7 @@ def _polish_wallet_impact_rtl(text: str) -> str:
     """
     value = str(text or "")
     value = re.sub(
-        "(?m)^\U0001f4cc\s*\u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644:\s*([^\\n]+)$",
+        "(?m)^\U0001f4cc\\s*\u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644:\\s*([^\\n]+)$",
         "\U0001f4cc \u0631\u0623\u0633 \u0627\u0644\u0645\u0627\u0644\\n<b>\\1</b>",
         value,
     )
