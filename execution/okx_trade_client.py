@@ -765,8 +765,8 @@ class OKXTradeClient:
         *,
         tp1_price: float,
         tp2_price: float,
-        tp1_pct: float = 40.0,
-        tp2_pct: float = 40.0,
+        tp1_pct: float = 30.0,  # ✅ FIX #14: standard 30/50/20 (كان 40/40)
+        tp2_pct: float = 50.0,
         td_mode: str = "isolated",
         pos_side: str = "long",
         tag: str | None = None,
@@ -1112,8 +1112,8 @@ class OKXTradeClient:
         tp1_price: float,
         tp2_price: float,
         *,
-        tp1_pct: float = 40.0,
-        tp2_pct: float = 40.0,
+        tp1_pct: float = 30.0,  # ✅ FIX #14: standard 30/50/20 (كان 40/40)
+        tp2_pct: float = 50.0,
         runner_pct: float = 20.0,
     ) -> dict[str, Any]:
         try:
