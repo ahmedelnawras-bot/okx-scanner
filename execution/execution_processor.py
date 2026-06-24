@@ -471,6 +471,9 @@ def process_trade_candidate(
                 effective_risk_mode=risk_mode,
             )
     else:
+        # ✅ FIX: block_exception يتخطى candle gate، لكن لحظة القبول النهائي
+        # بتستخدم _candle_gate. نعرّفه فاضي هنا لتفادي NameError.
+        _candle_gate = {}
         try:
             signal.meta = dict(getattr(signal, "meta", {}) or {})
             signal.meta["decision_trace_id"] = decision_trace_id
