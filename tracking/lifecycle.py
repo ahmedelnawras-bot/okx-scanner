@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from utils.constants import TRAILING_STOP_AFTER_TP2_PCT, BREAKEVEN_BUFFER_PCT
+from utils.constants import (
+    TRAILING_STOP_AFTER_TP2_PCT,
+    BREAKEVEN_BUFFER_PCT,
+    TP1_CLOSE_PCT,
+    TP2_CLOSE_PCT,
+    RUNNER_CLOSE_PCT,
+)
 from .models import TrackedTrade
 
 
@@ -239,9 +245,21 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
         _safe_setattr(trade, "exchange_sync_state", "stopped_before_tp1")
         return _mark_closed(trade, status)
 
-    tp1_close_pct = float(trade.tp1_close_pct or 40.0)
-    tp2_close_pct = float(trade.tp2_close_pct or 40.0)
-    runner_close_pct = float(trade.runner_close_pct or 20.0)
+    # ✅ FIX #14: fallback كان 40/40/20 (قديم) ومخالف للمعتمد.
+    # standard = 30/50/20 ، recovery = 50/25/25. نشتق الافتراضي من model/path الصفقة
+    # (getattr بـ default آمن لو الحقول مش موجودة).
+    _target_model = str(
+        getattr(trade, "target_model", "")
+        or getattr(trade, "execution_path", "")
+        or ""
+    ).lower()
+    if "recovery" in _target_model or "50_25_25" in _target_model:
+        _def_tp1, _def_tp2, _def_runner = 50.0, 25.0, 25.0
+    else:
+        _def_tp1, _def_tp2, _def_runner = TP1_CLOSE_PCT, TP2_CLOSE_PCT, RUNNER_CLOSE_PCT
+    tp1_close_pct = float(trade.tp1_close_pct or _def_tp1)
+    tp2_close_pct = float(trade.tp2_close_pct or _def_tp2)
+    runner_close_pct = float(trade.runner_close_pct or _def_runner)
 
     tp1_ready, tp1_source = _tp1_confirmed(trade, current_price)
     if not trade.tp1_hit and tp1_ready:
