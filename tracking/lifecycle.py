@@ -217,6 +217,14 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
     if trade.status in _CLOSED_STATUSES:
         return trade
 
+    # ✅ FIX #8 guard: لو السعر غير صالح (<= 0) لا تتخذ قرار SL/TP على سعر فاسد.
+    # سيب الصفقة زي ما هي وعلّمها stale بدل ما تتقفل Direct SL غلط.
+    if not (current_price and current_price > 0):
+        trade.updated_at = datetime.now(timezone.utc)
+        _safe_setattr(trade, "price_stale", True)
+        _safe_setattr(trade, "price_stale_reason", "invalid_price_skipped_lifecycle")
+        return trade
+
     if not _entry_is_live_or_filled(trade):
         trade.updated_at = datetime.now(timezone.utc)
         trade.current_price = current_price
