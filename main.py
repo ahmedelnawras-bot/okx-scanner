@@ -5755,39 +5755,26 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
     legacy/non-active rows are ignored for wallet equity.
     """
     sim_trades = _sanitize_simulation_trade_records(list(sim_trades or []), settings=None, source="wallet_snapshot")
-    groups = _simulation_report_visible_trade_sets(sim_trades)
-    floating_trades = list(groups.get("floating", []) or [])
-    closed_trades_list = list(groups.get("closed", []) or [])
-    ignored_trades = list(groups.get("ignored", []) or [])
 
-    realized = 0.0
-    floating = 0.0
-    for trade in closed_trades_list:
-        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
-        try:
-            pct = _report_trade_effective_pnl(trade)
-        except Exception:
-            pct = _trade_effective_pnl_pct(trade)
-        realized += _money_from_pct(pct, margin=margin)
+    # ✅ توحيد المحاسبة: نحسب realized/floating بنفس scope ودوال Wallet Impact
+    # بالظبط (_simulation_scope_trades + closed_trades + _simulation_floating_trades
+    # + trade_money_pnl)، فيضمن دايماً: Current = Start + Wallet Impact.
+    # قبل كده الـ floating كان set مختلف (visible_trade_sets) فظهر +124$ بدل +19$.
+    from reporting import report_simulation as _sim_report
 
-    for trade in floating_trades:
-        margin = _simulation_wallet_margin_for_accounting(trade, start_balance)
-        try:
-            pct = _report_trade_effective_pnl(trade)
-        except Exception:
-            pct = _trade_effective_pnl_pct(trade)
-        floating += _money_from_pct(pct, margin=margin)
+    scoped = _sim_report._simulation_scope_trades(sim_trades)
+    closed_trades_list = list(_sim_report.closed_trades(scoped) or [])
+    floating_trades = list(_sim_report._simulation_floating_trades(scoped) or [])
+    ignored_trades: list = []
 
-    if ignored_trades:
+    def _money(t) -> float:
         try:
-            print(
-                "SIM_WALLET_VISIBLE_SCOPE | "
-                f"floating={len(floating_trades)} | closed={len(closed_trades_list)} | "
-                f"ignored_legacy={len(ignored_trades)} | source={groups.get('source')}",
-                flush=True,
-            )
+            return float(_sim_report.trade_money_pnl(t))
         except Exception:
-            pass
+            return 0.0
+
+    realized = sum(_money(t) for t in closed_trades_list)
+    floating = sum(_money(t) for t in floating_trades)
 
     equity = float(start_balance or SIMULATION_START_BALANCE_USDT) + realized + floating
     if _simulation_wallet_equity_is_corrupted(equity, start_balance):
@@ -5808,7 +5795,7 @@ def _build_simulation_wallet_snapshot(sim_trades: list, start_balance: float = S
         "closed_count": len(closed_trades_list),
         "ignored_legacy_count": len(ignored_trades),
         "total_count": len(sim_trades or []),
-        "wallet_scope": str(groups.get("source") or "report_simulation_visible_scope"),
+        "wallet_scope": "wallet_impact_unified_scope",
     }
 
 
