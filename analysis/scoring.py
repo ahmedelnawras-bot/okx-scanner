@@ -77,7 +77,7 @@ BLOCK_EXCEPTION_SETUPS = {
     # relative_strength_vs_btc is confirmation-only, not a block exception by itself.
 }
 
-SMART_SL_MIN_PCT = 1.15
+SMART_SL_MIN_PCT = 1.60  # ✅ SL tuning: رفع الـ floor من 1.15 (كان noise stop)
 SMART_SL_MAX_PCT = 3.40
 
 SMART_TP1_MIN_RR = 1.15
@@ -961,11 +961,11 @@ def _calculate_adaptive_targets(
         float(pair.change_pct or 0.0)
     )
 
-    # base SL
+    # base SL  ✅ SL tuning: وسّعنا الأساس (pullback 1.75→2.10 ، immediate 1.45→1.80)
     if entry_timing == "pullback":
-        risk_pct = 1.75
+        risk_pct = 2.10
     else:
-        risk_pct = 1.45
+        risk_pct = 1.80
 
     if market_mode == MODE_RECOVERY_LONG:
         risk_pct += 0.08
