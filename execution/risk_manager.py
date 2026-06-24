@@ -28,6 +28,13 @@ max_positions_total_normal_strong = 7
 max_positions_block = 3
 max_positions_recovery = 3
 
+# ✅ FIX #12: تشديد فعلي عند مستويات الـ drawdown الوسطى (warning/soft stop).
+# القيم على سُلّم السكور ~0–10 وقابلة للمعايرة. الإيقاف الكامل يفضل عند hard stop فقط.
+DRAWDOWN_L1_SCORE_BUMP = 0.30   # warning  (drawdown ≥ 20%)
+DRAWDOWN_L2_SCORE_BUMP = 0.60   # soft stop (drawdown ≥ 28%)
+DRAWDOWN_L1_SLOT_CUT = 1
+DRAWDOWN_L2_SLOT_CUT = 2
+
 risk_mode: str = "normal"
 
 # مزود اختياري لجلب الرصيد الحقيقي من OKX أو أي مصدر خارجي.
@@ -185,6 +192,22 @@ def evaluate_execution_risk(
     drawdown_pct = getattr(drawdown_status, "drawdown_pct", 0.0)
     mode = _normalize_risk_mode(risk_mode)
     allowed_slots = max_positions_for_mode(mode, explicit_limit=max_open_positions)
+
+    # ✅ FIX #12: مستويات الـ drawdown الوسطى تشدّد فعلياً (مش logging بس):
+    # ترفع عتبة السكور وتقلّل عدد الـ slots. الإيقاف الكامل لسه عند hard stop.
+    effective_min_score = float(min_execution_score)
+    score_bump = 0.0
+    slot_cut = 0
+    if drawdown_level >= 2:
+        score_bump = DRAWDOWN_L2_SCORE_BUMP
+        slot_cut = DRAWDOWN_L2_SLOT_CUT
+    elif drawdown_level >= 1:
+        score_bump = DRAWDOWN_L1_SCORE_BUMP
+        slot_cut = DRAWDOWN_L1_SLOT_CUT
+    if slot_cut:
+        allowed_slots = max(1, allowed_slots - slot_cut)
+    effective_min_score += score_bump
+
     counted_slots = max(0, int(current_open_positions or 0))
     remaining = max(0, allowed_slots - counted_slots)
 
@@ -194,6 +217,11 @@ def evaluate_execution_risk(
         "position_pct": get_position_pct(),
         "drawdown_level": drawdown_level,
         "drawdown_pct": drawdown_pct,
+        "drawdown_tightening": {
+            "score_bump": round(score_bump, 2),
+            "effective_min_score": round(effective_min_score, 2),
+            "slot_cut": slot_cut,
+        },
         "slots": {
             "allowed": allowed_slots,
             "counted": counted_slots,
@@ -213,15 +241,15 @@ def evaluate_execution_risk(
         return {
             **base,
             "allowed": False,
-            "reason": "max_positions_reached",
+            "reason": ("max_positions_reached_drawdown_tightened" if slot_cut else "max_positions_reached"),
             "slots": {"allowed": allowed_slots, "counted": counted_slots, "remaining": 0},
         }
 
-    if score < min_execution_score:
+    if score < effective_min_score:
         return {
             **base,
             "allowed": False,
-            "reason": "score_too_low",
+            "reason": ("score_too_low_drawdown_tightened" if score_bump else "score_too_low"),
         }
 
     return {
