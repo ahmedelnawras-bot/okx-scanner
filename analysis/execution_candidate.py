@@ -1022,6 +1022,25 @@ def decide_execution_candidate(
         tags & STRICT_WHITELIST
     )
 
+    # ─────────────────────────────────────────────────────────────
+    # support_bounce_confirmed في STRONG_LONG_ONLY
+    # يُسمح له بالدخول بشروط صارمة إضافية:
+    # - vol_ratio >= 1.20 (حجم قوي)
+    # - mtf_confirmed = True (من Tier 2 في scoring.py)
+    # - score >= 8.0
+    # - لا مقاومة قريبة
+    # ─────────────────────────────────────────────────────────────
+    _meta = signal.meta or {}
+    _support_bounce_strong_allowed = bool(
+        signal.market_mode == MODE_STRONG_LONG_ONLY
+        and signal.setup_type == "support_bounce_confirmed"
+        and float(_meta.get("vol_ratio") or 0.0) >= 1.20
+        and bool(_meta.get("mtf_confirmed"))
+        and _execution_score(signal) >= 8.0
+        and not bool(_meta.get("resistance_warning"))
+        and "near_resistance" not in tags
+    )
+
     normal_extra_allowed = (
         _has_normal_long_execution_setup(signal)
     )
@@ -1246,6 +1265,7 @@ def decide_execution_candidate(
         and (
             elite_allowed
             or strict_allowed
+            or _support_bounce_strong_allowed
         )
         and _execution_score(signal) >= 7.75
     ):
@@ -1400,6 +1420,7 @@ def decide_execution_candidate(
         "normal_extra_allowed": normal_extra_allowed,
         "elite_allowed": elite_allowed,
         "recovery_allowed": recovery_allowed,
+        "support_bounce_strong_allowed": _support_bounce_strong_allowed,
         "pending_pullback": pending_pullback,
         "near_resistance_warning": near_resistance_warning,
         "pa_gate": pa_gate,
