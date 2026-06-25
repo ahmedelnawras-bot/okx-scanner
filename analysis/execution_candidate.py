@@ -17,6 +17,25 @@ from utils.constants import (
     MODE_BLOCK_LONGS,
 )
 
+# ── Centralized score thresholds (Phase 2) ──────────────────────────────
+# المصدر الموحّد: config/risk_config.py. fallback آمن لو الاستيراد فشل.
+try:
+    from config.risk_config import SCORE_THRESHOLDS as _ST
+except Exception:
+    _ST = {
+        "normal": {"strict": 6.5, "elite": 7.2, "extra": 7.8, "recovery_quality": 6.8},
+        "strong": {"strict": 7.3, "elite": 7.5, "support_bounce": 8.0, "general": 7.75},
+    }
+
+NORMAL_STRICT_SCORE = _ST["normal"]["strict"]
+NORMAL_ELITE_SCORE = _ST["normal"]["elite"]
+NORMAL_EXTRA_SCORE = _ST["normal"]["extra"]
+NORMAL_RECOVERY_QUALITY_SCORE = _ST["normal"]["recovery_quality"]
+STRONG_STRICT_SCORE = _ST["strong"]["strict"]
+STRONG_ELITE_SCORE = _ST["strong"]["elite"]
+STRONG_SUPPORT_BOUNCE_SCORE = _ST["strong"]["support_bounce"]
+STRONG_GENERAL_SCORE = _ST["strong"]["general"]
+
 
 # =========================================================
 # Nour Precision Filters Flags
@@ -678,7 +697,7 @@ def _candidate_passes_weak_drift_execution_quality(
 
         if (
             setup_weight >= 3
-            and score >= 6.5
+            and score >= NORMAL_STRICT_SCORE
             and mtf_confirmed
             and vol_ratio >= 1.05
         ):
@@ -686,7 +705,7 @@ def _candidate_passes_weak_drift_execution_quality(
 
         if (
             setup_weight >= 2
-            and score >= 7.2
+            and score >= NORMAL_ELITE_SCORE
             and mtf_confirmed
             and vol_ratio >= 1.10
         ):
@@ -694,7 +713,7 @@ def _candidate_passes_weak_drift_execution_quality(
 
         if (
             setup_weight >= 2
-            and score >= 7.8
+            and score >= NORMAL_EXTRA_SCORE
             and vol_ratio >= 1.25
         ):
             return True
@@ -702,7 +721,7 @@ def _candidate_passes_weak_drift_execution_quality(
         if (
             soft_late_warning
             and setup_weight >= 3
-            and score >= 6.8
+            and score >= NORMAL_RECOVERY_QUALITY_SCORE
             and mtf_confirmed
             and vol_ratio >= 1.08
         ):
@@ -712,13 +731,13 @@ def _candidate_passes_weak_drift_execution_quality(
         breakout_quality == "strong"
         and mtf_confirmed
         and vol_ratio >= 1.10
-        and score >= 7.2
+        and score >= NORMAL_ELITE_SCORE
     ):
         return True
 
     if (
         setup_weight >= 3
-        and score >= 7.3
+        and score >= STRONG_STRICT_SCORE
         and mtf_confirmed
         and vol_ratio >= 1.10
     ):
@@ -726,14 +745,14 @@ def _candidate_passes_weak_drift_execution_quality(
 
     if (
         setup_weight >= 3
-        and score >= 7.7
+        and score >= STRONG_GENERAL_SCORE
         and vol_ratio >= 1.25
     ):
         return True
 
     if (
         setup_weight >= 2
-        and score >= 7.5
+        and score >= STRONG_ELITE_SCORE
         and mtf_confirmed
         and vol_ratio >= 1.15
     ):
@@ -1036,7 +1055,7 @@ def decide_execution_candidate(
         and signal.setup_type == "support_bounce_confirmed"
         and float(_meta.get("vol_ratio") or 0.0) >= 1.20
         and bool(_meta.get("mtf_confirmed"))
-        and _execution_score(signal) >= 8.0
+        and _execution_score(signal) >= STRONG_SUPPORT_BOUNCE_SCORE
         and not bool(_meta.get("resistance_warning"))
         and "near_resistance" not in tags
     )
@@ -1267,7 +1286,7 @@ def decide_execution_candidate(
             or strict_allowed
             or _support_bounce_strong_allowed
         )
-        and _execution_score(signal) >= 7.75
+        and _execution_score(signal) >= STRONG_GENERAL_SCORE
     ):
 
         allowed = True
