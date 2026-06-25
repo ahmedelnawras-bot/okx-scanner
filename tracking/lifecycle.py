@@ -10,6 +10,17 @@ from utils.constants import (
     TP2_CLOSE_PCT,
     RUNNER_CLOSE_PCT,
 )
+
+try:
+    from config.risk_config import (
+        TRAILING_ADAPTIVE_MULTIPLIER,
+        TRAILING_ADAPTIVE_FLOOR_PCT,
+        TRAILING_ADAPTIVE_CEILING_PCT,
+    )
+except Exception:
+    TRAILING_ADAPTIVE_MULTIPLIER = 1.3
+    TRAILING_ADAPTIVE_FLOOR_PCT = 2.0
+    TRAILING_ADAPTIVE_CEILING_PCT = 4.5
 from .models import TrackedTrade
 
 
@@ -289,7 +300,20 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
     if trade.tp2_hit:
         _stamp_once(trade, "trailing_started_at")
         trade = _mark_protected_runner(trade)
-        trail_pct = max(0.9, TRAILING_STOP_AFTER_TP2_PCT - (0.6 if trade.trailing_tightened else 0.0))
+        # ✅ Adaptive trailing: trail_pct يتكيّف مع تقلب العملة.
+        # المصدر: entry_avg_range_pct (متوسط مدى الشمعة وقت الدخول).
+        # عملة هادئة → trailing ضيّق؛ عملة متقلبة → trailing أوسع (مايضربش بسهولة).
+        # fallback للثابت لو avg_range مش متوفر.
+        _avg_range = float(getattr(trade, "entry_avg_range_pct", 0.0) or 0.0)
+        if _avg_range > 0:
+            _adaptive = _avg_range * TRAILING_ADAPTIVE_MULTIPLIER
+            _base_trail = min(
+                TRAILING_ADAPTIVE_CEILING_PCT,
+                max(TRAILING_ADAPTIVE_FLOOR_PCT, _adaptive),
+            )
+        else:
+            _base_trail = TRAILING_STOP_AFTER_TP2_PCT
+        trail_pct = max(0.9, _base_trail - (0.6 if trade.trailing_tightened else 0.0))
         trail_anchor = max(trade.highest_price, trade.tp2)
         trailing_stop_price = max(trail_anchor * (1 - trail_pct / 100.0), trade.protected_sl or trade.entry)
 
