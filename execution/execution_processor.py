@@ -9,12 +9,25 @@ from analysis.execution_candidate import decide_execution_candidate
 from utils.constants import (
     MAX_BLOCK_EXCEPTION_TRADES_PER_CYCLE,
     MAX_RECOVERY_TRADES_PER_CYCLE,
+    MODE_RECOVERY_LONG,
 )
 
 from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
 from .candle_reversal_gate import evaluate_candle_reversal_gate
 from tracking.trade_registry import symbol_cooldown_tracker
+
+try:
+    from config.risk_config import BTC_MICRO_GATE_15M_DROP_PCT
+except Exception:
+    BTC_MICRO_GATE_15M_DROP_PCT = -0.50
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ─────────────────────────────────────────
@@ -170,6 +183,8 @@ def _classify_rejection(status: str, reason: str) -> str:
         return "same_symbol"
     if reason_l == "symbol_cooldown_active":
         return "symbol_cooldown"
+    if reason_l == "btc_15m_dropping":
+        return "btc_micro_gate"
     if reason_l in {"max_positions_reached", "recovery_cycle_full"} or status_l == "rejected_limit":
         return "max_positions"
     if status_l == "rejected_risk" or any(token in reason_l for token in ("drawdown", "risk", "loss_streak")):
@@ -507,6 +522,30 @@ def process_trade_candidate(
         ) | {
             "cooldown_remaining_minutes": _cooldown_remaining,
             "cooldown_symbol": signal.symbol,
+        }
+
+    # ─────────────────────────────────────────
+    # BTC Micro-Gate (15m)
+    # لو BTC نازل بقوة على إطار 15m → نتجنب الدخول
+    # في NORMAL/STRONG. RECOVERY مستثنى (rebound متوقع).
+    # المصدر: signal.meta["btc_15m_move"] = حركة BTC الفعلية.
+    # ─────────────────────────────────────────
+    _btc_15m = _safe_float((signal.meta or {}).get("btc_15m_move"), 0.0)
+    _mode_for_btc = str(signal.market_mode or "")
+    if (
+        _mode_for_btc != MODE_RECOVERY_LONG
+        and _btc_15m <= BTC_MICRO_GATE_15M_DROP_PCT
+    ):
+        return _base_response(
+            signal=signal,
+            gate=gate,
+            status="rejected_risk",
+            reason="btc_15m_dropping",
+            decision_trace_id=decision_trace_id,
+            effective_risk_mode=risk_mode,
+        ) | {
+            "btc_15m_move": _btc_15m,
+            "btc_gate_threshold": BTC_MICRO_GATE_15M_DROP_PCT,
         }
 
     # ─────────────────────────────────────────
