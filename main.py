@@ -44,7 +44,7 @@ except Exception:
     risk_manager_module = None
 from risk.portfolio_state import build_portfolio_state_from_trades
 from risk.drawdown_monitor import evaluate_drawdown, build_drawdown_report
-from tracking.trade_registry import register_trade
+from tracking.trade_registry import register_trade, notify_trade_closed
 try:
     from tracking.open_trades_updater import update_open_trades
 except Exception as _open_trades_updater_import_exc:
@@ -6689,6 +6689,17 @@ def _collect_execution_lifecycle_notifications(before: dict, trades: list, prote
         if now_closed and not prev.get("is_closed") and status in closed_sl_statuses and not bool(getattr(trade, "sl_hit_telegram_sent", False)):
             reason = str(getattr(trade, "exchange_sync_state", "") or status)
             events.append(("sl_hit", _format_trade_lifecycle_notice(trade, "sl_hit", reason=reason), "sl_hit_telegram_sent"))
+
+        # ── Cooldown Tracker ──────────────────────────────────────
+        # يُستدعى مرة واحدة عند اكتشاف الإغلاق الجديد فقط.
+        # prev.get("is_closed") == False  → كانت مفتوحة
+        # now_closed == True              → أُغلقت للتو في هذا الـ scan
+        # ─────────────────────────────────────────────────────────
+        if now_closed and not prev.get("is_closed"):
+            try:
+                notify_trade_closed(trade)
+            except Exception as _cd_exc:
+                print(f"[CooldownTracker] notify_trade_closed error: {_cd_exc}", flush=True)
 
         old_sl = _safe_float(prev.get("active_sl"), 0.0)
         new_sl = _trade_active_sl_value(trade)
