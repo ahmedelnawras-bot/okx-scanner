@@ -552,6 +552,9 @@ def register_trade(
         tp2_close_pct=tp2_pct,
         runner_close_pct=runner_pct,
 
+        # ✅ Adaptive trailing: متوسط مدى الشمعة وقت الدخول من signal.meta
+        entry_avg_range_pct=float((_signal_meta(signal).get("avg_range_pct") or 0.0)),
+
         opened_at=now,
         updated_at=now,
         current_price=resolved_entry,
