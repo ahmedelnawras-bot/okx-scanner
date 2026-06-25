@@ -14,6 +14,7 @@ from utils.constants import (
 from .risk_manager import evaluate_execution_risk
 from .order_builder import build_preview_order
 from .candle_reversal_gate import evaluate_candle_reversal_gate
+from tracking.trade_registry import symbol_cooldown_tracker
 
 
 # ─────────────────────────────────────────
@@ -167,6 +168,8 @@ def _classify_rejection(status: str, reason: str) -> str:
 
     if status_l == "rejected_same_symbol" or reason_l == "same_symbol_active_trade":
         return "same_symbol"
+    if reason_l == "symbol_cooldown_active":
+        return "symbol_cooldown"
     if reason_l in {"max_positions_reached", "recovery_cycle_full"} or status_l == "rejected_limit":
         return "max_positions"
     if status_l == "rejected_risk" or any(token in reason_l for token in ("drawdown", "risk", "loss_streak")):
@@ -483,6 +486,28 @@ def process_trade_candidate(
             signal.meta["candle_gate_path"] = "block_exception"
         except Exception:
             pass
+
+    # ─────────────────────────────────────────
+    # Symbol Cooldown Guard
+    # يمنع إعادة الدخول لعملة سجّلت Direct SL
+    # مرتين متتاليتين خلال 2 ساعة.
+    # الحظر يدوم ساعتين من آخر SL مُفعِّل.
+    # ─────────────────────────────────────────
+    _in_cooldown, _cooldown_remaining = symbol_cooldown_tracker.is_in_cooldown(
+        signal.symbol
+    )
+    if _in_cooldown:
+        return _base_response(
+            signal=signal,
+            gate=gate,
+            status="rejected_risk",
+            reason="symbol_cooldown_active",
+            decision_trace_id=decision_trace_id,
+            effective_risk_mode=risk_mode,
+        ) | {
+            "cooldown_remaining_minutes": _cooldown_remaining,
+            "cooldown_symbol": signal.symbol,
+        }
 
     # ─────────────────────────────────────────
     # Same symbol protection
