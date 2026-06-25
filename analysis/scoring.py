@@ -1869,10 +1869,6 @@ def build_signal_candidate(
             "btc_15m_move":
                 btc_control_context.get("btc_15m_move"),
 
-            # ✅ Adaptive trailing: متوسط مدى الشمعة وقت الدخول
-            "avg_range_pct":
-                round(float(structure_stop_context.get("anchor_range_pct") or 0.0), 4),
-
             "resistance_4h":
                 resistance_4h_context,
 
@@ -1914,7 +1910,12 @@ def build_signal_candidate(
 
             # ✅ Raw candles للـ candle reversal gate في execution layer فقط
             # لا يأثر على الـ score أو الـ ranking أو أي منطق حالي
-            "raw_candles": list(getattr(pair, "recent_candles", []) or [])[:5],
+            # ✅ FIX: recent_candles مرتّبة chronological [أقدم→أحدث]، فناخد آخر 5
+            # (الأحدث) بـ [-5:] مش أول 5. البوابة تعكسها داخلياً لـ latest-first.
+            "raw_candles": list(getattr(pair, "recent_candles", []) or [])[-5:],
+
+            # ✅ Adaptive trailing + adaptive candle thresholds
+            "avg_range_pct": round(float(structure_stop_context.get("anchor_range_pct") or 0.0), 4),
 
             **quality_meta,
         },
