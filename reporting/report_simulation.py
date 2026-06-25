@@ -129,6 +129,7 @@ def _simulation_scope_trades(trades: list | None) -> list:
     closed_statuses = {
         "closed", "stopped", "closed_loss", "closed_win", "expired",
         "trailing_hit", "breakeven_after_tp1", "duplicate_closed_by_okx_repair",
+        "protected_entry_exit",   # ← مضاف: SL ضُرب عند entry بدون خسارة كاملة
     }
     active_statuses = {"open", "tp1_hit", "tp1_partial", "accepted_preview", "pending_pullback_preview"}
     runner_statuses = {
@@ -179,7 +180,7 @@ def _simulation_scope_trades(trades: list | None) -> list:
         try:
             if is_closed:
                 setattr(t, "is_closed", True)
-                if status not in {"closed_loss", "closed_win", "breakeven_after_tp1", "trailing_hit"}:
+                if status not in {"closed_loss", "closed_win", "breakeven_after_tp1", "trailing_hit", "protected_entry_exit"}:
                     realized = _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
                     setattr(t, "status", "closed_win" if realized > 0 else "closed_loss")
             elif tp2_or_runner or slot_exempt or counts_as_active is False:
