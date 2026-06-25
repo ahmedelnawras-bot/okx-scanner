@@ -424,6 +424,86 @@ def trade_current_exposure_pnl(t: TrackedTrade) -> float:
     return leveraged_pct(trade_current_raw_pnl(t), _trade_report_leverage(t))
 
 
+# =========================================================
+# Realized / Floating split (Partial Accounting)
+# =========================================================
+# الجزء المُغلق فعلاً (TP1/TP2) يُحسب realized؛ الباقي المفتوح floating.
+# يعمل على النظامين (محاكاة + تنفيذ فعلي) لأن report_format مشترك.
+# =========================================================
+
+def trade_realized_raw_pnl(t: TrackedTrade) -> float:
+    """
+    الجزء المحقق raw (price-move %) لأي صفقة.
+
+    - صفقة مغلقة بالكامل → كل realized_pnl_pct المخزّن (مصدر الحقيقة بعد الإغلاق).
+    - صفقة TP2 runner مفتوحة → 30%+50% المعاد بناؤها من Entry/TP1/TP2.
+    - صفقة TP1 partial مفتوحة → 30% المعاد بناؤها من Entry/TP1.
+    - صفقة مفتوحة بدون أي TP → لا يوجد جزء محقق (0.0).
+    """
+    if t.status in CLOSED_STATUSES or bool(getattr(t, "is_closed", False)):
+        return _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
+
+    if bool(getattr(t, "tp2_hit", False)):
+        planned = _planned_realized_raw_for_open_trade(t, "tp2")
+        if planned is not None:
+            return planned
+        return _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
+
+    if bool(getattr(t, "tp1_hit", False)):
+        planned = _planned_realized_raw_for_open_trade(t, "tp1")
+        if planned is not None:
+            return planned
+        return _safe_float(getattr(t, "realized_pnl_pct", 0.0), 0.0)
+
+    return 0.0
+
+
+def trade_floating_raw_pnl(t: TrackedTrade) -> float:
+    """
+    الجزء المفتوح raw (price-move %) لأي صفقة.
+
+    - صفقة مغلقة بالكامل → 0.0 (مفيش floating).
+    - صفقة TP2 runner → 20% × (السعر الحالي).
+    - صفقة TP1 partial → 70% × (السعر الحالي).
+    - صفقة مفتوحة بدون TP → 100% × (السعر الحالي).
+    """
+    if t.status in CLOSED_STATUSES or bool(getattr(t, "is_closed", False)):
+        return 0.0
+
+    current_raw = _current_or_stored_raw_pnl(t)
+
+    if bool(getattr(t, "tp2_hit", False)):
+        runner_pct = _tp_close_pct(t, "runner_close_pct", 20.0)
+        return current_raw * (runner_pct / 100.0)
+
+    if bool(getattr(t, "tp1_hit", False)):
+        tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 30.0)
+        remaining_pct = max(0.0, 100.0 - tp1_close_pct)
+        return current_raw * (remaining_pct / 100.0)
+
+    return current_raw
+
+
+def trade_realized_pnl(t: TrackedTrade) -> float:
+    """الجزء المحقق leveraged % (للعرض)."""
+    return leveraged_pct(trade_realized_raw_pnl(t), _trade_report_leverage(t))
+
+
+def trade_floating_pnl(t: TrackedTrade) -> float:
+    """الجزء المفتوح leveraged % (للعرض)."""
+    return leveraged_pct(trade_floating_raw_pnl(t), _trade_report_leverage(t))
+
+
+def trade_realized_money_pnl(t: TrackedTrade, *, fallback_margin: float = DEFAULT_MARGIN_PER_TRADE) -> float:
+    """الجزء المحقق بالدولار."""
+    return (trade_realized_pnl(t) / 100.0) * trade_margin_usdt(t, fallback=fallback_margin)
+
+
+def trade_floating_money_pnl(t: TrackedTrade, *, fallback_margin: float = DEFAULT_MARGIN_PER_TRADE) -> float:
+    """الجزء المفتوح بالدولار."""
+    return (trade_floating_pnl(t) / 100.0) * trade_margin_usdt(t, fallback=fallback_margin)
+
+
 def trade_stage(t: TrackedTrade) -> str:
     return getattr(t, "stage_label", "OPEN") or "OPEN"
 
@@ -555,6 +635,22 @@ def trade_card_lines(
     else:
         pnl_label = f"{pnl:+.2f}%"
 
+    # ✅ Partial Accounting breakdown:
+    # للصفقات المفتوحة اللي ضربت TP1/TP2 — نعرض الجزء المحقق والجزء المفتوح.
+    partial_line = None
+    _is_open = not bool(getattr(t, "is_closed", False)) and t.status not in CLOSED_STATUSES
+    if _is_open and (bool(getattr(t, "tp1_hit", False)) or bool(getattr(t, "tp2_hit", False))):
+        _realized = trade_realized_pnl(t)
+        _floating = trade_floating_pnl(t)
+        if bool(getattr(t, "tp2_hit", False)):
+            _closed_pct = _tp_close_pct(t, "tp1_close_pct", 30.0) + _tp_close_pct(t, "tp2_close_pct", 50.0)
+        else:
+            _closed_pct = _tp_close_pct(t, "tp1_close_pct", 30.0)
+        partial_line = (
+            f"📊 محقق ({_closed_pct:.0f}%): {_realized:+.2f}% | "
+            f"مفتوح ({100.0 - _closed_pct:.0f}%): {_floating:+.2f}%"
+        )
+
     extra = []
 
     if getattr(t, "protected_runner", False):
@@ -577,6 +673,9 @@ def trade_card_lines(
         f"⭐ {float(t.score or 0):.2f}"
         f"{extra_text}",
 
+        # ✅ Partial Accounting: سطر تفصيل المحقق/المفتوح (فقط لو الصفقة جزئية مفتوحة)
+        *([partial_line] if partial_line else []),
+
         trade_actuals_line(t),
 
         # =================================================
@@ -589,7 +688,7 @@ def trade_card_lines(
 
         f"📦 Close Plan: "
         f"{float(getattr(t, 'tp1_close_pct', 30.0) or 30.0):.0f}/"
-        f"{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/"
+        f"{float(getattr(t, 'tp2_close_pct', 50.0) or 50.0):.0f}/"
         f"{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
 
         # عرض active SL = max(sl الأصلي, protected_sl)
@@ -658,6 +757,10 @@ def behavior_summary_lines(
     tp2_rate = tp2_count / total_closed * 100.0
     tp1_to_tp2 = (tp2_count / max(1, tp1_count) * 100.0) if tp1_count else 0.0
 
+    # ✅ Partial Accounting: milestones للصفقات المفتوحة النشطة (TP مُحقق لكن لسه شغالة)
+    open_tp1_active = sum(1 for t in opened if bool(getattr(t, "tp1_hit", False)) and not bool(getattr(t, "tp2_hit", False)))
+    open_tp2_active = sum(1 for t in opened if bool(getattr(t, "tp2_hit", False)))
+
     # ✅ FIX #10: أسباب الخروج كـ partition حصري حسب status (يجمع ≈100%).
     def _st(t: TrackedTrade) -> str:
         return str(getattr(t, "status", "") or "").lower()
@@ -690,6 +793,7 @@ def behavior_summary_lines(
         f"📈 Avg Winner: {avg_winner:+.2f}%",
         f"📉 Avg Loser: {avg_loser:+.2f}%",
         f"🏁 Reached TP1: {tp1_rate:.1f}% | TP2: {tp2_rate:.1f}% | TP1→TP2: {tp1_to_tp2:.1f}%  (milestones)",
+        f"🟢 نشطة جزئياً: TP1 فقط: {open_tp1_active} | TP2 runner: {open_tp2_active}",
         "🚪 <b>Exit Breakdown</b> (المغلقة، ≈100%):",
         f"   🛑 Direct SL: {_pct(direct_sl):.1f}% | 🟠 SL after TP1: {_pct(sl_after_tp1):.1f}%",
         f"   🛡 Protected BE: {_pct(protected_be):.1f}% | 🔒 Breakeven: {_pct(breakeven):.1f}%",
@@ -711,23 +815,36 @@ def wallet_impact_lines(
 
     closed = closed_trades(trades)
 
+    # ✅ Partial Accounting:
+    # الجزء المُغلق فعلاً (TP1/TP2) من الصفقات المفتوحة يُحسب realized.
+    # الجزء المتبقي المفتوح فقط يُحسب floating.
+    # المغلقة بالكامل → realized بالكامل (trade_realized_pnl يرجّع realized_pnl_pct المخزّن).
+
+    # ── Realized: closed بالكامل + الأجزاء المحققة من المفتوحة ──
     closed_profit = sum(
-        max(0.0, trade_effective_pnl(t))
+        max(0.0, trade_realized_pnl(t))
         for t in closed
+    ) + sum(
+        max(0.0, trade_realized_pnl(t))
+        for t in opened
     )
 
     closed_loss = sum(
-        min(0.0, trade_effective_pnl(t))
+        min(0.0, trade_realized_pnl(t))
         for t in closed
+    ) + sum(
+        min(0.0, trade_realized_pnl(t))
+        for t in opened
     )
 
+    # ── Floating: الجزء المفتوح المتبقي فقط من المفتوحة ──
     floating_profit = sum(
-        max(0.0, trade_effective_pnl(t))
+        max(0.0, trade_floating_pnl(t))
         for t in opened
     )
 
     floating_loss = sum(
-        min(0.0, trade_effective_pnl(t))
+        min(0.0, trade_floating_pnl(t))
         for t in opened
     )
 
@@ -737,23 +854,30 @@ def wallet_impact_lines(
 
     total = closed_net + floating_net
 
+    # ── نفس التقسيم بالدولار ──
     closed_profit_usd = sum(
-        max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        max(0.0, trade_realized_money_pnl(t, fallback_margin=margin_per_trade))
         for t in closed
+    ) + sum(
+        max(0.0, trade_realized_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in opened
     )
 
     closed_loss_usd = sum(
-        min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        min(0.0, trade_realized_money_pnl(t, fallback_margin=margin_per_trade))
         for t in closed
+    ) + sum(
+        min(0.0, trade_realized_money_pnl(t, fallback_margin=margin_per_trade))
+        for t in opened
     )
 
     floating_profit_usd = sum(
-        max(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        max(0.0, trade_floating_money_pnl(t, fallback_margin=margin_per_trade))
         for t in opened
     )
 
     floating_loss_usd = sum(
-        min(0.0, trade_money_pnl(t, fallback_margin=margin_per_trade))
+        min(0.0, trade_floating_money_pnl(t, fallback_margin=margin_per_trade))
         for t in opened
     )
 
