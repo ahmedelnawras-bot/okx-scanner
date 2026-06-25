@@ -82,7 +82,7 @@ def _execution_path(signal: SignalCandidate, execution_result: dict | None) -> s
 def _managed_split_for_path(path: str) -> tuple[int, int, int]:
     if str(path or "").lower() == "recovery":
         return 50, 25, 25
-    return 40, 40, 20
+    return 30, 50, 20
 
 
 def _tradingview_symbol(symbol: str) -> str:
@@ -217,7 +217,7 @@ def _trade_raw_effective_pnl_pct(trade) -> float:
     if getattr(trade, "tp2_hit", False):
         return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0)
     if getattr(trade, "tp1_hit", False):
-        remaining_pct = max(0.0, 100.0 - float(getattr(trade, "tp1_close_pct", 40.0) or 40.0))
+        remaining_pct = max(0.0, 100.0 - float(getattr(trade, "tp1_close_pct", 30.0) or 30.0))
         return float(getattr(trade, "realized_pnl_pct", 0.0) or 0.0) + max(0.0, float(getattr(trade, "pnl_pct", 0.0) or 0.0)) * (remaining_pct / 100.0)
     return float(getattr(trade, "pnl_pct", 0.0) or 0.0)
 
@@ -346,8 +346,8 @@ def build_execution_confirmation_message(
         f"• Entry Order ID: {plan.get('entry_order_id') or '-'}",
         "",
         "🎯 Managed Exit Plan",
-        f"• TP1: {_fmt_price(plan.get('tp1'))} | Close {int(plan.get('tp1_close_pct') or 40)}%",
-        f"• TP2: {_fmt_price(plan.get('tp2'))} | Close {int(plan.get('tp2_close_pct') or 40)}%",
+        f"• TP1: {_fmt_price(plan.get('tp1'))} | Close {int(plan.get('tp1_close_pct') or 30)}%",
+        f"• TP2: {_fmt_price(plan.get('tp2'))} | Close {int(plan.get('tp2_close_pct') or 50)}%",
         f"• Runner: {int(plan.get('runner_close_pct') or 20)}%",
         f"• TP1 Order ID: {plan.get('tp1_order_id') or '-'}",
         f"• TP2 Order ID: {plan.get('tp2_order_id') or '-'}",
@@ -416,8 +416,8 @@ def build_trade_track_message(trade) -> str:
     raw_floating_pct = float(getattr(trade, "runner_pnl_pct", 0.0) or 0.0) if getattr(trade, "tp2_hit", False) else float(getattr(trade, "pnl_pct", 0.0) or 0.0)
     floating_pct = _leveraged_pct(raw_floating_pct)
     floating_usd = _money_from_pct(floating_pct)
-    tp1_pct = float(getattr(trade, "tp1_close_pct", 40.0) or 40.0)
-    tp2_pct = float(getattr(trade, "tp2_close_pct", 40.0) or 40.0)
+    tp1_pct = float(getattr(trade, "tp1_close_pct", 30.0) or 30.0)
+    tp2_pct = float(getattr(trade, "tp2_close_pct", 50.0) or 50.0)
     runner_pct = float(getattr(trade, "runner_close_pct", 20.0) or 20.0)
     symbol = getattr(trade, "symbol", "-")
     opened_at = getattr(trade, "opened_at", None)
