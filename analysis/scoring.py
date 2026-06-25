@@ -1869,6 +1869,10 @@ def build_signal_candidate(
             "btc_15m_move":
                 btc_control_context.get("btc_15m_move"),
 
+            # ✅ Adaptive trailing: متوسط مدى الشمعة وقت الدخول
+            "avg_range_pct":
+                round(float(structure_stop_context.get("anchor_range_pct") or 0.0), 4),
+
             "resistance_4h":
                 resistance_4h_context,
 
