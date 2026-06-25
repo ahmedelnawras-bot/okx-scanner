@@ -1,12 +1,109 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from analysis.models import SignalCandidate
 from utils.constants import MODE_RECOVERY_LONG
 from .models import TrackedTrade
+
+
+# ─────────────────────────────────────────────────────────────
+# Symbol Cooldown Tracker
+# ─────────────────────────────────────────────────────────────
+# يتتبع Direct SL المتكررة لنفس العملة.
+# بعد SL ثانٍ متتالٍ بدون TP1 → cooldown ساعتين.
+#
+# القواعد:
+# - SL أول  → يُسجَّل فقط (لا حظر)
+# - SL ثانٍ خلال نافذة 2 ساعة من الأول → cooldown 2 ساعة
+# - لو حصل TP1 بين السلسلة → تصفير العداد
+# - الـ cooldown in-memory فقط (يصفر عند restart)
+# ─────────────────────────────────────────────────────────────
+
+SYMBOL_COOLDOWN_CONSECUTIVE_SL = 2        # عدد SL المتتالية لتفعيل الحظر
+SYMBOL_COOLDOWN_WINDOW_MINUTES  = 120     # نافذة احتساب التتالي
+SYMBOL_COOLDOWN_DURATION_MINUTES = 120    # مدة الحظر بعد تفعيله
+
+
+class SymbolCooldownTracker:
+    """
+    Tracks consecutive Direct SL events per symbol (in-memory only).
+    Resets on process restart.
+    """
+
+    def __init__(self) -> None:
+        # symbol → {"sl_times": [datetime, ...], "cooldown_until": datetime | None}
+        self._state: dict[str, dict] = {}
+
+    def _ensure(self, symbol: str) -> dict:
+        if symbol not in self._state:
+            self._state[symbol] = {"sl_times": [], "cooldown_until": None}
+        return self._state[symbol]
+
+    def record_direct_sl(self, symbol: str) -> bool:
+        """
+        سجّل Direct SL لعملة.
+        يُعيد True لو تم تفعيل cooldown جديد.
+        """
+        now  = datetime.now(timezone.utc)
+        data = self._ensure(symbol)
+        window_start = now - timedelta(minutes=SYMBOL_COOLDOWN_WINDOW_MINUTES)
+
+        # احتفظ فقط بـ SL ضمن النافذة الزمنية
+        data["sl_times"] = [t for t in data["sl_times"] if t >= window_start]
+        data["sl_times"].append(now)
+
+        if len(data["sl_times"]) >= SYMBOL_COOLDOWN_CONSECUTIVE_SL:
+            data["cooldown_until"] = now + timedelta(minutes=SYMBOL_COOLDOWN_DURATION_MINUTES)
+            data["sl_times"] = []   # reset العداد بعد التفعيل
+            print(
+                f"[CooldownTracker] {symbol} → cooldown حتى "
+                f"{data['cooldown_until'].strftime('%H:%M UTC')} "
+                f"({SYMBOL_COOLDOWN_CONSECUTIVE_SL} SL متتاليين)",
+                flush=True,
+            )
+            return True
+        return False
+
+    def record_tp1_hit(self, symbol: str) -> None:
+        """TP1 يصفّر العداد — السلسلة انكسرت."""
+        data = self._ensure(symbol)
+        data["sl_times"] = []
+        # لا نلغي cooldown موجود — لو كان نشطاً يبقى حتى انتهاء وقته
+
+    def is_in_cooldown(self, symbol: str) -> tuple[bool, int]:
+        """
+        هل العملة في cooldown الآن؟
+        يُعيد (True, remaining_minutes) أو (False, 0).
+        """
+        data = self._ensure(symbol)
+        cooldown_until = data.get("cooldown_until")
+        if cooldown_until is None:
+            return False, 0
+        now = datetime.now(timezone.utc)
+        if now >= cooldown_until:
+            data["cooldown_until"] = None
+            return False, 0
+        remaining = int((cooldown_until - now).total_seconds() / 60) + 1
+        return True, remaining
+
+    def get_state(self, symbol: str) -> dict:
+        """للـ diagnostics فقط."""
+        data = self._ensure(symbol)
+        in_cd, rem = self.is_in_cooldown(symbol)
+        return {
+            "symbol": symbol,
+            "consecutive_sl_count": len(data["sl_times"]),
+            "cooldown_active": in_cd,
+            "cooldown_remaining_minutes": rem,
+            "cooldown_until": data.get("cooldown_until"),
+        }
+
+
+# singleton — instance مشترك عبر كل الـ imports
+symbol_cooldown_tracker = SymbolCooldownTracker()
 
 
 # Execution trade here means "count as an actually opened execution path"
@@ -465,3 +562,38 @@ def register_trade(
         **ai_research_fields,
         **position_sizing_fields,
     )
+
+
+def notify_trade_closed(trade: "TrackedTrade") -> None:
+    """
+    يُستدعى من main.py عند إغلاق أي صفقة execution.
+    يُحدّث SymbolCooldownTracker بناءً على نتيجة الصفقة.
+
+    القواعد:
+    - closed_loss / protected_entry_exit بدون tp1_hit → Direct SL → record_direct_sl
+    - tp1_hit (بأي حالة إغلاق)                       → record_tp1_hit (يصفّر السلسلة)
+    - غير ذلك                                         → لا شيء
+    """
+    if not bool(getattr(trade, "execution_trade", False)):
+        return
+
+    symbol = str(getattr(trade, "symbol", "") or "")
+    if not symbol:
+        return
+
+    tp1_hit = bool(getattr(trade, "tp1_hit", False))
+    status  = str(getattr(trade, "status", "") or "").lower()
+
+    if tp1_hit:
+        symbol_cooldown_tracker.record_tp1_hit(symbol)
+        return
+
+    # Direct SL = أُغلقت بخسارة قبل TP1
+    if status in {"closed_loss", "protected_entry_exit"}:
+        activated = symbol_cooldown_tracker.record_direct_sl(symbol)
+        if activated:
+            _, rem = symbol_cooldown_tracker.is_in_cooldown(symbol)
+            print(
+                f"[CooldownTracker] {symbol} → حظر نشط | متبقي: {rem} دقيقة",
+                flush=True,
+            )
