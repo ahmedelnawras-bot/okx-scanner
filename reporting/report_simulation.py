@@ -511,7 +511,7 @@ def _periodic_execution_style_reports(sim_checks: list[dict], sim_trades: list, 
             build_open_trades_report(
                 trades,
                 title="\U0001f9ea\U0001f4c2 \u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0645\u062d\u0627\u0643\u0627\u0629 \u0627\u0644\u0645\u0641\u062a\u0648\u062d\u0629",
-                execution_only=True,
+                execution_only=False,   # ✅ FIX: صفقات المحاكاة tracking_bucket="simulation" — execution_only=True كان يستبعدها كلها
                 period=period,
             ),
             account_summary,
