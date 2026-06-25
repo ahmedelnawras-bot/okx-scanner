@@ -142,7 +142,7 @@ def _is_shooting_star(curr: dict) -> tuple[bool, str]:
     return False, ""
 
 
-def _is_bearish_engulfing(curr: dict, prev: dict) -> tuple[bool, str]:
+def _is_bearish_engulfing(curr: dict, prev: dict, min_body_pct: float = MIN_ENGULF_BODY_PCT) -> tuple[bool, str]:
     """Bearish Engulfing: شمعة حمراء تبتلع الخضراء السابقة."""
     if not curr or not prev:
         return False, ""
@@ -156,7 +156,7 @@ def _is_bearish_engulfing(curr: dict, prev: dict) -> tuple[bool, str]:
     prev_close = prev.get("close", 0)
 
     engulfs = curr_open >= prev_close and curr_close <= prev_open
-    meaningful = curr.get("body_pct", 0) >= MIN_ENGULF_BODY_PCT
+    meaningful = curr.get("body_pct", 0) >= min_body_pct
 
     if engulfs and meaningful:
         return True, "bearish_engulfing"
@@ -217,7 +217,7 @@ def _is_hammer(curr: dict) -> tuple[bool, str]:
     return False, ""
 
 
-def _is_bullish_engulfing(curr: dict, prev: dict) -> tuple[bool, str]:
+def _is_bullish_engulfing(curr: dict, prev: dict, min_body_pct: float = MIN_ENGULF_BODY_PCT) -> tuple[bool, str]:
     """Bullish Engulfing: شمعة خضراء تبتلع الحمراء السابقة."""
     if not curr or not prev:
         return False, ""
@@ -230,7 +230,7 @@ def _is_bullish_engulfing(curr: dict, prev: dict) -> tuple[bool, str]:
     prev_close = prev.get("close", 0)
 
     engulfs = curr_open <= prev_close and curr_close >= prev_open
-    meaningful = curr.get("body_pct", 0) >= MIN_ENGULF_BODY_PCT
+    meaningful = curr.get("body_pct", 0) >= min_body_pct
 
     if engulfs and meaningful:
         return True, "bullish_engulfing"
@@ -327,11 +327,16 @@ def evaluate_candle_reversal_gate(
         }
 
     # احسب metrics لآخر شمعتين مغلقتين
-    # raw_candles[0] = أحدث شمعة (قد تكون لسه بتتشكل)
-    # raw_candles[1] = الشمعة المغلقة الأخيرة ← المرجع الأساسي
-    # raw_candles[2] = الشمعة قبلها
-
-    closed = [_candle_metrics(c) for c in raw_candles[1:4] if c]
+    #
+    # ✅ FIX حرج: recent_candles (من main.py) مرتّبة chronological [أقدم → أحدث].
+    # البوابة محتاجة آخر شمعة مغلقة = آخر عنصر. لذلك نعكس الترتيب هنا عشان
+    # closed[0] = الأحدث، closed[1] = اللي قبلها... إلخ.
+    #
+    # ملاحظة: raw_candles ممكن تكون أصلاً [:5] من recent_candles، فآخر عنصر
+    # فيها هو آخر شمعة مغلقة فعلاً. reversed يخليها latest-first.
+    _chrono = [_candle_metrics(c) for c in raw_candles if c]
+    _chrono = [m for m in _chrono if m]  # شيل الفاضي
+    closed = list(reversed(_chrono))[:3]  # الأحدث أول
 
     if not closed:
         return {
@@ -349,9 +354,21 @@ def evaluate_candle_reversal_gate(
 
     mode = str(risk_mode or "normal").strip().lower()
     is_recovery = mode in {"recovery_long", "recovery"}
+    is_strong = mode in {"strong", "strong_long_only", "strong_long"}
+
+    # ✅ Adaptive thresholds: متوسط مدى الشمعة (لو متاح) لمعايرة عتبات الـ body
+    avg_range_pct = _safe_float(meta.get("avg_range_pct"), 0.0)
+
+    # عتبة body متكيّفة للـ engulfing:
+    # عملة متقلبة تحتاج body أكبر ليُعتبر معنوياً؛ عملة هادئة تكفيها أقل.
+    # الافتراضي MIN_ENGULF_BODY_PCT لو avg_range مش متاح.
+    if avg_range_pct > 0:
+        _adaptive_engulf_body = max(0.12, min(0.50, avg_range_pct * 0.35))
+    else:
+        _adaptive_engulf_body = MIN_ENGULF_BODY_PCT
 
     # ─────────────────────────────────────────
-    # NORMAL MODE — كشف Bearish Patterns
+    # NORMAL / STRONG MODE — كشف Bearish Patterns
     # ─────────────────────────────────────────
     if not is_recovery:
         bearish_found = False
@@ -360,11 +377,18 @@ def evaluate_candle_reversal_gate(
 
         checks = [
             _is_shooting_star(curr),
-            _is_bearish_engulfing(curr, prev),
+            _is_bearish_engulfing(curr, prev, _adaptive_engulf_body),
             _is_long_upper_wick_rejection(curr),
             _is_failed_breakout(curr, prev),
-            _is_strong_rejection_after_expansion(curr, prev),
         ]
+
+        # ✅ STRONG pullback tolerance:
+        # في التراند القوي، شمعة حمراء بعد خضراء كبيرة غالباً pullback صحي
+        # مش انعكاس. لذلك نستثني strong_rejection_after_expansion في STRONG
+        # فقط. باقي الأنماط (shooting star, engulfing, failed breakout) تظل
+        # فعّالة لأنها إشارات انعكاس أوضح.
+        if not is_strong:
+            checks.append(_is_strong_rejection_after_expansion(curr, prev))
 
         strengths = {
             "shooting_star": 0.75,
@@ -382,9 +406,9 @@ def evaluate_candle_reversal_gate(
                 break  # أول pattern يكفي للمنع
 
         print(
-            f"🕯 CANDLE_GATE | {symbol} | mode=normal | "
+            f"🕯 CANDLE_GATE | {symbol} | mode={mode} | "
             f"bearish={bearish_found} | pattern={bearish_pattern or 'none'} | "
-            f"allowed={not bearish_found}",
+            f"strong_tolerance={is_strong} | allowed={not bearish_found}",
             flush=True,
         )
         return {
@@ -412,7 +436,7 @@ def evaluate_candle_reversal_gate(
 
     checks = [
         _is_hammer(curr),
-        _is_bullish_engulfing(curr, prev),
+        _is_bullish_engulfing(curr, prev, _adaptive_engulf_body),
         _is_sweep_and_reclaim(curr, prev),
         _is_strong_lower_wick(curr),
         _is_compression_release(closed),
