@@ -61,6 +61,13 @@ TRAILING_ADAPTIVE_FLOOR_PCT: float = 2.0
 TRAILING_ADAPTIVE_CEILING_PCT: float = 4.5
 BREAKEVEN_BUFFER_PCT: float = 0.10
 
+# ── Runner Hard Stop ───────────────────────────────────────────────────────────
+# حماية مطلقة للـ runner بعد TP2: لو السعر انهار بحيث وصل ربح الصفقة الكلي
+# (من entry) إلى هذه الخسارة، يُغلق الـ runner فوراً بغض النظر عن trailing/protected_sl.
+# يحمي من سيناريو انهيار سريع أو فشل في تحديث protected_sl (صفقات قديمة/أخطاء sync).
+# القيمة بالـ raw price-move % (مش leveraged). −8% raw ≈ انهيار كبير تحت entry.
+RUNNER_HARD_STOP_RAW_PCT: float = -8.0
+
 # ── BTC Micro-Gate ─────────────────────────────────────────────────────────────
 # لو BTC نازل أكثر من هذه العتبة (15m) → نرفض الدخول في NORMAL/STRONG.
 # RECOVERY مستثنى لأنه أصلاً rebound متوقع.
