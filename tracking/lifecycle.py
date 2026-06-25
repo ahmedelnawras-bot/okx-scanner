@@ -16,11 +16,13 @@ try:
         TRAILING_ADAPTIVE_MULTIPLIER,
         TRAILING_ADAPTIVE_FLOOR_PCT,
         TRAILING_ADAPTIVE_CEILING_PCT,
+        RUNNER_HARD_STOP_RAW_PCT,
     )
 except Exception:
     TRAILING_ADAPTIVE_MULTIPLIER = 1.3
     TRAILING_ADAPTIVE_FLOOR_PCT = 2.0
     TRAILING_ADAPTIVE_CEILING_PCT = 4.5
+    RUNNER_HARD_STOP_RAW_PCT = -8.0
 from .models import TrackedTrade
 
 
@@ -151,13 +153,17 @@ def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
 
     SL بيتنقل لـ TP1 (مش entry) — هذا يضمن ربح محمي على الـ runner.
     """
-    if trade.tp2_hit and trade.sl_moved_to_entry:
+    if trade.tp2_hit:
+        # ✅ تحصين: protected_sl لازم يتحط لـ TP1 بعد TP2 حتى لو sl_moved_to_entry
+        # مش متفعّل (صفقات قديمة / مسار غير متوقع). الشرط القديم كان مزدوجاً
+        # وممكن يفشل فيترك الـ runner بدون حماية.
         trade.protected_runner = True
         trade.slot_exempt = True
         trade.daily_open_risk_exempt = True
         trade.same_symbol_block_exempt = True
         trade.slot_exempt_reason = "tp2_protected_runner"
-        # ✅ FIX: SL ينتقل لـ TP1 بعد TP2 — أعلى من entry = حماية أفضل للـ runner
+        trade.sl_moved_to_entry = True
+        # SL ينتقل لـ TP1 بعد TP2 — أعلى من entry = حماية أفضل للـ runner
         tp1_price = float(getattr(trade, "tp1", 0.0) or 0.0)
         fallback = float(trade.entry or 0.0)
         sl_floor = tp1_price if tp1_price > fallback else fallback
@@ -300,6 +306,27 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
     if trade.tp2_hit:
         _stamp_once(trade, "trailing_started_at")
         trade = _mark_protected_runner(trade)
+
+        # ✅ Runner Hard Stop (خط دفاع مطلق):
+        # لو السعر انهار تحت entry بما يتجاوز RUNNER_HARD_STOP_RAW_PCT،
+        # نقفل الـ runner فوراً — حماية ضد انهيار سريع أو فشل protected_sl
+        # (صفقات قديمة / أخطاء sync). مستقل تماماً عن الـ trailing.
+        _runner_raw_pnl = _pnl_pct(trade.entry, current_price)
+        if _runner_raw_pnl <= RUNNER_HARD_STOP_RAW_PCT:
+            runner_close_pct = float(trade.runner_close_pct or _def_runner)
+            trade.closed_portion_pct = 100.0
+            trade.realized_pnl_pct += _runner_raw_pnl * (runner_close_pct / 100.0)
+            trade.runner_pnl_pct = 0.0
+            trade.runner_active = False
+            trade.protected_runner = False
+            _safe_setattr(trade, "exchange_sync_state", "runner_hard_stop")
+            print(
+                f"🛑 RUNNER_HARD_STOP | {trade.symbol} | "
+                f"raw_pnl={_runner_raw_pnl:.2f}% <= {RUNNER_HARD_STOP_RAW_PCT}% | إغلاق فوري",
+                flush=True,
+            )
+            return _mark_closed(trade, "closed_loss")
+
         # ✅ Adaptive trailing: trail_pct يتكيّف مع تقلب العملة.
         # المصدر: entry_avg_range_pct (متوسط مدى الشمعة وقت الدخول).
         # عملة هادئة → trailing ضيّق؛ عملة متقلبة → trailing أوسع (مايضربش بسهولة).
