@@ -592,7 +592,19 @@ def trade_card_lines(
         f"{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/"
         f"{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
 
-        f"🛡 SL: {fmt_price(getattr(t, 'sl', 0.0))}",
+        # عرض active SL = max(sl الأصلي, protected_sl)
+        # protected_sl يتحرك مع الـ trailing وبعد TP1/TP2
+        # هذا يضمن إن التقرير يعكس الـ SL الفعلي الحالي
+        *(
+            [
+                f"🛡 SL: {fmt_price(max(float(getattr(t, 'sl', 0.0) or 0.0), float(getattr(t, 'protected_sl', 0.0) or 0.0)))}"
+                + (
+                    f" ← محمي"
+                    if float(getattr(t, 'protected_sl', 0.0) or 0.0) > float(getattr(t, 'sl', 0.0) or 0.0)
+                    else ""
+                ),
+            ]
+        ),
 
         f"🧠 {clean_setup(t)}",
 
