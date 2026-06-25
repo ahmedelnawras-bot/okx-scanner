@@ -20,6 +20,8 @@ CLOSED_STATUSES = {
     "breakeven_after_tp1",
     "trailing_hit",
     "closed_win",
+    "protected_entry_exit",   # SL ضُرب عند entry أو أعلى — مش خسارة كاملة
+    "expired",                 # صفقة انتهت بالوقت
 }
 
 WIN_STATUSES = {
@@ -233,14 +235,14 @@ def _planned_realized_raw_for_open_trade(t: TrackedTrade, stage: str) -> float |
     if tp1_raw is None:
         return None
 
-    tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 40.0)
+    tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 30.0)
     realized = tp1_raw * (tp1_close_pct / 100.0)
 
     if stage == "tp2":
         tp2_raw = _raw_move_to_price(t, _safe_float(getattr(t, "tp2", 0.0), 0.0))
         if tp2_raw is None:
             return None
-        tp2_close_pct = _tp_close_pct(t, "tp2_close_pct", 40.0)
+        tp2_close_pct = _tp_close_pct(t, "tp2_close_pct", 50.0)
         realized += tp2_raw * (tp2_close_pct / 100.0)
 
     return realized
@@ -396,7 +398,7 @@ def trade_raw_effective_pnl(t: TrackedTrade) -> float:
         # portion from Entry/TP1 if possible, then add only the remaining open leg.
         planned_realized = _planned_realized_raw_for_open_trade(t, "tp1")
         realized_raw = planned_realized if planned_realized is not None else stored_realized_raw
-        tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 40.0)
+        tp1_close_pct = _tp_close_pct(t, "tp1_close_pct", 30.0)
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
         return realized_raw + current_raw * (remaining_pct / 100.0)
 
@@ -586,7 +588,7 @@ def trade_card_lines(
         f"🏁 TP2: {fmt_price(getattr(t, 'tp2', 0.0))}",
 
         f"📦 Close Plan: "
-        f"{float(getattr(t, 'tp1_close_pct', 40.0) or 40.0):.0f}/"
+        f"{float(getattr(t, 'tp1_close_pct', 30.0) or 30.0):.0f}/"
         f"{float(getattr(t, 'tp2_close_pct', 40.0) or 40.0):.0f}/"
         f"{float(getattr(t, 'runner_close_pct', 20.0) or 20.0):.0f}",
 
@@ -648,14 +650,15 @@ def behavior_summary_lines(
     def _st(t: TrackedTrade) -> str:
         return str(getattr(t, "status", "") or "").lower()
 
-    direct_sl = sum(1 for t in closed if _st(t) == "closed_loss" and not t.tp1_hit)
+    direct_sl    = sum(1 for t in closed if _st(t) == "closed_loss" and not t.tp1_hit)
     sl_after_tp1 = sum(1 for t in closed if _st(t) == "closed_loss" and t.tp1_hit)
-    breakeven = sum(1 for t in closed if _st(t) == "breakeven_after_tp1")
-    trailing = sum(1 for t in closed if _st(t) == "trailing_hit")
-    tp_close = sum(1 for t in closed if _st(t) == "closed_win")
-    other_exit = max(
+    protected_be = sum(1 for t in closed if _st(t) == "protected_entry_exit")
+    breakeven    = sum(1 for t in closed if _st(t) == "breakeven_after_tp1")
+    trailing     = sum(1 for t in closed if _st(t) == "trailing_hit")
+    tp_close     = sum(1 for t in closed if _st(t) == "closed_win")
+    other_exit   = max(
         0,
-        len(closed) - (direct_sl + sl_after_tp1 + breakeven + trailing + tp_close),
+        len(closed) - (direct_sl + sl_after_tp1 + protected_be + breakeven + trailing + tp_close),
     )
 
     def _pct(n: int) -> float:
@@ -677,8 +680,8 @@ def behavior_summary_lines(
         f"🏁 Reached TP1: {tp1_rate:.1f}% | TP2: {tp2_rate:.1f}% | TP1→TP2: {tp1_to_tp2:.1f}%  (milestones)",
         "🚪 <b>Exit Breakdown</b> (المغلقة، ≈100%):",
         f"   🛑 Direct SL: {_pct(direct_sl):.1f}% | 🟠 SL after TP1: {_pct(sl_after_tp1):.1f}%",
-        f"   🔒 Breakeven: {_pct(breakeven):.1f}% | 🔄 Trailing: {_pct(trailing):.1f}%",
-        f"   ✅ TP Close: {_pct(tp_close):.1f}% | ⚪ Other: {_pct(other_exit):.1f}%",
+        f"   🛡 Protected BE: {_pct(protected_be):.1f}% | 🔒 Breakeven: {_pct(breakeven):.1f}%",
+        f"   🔄 Trailing: {_pct(trailing):.1f}% | ✅ TP Close: {_pct(tp_close):.1f}% | ⚪ Other: {_pct(other_exit):.1f}%",
         f"⚡ Total Floating PnL: {floating:+.2f}% (مجموع نسب الرافعة للصفقات المفتوحة)",
         f"💡 Risk / Reward Quality: {quality}",
     ]
