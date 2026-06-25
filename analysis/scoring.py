@@ -1246,7 +1246,13 @@ def _infer_quality_context(
         vol_ratio
     )
 
-    mtf_confirmed = bool(
+    # ─────────────────────────────────────────────────────────────
+    # MTF Confirmation
+    # ─────────────────────────────────────────────────────────────
+    # Tier 1 — setups ذات confirmation هيكلي مدمج (دايماً True)
+    # Tier 2 — setups تحتاج شروط حجم/حركة كبديل عن MTF الخارجي
+    # ─────────────────────────────────────────────────────────────
+    _tier1_mtf = bool(
         "rs_btc" in tags
         or setup_type in {
             "wave_3",
@@ -1258,6 +1264,21 @@ def _infer_quality_context(
             and change >= 0.75
         )
     )
+
+    # Tier 2: higher_low_continuation و support_bounce_confirmed
+    # يحتاجان دليلاً بديلاً: حجم كافٍ + حركة إيجابية واضحة
+    _tier2_mtf = bool(
+        setup_type == "higher_low_continuation"
+        and vol_ratio >= 1.15
+        and change >= 0.40
+    ) or bool(
+        setup_type == "support_bounce_confirmed"
+        and vol_ratio >= 1.20
+        and change >= 0.50
+        and "near_resistance" not in tags
+    )
+
+    mtf_confirmed = _tier1_mtf or _tier2_mtf
 
     breakout_quality = ""
 
