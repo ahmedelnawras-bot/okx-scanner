@@ -32,10 +32,12 @@ class TrackedTrade:
     execution_trade: bool = False
 
     # Position plan / lifecycle metadata.
-    target_model: str = "standard_40_40_20"  # standard_40_40_20 | recovery_50_25_25
-    tp1_close_pct: float = 40.0
-    tp2_close_pct: float = 40.0
+    target_model: str = "standard_30_50_20"  # standard_30_50_20 | recovery_50_25_25
+    tp1_close_pct: float = 30.0
+    tp2_close_pct: float = 50.0
     runner_close_pct: float = 20.0
+    # ✅ Adaptive trailing: متوسط مدى الشمعة وقت الدخول — يُستخدم لحساب trail_pct ديناميكياً بعد TP2
+    entry_avg_range_pct: float = 0.0
     protected_runner: bool = False
     slot_exempt: bool = False
     slot_exempt_reason: str = ""
