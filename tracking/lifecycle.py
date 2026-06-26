@@ -167,13 +167,24 @@ def _mark_protected_runner(trade: TrackedTrade) -> TrackedTrade:
         tp1_price = float(getattr(trade, "tp1", 0.0) or 0.0)
         fallback = float(trade.entry or 0.0)
         sl_floor = tp1_price if tp1_price > fallback else fallback
+        _sl_before_runner = float(trade.protected_sl or 0.0)
         trade.protected_sl = max(float(trade.protected_sl or 0.0), sl_floor)
+        # توضيح: بعد ضرب الهدف الثاني، الستوب اتنقل لمستوى الهدف الأول —
+        # يعني الـ runner (آخر 20%) بقى مضمون الربح مهما حصل.
+        if float(trade.protected_sl or 0.0) > _sl_before_runner:
+            print(
+                f"🔒 RUNNER_SL→TP1 | {trade.symbol} | "
+                f"SL → {float(trade.protected_sl):.6f} | "
+                f"الـ runner بقى ربح مضمون بعد TP2",
+                flush=True,
+            )
     return trade
 
 
 def apply_block_protection(trade: TrackedTrade, protection_level: int) -> TrackedTrade:
     if protection_level <= 1 or trade.status in _CLOSED_STATUSES:
         return trade
+    _sl_before = float(trade.protected_sl or 0.0)
     if protection_level >= 2 and trade.pnl_pct > 0:
         trade.protected_on_block = True
         trade.protection_level = max(trade.protection_level, 2)
@@ -194,6 +205,17 @@ def apply_block_protection(trade: TrackedTrade, protection_level: int) -> Tracke
             _stamp_once(trade, "trailing_tightened_at")
         trade.trailing_tightened = trade.tp2_hit or trade.trailing_tightened
         trade.protected_sl = max(trade.protected_sl or 0.0, trade.entry * (1 + BREAKEVEN_BUFFER_PCT / 100.0))
+
+    # توضيح: السوق دخل وضع Block (حظر شراء). الصفقات الرابحة بنحرّك ستوبها
+    # لنقطة الدخول أو أعلى لحماية الربح المحقق قبل أي انعكاس.
+    _sl_after = float(trade.protected_sl or 0.0)
+    if _sl_after > _sl_before:
+        print(
+            f"🛡 BLOCK_PROTECT | {trade.symbol} | L{protection_level} | "
+            f"SL: {_sl_before:.6f} → {_sl_after:.6f} | "
+            f"حماية الربح في وضع الحظر",
+            flush=True,
+        )
     return trade
 
 
