@@ -286,15 +286,20 @@ def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None
     closed_loss_usd = sum(min(0.0, trade_money_pnl(t)) for t in closed)
     floating_profit_usd = sum(max(0.0, trade_money_pnl(t)) for t in opened)
     floating_loss_usd = sum(min(0.0, trade_money_pnl(t)) for t in opened)
-    closed_profit = sum(max(0.0, trade_effective_pnl(t)) for t in closed)
-    closed_loss = sum(min(0.0, trade_effective_pnl(t)) for t in closed)
-    floating_profit = sum(max(0.0, trade_effective_pnl(t)) for t in opened)
-    floating_loss = sum(min(0.0, trade_effective_pnl(t)) for t in opened)
     closed_net_usd = closed_profit_usd + closed_loss_usd
     floating_net_usd = floating_profit_usd + floating_loss_usd
     total_usd = closed_net_usd + floating_net_usd
-    closed_net = closed_profit + closed_loss
-    floating_net = floating_profit + floating_loss
+
+    # النِسَب = % من رأس المال فعلاً (مطابقة لليبل أسفل التقرير).
+    # القديم كان يجمع trade_effective_pnl (مجموع نسب exposure مرفوعة) ويسمّيه
+    # "% من رأس المال" وده غير صحيح ويتضخّم بعدد الصفقات والرافعة.
+    cap = float(starting_balance or 1000.0) or 1000.0
+    closed_profit = (closed_profit_usd / cap) * 100.0
+    closed_loss = (closed_loss_usd / cap) * 100.0
+    floating_profit = (floating_profit_usd / cap) * 100.0
+    floating_loss = (floating_loss_usd / cap) * 100.0
+    closed_net = (closed_net_usd / cap) * 100.0
+    floating_net = (floating_net_usd / cap) * 100.0
 
     def money_icon(value: float) -> str:
         return ("🟢" if value >= 0 else "🔴") + f" {value:+.2f}$"
@@ -362,6 +367,9 @@ def build_simulation_report(
     closed = closed_trades(trades)
 
     win_count, loss_count, wr = _closed_wr_parts(trades)
+    # الصفقات المغلقة اللي PnL بتاعها = 0 بالظبط (مثل protected_entry_exit)
+    # مش بتتحسب رابحة ولا خاسرة. نعرضها صراحةً عشان 90 المغلقة تتطابق مع 31+56.
+    breakeven_count = max(0, len(closed) - win_count - loss_count)
     winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
     losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
@@ -374,7 +382,7 @@ def build_simulation_report(
         f"• Currently Open Tracked Trades: {len(opened)}",
         f"• Closed Tracked Trades: {len(closed)}",
         f"🏆 Win Rate: <b>{wr:.1f}%</b>",
-        f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count}",
+        f"🟢 Winners: {win_count} | 🔴 Losers: {loss_count} | ⚪ Breakeven: {breakeven_count}",
         "— <i>الأرقام التالية من آخر ≤500 فحص (نافذة حديثة، مش تراكمي)</i> —",
         f"• Checked Candidates: {checked}",
         f"• Accepted After Gate: {len(accepted_checks)} | Accept Rate: {acc_rate:.1f}%",
