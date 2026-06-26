@@ -37,6 +37,7 @@ class MarketModeState:
     consecutive_weak_scans: int = 0
     consecutive_recovery_ready_scans: int = 0
     consecutive_normal_ready_scans: int = 0
+    block_type: str = ""   # "FLASH" / "TREND" / "" — يتحدد فقط في وضع BLOCK
 
 
 # Keep transitions stable
@@ -61,6 +62,18 @@ BLOCK_AVG_CHANGE = -0.85
 BLOCK_BTC_CHANGE = -0.55
 BLOCK_BTC_RED_RATIO = 0.66
 ALT_WEAK_RED_RATIO = 0.62
+
+# ── Trend Filter (فلتر الاتجاه) ─────────────────────────────────────────────────
+# الـ 15m بيقيس السرعة بس. النزول التدريجي (السعر تحت MA5 الساعة باستمرار)
+# مكانش بيعمل BLOCK وكان بيخلي النظام يشتري في كل نزول → 8% WR في STRONG.
+# لو ترند هابط مؤكد (ضغط MA5 + فجوة عميقة) → نعمل TREND_BLOCK بدل STRONG.
+# قابل للإطفاء فوراً بـ TREND_BLOCK_ENABLED = False.
+TREND_BLOCK_ENABLED = True
+TREND_BLOCK_GAP_PCT = -0.40   # السعر أقل من MA5 الساعة بـ 0.40%+ = ترند هابط مؤكد
+
+# تسميات نوع البلوك (داخلية — للوضوح في اللوجز والتقارير)
+BLOCK_TYPE_FLASH = "FLASH"   # ⚡ انهيار سريع 15م — يسمح باستثناءات (ممكن ارتداد)
+BLOCK_TYPE_TREND = "TREND"   # 📉 ترند هابط مستمر — بدون استثناءات (صيد سكين)
 
 FAST_BLOCK_BTC_15M = -0.95
 FAST_BLOCK_RED_RATIO = 0.80
@@ -308,8 +321,25 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
 
     stabilizing = bool(no_longer_crashing or snapshot.breadth_improving or snapshot.btc_reclaim)
 
+    # ── Trend Block: ترند هابط مؤكد على الساعة = بلوك صلب ──
+    # يتجاوز فيتو stabilizing لأن النزول التدريجي بيبان "مستقر" في كل 15م
+    # لكنه فعلياً اتجاه هابط. يحتاج تأكيد مزدوج: ضغط MA5 + فجوة ≥0.40%.
+    gap_pct = float(getattr(snapshot, "btc_1h_ma5_gap_pct", 0.0) or 0.0)
+    btc_trend_block = bool(
+        TREND_BLOCK_ENABLED
+        and _has_hourly_ma5_pressure(snapshot)
+        and gap_pct <= TREND_BLOCK_GAP_PCT
+    )
+
     real_block_core = (broad_market_crash or btc_breakdown or alt_weak_pressure or severe_breadth_pressure or panic_breadth_pressure)
-    real_block = bool(real_block_core and not stabilizing and (red_ratio >= 0.60 or avg <= -0.50))
+    real_block = bool(
+        (real_block_core and not stabilizing and (red_ratio >= 0.60 or avg <= -0.50))
+        or btc_trend_block
+    )
+
+    # نوع البلوك للوضوح ومنطق الاستثناءات: TREND أصلب من FLASH.
+    # لو ترند هابط مؤكد → TREND (بدون استثناءات). غير كده → FLASH.
+    block_type = BLOCK_TYPE_TREND if btc_trend_block else BLOCK_TYPE_FLASH
 
     hourly_ma5_pressure = _has_hourly_ma5_pressure(snapshot)
 
@@ -352,6 +382,8 @@ def _risk_flags(snapshot: MarketSnapshot) -> dict:
         "hourly_ma5_pressure": hourly_ma5_pressure,
         "recovery_to_strong_ready": bool(recovery_to_strong_ready and not real_block),
         "real_block": real_block,
+        "btc_trend_block": btc_trend_block,
+        "block_type": block_type,
     }
 
 
@@ -527,6 +559,12 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
     next_state.changed_at = now if changed else previous.changed_at
     next_state.reminder_count = 0 if changed else previous.reminder_count
 
+    # نوع البلوك: يتحدد فقط في وضع BLOCK. TREND لو ترند هابط مؤكد، غير كده FLASH.
+    if candidate_mode == MODE_BLOCK_LONGS:
+        next_state.block_type = flags.get("block_type") or BLOCK_TYPE_FLASH
+    else:
+        next_state.block_type = ""
+
     if changed:
         # Avoid carrying confirmation counters from the old mode into the new
         # mode. This prevents instant RECOVERY -> NORMAL flips after entry.
@@ -560,6 +598,19 @@ def decide_market_mode(snapshot: MarketSnapshot, previous: MarketModeState | Non
 
 def increment_reminder_count(state: MarketModeState) -> MarketModeState:
     return replace(state, reminder_count=state.reminder_count + 1)
+
+
+def current_block_type(state: MarketModeState | None) -> str:
+    """نوع البلوك الحالي: "FLASH" / "TREND" / "". يستخدمه execution_processor
+    لمنع الاستثناءات وقت TREND_BLOCK تحديداً."""
+    if state is None or state.mode != MODE_BLOCK_LONGS:
+        return ""
+    return state.block_type or BLOCK_TYPE_FLASH
+
+
+def block_allows_exceptions(state: MarketModeState | None) -> bool:
+    """FLASH يسمح باستثناءات (ممكن ارتداد). TREND لا (ترند هابط مستمر)."""
+    return current_block_type(state) != BLOCK_TYPE_TREND
 
 
 def register_recovery_trade(state: MarketModeState) -> MarketModeState:
