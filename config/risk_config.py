@@ -61,6 +61,18 @@ TRAILING_ADAPTIVE_FLOOR_PCT: float = 2.0
 TRAILING_ADAPTIVE_CEILING_PCT: float = 4.5
 BREAKEVEN_BUFFER_PCT: float = 0.10
 
+# ── SL Move After TP1 ──────────────────────────────────────────────────────────
+# بعد ضرب TP1 ننقل الـ SL لجزء من المسافة بين الـ SL الأصلي والدخول، بدل ما
+# تفضل الـ 70% الباقية محمية بالـ SL الواسع الكامل (سبب رئيسي لصغر متوسط الربح).
+# SL_AFTER_TP1_FRACTION = كسر المسافة:
+#   0.0  → لا حركة (السلوك القديم)
+#   0.5  → نص المسافة (المعتمد) — يحمي الربح ويسيب مجال للـ runner يكمّل TP2
+#   1.0  → breakeven كامل عند الدخول
+# للإطفاء الفوري: ENABLED=False أو FRACTION=0.0 (يرجع السلوك القديم).
+# ملاحظة: بعد TP2 الـ SL بينتقل لـ TP1 (ربح مضمون) — منطق منفصل في lifecycle.
+MOVE_SL_AFTER_TP1_ENABLED: bool = True
+SL_AFTER_TP1_FRACTION: float = 0.5
+
 # ── Runner Hard Stop ───────────────────────────────────────────────────────────
 # حماية مطلقة للـ runner بعد TP2: لو السعر انهار بحيث وصل ربح الصفقة الكلي
 # (من entry) إلى هذه الخسارة، يُغلق الـ runner فوراً بغض النظر عن trailing/protected_sl.
