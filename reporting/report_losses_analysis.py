@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from tracking.models import TrackedTrade
-from reporting.report_format import SEP, score_range, trade_effective_pnl
+from reporting.report_format import SEP, score_range, trade_effective_pnl, closed_trades
 
 LOSS_STATUSES = {"closed_loss"}
 
@@ -28,7 +28,11 @@ def _entry_timing_label(t: TrackedTrade) -> str:
 
 
 def build_losses_analysis_report(trades: list[TrackedTrade], title: str = "📉 تحليل أسباب خسائر التنفيذ") -> str:
-    losing = [t for t in trades if t.status in LOSS_STATUSES or trade_effective_pnl(t) < 0]
+    # تقييد التحليل بالصفقات المغلقة فقط. القديم كان يدخّل الصفقات المفتوحة
+    # اللي floating بتاعها سالب، فيتضخّم عدد "Losing Trades" ويختلف عن عدد
+    # الخاسرة في Win Rate (المحسوب على المغلقة). الاتساق مهم.
+    closed = closed_trades(trades)
+    losing = [t for t in closed if t.status in LOSS_STATUSES or trade_effective_pnl(t) < 0]
     setup_counter = Counter(t.setup_type for t in losing)
     market_counter = Counter(_market_state_label(t) for t in losing)
     timing_counter = Counter(_entry_timing_label(t) for t in losing)
