@@ -9033,6 +9033,37 @@ def _dispatch_signals(sender: TelegramSender, result: dict, settings: Settings, 
                         managed_order_result,
                         trade_store=trade_store,
                     )
+
+                    # 🚨 تنبيه عاجل مستقل: لو الدخول نجح والـ TP فشل (بعد retry)،
+                    # الصفقة مفتوحة بستوب فقط بدون أهداف على المنصة — تحتاج تدخّل يدوي.
+                    # ده تنبيه منفصل ومفرقع عشان ما يضيعش وسط تفاصيل كارت الصفقة.
+                    if managed_order_result.get("tp_placement_failed"):
+                        _sym = getattr(signal, "symbol", "-")
+                        try:
+                            _send_text(
+                                sender,
+                                "\n".join([
+                                    "🚨🚨 <b>تنبيه عاجل — تدخّل يدوي مطلوب</b> 🚨🚨",
+                                    "┄┄┄┄┄┄┄┄",
+                                    f"💱 العملة: <b>{_sym}</b>",
+                                    "✅ الصفقة <b>مفتوحة على OKX</b> ومحمية بالستوب (SL).",
+                                    "❌ لكن أوامر الأهداف (TP1/TP2) <b>فشلت</b> بعد إعادة المحاولة.",
+                                    "",
+                                    "⚠️ <b>المطلوب منك:</b> افتح OKX وضع أوامر TP يدوياً،",
+                                    "أو أغلق الصفقة يدوياً لو حبيت.",
+                                    "الصفقة مش هتتقفل تلقائياً عند الهدف بدون تدخّلك.",
+                                ]),
+                            )
+                            print(
+                                f"🚨 MANUAL_TP_ALERT_SENT | {_sym} | تنبيه عاجل اتبعت للمستخدم",
+                                flush=True,
+                            )
+                        except Exception as _alert_exc:
+                            print(
+                                f"🚨 MANUAL_TP_ALERT_FAILED | {_sym} | {_alert_exc} | "
+                                "فشل إرسال تنبيه الـ TP اليدوي — راجع اللوج",
+                                flush=True,
+                            )
             text += "\n\n" + "\n".join(_build_managed_execution_lines(managed_order_result))
         elif simulation_mode_active and can_place_order:
             text += "\n\n" + "\n".join([
