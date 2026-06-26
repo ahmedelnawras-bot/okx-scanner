@@ -23,6 +23,22 @@ except Exception:
     TRAILING_ADAPTIVE_FLOOR_PCT = 2.0
     TRAILING_ADAPTIVE_CEILING_PCT = 4.5
     RUNNER_HARD_STOP_RAW_PCT = -8.0
+
+# ── SL move after TP1 (configurable) ───────────────────────────────────────────
+# بعد ضرب TP1 ننقل الـ SL لجزء من المسافة بين الـ SL الأصلي والدخول بدل ما
+# يفضل الـ 70% الباقية محمية بالـ SL الواسع. القيمة = كسر المسافة:
+#   0.0  → لا حركة (السلوك القديم)
+#   0.5  → نصف المسافة (المطلوب)
+#   1.0  → breakeven كامل عند الدخول
+# قابل للإطفاء فوراً بضبط الـ fraction = 0.0 لو المحاكاة طلعت أسوأ.
+try:
+    from config.risk_config import (
+        MOVE_SL_AFTER_TP1_ENABLED,
+        SL_AFTER_TP1_FRACTION,
+    )
+except Exception:
+    MOVE_SL_AFTER_TP1_ENABLED = True
+    SL_AFTER_TP1_FRACTION = 0.5
 from .models import TrackedTrade
 
 
@@ -227,6 +243,35 @@ def _apply_tp1_partial(trade: TrackedTrade, tp1_close_pct: float, source: str) -
     trade.closed_portion_pct = tp1_close_pct
     trade.realized_pnl_pct += _pnl_pct(trade.entry, trade.tp1) * (tp1_close_pct / 100.0)
     trade.status = "tp1_partial"
+
+    # ✅ بعد TP1: ننقل الـ SL لجزء من المسافة بين الـ SL الأصلي والدخول.
+    # ده بيحمي الـ 70% الباقية من الرجوع للـ SL الواسع الكامل، مع ترك
+    # مجال للـ runner يتنفّس ويكمّل لـ TP2 (مش breakeven كامل عشان مايتقفلش
+    # من أول ارتداد بسيط). fraction = 0.5 = نصف المسافة.
+    try:
+        if MOVE_SL_AFTER_TP1_ENABLED and float(SL_AFTER_TP1_FRACTION or 0.0) > 0.0:
+            entry = float(trade.entry or 0.0)
+            base_sl = float(trade.sl or 0.0)
+            if entry > 0 and base_sl > 0 and entry > base_sl:
+                frac = max(0.0, min(1.0, float(SL_AFTER_TP1_FRACTION)))
+                target_sl = base_sl + (entry - base_sl) * frac
+                _sl_before = float(trade.protected_sl or 0.0)
+                trade.protected_sl = max(_sl_before, target_sl)
+                if frac >= 1.0:
+                    trade.sl_moved_to_entry = True
+                    _stamp_once(trade, "sl_move_to_entry_at")
+                _safe_setattr(trade, "sl_moved_after_tp1", True)
+                _stamp_once(trade, "sl_move_after_tp1_at")
+                if float(trade.protected_sl or 0.0) > _sl_before:
+                    print(
+                        f"🔓 SL_AFTER_TP1 | {trade.symbol} | "
+                        f"SL: {_sl_before:.6f} → {float(trade.protected_sl):.6f} | "
+                        f"نقل {int(frac*100)}% من المسافة للدخول بعد TP1",
+                        flush=True,
+                    )
+    except Exception:
+        pass
+
     _safe_setattr(trade, "exchange_sync_state", "tp1_filled_exchange" if source == "exchange" else "tp1_touched")
     return trade
 
@@ -312,11 +357,17 @@ def update_trade_with_price(trade: TrackedTrade, current_price: float, protectio
     if not trade.tp1_hit and tp1_ready:
         trade = _apply_tp1_partial(trade, tp1_close_pct, tp1_source)
 
+    # ✅ نعيد حساب active_sl بعد TP1 لأن _apply_tp1_partial ممكن يكون رفع
+    # protected_sl لنص المسافة. من غير كده الـ SL الجديد مش هيتطبّق.
+    active_sl = max(trade.sl, trade.protected_sl or 0.0)
     post_tp1_sl = max(active_sl, trade.entry if trade.sl_moved_to_entry else active_sl)
     if trade.tp1_hit and not trade.tp2_hit and current_price <= post_tp1_sl:
         trade.closed_portion_pct = 100.0
         remaining_pct = max(0.0, 100.0 - tp1_close_pct)
-        trade.realized_pnl_pct += max(0.0, _pnl_pct(trade.entry, post_tp1_sl)) * (remaining_pct / 100.0)
+        # ✅ نسجّل الإغلاق الفعلي عند post_tp1_sl (مش max(0)) عشان المحاكاة
+        # تطابق الـ live. لو SL عند نص المسافة (تحت الدخول) = خسارة صغيرة
+        # حقيقية على الباقي، مش breakeven وهمي. صدق المحاسبة (Level 1).
+        trade.realized_pnl_pct += _pnl_pct(trade.entry, post_tp1_sl) * (remaining_pct / 100.0)
         trade.runner_pnl_pct = 0.0
         _safe_setattr(trade, "exchange_sync_state", "post_tp1_breakeven")
         return _mark_closed(trade, "breakeven_after_tp1")
