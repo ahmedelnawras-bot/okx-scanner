@@ -208,6 +208,17 @@ def evaluate_execution_risk(
         allowed_slots = max(1, allowed_slots - slot_cut)
     effective_min_score += score_bump
 
+    # توضيح: لما الخسارة اليومية تتعدى عتبة التحذير، البوت بيشدّد تلقائياً —
+    # بيقلّل عدد الصفقات المسموحة ويرفع الحد الأدنى للسكور المطلوب للدخول.
+    if slot_cut or score_bump:
+        print(
+            f"⚠️ DD_TIGHTEN | drawdown={drawdown_pct:.1f}% L{drawdown_level} | "
+            f"slots −{slot_cut} (={allowed_slots}) | "
+            f"min_score +{score_bump:.2f} (={effective_min_score:.2f}) | "
+            f"تشديد بسبب الخسارة اليومية",
+            flush=True,
+        )
+
     counted_slots = max(0, int(current_open_positions or 0))
     remaining = max(0, allowed_slots - counted_slots)
 
@@ -230,6 +241,13 @@ def evaluate_execution_risk(
     }
 
     if drawdown_status is not None and not drawdown_status.allowed:
+        # توضيح: الخسارة اليومية وصلت الحد الأقصى (Hard Stop) — التنفيذ متوقف
+        # بالكامل لباقي اليوم حماية لرأس المال من مزيد من الخسائر.
+        print(
+            f"🔴 HARD_STOP | drawdown={drawdown_pct:.1f}% | "
+            f"التنفيذ متوقف بالكامل — حماية رأس المال",
+            flush=True,
+        )
         return {
             **base,
             "allowed": False,
