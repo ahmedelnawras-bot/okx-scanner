@@ -32,6 +32,7 @@ from analysis.market_modes import (
     block_protection_status,
     recovery_slots_remaining,
     register_recovery_trade,
+    current_block_type,
 )
 from analysis.pair_selection import select_ranked_pairs
 from analysis.market_guard import build_market_guard_snapshot, fetch_okx_candles
@@ -7122,6 +7123,7 @@ def run_once(
             max_recovery_positions=effective_max_recovery_positions,
             drawdown_status=drawdown_status,
             risk_mode=state.mode,
+            block_type=current_block_type(state),
         )
         pre_protection_exec_result["decision_engine"] = "process_trade_candidate"
         pre_protection_exec_result["runtime_mode"] = "simulation" if simulation_mode_active else _get_signal_delivery_mode(settings)
