@@ -28,6 +28,14 @@ except Exception:
     }
 
 NORMAL_STRICT_SCORE = _ST["normal"]["strict"]
+
+# ── Over-extension guard لمسار STRONG ──────────────────────────────────────────
+# عتبة dist_ma اللي فوقها العملة تُعتبر متمددة (دخول متأخر). الـ normal بيستخدم
+# 3.8؛ نخلي strong أصرم (3.2) لأنه الأعلى خسارة. للإطفاء: ارفعها لرقم كبير (99).
+try:
+    from config.risk_config import STRONG_OVEREXTENSION_DIST_MA
+except Exception:
+    STRONG_OVEREXTENSION_DIST_MA = 3.2
 NORMAL_ELITE_SCORE = _ST["normal"]["elite"]
 NORMAL_EXTRA_SCORE = _ST["normal"]["extra"]
 NORMAL_RECOVERY_QUALITY_SCORE = _ST["normal"]["recovery_quality"]
@@ -356,6 +364,10 @@ def nour_execution_filter_strong_v1(
             meta.get("breakout_quality") or ""
         ).lower()
 
+        dist_ma = float(
+            meta.get("dist_ma") or 0.0
+        )
+
         if score < 7.85:
             return {
                 "passed": False,
@@ -374,6 +386,17 @@ def nour_execution_filter_strong_v1(
                 "reason": (
                     "nour_strong_no_mtf_confirmation"
                 ),
+            }
+
+        # ── Over-extension guard لمسار STRONG (مشكلة الدخول المتأخر) ──
+        # كان موجود للـ normal فقط (dist_ma > 3.8) ومفقود تماماً من strong،
+        # فالعملات المتمددة (مثل AGLD +60%) كانت تدخل سوقياً عند القمة وتنعكس.
+        # نخليه أصرم من normal لأن مسار strong هو الأعلى خسارة.
+        # قابل للضبط/الإطفاء عبر STRONG_OVEREXTENSION_DIST_MA.
+        if dist_ma > STRONG_OVEREXTENSION_DIST_MA:
+            return {
+                "passed": False,
+                "reason": "nour_strong_overextended",
             }
 
         if breakout_quality not in {
