@@ -93,6 +93,15 @@ SMART_TP2_MAX_RR = 3.20
 EFFECTIVE_TP1_MIN_RR = 0.90
 EFFECTIVE_TP2_MIN_RR = 1.50
 
+# ── Structure-based SL/TP (مبني على البنية الفعلية 15م) ────────────────────────
+# بدل نسب رياضية ثابتة، نضع SL تحت أقرب swing low و TP1 عند أقرب مقاومة 15م.
+# يفسّر مشكلة TP1 البعيد (3.71% مقابل MFE 0.97%): التارجت الرياضي مش عند مقاومة
+# حقيقية قريبة. قابل للإطفاء فوراً بـ STRUCTURE_LEVELS_ENABLED = False.
+STRUCTURE_LEVELS_ENABLED = True
+STRUCTURE_SL_BUFFER_PCT = 0.15   # هامش تحت swing low (عشان مايتضربش بالظل)
+STRUCTURE_TP1_BUFFER_PCT = 0.10  # هامش تحت المقاومة (نأمّن قبلها)
+STRUCTURE_LOOKBACK = 8           # عدد شموع 15م للبحث عن البنية
+
 
 def _safe_float(
     value: object,
@@ -943,6 +952,33 @@ def _calculate_execution_stability(
 # FIXED:
 # more realistic TP2
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def _structure_levels_15m(pair, entry: float, lookback: int = 8) -> dict:
+    """يستخرج أقرب swing low (دعم) و swing high (مقاومة) من شموع 15م.
+
+    يُستخدم لجعل SL/TP مبنيين على البنية الفعلية بدل نسب رياضية ثابتة.
+    يرجّع None للقيم لو مفيش بيانات كافية (fallback للمنطق الرياضي).
+    """
+    out = {"swing_low": None, "swing_high": None}
+    try:
+        candles = list(getattr(pair, "recent_candles", []) or [])
+        if len(candles) < 3:
+            return out
+        window = candles[-lookback:]
+        lows = [float(c.get("low", 0) or 0) for c in window if float(c.get("low", 0) or 0) > 0]
+        highs = [float(c.get("high", 0) or 0) for c in window if float(c.get("high", 0) or 0) > 0]
+        if not lows or not highs:
+            return out
+        lows_below = [l for l in lows if l < entry]
+        if lows_below:
+            out["swing_low"] = max(lows_below)   # أقرب دعم (الأعلى تحت الدخول)
+        highs_above = [h for h in highs if h > entry]
+        if highs_above:
+            out["swing_high"] = min(highs_above)  # أقرب مقاومة (الأدنى فوق الدخول)
+    except Exception:
+        pass
+    return out
+
+
 def _calculate_adaptive_targets(
     pair: PairCandidate,
     setup_type: str,
@@ -1618,6 +1654,27 @@ def build_signal_candidate(
         1.0 - risk_pct / 100.0
     )
 
+    # ── Structure-based SL: تحت أقرب swing low فعلي (15م) ──
+    # نأخذ الأبعد (الأكثر أماناً) بين SL الرياضي و SL البنيوي, ثم نقصّه
+    # ضمن floor/ceiling عشان مايبقاش ضيّق أو واسع بشكل خطير.
+    structure_meta = {"sl_source": "math", "tp1_source": "math"}
+    _struct_lvls = (
+        _structure_levels_15m(pair, entry, STRUCTURE_LOOKBACK)
+        if STRUCTURE_LEVELS_ENABLED
+        else {"swing_low": None, "swing_high": None}
+    )
+    if STRUCTURE_LEVELS_ENABLED:
+        _swing_low = _struct_lvls.get("swing_low")
+        if _swing_low and _swing_low < entry:
+            _struct_sl = _swing_low * (1.0 - STRUCTURE_SL_BUFFER_PCT / 100.0)
+            _struct_risk_pct = (entry - _struct_sl) / entry * 100.0
+            if _struct_risk_pct < SMART_SL_MIN_PCT:
+                _struct_sl = entry * (1.0 - SMART_SL_MIN_PCT / 100.0)
+            elif _struct_risk_pct > SMART_SL_MAX_PCT:
+                _struct_sl = entry * (1.0 - SMART_SL_MAX_PCT / 100.0)
+            sl = _struct_sl
+            structure_meta["sl_source"] = "structure"
+
     risk_amount = entry - sl
 
     tp1 = entry + (
@@ -1627,6 +1684,18 @@ def build_signal_candidate(
     tp2 = entry + (
         risk_amount * rr2
     )
+
+    # ── Structure-based TP1: عند أقرب مقاومة/swing high فعلي (15م) ──
+    # لو فيه مقاومة قريبة فوق الدخول، نضع TP1 تحتها مباشرة (واقعي وقابل للتحقق)
+    # بدل المضاعف الرياضي البعيد. نقرّب TP1 فقط (مانبعّدوش) ونحترم أدنى RR.
+    if STRUCTURE_LEVELS_ENABLED and risk_amount > 0:
+        _swing_high = _struct_lvls.get("swing_high")
+        if _swing_high and _swing_high > entry:
+            _struct_tp1 = _swing_high * (1.0 - STRUCTURE_TP1_BUFFER_PCT / 100.0)
+            _struct_rr = (_struct_tp1 - entry) / risk_amount
+            if _struct_tp1 > entry and _struct_rr >= SMART_TP1_MIN_RR and _struct_tp1 < tp1:
+                tp1 = _struct_tp1
+                structure_meta["tp1_source"] = "structure"
 
     original_tp1 = tp1
     original_tp2 = tp2
