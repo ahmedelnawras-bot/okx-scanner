@@ -55,14 +55,14 @@ def _mode_color_identity(mode: str) -> str:
 def _mix_action(mode: str, context: dict) -> str:
     mix_label = str(context.get("mix_label", "") or context.get("market_mix", "")).upper()
     if mode == MODE_BLOCK_LONGS:
-        return "🚫 الضعيف ممنوع — استثناءات قوية فقط"
+        return "🚫 الضعيف ممنوع — الاستثناءات القوية فقط"
     if mode == MODE_RECOVERY_LONG:
-        return "🔄 ارتداد سريع — Recovery path فقط"
+        return "🔄 ارتداد سريع — مسار الاستعادة فقط"
     if mode == MODE_STRONG_LONG_ONLY:
-        return "⚠️ قبول أقوى فقط — لا يعتبر Block"
+        return "⚠️ قبول الأقوى فقط — السوق غير محظور"
     if "CHOPPY" in mix_label or "MIXED" in mix_label:
         return "⚠️ جودة أعلى قبل التنفيذ"
-    return "✅ القواعد العادية فعالة"
+    return "✅ القواعد العادية فعّالة"
 
 
 def _signal_rules(mode: str, context: dict) -> list[str]:
@@ -126,34 +126,27 @@ def _btc_ma5_guard_line(context: dict) -> str:
 
 
 def _btc_trend_line(context: dict) -> str:
-    """سطر صريح لحالة اتجاه BTC — مربوط بفلتر الاتجاه (TREND_BLOCK).
-
-    يقرأ نفس البيانات اللي بيستخدمها الفلتر: gap عن MA5 الساعة + الضغط.
-    عتبة الترند الهابط -0.40% (نفس TREND_BLOCK_GAP_PCT).
-    """
+    """سطر اتجاه BTC — إنجليزي صافي لمنع كسر RTL، ومتسق مع باقي السطور."""
     gap = context.get("btc_1h_ma5_gap_pct")
     try:
         gap_f = float(gap)
     except Exception:
-        return "• 📊 BTC Trend: ⚪ N/A"
+        return "• 📊 BTC Trend     ·  N/A"
 
     if gap is None:
-        return "• 📊 BTC Trend: ⚪ N/A"
+        return "• 📊 BTC Trend     ·  N/A"
 
     pressure = bool(context.get("hourly_ma5_pressure"))
     block_type = str(context.get("block_type", "") or "").upper()
+    gap_txt = f"{gap_f:+.2f}%"
 
-    # ترند هابط مؤكد (نفس منطق TREND_BLOCK)
     if block_type == "TREND" or (pressure and gap_f <= -0.40):
-        return f"• 📉 BTC Trend: هابط — تحت MA5 الساعة (Gap {gap_f:+.2f}%) | فلتر الاتجاه نشط 🚫"
-    # ضغط هابط بسيط (تحت MA5 بس مش لدرجة البلوك)
+        return f"• 📉 BTC Trend     ·  DOWN · {gap_txt} · 🚫 blocked"
     if gap_f <= -0.15:
-        return f"• 📉 BTC Trend: ضعيف — تحت MA5 (Gap {gap_f:+.2f}%)"
-    # صاعد واضح
+        return f"• 📉 BTC Trend     ·  weak · {gap_txt}"
     if gap_f >= 0.15:
-        return f"• 📈 BTC Trend: صاعد — فوق MA5 الساعة (Gap {gap_f:+.2f}%)"
-    # محايد
-    return f"• ➖ BTC Trend: محايد (Gap {gap_f:+.2f}%)"
+        return f"• 📈 BTC Trend     ·  UP · {gap_txt}"
+    return f"• ➖ BTC Trend     ·  flat · {gap_txt}"
 
 
 def _btc_dominance_line(context: dict) -> str:
@@ -175,17 +168,14 @@ def _btc_dominance_line(context: dict) -> str:
         unknown_flag = True
 
     if raw is None or unknown_flag:
-        return "• 🧭 BTC.D الاستحواذ: ⚪ N/A"
+        return "• 🧭 BTC.D Dom    ·  N/A"
 
-    # توضيح أثر الاستحواذ على الـ alts صراحةً.
+    dom_txt = f"{dom:+.2f}%"
     if dom >= 0.25:
-        status = f"🔴 ارتفع {dom:+.2f}% — ضغط على الـ alts"
+        return f"• 🧭 BTC.D Dom    ·  🔴 up {dom_txt} · alts pressured"
     elif dom <= -0.25:
-        status = f"🟢 نزل {dom:+.2f}% — سيولة تجاه الـ alts"
-    else:
-        status = f"➖ ثابت ({dom:+.2f}%)"
-
-    return f"• 🧭 BTC.D الاستحواذ: {status}"
+        return f"• 🧭 BTC.D Dom    ·  🟢 down {dom_txt} · alts favored"
+    return f"• 🧭 BTC.D Dom    ·  ➖ flat {dom_txt}"
 
 
 def _market_mix_lines(context: dict) -> list[str]:
@@ -197,7 +187,7 @@ def _market_mix_lines(context: dict) -> list[str]:
             _btc_ma5_guard_line(context),
             _btc_trend_line(context),
             _btc_dominance_line(context),
-            f"• Action: {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• Action: {context.get('action', '') or _mix_action('', context)}",
+            f"• الإجراء — {_mix_action(str(context.get('mode', '')), context)}" if context.get("mode") else f"• الإجراء — {context.get('action', '') or _mix_action('', context)}",
         ]
     return [
         f"Status: {context.get('market_mix', 'N/A')}",
