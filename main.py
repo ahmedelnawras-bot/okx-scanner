@@ -3351,6 +3351,7 @@ def _build_mode_context(state: MarketModeState, snapshot: MarketSnapshot, protec
         "hourly_ma_guard": hourly_ma_guard,
         "btc_dominance_change_1h": dom_change,
         "btc_dominance_unknown": dom_unknown,
+        "block_type": current_block_type(state),
         "sample_size": int(getattr(snapshot, "market_guard_valid_count", 0) or getattr(snapshot, "market_guard_sample_size", 200) or 200),
         "market_mix": f"Strong Coins: {strong_coins} | Red Ratio: {red_ratio_pct:.0f}% | Avg 15m Move: {avg15m:.2f}%",
         "market_state": f"strong_coins={strong_coins} | avg15m={avg15m:.2f}% | red_ratio={red_ratio_pct:.0f}% | 1h_ma5={hourly_ma_guard}",
