@@ -13,6 +13,8 @@ from reporting.report_diagnostics import build_diagnostics_report
 from reporting.report_format import (
     SEP,
     LEVERAGE_NOTE_AR,
+    WIN_STATUSES,
+    LOSS_STATUSES,
     append_trade_cards,
     behavior_summary_lines,
     closed_trades,
@@ -78,9 +80,18 @@ def _execution_path_counts(execution_results: list[dict]) -> dict[str, int]:
 
 
 def _closed_wr_parts(trades: list) -> tuple[int, int, float]:
-    closed = closed_trades(trades)
-    wins = [t for t in closed if trade_effective_pnl(t) > 0]
-    losses = [t for t in closed if trade_effective_pnl(t) < 0]
+    # رابح = أمّن ربح عبر TP1/TP2/runner (WIN_STATUSES) أو ضرب TP1 (حتى لو
+    # الـ runner لسه مفتوح). خاسر = خسارة كاملة (LOSS_STATUSES). الباقي
+    # (تعادل مثل protected_entry_exit، أو مفتوح لم يضرب TP1) لا يُحتسب.
+    # كان الباگ: closed_trades بتستخدم CLOSED_STATUSES اللي مفيهاش الـ runners،
+    # فالرابحين اللي بقوا runners كانوا يُستبعدوا → WR يطلع 0%.
+    wins, losses = [], []
+    for t in trades:
+        st = str(getattr(t, "status", "") or "").strip().lower()
+        if st in WIN_STATUSES or bool(getattr(t, "tp1_hit", False)):
+            wins.append(t)
+        elif st in LOSS_STATUSES:
+            losses.append(t)
     denom = len(wins) + len(losses)
     return len(wins), len(losses), (len(wins) / denom * 100.0 if denom else 0.0)
 
@@ -367,9 +378,14 @@ def build_simulation_report(
     closed = closed_trades(trades)
 
     win_count, loss_count, wr = _closed_wr_parts(trades)
-    # الصفقات المغلقة اللي PnL بتاعها = 0 بالظبط (مثل protected_entry_exit)
-    # مش بتتحسب رابحة ولا خاسرة. نعرضها صراحةً عشان 90 المغلقة تتطابق مع 31+56.
-    breakeven_count = max(0, len(closed) - win_count - loss_count)
+    # التعادل = صفقات محسومة لكنها ليست رابحة (TP1) ولا خاسرة كاملة.
+    # مثل protected_entry_exit (خرجت عند الدخول قبل TP1). نحسبها من المقفولة.
+    breakeven_count = sum(
+        1 for t in closed
+        if str(getattr(t, "status", "") or "").strip().lower() not in WIN_STATUSES
+        and str(getattr(t, "status", "") or "").strip().lower() not in LOSS_STATUSES
+        and not bool(getattr(t, "tp1_hit", False))
+    )
     winners = sorted([t for t in opened if trade_effective_pnl(t) >= 0], key=trade_effective_pnl, reverse=True)
     losers = sorted([t for t in opened if trade_effective_pnl(t) < 0], key=trade_effective_pnl)
     closed_wins = sorted([t for t in closed if trade_effective_pnl(t) > 0], key=trade_effective_pnl, reverse=True)
