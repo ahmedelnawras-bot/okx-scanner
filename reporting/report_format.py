@@ -779,7 +779,12 @@ def behavior_summary_lines(
     def _pct(n: int) -> float:
         return n / total_closed * 100.0
 
-    floating = sum(trade_current_exposure_pnl(t) for t in opened)
+    # النسبة الموزونة بحجم المركز: إجمالي الـ floating بالدولار ÷ إجمالي الهامش.
+    # القديم: sum(trade_current_exposure_pnl) = جمع نسب مرفوعة من كل صفقة
+    # → يطلّع +1541% بلا معنى. الصح = دولار موزون بالهامش.
+    _open_margin = sum(trade_margin_usdt(t) for t in opened) or 1.0
+    _floating_usd = sum(trade_floating_money_pnl(t) for t in opened)
+    floating = (_floating_usd / _open_margin) * 100.0
 
     quality = (
         "إيجابي ✔️"
@@ -798,7 +803,7 @@ def behavior_summary_lines(
         f"   🛑 Direct SL: {_pct(direct_sl):.1f}% | 🟠 SL after TP1: {_pct(sl_after_tp1):.1f}%",
         f"   🛡 Protected BE: {_pct(protected_be):.1f}% | 🔒 Breakeven: {_pct(breakeven):.1f}%",
         f"   🔄 Trailing: {_pct(trailing):.1f}% | ✅ TP Close: {_pct(tp_close):.1f}% | ⚪ Other: {_pct(other_exit):.1f}%",
-        f"⚡ Total Floating PnL: {floating:+.2f}% (مجموع نسب الرافعة للصفقات المفتوحة)",
+        f"⚡ Total Floating PnL: {_floating_usd:+.2f}$ | {floating:+.2f}% (موزونة بحجم المركز)",
         f"💡 Risk / Reward Quality: {quality}",
     ]
 
