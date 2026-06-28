@@ -30,6 +30,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+# قوائم الحالات الموحّدة — نفس المصدر اللي يستخدمه report_simulation عشان
+# يبقى عدّ الرابحين/الخاسرين متطابق 100% بين تقرير المحاكاة وملفات JSON.
+try:
+    from reporting.report_format import WIN_STATUSES as _WIN_STATUSES, LOSS_STATUSES as _LOSS_STATUSES
+except Exception:
+    _WIN_STATUSES = {"tp1_partial", "tp2_partial", "runner", "trailing_hit", "closed_win", "breakeven_after_tp1"}
+    _LOSS_STATUSES = {"closed_loss"}
+
 
 # =========================================================
 # Config
@@ -799,31 +807,28 @@ def _build_daily_snapshot(
 ) -> dict:
     """Build comprehensive daily snapshot for AI analysis."""
 
-    # ── تصنيف الصفقات للإحصائيات ──────────────────────────────────────────────
-    # مشكلة سابقة: الصفقات اللي ضربت TP1/TP2 وبقت runner (status=tp1_partial/
-    # tp2_partial) كانت تُعتبر "مفتوحة" فتُستبعد من عدّ الرابحين → WR يطلع 0%
-    # رغم وجود أرباح مؤمّنة. الإصلاح: أي صفقة ضربت TP1 = أمّنت ربح = "محسومة"
-    # وتُحتسب رابحة، حتى لو الـ runner (آخر 20%) لسه مفتوح.
-    _CLOSED_STATUSES = {"closed_win", "closed_loss", "breakeven_after_tp1", "trailing_hit", "expired"}
-    _LOCKED_PROFIT_STATUSES = {"tp1_partial", "tp2_partial", "runner", "protected_runner"}
+    # ── تصنيف الصفقات (موحّد مع report_simulation تماماً) ────────────────────────
+    # رابح = status في WIN_STATUSES أو ضرب TP1 (أمّن ربح، حتى لو runner مفتوح).
+    # خاسر = status في LOSS_STATUSES (خسارة كاملة) فقط.
+    # الباقي (تعادل مثل protected_entry_exit، أو مفتوح لم يضرب TP1) لا يُحتسب.
+    # نفس منطق _closed_wr_parts في report_simulation عشان التطابق 100%.
+    def _status_l(t) -> str:
+        return str(getattr(t, "status", "") or "").strip().lower()
 
-    def _has_locked_profit(t) -> bool:
-        # ضربت TP1 = أمّنت جزء من الربح (سواء لسه runner أو اتقفلت)
-        return _b(getattr(t, "tp1_hit", False)) or str(getattr(t, "status", "")) in _LOCKED_PROFIT_STATUSES
+    def _is_winner(t) -> bool:
+        return _status_l(t) in _WIN_STATUSES or _b(getattr(t, "tp1_hit", False))
+
+    def _is_loser(t) -> bool:
+        return (not _is_winner(t)) and _status_l(t) in _LOSS_STATUSES
 
     def _is_decided(t) -> bool:
-        # "محسومة" = اتقفلت بالكامل أو أمّنت ربح عبر TP1
-        return (
-            getattr(t, "is_closed", False)
-            or str(getattr(t, "status", "")) in _CLOSED_STATUSES
-            or _has_locked_profit(t)
-        )
+        # محسومة = رابحة (TP1) أو خاسرة كاملة. (التعادل والمفتوح مش محسومين)
+        return _is_winner(t) or _is_loser(t)
 
     open_trades = [t for t in trades if not _is_decided(t)]
     closed_trades = [t for t in trades if _is_decided(t)]
-    # رابح = أمّن ربح عبر TP1 (runner أو مقفول) أو realized موجب
-    winners = [t for t in closed_trades if _has_locked_profit(t) or _f(getattr(t, "realized_pnl_pct", 0.0)) > 0]
-    losers = [t for t in closed_trades if not (_has_locked_profit(t) or _f(getattr(t, "realized_pnl_pct", 0.0)) > 0)]
+    winners = [t for t in closed_trades if _is_winner(t)]
+    losers = [t for t in closed_trades if _is_loser(t)]
 
     # Execution statistics
     accepted = [r for r in execution_results if r.get("status") in {"accepted_preview", "pending_pullback_preview"}]
