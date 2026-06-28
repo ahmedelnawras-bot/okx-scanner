@@ -15,6 +15,7 @@ from reporting.report_format import (
     LEVERAGE_NOTE_AR,
     WIN_STATUSES,
     LOSS_STATUSES,
+    CLOSED_STATUSES,
     append_trade_cards,
     behavior_summary_lines,
     closed_trades,
@@ -23,7 +24,9 @@ from reporting.report_format import (
     open_trades,
     period_label,
     trade_effective_pnl,
+    trade_raw_effective_pnl,
     trade_money_pnl,
+    trade_margin_usdt,
 )
 
 
@@ -288,15 +291,54 @@ def _simulation_behavior_trades(trades: list) -> list:
             merged.append(t)
     return merged
 
+def _trade_realized_money(t) -> float:
+    """الجزء المحقق (المقفول) من الصفقة بالدولار.
+
+    - صفقة مقفولة 100%: كل الـ PnL محقق.
+    - runner/partial (ضرب TP1/TP2): الجزء المقفول (80% مثلاً) محقق،
+      والباقي (runner المفتوح) عائم. نفصلهم بنسبة المحقق من الإجمالي الخام.
+    - صفقة مفتوحة لم تضرب TP1: المحقق = 0 (كلها عائمة).
+    """
+    total_money = trade_money_pnl(t)
+    st = str(getattr(t, "status", "") or "").strip().lower()
+    if bool(getattr(t, "is_closed", False)) or st in CLOSED_STATUSES:
+        return total_money
+    total_raw = trade_raw_effective_pnl(t)
+    try:
+        realized_raw = float(getattr(t, "realized_pnl_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        realized_raw = 0.0
+    if abs(total_raw) < 1e-9:
+        return 0.0
+    # النسبة خطية (الرافعة والهامش يتقاسمان بالتساوي) فنقسم بنسبة الخام.
+    return total_money * (realized_raw / total_raw)
+
+
+def _trade_floating_money(t) -> float:
+    """الجزء العائم (المفتوح) من الصفقة بالدولار = الإجمالي − المحقق."""
+    return trade_money_pnl(t) - _trade_realized_money(t)
+
+
+def _simulation_settled_union(trades: list) -> list:
+    """كل صفقات المحاكاة (مقفولة + مفتوحة) بدون تكرار — أساس حساب المحفظة."""
+    merged = []
+    seen: set[int] = set()
+    for t in [*closed_trades(trades), *_simulation_floating_trades(trades)]:
+        if id(t) not in seen:
+            seen.add(id(t))
+            merged.append(t)
+    return merged
+
+
 def _simulation_wallet_impact_lines(trades: list, *, account_summary: str | None = None, starting_balance: float = 1000.0) -> list[str]:
-    active_opened = _simulation_active_open_trades(trades)
-    runners = _simulation_runner_trades(trades)
-    opened = _simulation_floating_trades(trades)
-    closed = closed_trades(trades)
-    closed_profit_usd = sum(max(0.0, trade_money_pnl(t)) for t in closed)
-    closed_loss_usd = sum(min(0.0, trade_money_pnl(t)) for t in closed)
-    floating_profit_usd = sum(max(0.0, trade_money_pnl(t)) for t in opened)
-    floating_loss_usd = sum(min(0.0, trade_money_pnl(t)) for t in opened)
+    # كل صفقات المحاكاة (مقفولة + runners + مفتوحة) — نفصل المحقق عن العائم.
+    # المغلقة (Realized) = الجزء المقفول من كل صفقة (يشمل 80% المحقق من الـ runners).
+    # المفتوحة (Floating) = الجزء المفتوح فقط (runner المتبقي + الصفقات المفتوحة).
+    all_sim = _simulation_settled_union(trades)
+    closed_profit_usd = sum(max(0.0, _trade_realized_money(t)) for t in all_sim)
+    closed_loss_usd = sum(min(0.0, _trade_realized_money(t)) for t in all_sim)
+    floating_profit_usd = sum(max(0.0, _trade_floating_money(t)) for t in all_sim)
+    floating_loss_usd = sum(min(0.0, _trade_floating_money(t)) for t in all_sim)
     closed_net_usd = closed_profit_usd + closed_loss_usd
     floating_net_usd = floating_profit_usd + floating_loss_usd
     total_usd = closed_net_usd + floating_net_usd
@@ -413,7 +455,13 @@ def build_simulation_report(
     lines.extend([SEP, "📂 <b>Open Trades</b>"])
     lines.append(f"🟢 Open Winners: {len(winners)} | 🔴 Open Losers: {len(losers)}")
     if opened:
-        lines.append(f"⚡ Total Floating PnL: {sum(trade_effective_pnl(t) for t in opened):+.2f}% (مجموع نسب الرافعة للمفتوحة)")
+        # النسبة الموزونة بحجم المركز: إجمالي الـ PnL بالدولار ÷ إجمالي الهامش.
+        # القديم كان يجمع نسب الرافعة من كل صفقة (مثلاً +143% + +124% + ...)
+        # فيطلّع رقم بلا معنى (+1541%) لأنه مش موزون. الصح = الدولار/الهامش.
+        _open_money = sum(trade_money_pnl(t) for t in opened)
+        _open_margin = sum(trade_margin_usdt(t) for t in opened) or 1.0
+        _open_pct = (_open_money / _open_margin) * 100.0
+        lines.append(f"⚡ Total Floating PnL: {_open_money:+.2f}$ | {_open_pct:+.2f}% (موزونة بحجم المركز)")
     append_trade_cards(lines, "🟢 <b>Top 3 Open Winners</b>", winners[:3], limit=3)
     append_trade_cards(lines, "🔴 <b>Top 3 Open Losers</b>", losers[:3], limit=3)
     append_trade_cards(lines, "🏆 <b>Top 3 Closed Winners</b>", closed_wins[:3], limit=3)
