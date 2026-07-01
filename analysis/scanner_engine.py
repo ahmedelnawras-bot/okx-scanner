@@ -71,7 +71,15 @@ class ScannerEngine:
             if response.status_code == 200:
                 data = response.json()
                 if data.get("code") == "0" and data.get("data"):
-                    return [list(map(float, c[:5])) + [float(c[7])] for c in data["data"]]
+                    # OKX يرجّع [ts, o, h, l, c, vol, volCcy, ...] لكل شمعة.
+                    # نستخدم index 5 (vol) بدل 7 (volCcyQuote) — دايماً موجود، وأأمن.
+                    candles = [list(map(float, c[:5])) + [float(c[5])] for c in data["data"]]
+                    # ⚠️ مهم جداً: OKX يرجّع الشموع بترتيب الأحدث أولاً (newest-first).
+                    # كل الكود هنا بيفترض ترتيب زمني تصاعدي (الأقدم أولاً، الأحدث آخراً)
+                    # عشان index [-1] يمثّل فعلاً "الشمعة/السعر الحالي". لو مانعكسناش
+                    # الترتيب هنا، الماسح بيحلل بيانات قديمة على إنها حالية = نتائج خاطئة بالكامل.
+                    candles.reverse()
+                    return candles
         except Exception as e:
             print(f"❌ خطأ جلب BTC 4h: {e}")
         
@@ -91,7 +99,10 @@ class ScannerEngine:
             if response.status_code == 200:
                 data = response.json()
                 if data.get("code") == "0" and data.get("data"):
-                    return [list(map(float, c[:5])) + [float(c[7])] for c in data["data"]]
+                    candles = [list(map(float, c[:5])) + [float(c[5])] for c in data["data"]]
+                    # ⚠️ نفس ملاحظة BTC — لازم نعكس الترتيب عشان [-1] = الأحدث فعلاً.
+                    candles.reverse()
+                    return candles
         except Exception as e:
             print(f"❌ خطأ جلب {symbol}: {e}")
         
