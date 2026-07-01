@@ -23,6 +23,13 @@ class ScannerHandler:
         self.telegram_sender = telegram_sender
         self.redis_client = redis_client
         self.settings = settings
+
+        # ✅ استخدام نفس base_url اللي البوت الأساسي بيستخدمه (settings.okx_base_url)
+        # بدل "https://www.okx.com" الثابت — لأن السيرفر ممكن يحتاج مصدر مختلف
+        # (proxy/مسار بديل) عشان يتجاوز حظر جغرافي أو rate-limit.
+        self.base_url = (
+            getattr(settings, "okx_base_url", None) or "https://www.okx.com"
+        )
         
         # المسار للحفظ (على السيرفر، فولدر مؤقت بجانب البوت)
         self.data_dir = Path("data/scanner_reports")
@@ -36,33 +43,43 @@ class ScannerHandler:
         self.last_diagnostics: dict = {}
         
     async def get_all_tradeable_symbols(self) -> list[str]:
-        """جلب قائمة بكل العملات القابلة للتداول من OKX"""
+        """جلب قائمة بكل العملات القابلة للتداول من OKX (نفس base_url الخاص بالبوت)"""
         try:
-            import requests
-            
-            url = "https://www.okx.com/api/v5/market/tickers"
-            params = {"instType": "SWAP"}
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("code") == "0":
-                    symbols = []
-                    for ticker in data.get("data", []):
-                        inst_id = ticker.get("instId", "")
-                        # فلتر: BTC-USDT-SWAP فقط، لا stablecoins
-                        if inst_id.endswith("-USDT-SWAP") and not any(
-                            x in inst_id.upper() for x in ["USDC", "USDE", "FDUSD", "TUSD", "BUSD", "DAI"]
-                        ):
-                            symbol = inst_id.split("-")[0]
-                            if symbol != "BTC":  # لا نفحص BTC نفسه
-                                symbols.append(symbol)
-                    
-                    return list(set(symbols))[:300]  # أفضل 300 عملة
+            return await asyncio.to_thread(self._fetch_symbols_sync)
         except Exception as e:
-            print(f"❌ خطأ جلب قائمة العملات: {e}")
+            print(f"❌ خطأ جلب قائمة العملات: {e}", flush=True)
         
         return []
+
+    def _fetch_symbols_sync(self) -> list[str]:
+        """استدعاء متزامن (في thread) لجلب قائمة العملات — يتجنب تجميد event loop"""
+        import requests
+        
+        url = f"{self.base_url}/api/v5/market/tickers"
+        params = {"instType": "SWAP"}
+        
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            print(f"⚠️ OKX tickers HTTP {response.status_code}", flush=True)
+            return []
+        
+        data = response.json()
+        if data.get("code") != "0":
+            print(f"⚠️ OKX tickers API error | code={data.get('code')} msg={data.get('msg')}", flush=True)
+            return []
+        
+        symbols = []
+        for ticker in data.get("data", []):
+            inst_id = ticker.get("instId", "")
+            # فلتر: BTC-USDT-SWAP فقط، لا stablecoins
+            if inst_id.endswith("-USDT-SWAP") and not any(
+                x in inst_id.upper() for x in ["USDC", "USDE", "FDUSD", "TUSD", "BUSD", "DAI"]
+            ):
+                symbol = inst_id.split("-")[0]
+                if symbol != "BTC":  # لا نفحص BTC نفسه
+                    symbols.append(symbol)
+        
+        return list(set(symbols))[:300]  # أفضل 300 عملة
     
     async def run_scan(self, btc_dominance_change: float = 0.0) -> list[ConsolidationSignal]:
         """تشغيل فحص واحد
@@ -72,7 +89,7 @@ class ScannerHandler:
         """
         
         # جلب BTC 4h
-        btc_candles = await self.engine.fetch_btc_4h_candles()
+        btc_candles = await self.engine.fetch_btc_4h_candles(base_url=self.base_url)
         if not btc_candles:
             print("❌ RUN_SCAN_FAILED | فشل جلب شموع BTC من OKX", flush=True)
             self.last_diagnostics = {"btc_fetch_failed": True, "total": 0}
@@ -92,7 +109,7 @@ class ScannerHandler:
         print(f"📡 RUN_SCAN | فحص {len(symbols)} عملة...", flush=True)
         
         # فحص الكل
-        scan_result = await self.engine.scan_all(symbols, btc_candles, btc_dominance_change)
+        scan_result = await self.engine.scan_all(symbols, btc_candles, btc_dominance_change, base_url=self.base_url)
         signals = scan_result["signals"]
         self.last_diagnostics = scan_result["diagnostics"]
         
