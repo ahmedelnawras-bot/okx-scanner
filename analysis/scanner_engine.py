@@ -89,11 +89,11 @@ class ScannerEngine:
         candles.reverse()
         return candles
     
-    async def fetch_alt_candles(self, symbol: str, timeframe: str = "4h", limit: int = 20) -> list[list]:
+    async def fetch_alt_candles(self, symbol: str, timeframe: str = "4h", limit: int = 20, base_url: str = "https://www.okx.com") -> list[list]:
         """جلب شموع عملة (4h أو 15m) — في thread منفصل لتوازي حقيقي"""
         try:
             return await asyncio.to_thread(
-                self._fetch_candles_sync, "https://www.okx.com", f"{symbol}-USDT", timeframe, limit
+                self._fetch_candles_sync, base_url, f"{symbol}-USDT", timeframe, limit
             )
         except Exception as e:
             print(f"❌ خطأ جلب {symbol}: {e}", flush=True)
@@ -201,7 +201,7 @@ class ScannerEngine:
         return min(max(score, 0), 100)
     
     async def scan_symbol(self, symbol: str, btc_support: float, btc_resistance: float, 
-                         btc_dominance_change: float) -> tuple[Optional[ConsolidationSignal], str]:
+                         btc_dominance_change: float, base_url: str = "https://www.okx.com") -> tuple[Optional[ConsolidationSignal], str]:
         """فحص عملة واحدة للفرص
         
         Return: (الإشارة أو None, سبب الرفض للتشخيص)
@@ -209,7 +209,7 @@ class ScannerEngine:
         
         try:
             # جلب الشموع 4h
-            candles_4h = await self.fetch_alt_candles(symbol, timeframe="4h", limit=20)
+            candles_4h = await self.fetch_alt_candles(symbol, timeframe="4h", limit=20, base_url=base_url)
             if not candles_4h or len(candles_4h) < 10:
                 return None, "no_data"
             
@@ -253,7 +253,8 @@ class ScannerEngine:
             return None, "exception"
     
     async def scan_all(self, symbols: list[str], btc_candles: list[list], 
-                      btc_dominance_change: float = 0.0, max_workers: int = 10) -> dict:
+                      btc_dominance_change: float = 0.0, max_workers: int = 10,
+                      base_url: str = "https://www.okx.com") -> dict:
         """فحص كل العملات (بالتوازي الحقيقي عبر threads)
         
         Return: {
@@ -273,7 +274,7 @@ class ScannerEngine:
         
         # فحص بالتوازي (asyncio.to_thread داخل scan_symbol → توازي فعلي)
         tasks = [
-            self.scan_symbol(symbol, btc_support, btc_resistance, btc_dominance_change)
+            self.scan_symbol(symbol, btc_support, btc_resistance, btc_dominance_change, base_url=base_url)
             for symbol in symbols
         ]
         
