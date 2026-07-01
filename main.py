@@ -11035,6 +11035,27 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
         runtime_settings = settings or get_settings()
+
+        # ✅ Scanner commands — كاشف الفرص، بدون تداول (نفس معالج الأزرار)
+        if command in ("/scan_now", "/scan_1h", "/scan_24h", "/scan_week"):
+            _period_labels = {
+                "/scan_now": "🔍 فحص فوري",
+                "/scan_1h": "📊 آخر ساعة",
+                "/scan_24h": "📊 آخر 24 ساعة",
+                "/scan_week": "📊 آخر أسبوع",
+            }
+            if _SCANNER_INSTANCE is None:
+                _send_text(sender, "⚠️ الماسح غير متاح حالياً (فشلت التهيئة).")
+                return
+            try:
+                import asyncio as _scan_asyncio
+                _signals = _scan_asyncio.run(_SCANNER_INSTANCE.run_scan())
+                _report = _SCANNER_INSTANCE.engine.format_report_ar(_signals, _period_labels.get(command, "🔍 الماسح"), diagnostics=_SCANNER_INSTANCE.last_diagnostics)
+            except Exception as _scan_cmd_exc:
+                _report = f"❌ خطأ في الفحص: {_scan_cmd_exc}"
+            _send_text(sender, _report, reply_markup=build_scanner_submenu())
+            return
+
         admin_reply = _handle_admin_clean_command(
             command,
             trade_store,
@@ -11272,7 +11293,7 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
                 try:
                     import asyncio as _scan_asyncio
                     _signals = _scan_asyncio.run(_SCANNER_INSTANCE.run_scan())
-                    _report = _SCANNER_INSTANCE.engine.format_report_ar(_signals, _period_labels.get(command, "🔍 الماسح"))
+                    _report = _SCANNER_INSTANCE.engine.format_report_ar(_signals, _period_labels.get(command, "🔍 الماسح"), diagnostics=_SCANNER_INSTANCE.last_diagnostics)
                 except Exception as _scan_cmd_exc:
                     _report = f"❌ خطأ في الفحص: {_scan_cmd_exc}"
                 _send_text(sender, _report)
