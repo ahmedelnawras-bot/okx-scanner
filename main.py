@@ -110,6 +110,9 @@ from reporting.help_menus import (
     build_admin_help,
     build_diagnostics_help,
     build_diagnostics_commands_help,
+    build_scanner_submenu,       # ✅ Scanner
+    scanner_help_text,           # ✅ Scanner
+    scanner_status_block,        # ✅ Scanner
 )
 try:
     from ui.telegram_signals import (
@@ -256,6 +259,11 @@ except ImportError:
         return {"ok": False, "error": "ai_exporter not found"}
 
 from services.telegram_sender import TelegramSender
+from services.scanner_handler import ScannerHandler  # ✅ Scanner: كاشف الفرص (consolidation)
+
+# ✅ Scanner global instance — يُهيّأ مرة واحدة في live_worker، ويُستخدم من أي مكان
+# (بدون تعديل توقيعات الدوال الموجودة مثل _handle_callback_query)
+_SCANNER_INSTANCE: "ScannerHandler | None" = None
 from analytics.gate_simulation import build_gate_sim_all_artifact, build_gate_sim_all_report, build_gate_sim_artifact, build_gate_sim_report, build_mode_coverage_report, build_score_calibration_report
 from analytics.technical_dataset import (
     append_many_signal_snapshots,
@@ -9974,7 +9982,7 @@ def _build_main_inline_keyboard_with_bot_modes(settings: Settings | None = None)
         "inline_keyboard": [
             [
                 {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
-                {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
+                {"text": active("scan", "🔍 الماسح"), "callback_data": "menu:scanner"},
                 {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
             ],
             [
@@ -10983,8 +10991,12 @@ def _handle_callback_query(sender: TelegramSender, result: dict, callback_query:
         key = data.split(":", 1)[1]
         if key == "execution":
             _send_text(sender, result.get("help_execution", ""))
-        elif key == "normal":
-            _send_text(sender, result.get("help_normal", ""))
+        elif key == "scanner":
+            # ✅ الماسح — كاشف الفرص، بدون تداول
+            if _SCANNER_INSTANCE is not None:
+                _send_text(sender, scanner_help_text(), reply_markup=build_scanner_submenu())
+            else:
+                _send_text(sender, "⚠️ الماسح غير متاح حالياً (فشلت التهيئة).")
         elif key == "simulation":
             _send_text(sender, _build_simulation_help())
         elif key == "exec_intel":
@@ -11246,6 +11258,26 @@ def _answer_commands(sender: TelegramSender, result: dict, offset: int | None, s
             continue
 
         for command in commands:
+            # ✅ Scanner commands — كاشف الفرص، بدون تداول
+            if command in ("/scan_now", "/scan_1h", "/scan_24h", "/scan_week"):
+                _period_labels = {
+                    "/scan_now": "🔍 فحص فوري",
+                    "/scan_1h": "📊 آخر ساعة",
+                    "/scan_24h": "📊 آخر 24 ساعة",
+                    "/scan_week": "📊 آخر أسبوع",
+                }
+                if _SCANNER_INSTANCE is None:
+                    _send_text(sender, "⚠️ الماسح غير متاح حالياً (فشلت التهيئة).")
+                    continue
+                try:
+                    import asyncio as _scan_asyncio
+                    _signals = _scan_asyncio.run(_SCANNER_INSTANCE.run_scan())
+                    _report = _SCANNER_INSTANCE.engine.format_report_ar(_signals, _period_labels.get(command, "🔍 الماسح"))
+                except Exception as _scan_cmd_exc:
+                    _report = f"❌ خطأ في الفحص: {_scan_cmd_exc}"
+                _send_text(sender, _report)
+                continue
+
             clean_reply = _handle_admin_clean_command(command, trade_store, result, settings)
             if clean_reply is not None:
                 _send_text(sender, clean_reply)
@@ -11784,6 +11816,16 @@ def live_worker() -> None:
         timeout=settings.request_timeout,
     )
     trade_store = RedisTradeStore(settings.redis_url)
+
+    # ✅ Scanner initialization — كاشف الفرص (consolidation)، بدون تداول
+    global _SCANNER_INSTANCE
+    try:
+        _SCANNER_INSTANCE = ScannerHandler(telegram_sender=sender, redis_client=None)
+    except Exception as _scanner_init_exc:
+        print(f"⚠️ SCANNER_INIT_FAILED | {_scanner_init_exc}", flush=True)
+        _SCANNER_INSTANCE = None
+    scanner = _SCANNER_INSTANCE
+
     state: MarketModeState | None = None
     sent_fingerprints: dict[str, float] = {}
     telegram_offset: int | None = None
@@ -11834,6 +11876,27 @@ def live_worker() -> None:
     print("\n".join(startup_lines), flush=True)
     if sender.enabled and settings.telegram_enabled:
         sender.send_message("\n".join(startup_lines))
+
+    # ✅ Scanner background thread — يشتغل بشكل مستقل عن حلقة التداول
+    if _SCANNER_INSTANCE is not None:
+        def _scanner_thread_loop():
+            import asyncio as _asyncio
+            try:
+                loop = _asyncio.new_event_loop()
+                _asyncio.set_event_loop(loop)
+                loop.run_until_complete(
+                    _SCANNER_INSTANCE.schedule_scanner(alert_interval_minutes=15, report_interval_hours=24)
+                )
+            except Exception as _scanner_loop_exc:
+                print(f"❌ SCANNER_THREAD_ERROR | {_scanner_loop_exc}", flush=True)
+
+        _scanner_thread = threading.Thread(
+            target=_scanner_thread_loop,
+            daemon=True,
+            name="scanner_background",
+        )
+        _scanner_thread.start()
+        print("✅ Scanner thread started (alerts every 15min, report every 24h)", flush=True)
 
     while True:
         try:
