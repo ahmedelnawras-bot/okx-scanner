@@ -11841,7 +11841,7 @@ def live_worker() -> None:
     # ✅ Scanner initialization — كاشف الفرص (consolidation)، بدون تداول
     global _SCANNER_INSTANCE
     try:
-        _SCANNER_INSTANCE = ScannerHandler(telegram_sender=sender, redis_client=None)
+        _SCANNER_INSTANCE = ScannerHandler(telegram_sender=sender, redis_client=None, settings=settings)
     except Exception as _scanner_init_exc:
         print(f"⚠️ SCANNER_INIT_FAILED | {_scanner_init_exc}", flush=True)
         _SCANNER_INSTANCE = None
