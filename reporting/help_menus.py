@@ -8,7 +8,7 @@ def build_main_menu_layout() -> list[list[str]]:
     so it does not open the big persistent Telegram keyboard.
     """
     return [
-        ["🚀 Execution", "📊 Normal Trades", "🧪 Simulation"],
+        ["🚀 Execution", "🔍 الماسح", "🧪 Simulation"],
         ["🧠🚀 Execution Intelligence", "🧠📊 Market Intelligence", "🧠🧪 Simulation Intelligence"],
         ["🧭 أوضاع البوت"],
         ["🧠 Diagnostics", "🤖 OKX Control"],
@@ -39,12 +39,12 @@ def build_main_inline_keyboard(mode: str | None = None) -> dict:
         "inline_keyboard": [
             [
                 {"text": active("trading", "🚀 Execution"), "callback_data": "menu:execution"},
-                {"text": active("scan", "📊 Normal Trades"), "callback_data": "menu:normal"},
+                {"text": active("scanner", "🔍 الماسح"), "callback_data": "menu:scanner"},
                 {"text": active("simulation", "🧪 Simulation"), "callback_data": "menu:simulation"},
             ],
             [
                 {"text": active("trading", "🧠🚀 Exec Intel"), "callback_data": "cmd:/report_execution_intelligence"},
-                {"text": active("scan", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
+                {"text": active("scanner", "🧠📊 Market Intel"), "callback_data": "cmd:/report_intelligence"},
                 {"text": active("simulation", "🧠🧪 Sim Intel"), "callback_data": "cmd:/report_simulation_intelligence"},
             ],
             [
@@ -360,5 +360,65 @@ def build_master_help(
         "• /open_trades يعرض كل الصفقات المتابعة.",
         "• /report_execution خاص بصفقات التنفيذ المرشحة.",
         "• أوامر OKX تعتمد على وضع التنفيذ الحالي.",
+    ]
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ✅ Scanner Mode — دوال الماسح (كاشف الفرص، بدون تداول)
+# ═══════════════════════════════════════════════════════════════
+
+def build_scanner_submenu() -> dict:
+    """قائمة الماسح الفرعية"""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔍 الآن", "callback_data": "cmd:/scan_now"},
+            ],
+            [
+                {"text": "📊 آخر ساعة", "callback_data": "cmd:/scan_1h"},
+                {"text": "📊 آخر 24h", "callback_data": "cmd:/scan_24h"},
+            ],
+            [
+                {"text": "📊 آخر أسبوع", "callback_data": "cmd:/scan_week"},
+            ],
+            [
+                {"text": "⬅️ رجوع", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+
+
+def scanner_help_text() -> str:
+    """نص مساعد الماسح"""
+    return (
+        "🔍 الماسح — كاشف الفرص\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "يكتشف العملات المضغوطة في مرحلة تجميع استعداداً للانفجار:\n\n"
+        "العلامات:\n"
+        "✅ BTC عند دعم 4h\n"
+        "✅ العملة في نطاق ضيق (تجميع)\n"
+        "✅ حجم التداول يزيد تدريجياً\n"
+        "✅ Supply/Demand في الصالح\n\n"
+        "الأوامر:\n"
+        "/scan_now — فحص الآن\n"
+        "/scan_1h — آخر ساعة\n"
+        "/scan_24h — آخر 24 ساعة\n"
+        "/scan_week — آخر أسبوع\n\n"
+        "الجدولة التلقائية:\n"
+        "• تنبيه كل 15 دقيقة (فرص جديدة)\n"
+        "• تقرير يومي (24 ساعة)\n"
+    )
+
+
+def scanner_status_block(last_scan_time: str | None = None, signal_count: int = 0) -> str:
+    """كتلة حالة الماسح"""
+    lines = [
+        "🔍 Scanner Status",
+        "━━━━━━━━━━━━━━━",
+        f"📡 Last Scan: {last_scan_time or 'Never'}",
+        f"🟢 Current Signals: {signal_count}",
+        "⏰ Auto Alerts: كل 15 دقيقة",
+        "📊 Daily Report: كل 24 ساعة",
     ]
     return "\n".join(lines)
