@@ -33,6 +33,7 @@ class ScannerHandler:
         self.last_alert_time = None
         self.last_report_time = None
         self.current_signals = []
+        self.last_diagnostics: dict = {}
         
     async def get_all_tradeable_symbols(self) -> list[str]:
         """جلب قائمة بكل العملات القابلة للتداول من OKX"""
@@ -67,20 +68,33 @@ class ScannerHandler:
         """تشغيل فحص واحد
         
         Return: قائمة الإشارات (الفرص المكتشفة)
+        التشخيص (سبب عدم وجود نتائج لو حصل) بيتخزن في self.last_diagnostics
         """
         
         # جلب BTC 4h
         btc_candles = await self.engine.fetch_btc_4h_candles()
         if not btc_candles:
+            print("❌ RUN_SCAN_FAILED | فشل جلب شموع BTC من OKX", flush=True)
+            self.last_diagnostics = {"btc_fetch_failed": True, "total": 0}
+            self.current_signals = []
+            self.last_scan_time = datetime.now(timezone.utc)
             return []
         
         # جلب العملات
         symbols = await self.get_all_tradeable_symbols()
         if not symbols:
+            print("❌ RUN_SCAN_FAILED | فشل جلب قائمة العملات من OKX (0 عملة)", flush=True)
+            self.last_diagnostics = {"total": 0}
+            self.current_signals = []
+            self.last_scan_time = datetime.now(timezone.utc)
             return []
         
+        print(f"📡 RUN_SCAN | فحص {len(symbols)} عملة...", flush=True)
+        
         # فحص الكل
-        signals = await self.engine.scan_all(symbols, btc_candles, btc_dominance_change)
+        scan_result = await self.engine.scan_all(symbols, btc_candles, btc_dominance_change)
+        signals = scan_result["signals"]
+        self.last_diagnostics = scan_result["diagnostics"]
         
         self.current_signals = signals
         self.last_scan_time = datetime.now(timezone.utc)
@@ -122,7 +136,8 @@ class ScannerHandler:
         try:
             report = self.engine.format_report_ar(
                 signals,
-                title=f"📊 تقرير الماسح — آخر {period}"
+                title=f"📊 تقرير الماسح — آخر {period}",
+                diagnostics=self.last_diagnostics,
             )
             
             # حفظ الملف
@@ -189,7 +204,7 @@ class ScannerHandler:
         signals = await self.run_scan()
         
         if not signals:
-            return "❌ لا توجد فرص حالياً"
+            return self.engine.format_report_ar([], title=f"🔍 الماسح — آخر {period}", diagnostics=self.last_diagnostics)
         
         report = self.engine.format_report_ar(
             signals,
