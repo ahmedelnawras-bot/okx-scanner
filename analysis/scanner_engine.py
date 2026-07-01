@@ -60,53 +60,44 @@ class ScannerEngine:
         Return: [[timestamp, open, high, low, close, volume, ...], ...]
         """
         try:
-            url = f"{base_url}/api/v5/market/candles"
-            params = {
-                "instId": "BTC-USDT",
-                "bar": "4h",
-                "limit": limit,
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("code") == "0" and data.get("data"):
-                    # OKX يرجّع [ts, o, h, l, c, vol, volCcy, ...] لكل شمعة.
-                    # نستخدم index 5 (vol) بدل 7 (volCcyQuote) — دايماً موجود، وأأمن.
-                    candles = [list(map(float, c[:5])) + [float(c[5])] for c in data["data"]]
-                    # ⚠️ مهم جداً: OKX يرجّع الشموع بترتيب الأحدث أولاً (newest-first).
-                    # كل الكود هنا بيفترض ترتيب زمني تصاعدي (الأقدم أولاً، الأحدث آخراً)
-                    # عشان index [-1] يمثّل فعلاً "الشمعة/السعر الحالي". لو مانعكسناش
-                    # الترتيب هنا، الماسح بيحلل بيانات قديمة على إنها حالية = نتائج خاطئة بالكامل.
-                    candles.reverse()
-                    return candles
+            return await asyncio.to_thread(self._fetch_candles_sync, base_url, "BTC-USDT", "4h", limit)
         except Exception as e:
-            print(f"❌ خطأ جلب BTC 4h: {e}")
-        
-        return []
+            print(f"❌ خطأ جلب BTC 4h: {e}", flush=True)
+            return []
+
+    def _fetch_candles_sync(self, base_url: str, inst_id: str, bar: str, limit: int) -> list[list]:
+        """جلب الشموع (استدعاء متزامن — يُشغَّل داخل thread عبر asyncio.to_thread
+        عشان الفحوصات المتعددة تشتغل بالتوازي فعلاً، مش الواحدة ورا التانية).
+        """
+        url = f"{base_url}/api/v5/market/candles"
+        params = {"instId": inst_id, "bar": bar, "limit": limit}
+
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            print(f"⚠️ OKX HTTP {response.status_code} | {inst_id}", flush=True)
+            return []
+
+        data = response.json()
+        if data.get("code") != "0" or not data.get("data"):
+            print(f"⚠️ OKX API error | {inst_id} | code={data.get('code')} msg={data.get('msg')}", flush=True)
+            return []
+
+        # OKX يرجّع [ts, o, h, l, c, vol, volCcy, ...] — نستخدم index 5 (vol) الآمن دايماً.
+        candles = [list(map(float, c[:5])) + [float(c[5])] for c in data["data"]]
+        # ⚠️ مهم جداً: OKX يرجّع الشموع بترتيب الأحدث أولاً (newest-first).
+        # كل منطق الماسح بيفترض ترتيب زمني تصاعدي عشان [-1] = الشمعة الحالية فعلاً.
+        candles.reverse()
+        return candles
     
     async def fetch_alt_candles(self, symbol: str, timeframe: str = "4h", limit: int = 20) -> list[list]:
-        """جلب شموع عملة (4h أو 15m)"""
+        """جلب شموع عملة (4h أو 15m) — في thread منفصل لتوازي حقيقي"""
         try:
-            url = "https://www.okx.com/api/v5/market/candles"
-            params = {
-                "instId": f"{symbol}-USDT",
-                "bar": timeframe,
-                "limit": limit,
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("code") == "0" and data.get("data"):
-                    candles = [list(map(float, c[:5])) + [float(c[5])] for c in data["data"]]
-                    # ⚠️ نفس ملاحظة BTC — لازم نعكس الترتيب عشان [-1] = الأحدث فعلاً.
-                    candles.reverse()
-                    return candles
+            return await asyncio.to_thread(
+                self._fetch_candles_sync, "https://www.okx.com", f"{symbol}-USDT", timeframe, limit
+            )
         except Exception as e:
-            print(f"❌ خطأ جلب {symbol}: {e}")
-        
-        return []
+            print(f"❌ خطأ جلب {symbol}: {e}", flush=True)
+            return []
     
     def detect_btc_support_resistance(self, candles: list[list]) -> tuple[float, float]:
         """كشف دعم/مقاومة BTC من آخر 20 شمعة 4h
@@ -210,19 +201,22 @@ class ScannerEngine:
         return min(max(score, 0), 100)
     
     async def scan_symbol(self, symbol: str, btc_support: float, btc_resistance: float, 
-                         btc_dominance_change: float) -> Optional[ConsolidationSignal]:
-        """فحص عملة واحدة للفرص"""
+                         btc_dominance_change: float) -> tuple[Optional[ConsolidationSignal], str]:
+        """فحص عملة واحدة للفرص
+        
+        Return: (الإشارة أو None, سبب الرفض للتشخيص)
+        """
         
         try:
             # جلب الشموع 4h
             candles_4h = await self.fetch_alt_candles(symbol, timeframe="4h", limit=20)
             if not candles_4h or len(candles_4h) < 10:
-                return None
+                return None, "no_data"
             
             # كشف التجميع
             consolidation = self.detect_consolidation(candles_4h)
             if not consolidation or not consolidation.get("is_consolidating"):
-                return None
+                return None, "not_consolidating"
             
             # حساب volume trend
             last_n = candles_4h[-10:]
@@ -234,7 +228,7 @@ class ScannerEngine:
             # حساب accumulation score
             score = self.calculate_accumulation_score(consolidation, volume_trend)
             if score < 50:  # threshold 50
-                return None
+                return None, "low_score"
             
             # فاصلة من دعم BTC
             current_price = consolidation["current_price"]
@@ -252,45 +246,80 @@ class ScannerEngine:
                 accumulation_score=score,
             )
             
-            return signal
+            return signal, "ok"
             
         except Exception as e:
-            print(f"⚠️ خطأ فحص {symbol}: {e}")
-            return None
+            print(f"⚠️ خطأ فحص {symbol}: {e}", flush=True)
+            return None, "exception"
     
     async def scan_all(self, symbols: list[str], btc_candles: list[list], 
-                      btc_dominance_change: float = 0.0, max_workers: int = 10) -> list[ConsolidationSignal]:
-        """فحص كل العملات
+                      btc_dominance_change: float = 0.0, max_workers: int = 10) -> dict:
+        """فحص كل العملات (بالتوازي الحقيقي عبر threads)
         
-        يستخدم ThreadPoolExecutor للسرعة
+        Return: {
+            "signals": [...],
+            "diagnostics": {"total": N, "no_data": N, "not_consolidating": N, "low_score": N, "exception": N, "ok": N}
+        }
         """
+        
+        diagnostics = {"total": len(symbols), "no_data": 0, "not_consolidating": 0, "low_score": 0, "exception": 0, "ok": 0}
         
         # كشف BTC support/resistance
         btc_support, btc_resistance = self.detect_btc_support_resistance(btc_candles)
         if not btc_support or not btc_resistance:
-            print("❌ لا يمكن كشف دعم BTC")
-            return []
+            print("❌ لا يمكن كشف دعم BTC — شموع BTC غير كافية أو فارغة", flush=True)
+            diagnostics["btc_fetch_failed"] = True
+            return {"signals": [], "diagnostics": diagnostics}
         
-        signals = []
-        
-        # فحص بالتوازي
+        # فحص بالتوازي (asyncio.to_thread داخل scan_symbol → توازي فعلي)
         tasks = [
             self.scan_symbol(symbol, btc_support, btc_resistance, btc_dominance_change)
             for symbol in symbols
         ]
         
         results = await asyncio.gather(*tasks)
-        signals = [s for s in results if s is not None]
+        
+        signals = []
+        for sig, reason in results:
+            diagnostics[reason] = diagnostics.get(reason, 0) + 1
+            if sig is not None:
+                signals.append(sig)
         
         # ترتيب بـ score تنازلي
         signals.sort(key=lambda s: s.accumulation_score, reverse=True)
         
-        return signals
+        print(
+            f"📊 Scan diagnostics | total={diagnostics['total']} "
+            f"no_data={diagnostics['no_data']} not_consolidating={diagnostics['not_consolidating']} "
+            f"low_score={diagnostics['low_score']} exception={diagnostics['exception']} ok={diagnostics['ok']}",
+            flush=True,
+        )
+        
+        return {"signals": signals, "diagnostics": diagnostics}
     
-    def format_report_ar(self, signals: list[ConsolidationSignal], title: str = "🔍 تقرير الماسح") -> str:
-        """تنسيق التقرير بالعربي"""
+    def format_report_ar(self, signals: list[ConsolidationSignal], title: str = "🔍 تقرير الماسح", diagnostics: dict | None = None) -> str:
+        """تنسيق التقرير بالعربي (مع تشخيص واضح عند عدم وجود نتائج)"""
         
         if not signals:
+            if diagnostics:
+                if diagnostics.get("btc_fetch_failed"):
+                    return f"{title}\n━━━━━━━━━━━━\n⚠️ فشل جلب بيانات BTC من OKX. حاول مرة أخرى بعد قليل."
+                total = diagnostics.get("total", 0)
+                if total == 0:
+                    return f"{title}\n━━━━━━━━━━━━\n⚠️ فشل جلب قائمة العملات من OKX (0 عملة). تحقق من الاتصال."
+                no_data = diagnostics.get("no_data", 0)
+                not_cons = diagnostics.get("not_consolidating", 0)
+                low_score = diagnostics.get("low_score", 0)
+                exc = diagnostics.get("exception", 0)
+                return (
+                    f"{title}\n━━━━━━━━━━━━\n"
+                    f"❌ لا توجد فرص حالياً\n\n"
+                    f"📊 تفاصيل الفحص ({total} عملة):\n"
+                    f"• بدون بيانات: {no_data}\n"
+                    f"• غير مجمّعة (خارج النطاق): {not_cons}\n"
+                    f"• أقل من الحد الأدنى (score<50): {low_score}\n"
+                    f"• أخطاء اتصال: {exc}\n"
+                )
             return f"{title}\n━━━━━━━━━━━━\n❌ لا توجد فرص حالياً"
         
         lines = [
